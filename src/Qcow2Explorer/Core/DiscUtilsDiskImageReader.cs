@@ -107,6 +107,7 @@ public sealed class DiscUtilsDiskImageReader : IDiskImageReader
         SetupHelper.RegisterAssembly(typeof(DiscUtils.Vhd.Disk).Assembly);
         SetupHelper.RegisterAssembly(typeof(DiscUtils.Vhdx.Disk).Assembly);
         SetupHelper.RegisterAssembly(typeof(DiscUtils.Vmdk.Disk).Assembly);
+        SetupHelper.RegisterAssembly(typeof(DiscUtils.Vdi.Disk).Assembly);
     }
 
     private static string DetectFormatName(string path)
@@ -117,6 +118,7 @@ public sealed class DiscUtilsDiskImageReader : IDiskImageReader
             ".vhd" => "VHD",
             ".vhdx" => "VHDX",
             ".vmdk" => "VMDK",
+            ".vdi" => "VDI",
             _ => "DiscUtils virtual disk"
         };
     }

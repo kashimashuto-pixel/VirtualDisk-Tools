@@ -55,7 +55,10 @@ public partial class Form1 : Form
         var toolStrip = new ToolStrip { GripStyle = ToolStripGripStyle.Hidden };
         var openButton = new ToolStripButton("開く");
         openButton.Click += (_, _) => OpenImageDialog();
+        var openFolderButton = new ToolStripButton("フォルダ");
+        openFolderButton.Click += (_, _) => OpenImageFolderDialog();
         toolStrip.Items.Add(openButton);
+        toolStrip.Items.Add(openFolderButton);
         toolStrip.Items.Add(new ToolStripSeparator());
         toolStrip.Items.Add(new ToolStripLabel("ファイル"));
         toolStrip.Items.Add(_pathBox);
@@ -231,6 +234,21 @@ public partial class Form1 : Form
         if (dialog.ShowDialog(this) == DialogResult.OK)
         {
             LoadImage(dialog.FileName);
+        }
+    }
+
+    private void OpenImageFolderDialog()
+    {
+        using var dialog = new FolderBrowserDialog
+        {
+            Description = "Parallels .hdd フォルダを選択してください",
+            UseDescriptionForTitle = true,
+            ShowNewFolderButton = false
+        };
+
+        if (dialog.ShowDialog(this) == DialogResult.OK)
+        {
+            LoadImage(dialog.SelectedPath);
         }
     }
 

@@ -5,7 +5,9 @@ using Qcow2Explorer.Core;
 using Qcow2Explorer.FileSystems;
 using Qcow2Explorer.Mounting;
 using Qcow2Explorer.Partitions;
+using DiscUtils.Streams;
 using DiscXfsFileSystem = DiscUtils.Xfs.XfsFileSystem;
+using VdiDisk = DiscUtils.Vdi.Disk;
 
 if (args.Length > 0)
 {
@@ -82,18 +84,50 @@ static void RunGeneratedImageTests()
     TestImageFactory.CreateRawFat16Disk(rawImagePath);
     using var rawReader = DiskImageReaderFactory.Open(rawImagePath);
     Assert(rawReader.FormatName.StartsWith("raw", StringComparison.OrdinalIgnoreCase), "raw image factory");
-    var rawPartitions = PartitionTableReader.ReadPartitions(rawReader);
-    Assert(rawPartitions.Count == 1, "raw partition count");
-    var rawPartition = rawPartitions[0];
-    rawPartition.FileSystem = FileSystemDetector.Detect(rawReader, rawPartition);
-    Assert(rawPartition.FileSystem == "FAT16", "raw FAT16 detection");
-    var rawFs = FileSystemDetector.TryOpen(rawReader, rawPartition, out var rawError);
-    Assert(rawFs is not null, rawError);
-    var rawHello = rawFs!.ListDirectory(rawFs.Root).Single(n => n.Name == "HELLO.TXT");
-    Assert(Encoding.ASCII.GetString(rawFs.ReadFile(rawHello, 0, (int)rawHello.Size)) == TestImageFactory.HelloText, "raw HELLO.TXT content");
+    var rawFs = AssertFat16Readable(rawReader, "raw");
     Console.WriteLine(rawImagePath);
 
+    var vdiImagePath = Path.Combine(AppContext.BaseDirectory, "sample-fat16.vdi");
+    TestImageFactory.CreateFat16Vdi(vdiImagePath);
+    using (var vdiReader = DiskImageReaderFactory.Open(vdiImagePath))
+    {
+        Assert(vdiReader.FormatName == "VDI", "VDI image factory");
+        AssertFat16Readable(vdiReader, "VDI");
+    }
+
+    Console.WriteLine(vdiImagePath);
+
+    var hddImagePath = Path.Combine(AppContext.BaseDirectory, "sample-fat16.hdd");
+    TestImageFactory.CreateParallelsHdd(hddImagePath);
+    using (var hddReader = DiskImageReaderFactory.Open(hddImagePath))
+    {
+        Assert(hddReader.FormatName.StartsWith("Parallels HDD", StringComparison.OrdinalIgnoreCase), "Parallels HDD image factory");
+        AssertFat16Readable(hddReader, "Parallels HDD");
+    }
+
+    Console.WriteLine(hddImagePath);
+
+    using (var hdsReader = DiskImageReaderFactory.Open(Path.Combine(hddImagePath, "disk.hds")))
+    {
+        Assert(hdsReader.FormatName == "Parallels HDD (.hds)", "Parallels HDS image factory");
+        AssertFat16Readable(hdsReader, "Parallels HDS");
+    }
+
     RunProjFsRemountSmoke(rawFs);
+}
+
+static IReadOnlyFileSystem AssertFat16Readable(IDiskImageReader reader, string label)
+{
+    var partitions = PartitionTableReader.ReadPartitions(reader);
+    Assert(partitions.Count == 1, $"{label} partition count");
+    var partition = partitions[0];
+    partition.FileSystem = FileSystemDetector.Detect(reader, partition);
+    Assert(partition.FileSystem == "FAT16", $"{label} FAT16 detection");
+    var fs = FileSystemDetector.TryOpen(reader, partition, out var error);
+    Assert(fs is not null, error);
+    var hello = fs!.ListDirectory(fs.Root).Single(n => n.Name == "HELLO.TXT");
+    Assert(Encoding.ASCII.GetString(fs.ReadFile(hello, 0, (int)hello.Size)) == TestImageFactory.HelloText, $"{label} HELLO.TXT content");
+    return fs;
 }
 
 static void InspectImage(string imagePath, bool copySmoke)
@@ -398,6 +432,63 @@ internal static class TestImageFactory
         File.WriteAllBytes(path, CreateVirtualDisk());
     }
 
+    public static void CreateFat16Vdi(string path)
+    {
+        if (File.Exists(path))
+        {
+            File.Delete(path);
+        }
+
+        using var stream = new FileStream(path, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None);
+        using var disk = VdiDisk.InitializeDynamic(stream, Ownership.Dispose, VirtualSize);
+        var bytes = CreateVirtualDisk();
+        disk.Content.Position = 0;
+        disk.Content.Write(bytes, 0, bytes.Length);
+    }
+
+    public static void CreateParallelsHdd(string path)
+    {
+        const string topGuid = "{5fbaabe3-6958-40ff-92a7-860e329aab41}";
+        const string zeroGuid = "{00000000-0000-0000-0000-000000000000}";
+        if (Directory.Exists(path))
+        {
+            Directory.Delete(path, recursive: true);
+        }
+
+        Directory.CreateDirectory(path);
+        CreateParallelsHds(Path.Combine(path, "disk.hds"), CreateVirtualDisk());
+        File.WriteAllText(
+            Path.Combine(path, "DiskDescriptor.xml"),
+            $"""
+            <?xml version="1.0" encoding="UTF-8"?>
+            <Parallels_disk_image Version="1.0">
+              <Disk_Parameters>
+                <Disk_size>{VirtualSize / BytesPerSector}</Disk_size>
+              </Disk_Parameters>
+              <StorageData>
+                <Storage>
+                  <Start>0</Start>
+                  <End>{VirtualSize / BytesPerSector}</End>
+                  <Blocksize>{BytesPerSector}</Blocksize>
+                  <Image>
+                    <GUID>{topGuid}</GUID>
+                    <Type>Compressed</Type>
+                    <File>disk.hds</File>
+                  </Image>
+                </Storage>
+              </StorageData>
+              <Snapshots>
+                <TopGUID>{topGuid}</TopGUID>
+                <Shot>
+                  <GUID>{topGuid}</GUID>
+                  <ParentGUID>{zeroGuid}</ParentGUID>
+                </Shot>
+              </Snapshots>
+            </Parallels_disk_image>
+            """,
+            Encoding.UTF8);
+    }
+
     public static void CreateFat16Qcow2(string path, bool compressKeyClusters = false)
     {
         var disk = CreateVirtualDisk();
@@ -480,6 +571,51 @@ internal static class TestImageFactory
         File.WriteAllBytes(path, image.ToArray());
     }
 
+    private static void CreateParallelsHds(string path, byte[] disk)
+    {
+        const int hdsHeaderSize = 64;
+        const int hdsClusterSectors = 2048;
+        const int hdsClusterSize = hdsClusterSectors * BytesPerSector;
+        var batEntries = (disk.Length + hdsClusterSize - 1) / hdsClusterSize;
+        var dataOffset = AlignUp(hdsHeaderSize + batEntries * 4, BytesPerSector);
+
+        using var stream = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None);
+        var header = new byte[hdsHeaderSize];
+        WriteAscii(header, 0, "WithoutFreeSpace", 16);
+        WriteU32Le(header, 16, 2);
+        WriteU32Le(header, 20, 16);
+        WriteU32Le(header, 24, 63);
+        WriteU32Le(header, 28, hdsClusterSectors);
+        WriteU32Le(header, 32, batEntries);
+        WriteU32Le(header, 36, disk.Length / BytesPerSector);
+        WriteU32Le(header, 44, 0);
+        WriteU32Le(header, 48, dataOffset / BytesPerSector);
+        WriteU32Le(header, 52, 0);
+        WriteU32Le(header, 56, 0);
+        stream.Write(header, 0, header.Length);
+
+        var firstHostSector = dataOffset / BytesPerSector;
+        var batBytes = new byte[4];
+        for (var i = 0; i < batEntries; i++)
+        {
+            var entry = firstHostSector + i * hdsClusterSectors;
+            WriteU32Le(batBytes, 0, entry);
+            stream.Write(batBytes, 0, batBytes.Length);
+        }
+
+        stream.Position = dataOffset;
+        var zeroPadding = new byte[hdsClusterSize];
+        for (var offset = 0; offset < disk.Length; offset += hdsClusterSize)
+        {
+            var count = Math.Min(hdsClusterSize, disk.Length - offset);
+            stream.Write(disk, offset, count);
+            if (count < hdsClusterSize)
+            {
+                stream.Write(zeroPadding, 0, hdsClusterSize - count);
+            }
+        }
+    }
+
     private static byte[] CompressCluster(byte[] cluster)
     {
         using var output = new MemoryStream();
@@ -522,6 +658,11 @@ internal static class TestImageFactory
         {
             image.AddRange(new byte[padding]);
         }
+    }
+
+    private static int AlignUp(int value, int alignment)
+    {
+        return (value + alignment - 1) / alignment * alignment;
     }
 
     private static byte[] CreateVirtualDisk()
@@ -615,6 +756,14 @@ internal static class TestImageFactory
     }
 
     private static void WriteU32Le(byte[] data, int offset, int value)
+    {
+        data[offset] = (byte)value;
+        data[offset + 1] = (byte)(value >> 8);
+        data[offset + 2] = (byte)(value >> 16);
+        data[offset + 3] = (byte)(value >> 24);
+    }
+
+    private static void WriteU32Le(Span<byte> data, int offset, int value)
     {
         data[offset] = (byte)value;
         data[offset + 1] = (byte)(value >> 8);

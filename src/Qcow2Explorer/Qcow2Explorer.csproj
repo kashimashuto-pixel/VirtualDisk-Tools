@@ -13,6 +13,7 @@
     <PackageReference Include="LTRData.DiscUtils.Lvm" Version="1.0.84" />
     <PackageReference Include="LTRData.DiscUtils.Ntfs" Version="1.0.84" />
     <PackageReference Include="LTRData.DiscUtils.SquashFs" Version="1.0.84" />
+    <PackageReference Include="LTRData.DiscUtils.Vdi" Version="1.0.84" />
     <PackageReference Include="LTRData.DiscUtils.Vhd" Version="1.0.84" />
     <PackageReference Include="LTRData.DiscUtils.Vhdx" Version="1.0.84" />
     <PackageReference Include="LTRData.DiscUtils.Vmdk" Version="1.0.84" />
