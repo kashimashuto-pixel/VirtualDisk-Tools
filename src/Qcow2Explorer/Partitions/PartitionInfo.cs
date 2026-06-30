@@ -1,5 +1,7 @@
 namespace Qcow2Explorer.Partitions;
 
+using Qcow2Explorer.Core;
+
 public sealed class PartitionInfo
 {
     public int Number { get; init; }
@@ -12,9 +14,11 @@ public sealed class PartitionInfo
     public ulong SectorCount { get; init; }
     public uint SectorSize { get; init; } = 512;
     public string FileSystem { get; set; } = "";
+    public IBlockReader? ReaderOverride { get; init; }
+    public long? LengthOverrideBytes { get; init; }
 
-    public long StartOffset => checked((long)(StartLba * SectorSize));
-    public long LengthBytes => checked((long)(SectorCount * SectorSize));
+    public long StartOffset => ReaderOverride is not null ? 0 : checked((long)(StartLba * SectorSize));
+    public long LengthBytes => LengthOverrideBytes ?? checked((long)(SectorCount * SectorSize));
 
     public override string ToString()
     {

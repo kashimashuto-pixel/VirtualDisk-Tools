@@ -3,6 +3,7 @@ using System.IO.Compression;
 using System.Text;
 using Qcow2Explorer.Core;
 using Qcow2Explorer.FileSystems;
+using Qcow2Explorer.Mounting;
 using Qcow2Explorer.Partitions;
 using DiscXfsFileSystem = DiscUtils.Xfs.XfsFileSystem;
 
@@ -76,13 +77,30 @@ static void RunGeneratedImageTests()
     var compressedHello = compressedRoot.Single(n => n.Name == "HELLO.TXT");
     Assert(Encoding.ASCII.GetString(compressedFs.ReadFile(compressedHello, 0, (int)compressedHello.Size)) == TestImageFactory.HelloText, "compressed HELLO.TXT content");
     Console.WriteLine(compressedImagePath);
+
+    var rawImagePath = Path.Combine(AppContext.BaseDirectory, "sample-fat16.img");
+    TestImageFactory.CreateRawFat16Disk(rawImagePath);
+    using var rawReader = DiskImageReaderFactory.Open(rawImagePath);
+    Assert(rawReader.FormatName.StartsWith("raw", StringComparison.OrdinalIgnoreCase), "raw image factory");
+    var rawPartitions = PartitionTableReader.ReadPartitions(rawReader);
+    Assert(rawPartitions.Count == 1, "raw partition count");
+    var rawPartition = rawPartitions[0];
+    rawPartition.FileSystem = FileSystemDetector.Detect(rawReader, rawPartition);
+    Assert(rawPartition.FileSystem == "FAT16", "raw FAT16 detection");
+    var rawFs = FileSystemDetector.TryOpen(rawReader, rawPartition, out var rawError);
+    Assert(rawFs is not null, rawError);
+    var rawHello = rawFs!.ListDirectory(rawFs.Root).Single(n => n.Name == "HELLO.TXT");
+    Assert(Encoding.ASCII.GetString(rawFs.ReadFile(rawHello, 0, (int)rawHello.Size)) == TestImageFactory.HelloText, "raw HELLO.TXT content");
+    Console.WriteLine(rawImagePath);
+
+    RunProjFsRemountSmoke(rawFs);
 }
 
 static void InspectImage(string imagePath, bool copySmoke)
 {
-    using var reader = new Qcow2Reader(imagePath);
+    using var reader = DiskImageReaderFactory.Open(imagePath);
     Console.WriteLine(imagePath);
-    Console.WriteLine($"qcow2 version: {reader.Header.Version}");
+    Console.WriteLine($"format: {reader.FormatName}");
     Console.WriteLine($"virtual size: {FormatBytes(reader.Length)}");
     foreach (var warning in reader.GetWarnings())
     {
@@ -122,6 +140,10 @@ static void InspectImage(string imagePath, bool copySmoke)
             {
                 AuditXfsPaths(fs, reader, partition);
             }
+            else if (fs.Name == "NTFS")
+            {
+                AuditNtfsPaths(fs);
+            }
 
             if (copySmoke && TryFindSmallFile(fs, fs.Root, maxDepth: 3, out var fileToCopy))
             {
@@ -143,7 +165,68 @@ static void InspectImage(string imagePath, bool copySmoke)
     }
 }
 
-static void AuditXfsPaths(IReadOnlyFileSystem fs, Qcow2Reader reader, PartitionInfo partition)
+static void AuditNtfsPaths(IReadOnlyFileSystem fs)
+{
+    foreach (var path in new[] { "Windows", "Windows/System32", "Windows/System32/cmd.exe" })
+    {
+        if (!TryFindPath(fs, fs.Root, path.Split('/'), out var node))
+        {
+            Console.WriteLine($"  audit /{path}: not found");
+            continue;
+        }
+
+        Console.WriteLine($"  audit /{path}: {(node.IsDirectory ? "dir" : "file")}, size={FormatBytes(node.Size)}, meta={node.Metadata}");
+        if (!node.IsDirectory && node.Size >= 2)
+        {
+            var signature = fs.ReadFile(node, 0, 2);
+            Console.WriteLine($"      signature: {FormatSignature(signature)}");
+        }
+
+        if (node.IsDirectory)
+        {
+            var children = fs.ListDirectory(node);
+            Console.WriteLine($"      entries={children.Count}");
+            foreach (var child in children.Take(8))
+            {
+                Console.WriteLine($"      {(child.IsDirectory ? "<DIR>" : FormatBytes(child.Size)),10} {child.Name}");
+            }
+        }
+    }
+}
+
+static void RunProjFsRemountSmoke(IReadOnlyFileSystem fs)
+{
+    if (!ProjectedFileSystemMount.IsProjFsLibraryPresent())
+    {
+        Console.WriteLine("ProjFS smoke skipped: Client-ProjFS is not available.");
+        return;
+    }
+
+    var root = Path.Combine(AppContext.BaseDirectory, "projfs-remount-smoke");
+    if (Directory.Exists(root))
+    {
+        Directory.Delete(root, recursive: true);
+    }
+
+    Directory.CreateDirectory(root);
+    for (var i = 0; i < 2; i++)
+    {
+        using (var mount = ProjectedFileSystemMount.Start(fs, root))
+        {
+            var helloPath = Path.Combine(root, "HELLO.TXT");
+            Assert(File.Exists(helloPath), $"ProjFS HELLO.TXT exists pass {i + 1}");
+            Assert(File.ReadAllText(helloPath, Encoding.ASCII) == TestImageFactory.HelloText, $"ProjFS HELLO.TXT pass {i + 1}");
+        }
+
+        Assert(Directory.Exists(root), $"ProjFS root recreated pass {i + 1}");
+        Assert((File.GetAttributes(root) & FileAttributes.ReparsePoint) == 0, $"ProjFS root reparse cleared pass {i + 1}");
+    }
+
+    Directory.Delete(root, recursive: true);
+    Console.WriteLine("ProjFS remount smoke passed.");
+}
+
+static void AuditXfsPaths(IReadOnlyFileSystem fs, IBlockReader reader, PartitionInfo partition)
 {
     using var directStream = new BlockReaderStream(new PartitionSliceReader(reader, partition));
     using var directXfs = new DiscXfsFileSystem(directStream);
@@ -309,6 +392,11 @@ internal static class TestImageFactory
     private const int RootDirectoryEntries = 512;
     private const int RootDirectorySectors = 32;
     private const int FirstDataSector = ReservedSectors + FatSectors + RootDirectorySectors;
+
+    public static void CreateRawFat16Disk(string path)
+    {
+        File.WriteAllBytes(path, CreateVirtualDisk());
+    }
 
     public static void CreateFat16Qcow2(string path, bool compressKeyClusters = false)
     {
