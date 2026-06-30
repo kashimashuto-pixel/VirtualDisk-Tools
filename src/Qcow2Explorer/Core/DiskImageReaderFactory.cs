@@ -3,10 +3,20 @@ namespace Qcow2Explorer.Core;
 public static class DiskImageReaderFactory
 {
     public const string DialogFilter =
-        "対応/検出ディスク (*.qcow2;*.qcow;*.vhd;*.vhdx;*.vmdk;*.dd;*.img;*.raw;*.dd.lzo)|*.qcow2;*.qcow;*.vhd;*.vhdx;*.vmdk;*.dd;*.img;*.raw;*.dd.lzo|All files (*.*)|*.*";
+        "対応/検出ディスク (*.qcow2;*.qcow;*.vhd;*.vhdx;*.vmdk;*.vdi;*.hdd;*.hds;*.dd;*.img;*.raw;*.dd.lzo)|*.qcow2;*.qcow;*.vhd;*.vhdx;*.vmdk;*.vdi;*.hdd;*.hds;*.dd;*.img;*.raw;*.dd.lzo|All files (*.*)|*.*";
 
     public static IDiskImageReader Open(string path)
     {
+        if (Directory.Exists(path))
+        {
+            if (ParallelsHddReader.CanOpenDirectory(path))
+            {
+                return ParallelsHddReader.Open(path);
+            }
+
+            throw new NotSupportedException("フォルダ形式の仮想ディスクは Parallels .hdd の DiskDescriptor.xml がある場合のみ対応しています。");
+        }
+
         var lower = path.ToLowerInvariant();
         if (lower.EndsWith(".dd.lzo", StringComparison.Ordinal))
         {
@@ -22,7 +32,8 @@ public static class DiskImageReaderFactory
         var extension = Path.GetExtension(path).ToLowerInvariant();
         return extension switch
         {
-            ".vhd" or ".vhdx" or ".vmdk" => DiscUtilsDiskImageReader.Open(path),
+            ".vhd" or ".vhdx" or ".vmdk" or ".vdi" => DiscUtilsDiskImageReader.Open(path),
+            ".hdd" or ".hds" => ParallelsHddReader.Open(path),
             ".dd" or ".img" or ".raw" => new RawDiskImageReader(path),
             _ => new RawDiskImageReader(path, "raw/dd (拡張子未判定)")
         };
