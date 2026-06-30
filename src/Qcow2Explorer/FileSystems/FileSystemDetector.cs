@@ -1,5 +1,7 @@
 using Qcow2Explorer.Core;
 using Qcow2Explorer.Partitions;
+using DiscExFatFileSystem = DiscUtils.ExFat.ExFatFileSystem;
+using DiscNtfsFileSystem = DiscUtils.Ntfs.NtfsFileSystem;
 
 namespace Qcow2Explorer.FileSystems;
 
@@ -27,7 +29,7 @@ public static class FileSystemDetector
 
         if (oem == "EXFAT")
         {
-            return "exFAT (検出のみ)";
+            return "exFAT";
         }
 
         if (boot[0] == (byte)'X' && boot[1] == (byte)'F' && boot[2] == (byte)'S' && boot[3] == (byte)'B')
@@ -298,7 +300,19 @@ public static class FileSystemDetector
 
         if (detected == "NTFS")
         {
-            return new NtfsFileSystem(slice, partition);
+            try
+            {
+                return new DiscUtilsFileSystem(slice, partition, stream => new DiscNtfsFileSystem(stream), "NTFS");
+            }
+            catch
+            {
+                return new NtfsFileSystem(slice, partition);
+            }
+        }
+
+        if (detected == "exFAT")
+        {
+            return new DiscUtilsFileSystem(slice, partition, stream => new DiscExFatFileSystem(stream, ['\\', '/']), "exFAT");
         }
 
         if (detected is "ext4" or "ext2/ext3")

@@ -10,7 +10,7 @@ namespace Qcow2Explorer;
 public partial class Form1 : Form
 {
     private readonly ToolStripTextBox _pathBox = new() { AutoSize = false, Width = 480, ReadOnly = true };
-    private readonly ToolStripLabel _statusLabel = new("qcow2 を開いてください");
+    private readonly ToolStripLabel _statusLabel = new("ディスクイメージを開いてください");
     private readonly ListView _headerList = new() { Dock = DockStyle.Fill, View = View.Details, FullRowSelect = true, GridLines = true };
     private readonly TextBox _warningText = new() { Dock = DockStyle.Fill, Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical };
     private readonly TextBox _offsetBox = new() { Text = "0x0", Width = 140 };
@@ -23,9 +23,10 @@ public partial class Form1 : Form
     private readonly ListView _mountList = new() { Dock = DockStyle.Fill, View = View.Details, FullRowSelect = true, GridLines = true, MultiSelect = true };
     private readonly TextBox _mountText = new() { Dock = DockStyle.Fill, Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical };
 
-    private Qcow2Reader? _reader;
+    private IDiskImageReader? _reader;
     private readonly List<PartitionInfo> _partitions = new();
     private readonly Dictionary<int, IReadOnlyFileSystem> _fileSystems = new();
+    private readonly List<IDisposable> _partitionReaders = new();
     private readonly List<ProjectedFileSystemMount> _mounts = new();
     private IReadOnlyFileSystem? _currentFileSystem;
     private VfsNode? _currentDirectory;
@@ -39,13 +40,14 @@ public partial class Form1 : Form
         {
             DisposeMounts();
             DisposeFileSystems();
+            DisposePartitionReaders();
             _reader?.Dispose();
         };
     }
 
     private void BuildUi()
     {
-        Text = "Qcow2 Explorer";
+        Text = "Virtual Disk Explorer";
         MinimumSize = new Size(980, 640);
         Width = 1180;
         Height = 760;
@@ -222,8 +224,8 @@ public partial class Form1 : Form
     {
         using var dialog = new OpenFileDialog
         {
-            Filter = "qcow2 files (*.qcow2;*.qcow)|*.qcow2;*.qcow|All files (*.*)|*.*",
-            Title = "qcow2 ファイルを開く"
+            Filter = DiskImageReaderFactory.DialogFilter,
+            Title = "ディスクイメージを開く"
         };
 
         if (dialog.ShowDialog(this) == DialogResult.OK)
@@ -234,7 +236,7 @@ public partial class Form1 : Form
 
     private void LoadImage(string path)
     {
-        if (!ConfirmAndDisposeMounts("新しい qcow2 を開く前に、現在のマウントを解除します。続行しますか？"))
+        if (!ConfirmAndDisposeMounts("新しいディスクイメージを開く前に、現在のマウントを解除します。続行しますか？"))
         {
             return;
         }
@@ -243,8 +245,9 @@ public partial class Form1 : Form
         {
             Cursor = Cursors.WaitCursor;
             DisposeFileSystems();
+            DisposePartitionReaders();
             _reader?.Dispose();
-            _reader = new Qcow2Reader(path);
+            _reader = DiskImageReaderFactory.Open(path);
             _partitions.Clear();
             _pathBox.Text = path;
 
@@ -256,7 +259,7 @@ public partial class Form1 : Form
         catch (Exception ex)
         {
             _statusLabel.Text = "読込失敗";
-            MessageBox.Show(this, ex.Message, "qcow2 読込エラー", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            MessageBox.Show(this, ex.Message, "ディスクイメージ読込エラー", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
         finally
         {
@@ -297,35 +300,64 @@ public partial class Form1 : Form
             return;
         }
 
-        foreach (var partition in PartitionTableReader.ReadPartitions(_reader))
+        var discovered = PartitionTableReader.ReadPartitions(_reader).ToList();
+        if (discovered.Count == 0 && _reader.Length >= 512)
+        {
+            discovered.Add(new PartitionInfo
+            {
+                Number = 1,
+                Scheme = "WholeDisk",
+                Name = "Whole disk",
+                Type = "Unpartitioned",
+                TypeId = "",
+                StartLba = 0,
+                SectorCount = checked((ulong)(_reader.Length / 512))
+            });
+        }
+
+        foreach (var partition in discovered)
         {
             partition.FileSystem = FileSystemDetector.Detect(_reader, partition);
-            _partitions.Add(partition);
-            _partitionGrid.Rows.Add(
-                partition.Number,
-                partition.Scheme,
-                partition.FileSystem,
-                partition.Name,
-                $"{partition.Type} ({partition.TypeId})",
-                partition.StartLba.ToString("N0"),
-                partition.SectorCount.ToString("N0"),
-                FormatBytes(partition.LengthBytes));
+            AddPartitionRow(partition);
+        }
 
-            var label = $"{partition.Number}: {partition.Name}";
-            if (!string.IsNullOrWhiteSpace(partition.FileSystem))
+        if (discovered.Any(p => p.FileSystem.StartsWith("LVM2", StringComparison.OrdinalIgnoreCase)))
+        {
+            foreach (var partition in LogicalVolumeDiscoverer.Discover(_reader, _partitions.Count + 1, _partitionReaders))
             {
-                label += $" [{partition.FileSystem}]";
+                partition.FileSystem = FileSystemDetector.Detect(_reader, partition);
+                AddPartitionRow(partition);
             }
-
-            var node = new TreeNode(label) { Tag = new PartitionNodeTag(partition) };
-            node.Nodes.Add(CreateDummyNode());
-            _tree.Nodes.Add(node);
         }
 
         if (_partitions.Count == 0)
         {
             _statusLabel.Text = "パーティションなし";
         }
+    }
+
+    private void AddPartitionRow(PartitionInfo partition)
+    {
+        _partitions.Add(partition);
+        _partitionGrid.Rows.Add(
+            partition.Number,
+            partition.Scheme,
+            partition.FileSystem,
+            partition.Name,
+            string.IsNullOrWhiteSpace(partition.TypeId) ? partition.Type : $"{partition.Type} ({partition.TypeId})",
+            partition.StartLba.ToString("N0"),
+            partition.SectorCount.ToString("N0"),
+            FormatBytes(partition.LengthBytes));
+
+        var label = $"{partition.Number}: {partition.Name}";
+        if (!string.IsNullOrWhiteSpace(partition.FileSystem))
+        {
+            label += $" [{partition.FileSystem}]";
+        }
+
+        var node = new TreeNode(label) { Tag = new PartitionNodeTag(partition) };
+        node.Nodes.Add(CreateDummyNode());
+        _tree.Nodes.Add(node);
     }
 
     private void ReadRawData()
@@ -361,11 +393,9 @@ public partial class Form1 : Form
         try
         {
             var offset = ParseOffset(_offsetBox.Text);
-            var result = _reader.LookupCluster(offset);
-            var host = result.HostClusterOffset.HasValue ? $"0x{result.HostClusterOffset.Value:X}" : "(未割当)";
-            var compression = result.IsCompressed ? $", compressed={FormatBytes(result.CompressedLength)}" : "";
-            _statusLabel.Text = $"virtual cluster {result.VirtualClusterIndex:N0} -> {host}";
-            _hexText.Text = $"{_statusLabel.Text}{Environment.NewLine}zero={result.ReadsAsZero}{compression}{Environment.NewLine}{Environment.NewLine}{_hexText.Text}";
+            var description = _reader.DescribeOffset(offset);
+            _statusLabel.Text = $"{_reader.FormatName}: 0x{offset:X}";
+            _hexText.Text = $"{description}{Environment.NewLine}{Environment.NewLine}{_hexText.Text}";
         }
         catch (Exception ex)
         {
@@ -518,6 +548,16 @@ public partial class Form1 : Form
         }
 
         _fileSystems.Clear();
+    }
+
+    private void DisposePartitionReaders()
+    {
+        foreach (var reader in _partitionReaders)
+        {
+            reader.Dispose();
+        }
+
+        _partitionReaders.Clear();
     }
 
     private void OpenSelectedListItem()

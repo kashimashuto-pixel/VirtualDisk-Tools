@@ -40,13 +40,18 @@ public sealed class ProjectedFileSystemMount : IDisposable
 
     public static ProjectedFileSystemMount Start(IReadOnlyFileSystem fileSystem, string rootPath)
     {
+        return Start(fileSystem, rootPath, allowStaleRootRepair: true);
+    }
+
+    private static ProjectedFileSystemMount Start(IReadOnlyFileSystem fileSystem, string rootPath, bool allowStaleRootRepair)
+    {
         if (!IsProjFsLibraryPresent())
         {
             throw new ProjFsUnavailableException("ProjFS のライブラリが見つかりません。Windows の Client-ProjFS 機能が無効の可能性があります。");
         }
 
         Directory.CreateDirectory(rootPath);
-        if (Directory.EnumerateFileSystemEntries(rootPath).Any())
+        if (MountRootHasEntries(rootPath))
         {
             throw new InvalidOperationException("マウント先フォルダは空にしてください。");
         }
@@ -55,6 +60,12 @@ public sealed class ProjectedFileSystemMount : IDisposable
         var markResult = VirtualizationInstance.MarkDirectoryAsVirtualizationRoot(rootPath, instanceId);
         if (markResult is not HResult.Ok and not HResult.AlreadyInitialized)
         {
+            if (allowStaleRootRepair && HasStaleReparsePoint(rootPath))
+            {
+                TryRecreateMountRoot(rootPath);
+                return Start(fileSystem, rootPath, allowStaleRootRepair: false);
+            }
+
             throw CreateProjFsException("マウント先フォルダを ProjFS ルートに設定できませんでした。", markResult);
         }
 
@@ -83,6 +94,12 @@ public sealed class ProjectedFileSystemMount : IDisposable
         if (startResult != HResult.Ok)
         {
             instance.Dispose();
+            if (allowStaleRootRepair && HasStaleReparsePoint(rootPath))
+            {
+                TryRecreateMountRoot(rootPath);
+                return Start(fileSystem, rootPath, allowStaleRootRepair: false);
+            }
+
             throw CreateProjFsException("ProjFS の仮想化を開始できませんでした。", startResult);
         }
 
@@ -109,7 +126,6 @@ public sealed class ProjectedFileSystemMount : IDisposable
         try
         {
             _instance.StopVirtualizing();
-            TryCleanMountRootContents();
         }
         catch
         {
@@ -117,6 +133,47 @@ public sealed class ProjectedFileSystemMount : IDisposable
         }
 
         _instance.Dispose();
+
+        try
+        {
+            TryCleanMountRootContents();
+            TryRecreateMountRoot(RootPath);
+        }
+        catch
+        {
+            // If another process still owns a handle, the close confirmation already warned.
+        }
+    }
+
+    private static bool MountRootHasEntries(string rootPath)
+    {
+        try
+        {
+            return Directory.EnumerateFileSystemEntries(rootPath).Any();
+        }
+        catch (IOException) when (HasStaleReparsePoint(rootPath))
+        {
+            TryRecreateMountRoot(rootPath);
+            return Directory.EnumerateFileSystemEntries(rootPath).Any();
+        }
+        catch (UnauthorizedAccessException) when (HasStaleReparsePoint(rootPath))
+        {
+            TryRecreateMountRoot(rootPath);
+            return Directory.EnumerateFileSystemEntries(rootPath).Any();
+        }
+    }
+
+    private static bool HasStaleReparsePoint(string rootPath)
+    {
+        try
+        {
+            return Directory.Exists(rootPath)
+                && (File.GetAttributes(rootPath) & FileAttributes.ReparsePoint) != 0;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private void TryCleanMountRootContents()
@@ -130,6 +187,18 @@ public sealed class ProjectedFileSystemMount : IDisposable
         {
             TryDeleteEntry(entry);
         }
+    }
+
+    private static void TryRecreateMountRoot(string rootPath)
+    {
+        if (!Directory.Exists(rootPath))
+        {
+            Directory.CreateDirectory(rootPath);
+            return;
+        }
+
+        Directory.Delete(rootPath, recursive: false);
+        Directory.CreateDirectory(rootPath);
     }
 
     private static void TryDeleteEntry(string path)

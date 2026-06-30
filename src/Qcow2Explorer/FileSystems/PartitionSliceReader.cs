@@ -9,7 +9,7 @@ public sealed class PartitionSliceReader : IBlockReader
 
     public PartitionSliceReader(IBlockReader disk, PartitionInfo partition)
     {
-        _disk = disk;
+        _disk = partition.ReaderOverride ?? disk;
         Partition = partition;
     }
 

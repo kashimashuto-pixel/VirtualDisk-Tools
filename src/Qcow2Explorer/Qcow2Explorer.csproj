@@ -9,7 +9,13 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="LTRData.DiscUtils.ExFat" Version="1.0.84" />
+    <PackageReference Include="LTRData.DiscUtils.Lvm" Version="1.0.84" />
+    <PackageReference Include="LTRData.DiscUtils.Ntfs" Version="1.0.84" />
     <PackageReference Include="LTRData.DiscUtils.SquashFs" Version="1.0.84" />
+    <PackageReference Include="LTRData.DiscUtils.Vhd" Version="1.0.84" />
+    <PackageReference Include="LTRData.DiscUtils.Vhdx" Version="1.0.84" />
+    <PackageReference Include="LTRData.DiscUtils.Vmdk" Version="1.0.84" />
     <PackageReference Include="LTRData.DiscUtils.Xfs" Version="1.0.84" />
     <PackageReference Include="Microsoft.Windows.ProjFS" Version="2.1.0" />
   </ItemGroup>

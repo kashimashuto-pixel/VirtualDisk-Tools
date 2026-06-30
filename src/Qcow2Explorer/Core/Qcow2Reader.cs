@@ -2,7 +2,7 @@ using System.IO.Compression;
 
 namespace Qcow2Explorer.Core;
 
-public sealed class Qcow2Reader : IBlockReader, IDisposable
+public sealed class Qcow2Reader : IDiskImageReader
 {
     private const ulong OffsetMask = 0x00fffffffffffe00UL;
     private const ulong CompressedClusterBit = 1UL << 62;
@@ -18,6 +18,7 @@ public sealed class Qcow2Reader : IBlockReader, IDisposable
 
     public Qcow2Header Header { get; }
     public string Path { get; }
+    public string FormatName => "qcow2";
     public long Length { get; }
     public int L2Entries { get; }
 
@@ -120,6 +121,14 @@ public sealed class Qcow2Reader : IBlockReader, IDisposable
             mapping.Kind == ClusterKind.Zero,
             mapping.Kind == ClusterKind.Compressed,
             mapping.CompressedLength);
+    }
+
+    public string DescribeOffset(long offset)
+    {
+        var result = LookupCluster(offset);
+        var host = result.HostClusterOffset.HasValue ? $"0x{result.HostClusterOffset.Value:X}" : "(未割当)";
+        var compression = result.IsCompressed ? $", compressed={FormatBytes(result.CompressedLength)}" : "";
+        return $"virtual cluster {result.VirtualClusterIndex:N0} -> {host}{Environment.NewLine}zero={result.ReadsAsZero}{compression}";
     }
 
     public void Dispose()
@@ -274,6 +283,20 @@ public sealed class Qcow2Reader : IBlockReader, IDisposable
                 total += read;
             }
         }
+    }
+
+    private static string FormatBytes(long value)
+    {
+        string[] suffixes = { "B", "KB", "MB", "GB", "TB", "PB" };
+        double size = value;
+        var suffix = 0;
+        while (size >= 1024 && suffix < suffixes.Length - 1)
+        {
+            size /= 1024;
+            suffix++;
+        }
+
+        return $"{size:0.##} {suffixes[suffix]}";
     }
 }
 
