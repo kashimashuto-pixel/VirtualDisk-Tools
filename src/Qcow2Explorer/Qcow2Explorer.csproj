@@ -1,0 +1,17 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="LTRData.DiscUtils.SquashFs" Version="1.0.84" />
+    <PackageReference Include="LTRData.DiscUtils.Xfs" Version="1.0.84" />
+    <PackageReference Include="Microsoft.Windows.ProjFS" Version="2.1.0" />
+  </ItemGroup>
+
+</Project>

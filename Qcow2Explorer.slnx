@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Qcow2Explorer/Qcow2Explorer.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Qcow2Explorer.Tests/Qcow2Explorer.Tests.csproj" />
+  </Folder>
+</Solution>
