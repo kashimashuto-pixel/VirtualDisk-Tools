@@ -4,6 +4,7 @@ using Qcow2Explorer.Core;
 using Qcow2Explorer.FileSystems;
 using Qcow2Explorer.Mounting;
 using Qcow2Explorer.Partitions;
+using Qcow2Explorer.Reporting;
 
 namespace Qcow2Explorer;
 
@@ -11,6 +12,8 @@ public partial class Form1 : Form
 {
     private readonly ToolStripTextBox _pathBox = new() { AutoSize = false, Width = 480, ReadOnly = true };
     private readonly ToolStripLabel _statusLabel = new("ディスクイメージを開いてください");
+    private readonly ToolStripTextBox _searchBox = new() { AutoSize = false, Width = 240, BorderStyle = BorderStyle.FixedSingle, ToolTipText = "現在のパーティションからファイル名を検索" };
+    private readonly ToolStripButton _cancelOperationButton = new("キャンセル") { Enabled = false };
     private readonly ListView _headerList = new() { Dock = DockStyle.Fill, View = View.Details, FullRowSelect = true, GridLines = true };
     private readonly TextBox _warningText = new() { Dock = DockStyle.Fill, Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical };
     private readonly TextBox _offsetBox = new() { Text = "0x0", Width = 140 };
@@ -30,6 +33,7 @@ public partial class Form1 : Form
     private readonly List<ProjectedFileSystemMount> _mounts = new();
     private IReadOnlyFileSystem? _currentFileSystem;
     private VfsNode? _currentDirectory;
+    private CancellationTokenSource? _operationCancellation;
 
     public Form1()
     {
@@ -57,11 +61,17 @@ public partial class Form1 : Form
         openButton.Click += (_, _) => OpenImageDialog();
         var openFolderButton = new ToolStripButton("フォルダ");
         openFolderButton.Click += (_, _) => OpenImageFolderDialog();
+        var reportButton = new ToolStripButton("解析レポート");
+        reportButton.Click += (_, _) => SaveAnalysisReport();
+        var snapshotButton = new ToolStripButton("スナップショット");
+        snapshotButton.Click += (_, _) => SelectQcow2Snapshot();
         toolStrip.Items.Add(openButton);
         toolStrip.Items.Add(openFolderButton);
         toolStrip.Items.Add(new ToolStripSeparator());
         toolStrip.Items.Add(new ToolStripLabel("ファイル"));
         toolStrip.Items.Add(_pathBox);
+        toolStrip.Items.Add(reportButton);
+        toolStrip.Items.Add(snapshotButton);
         toolStrip.Items.Add(new ToolStripSeparator());
         toolStrip.Items.Add(_statusLabel);
 
@@ -141,7 +151,9 @@ public partial class Form1 : Form
         _fileList.Columns.Add("サイズ", 120, HorizontalAlignment.Right);
         _fileList.Columns.Add("更新日時 UTC", 170);
         _fileList.Columns.Add("種別", 120);
+        _fileList.Columns.Add("場所", 420);
         _fileList.DoubleClick += (_, _) => OpenSelectedListItem();
+        _fileList.SelectedIndexChanged += (_, _) => ShowSelectedItemProperties();
 
         var previewButton = new ToolStripButton("プレビュー");
         previewButton.Click += (_, _) => PreviewSelectedFile();
@@ -153,21 +165,62 @@ public partial class Form1 : Form
         copyFolderButton.Click += async (_, _) => await CopyCurrentDirectoryAsync();
         var mountButton = new ToolStripButton("マウント");
         mountButton.Click += (_, _) => MountSelectedPartition();
+        var deletedButton = new ToolStripButton("削除済みNTFS");
+        deletedButton.Click += (_, _) => ShowDeletedNtfsFiles();
+        var searchButton = new ToolStripButton("検索");
+        searchButton.Click += async (_, _) => await SearchCurrentFileSystemAsync();
+        var clearSearchButton = new ToolStripButton("クリア");
+        clearSearchButton.Click += (_, _) =>
+        {
+            _searchBox.Clear();
+            if (_currentFileSystem is not null && _currentDirectory is not null)
+            {
+                PopulateFileList(_currentFileSystem, _currentDirectory);
+            }
+        };
+        _searchBox.KeyDown += async (_, e) =>
+        {
+            if (e.KeyCode == Keys.Enter)
+            {
+                e.SuppressKeyPress = true;
+                await SearchCurrentFileSystemAsync();
+            }
+        };
+        _cancelOperationButton.Click += (_, _) => _operationCancellation?.Cancel();
         var explorerStrip = new ToolStrip { GripStyle = ToolStripGripStyle.Hidden };
+        explorerStrip.Items.Add(new ToolStripLabel("検索"));
+        explorerStrip.Items.Add(_searchBox);
+        explorerStrip.Items.Add(searchButton);
+        explorerStrip.Items.Add(clearSearchButton);
+        explorerStrip.Items.Add(_cancelOperationButton);
+        explorerStrip.Items.Add(new ToolStripSeparator());
         explorerStrip.Items.Add(previewButton);
         explorerStrip.Items.Add(extractButton);
         explorerStrip.Items.Add(copyButton);
         explorerStrip.Items.Add(copyFolderButton);
+        explorerStrip.Items.Add(deletedButton);
         explorerStrip.Items.Add(new ToolStripSeparator());
         explorerStrip.Items.Add(mountButton);
 
-        var right = new SplitContainer { Dock = DockStyle.Fill, Orientation = Orientation.Horizontal, SplitterDistance = 330 };
+        var right = new SplitContainer { Dock = DockStyle.Fill, Orientation = Orientation.Horizontal, FixedPanel = FixedPanel.Panel2 };
         right.Panel1.Controls.Add(_fileList);
         right.Panel2.Controls.Add(_previewText);
 
-        var split = new SplitContainer { Dock = DockStyle.Fill, SplitterDistance = 320 };
+        var split = new SplitContainer { Dock = DockStyle.Fill, FixedPanel = FixedPanel.Panel1 };
         split.Panel1.Controls.Add(_tree);
         split.Panel2.Controls.Add(right);
+        split.HandleCreated += (_, _) => BeginInvoke(() =>
+        {
+            if (!split.IsDisposed && split.Width > 600)
+            {
+                split.SplitterDistance = 270;
+            }
+
+            if (!right.IsDisposed && right.Height > 300)
+            {
+                right.SplitterDistance = Math.Max(180, right.Height - 180);
+            }
+        });
 
         var layout = new TableLayoutPanel { Dock = DockStyle.Fill, RowCount = 2, ColumnCount = 1 };
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 28));
@@ -305,6 +358,87 @@ public partial class Form1 : Form
         _warningText.Text = warnings.Count == 0
             ? "警告なし"
             : string.Join(Environment.NewLine, warnings);
+    }
+
+    private void SaveAnalysisReport()
+    {
+        if (_reader is null)
+        {
+            MessageBox.Show(this, "先にディスクイメージを開いてください。", "解析レポート", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        using var dialog = new SaveFileDialog
+        {
+            Filter = "JSON (*.json)|*.json",
+            FileName = $"{Path.GetFileName(_pathBox.Text.TrimEnd(Path.DirectorySeparatorChar))}-analysis.json",
+            Title = "解析レポートを保存"
+        };
+        if (dialog.ShowDialog(this) != DialogResult.OK)
+        {
+            return;
+        }
+
+        try
+        {
+            AnalysisReportWriter.Write(dialog.FileName, _reader, _partitions);
+            _statusLabel.Text = $"解析レポート保存: {dialog.FileName}";
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, ex.Message, "解析レポート保存エラー", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
+    private void SelectQcow2Snapshot()
+    {
+        if (_reader is not Qcow2Reader qcow2 || qcow2.Snapshots.Count == 0)
+        {
+            MessageBox.Show(this, "このイメージには選択可能なqcow2内部スナップショットがありません。", "スナップショット", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        using var dialog = new Form
+        {
+            Text = "qcow2スナップショット",
+            Width = 620,
+            Height = 380,
+            StartPosition = FormStartPosition.CenterParent,
+            MinimizeBox = false,
+            MaximizeBox = false
+        };
+        var list = new ListBox { Dock = DockStyle.Fill };
+        list.Items.Add("現在のアクティブイメージ");
+        foreach (var snapshot in qcow2.Snapshots)
+        {
+            list.Items.Add($"{snapshot.TimestampUtc:yyyy-MM-dd HH:mm:ss} UTC  {snapshot.Name}  ({snapshot.Id})");
+        }
+        list.SelectedIndex = qcow2.ActiveSnapshotIndex.HasValue ? qcow2.ActiveSnapshotIndex.Value + 1 : 0;
+
+        var ok = new Button { Text = "選択", DialogResult = DialogResult.OK, Width = 90 };
+        var cancel = new Button { Text = "キャンセル", DialogResult = DialogResult.Cancel, Width = 90 };
+        var buttons = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 46, FlowDirection = FlowDirection.RightToLeft, Padding = new Padding(8) };
+        buttons.Controls.Add(cancel);
+        buttons.Controls.Add(ok);
+        dialog.Controls.Add(list);
+        dialog.Controls.Add(buttons);
+        dialog.AcceptButton = ok;
+        dialog.CancelButton = cancel;
+
+        if (dialog.ShowDialog(this) != DialogResult.OK || list.SelectedIndex < 0)
+        {
+            return;
+        }
+
+        DisposeFileSystems();
+        DisposePartitionReaders();
+        _partitions.Clear();
+        qcow2.SelectSnapshot(list.SelectedIndex == 0 ? null : list.SelectedIndex - 1);
+        FillHeader();
+        AnalyzePartitions();
+        _statusLabel.Text = list.SelectedIndex == 0
+            ? "アクティブイメージを選択しました"
+            : $"スナップショットを選択しました: {qcow2.Snapshots[list.SelectedIndex - 1].Name}";
     }
 
     private void AnalyzePartitions()
@@ -522,7 +656,111 @@ public partial class Form1 : Form
             item.SubItems.Add(node.IsDirectory ? "" : FormatBytes(node.Size));
             item.SubItems.Add(node.ModifiedUtc?.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) ?? "");
             item.SubItems.Add(node.IsDirectory ? "Folder" : "File");
+            item.SubItems.Add("");
             _fileList.Items.Add(item);
+        }
+    }
+
+    private async Task SearchCurrentFileSystemAsync()
+    {
+        if (_currentFileSystem is null || string.IsNullOrWhiteSpace(_searchBox.Text))
+        {
+            return;
+        }
+
+        _operationCancellation?.Cancel();
+        _operationCancellation?.Dispose();
+        _operationCancellation = new CancellationTokenSource();
+        var token = _operationCancellation.Token;
+        _cancelOperationButton.Enabled = true;
+        _statusLabel.Text = "検索中...";
+        var progress = new Progress<int>(count => _statusLabel.Text = $"検索中: {count:N0} フォルダー");
+
+        try
+        {
+            var fileSystem = _currentFileSystem;
+            var query = _searchBox.Text.Trim();
+            var matches = await Task.Run(() => FileSystemSearch.Search(fileSystem, query, progress, token), token);
+            _fileList.BeginUpdate();
+            _fileList.Items.Clear();
+            _previewText.Clear();
+            foreach (var match in matches)
+            {
+                var node = match.Node;
+                var item = new ListViewItem(node.DisplayName) { Tag = node };
+                item.SubItems.Add(node.IsDirectory ? "" : FormatBytes(node.Size));
+                item.SubItems.Add(node.ModifiedUtc?.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) ?? "");
+                item.SubItems.Add(node.IsDirectory ? "Folder" : "File");
+                item.SubItems.Add(match.Path);
+                _fileList.Items.Add(item);
+            }
+            _fileList.EndUpdate();
+            _statusLabel.Text = $"検索結果: {matches.Count:N0} 件";
+        }
+        catch (OperationCanceledException)
+        {
+            _statusLabel.Text = "検索をキャンセルしました";
+        }
+        finally
+        {
+            _cancelOperationButton.Enabled = false;
+        }
+    }
+
+    private void ShowSelectedItemProperties()
+    {
+        if (_fileList.SelectedItems.Count != 1 || _fileList.SelectedItems[0].Tag is not VfsNode node)
+        {
+            return;
+        }
+
+        var location = _fileList.SelectedItems[0].SubItems.Count > 4 ? _fileList.SelectedItems[0].SubItems[4].Text : "";
+        _previewText.Text = string.Join(Environment.NewLine, new[]
+        {
+            $"名前: {node.DisplayName}",
+            $"種類: {(node.IsDirectory ? "フォルダー" : "ファイル")}",
+            $"サイズ: {(node.IsDirectory ? "-" : $"{node.Size:N0} bytes ({FormatBytes(node.Size)})")}",
+            $"更新日時 UTC: {node.ModifiedUtc?.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) ?? "-"}",
+            string.IsNullOrWhiteSpace(location) ? "" : $"場所: {location}",
+            $"ファイルシステム: {_currentFileSystem?.Name ?? "-"}"
+        }.Where(line => line.Length > 0));
+    }
+
+    private void ShowDeletedNtfsFiles()
+    {
+        if (_reader is null)
+        {
+            return;
+        }
+
+        var partition = _currentFileSystem?.Partition ?? GetSelectedPartitionForMount();
+        if (partition is null || !partition.FileSystem.Contains("NTFS", StringComparison.OrdinalIgnoreCase))
+        {
+            MessageBox.Show(this, "NTFSパーティションを選択してください。", "削除済みファイル", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        try
+        {
+            Cursor = Cursors.WaitCursor;
+            var source = partition.ReaderOverride ?? _reader;
+            var deleted = new NtfsFileSystem(new PartitionSliceReader(source, partition), partition, deletedOnly: true);
+            PopulateFileList(deleted, deleted.Root);
+            _statusLabel.Text = $"削除済みNTFSレコード: {_fileList.Items.Count:N0} 件";
+            MessageBox.Show(
+                this,
+                "削除済みMFTレコードを表示しています。削除後にクラスタが再利用されている場合、コピー内容は元ファイルと一致しないことがあります。",
+                "削除済みファイル",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, ex.Message, "削除済みファイル検出エラー", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+        finally
+        {
+            Cursor = Cursors.Default;
         }
     }
 
@@ -733,15 +971,28 @@ public partial class Form1 : Form
 
         try
         {
-            Cursor = Cursors.WaitCursor;
-            var result = await Task.Run(() => FileSystemExporter.CopyNodes(fileSystem, nodes, dialog.SelectedPath, progress));
+            _operationCancellation?.Cancel();
+            _operationCancellation?.Dispose();
+            _operationCancellation = new CancellationTokenSource();
+            _cancelOperationButton.Enabled = true;
+            var result = await Task.Run(() => FileSystemExporter.CopyNodes(
+                fileSystem,
+                nodes,
+                dialog.SelectedPath,
+                progress,
+                _operationCancellation.Token,
+                new CopyOptions(ContinueOnError: true, CreateSha256Manifest: true)));
             _statusLabel.Text = $"コピー完了: {result.FilesCopied:N0} files, {FormatBytes(result.BytesCopied)}";
             MessageBox.Show(
                 this,
-                $"コピーが完了しました。{Environment.NewLine}ファイル: {result.FilesCopied:N0}{Environment.NewLine}フォルダ: {result.DirectoriesCreated:N0}{Environment.NewLine}サイズ: {FormatBytes(result.BytesCopied)}",
+                $"コピーが完了しました。{Environment.NewLine}ファイル: {result.FilesCopied:N0}{Environment.NewLine}フォルダ: {result.DirectoriesCreated:N0}{Environment.NewLine}サイズ: {FormatBytes(result.BytesCopied)}{Environment.NewLine}エラー: {result.Errors.Count:N0}{Environment.NewLine}{Environment.NewLine}SHA-256一覧もコピー先へ保存しました。",
                 "コピー完了",
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Information);
+        }
+        catch (OperationCanceledException)
+        {
+            _statusLabel.Text = "コピーをキャンセルしました";
         }
         catch (Exception ex)
         {
@@ -750,7 +1001,7 @@ public partial class Form1 : Form
         }
         finally
         {
-            Cursor = Cursors.Default;
+            _cancelOperationButton.Enabled = false;
         }
     }
 

@@ -18,10 +18,12 @@ public sealed class NtfsFileSystem : IReadOnlyFileSystem
     private readonly long _mftSize;
     private readonly Dictionary<long, NtfsFileEntry> _entries = new();
     private readonly Dictionary<long, List<NtfsFileEntry>> _children = new();
+    private readonly bool _deletedOnly;
 
-    public NtfsFileSystem(IBlockReader reader, PartitionInfo partition)
+    public NtfsFileSystem(IBlockReader reader, PartitionInfo partition, bool deletedOnly = false)
     {
         _reader = reader;
+        _deletedOnly = deletedOnly;
         Partition = partition;
         var boot = EndianUtilities.ReadBytes(reader, 0, 512);
         if (Encoding.ASCII.GetString(boot, 3, 8) != "NTFS    ")
@@ -48,7 +50,7 @@ public sealed class NtfsFileSystem : IReadOnlyFileSystem
 
         _mftRuns = mftEntry.Data.Runs;
         _mftSize = mftEntry.Data.Size;
-        Root = new VfsNode { Name = "", IsDirectory = true, Metadata = 5L };
+        Root = new VfsNode { Name = deletedOnly ? "Deleted files" : "", IsDirectory = true, Metadata = deletedOnly ? -1L : 5L };
         ScanMft();
     }
 
@@ -121,10 +123,11 @@ public sealed class NtfsFileSystem : IReadOnlyFileSystem
 
         foreach (var entry in _entries.Values)
         {
-            if (!_children.TryGetValue(entry.ParentId, out var list))
+            var parentId = _deletedOnly ? -1 : entry.ParentId;
+            if (!_children.TryGetValue(parentId, out var list))
             {
                 list = new List<NtfsFileEntry>();
-                _children[entry.ParentId] = list;
+                _children[parentId] = list;
             }
 
             if (entry.Id != entry.ParentId)
@@ -150,7 +153,8 @@ public sealed class NtfsFileSystem : IReadOnlyFileSystem
         }
 
         var flags = EndianUtilities.ReadUInt16Little(record, 22);
-        if ((flags & 0x0001) == 0)
+        var isDeleted = (flags & 0x0001) == 0;
+        if (isDeleted != _deletedOnly)
         {
             return null;
         }
@@ -164,7 +168,8 @@ public sealed class NtfsFileSystem : IReadOnlyFileSystem
         var entry = new NtfsFileEntry
         {
             Id = id,
-            IsDirectory = (flags & 0x0002) != 0
+            IsDirectory = (flags & 0x0002) != 0,
+            IsDeleted = isDeleted
         };
 
         var names = new List<NtfsFileName>();
@@ -442,6 +447,7 @@ public sealed class NtfsFileSystem : IReadOnlyFileSystem
         public long ParentId { get; set; }
         public string Name { get; set; } = "";
         public bool IsDirectory { get; init; }
+        public bool IsDeleted { get; init; }
         public long FileNameSize { get; set; }
         public DateTime? ModifiedUtc { get; set; }
         public NtfsDataAttribute? Data { get; set; }

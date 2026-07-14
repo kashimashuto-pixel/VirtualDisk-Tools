@@ -47,6 +47,11 @@ public static class EndianUtilities
             | buffer[offset + 3];
     }
 
+    public static ushort ReadUInt16Big(byte[] buffer, int offset)
+    {
+        return (ushort)((buffer[offset] << 8) | buffer[offset + 1]);
+    }
+
     public static ulong ReadUInt64Big(byte[] buffer, int offset)
     {
         var hi = ReadUInt32Big(buffer, offset);
