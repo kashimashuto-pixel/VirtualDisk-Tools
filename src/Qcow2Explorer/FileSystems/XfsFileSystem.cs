@@ -118,6 +118,7 @@ public sealed class XfsFileSystem : IReadOnlyFileSystem, IDisposable
             IsDirectory = isDirectory,
             Size = isDirectory ? 0 : TryGetFileLength(path),
             ModifiedUtc = TryGetLastWriteTimeUtc(path),
+            Attributes = attributes,
             Metadata = NormalizePath(path)
         };
     }

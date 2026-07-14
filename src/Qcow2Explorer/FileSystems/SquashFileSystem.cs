@@ -82,6 +82,7 @@ public sealed class SquashFileSystem : IReadOnlyFileSystem, IDisposable
             IsDirectory = isDirectory,
             Size = isDirectory ? 0 : _reader.GetFileLength(path),
             ModifiedUtc = _reader.GetLastWriteTimeUtc(path),
+            Attributes = attributes,
             Metadata = NormalizePath(path)
         };
     }

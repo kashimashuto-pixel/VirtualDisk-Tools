@@ -236,6 +236,7 @@ public sealed class FatFileSystem : IReadOnlyFileSystem
                 IsDirectory = isDirectory,
                 Size = isDirectory ? 0 : size,
                 ModifiedUtc = ReadFatDateTime(data, offset + 22, offset + 24),
+                Attributes = ToFileAttributes(attr),
                 Metadata = new FatNodeMeta(cluster)
             });
         }
@@ -305,6 +306,17 @@ public sealed class FatFileSystem : IReadOnlyFileSystem
         {
             return null;
         }
+    }
+
+    private static FileAttributes ToFileAttributes(byte attributes)
+    {
+        var result = (FileAttributes)0;
+        if ((attributes & 0x01) != 0) result |= FileAttributes.ReadOnly;
+        if ((attributes & 0x02) != 0) result |= FileAttributes.Hidden;
+        if ((attributes & 0x04) != 0) result |= FileAttributes.System;
+        if ((attributes & 0x10) != 0) result |= FileAttributes.Directory;
+        if ((attributes & 0x20) != 0) result |= FileAttributes.Archive;
+        return result;
     }
 
     private sealed record FatNodeMeta(uint FirstCluster);

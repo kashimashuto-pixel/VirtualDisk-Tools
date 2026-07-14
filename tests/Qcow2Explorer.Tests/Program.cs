@@ -43,6 +43,7 @@ static void RunGeneratedImageTests()
     var hello = root.Single(n => n.Name == "HELLO.TXT");
     var docs = root.Single(n => n.Name == "DOCS");
     Assert(!hello.IsDirectory && docs.IsDirectory, "root entries");
+    Assert((hello.Attributes & (FileAttributes.Hidden | FileAttributes.System)) == (FileAttributes.Hidden | FileAttributes.System), "hidden/system attributes");
 
     var helloText = Encoding.ASCII.GetString(fs.ReadFile(hello, 0, (int)hello.Size));
     Assert(helloText == TestImageFactory.HelloText, "HELLO.TXT content");
@@ -723,7 +724,7 @@ internal static class TestImageFactory
         WriteU16Le(disk, fat + 8, 0xffff);
 
         var root = start + (ReservedSectors + FatSectors) * BytesPerSector;
-        WriteDirectoryEntry(disk, root, "HELLO   TXT", 0x20, 2, HelloText.Length);
+        WriteDirectoryEntry(disk, root, "HELLO   TXT", 0x26, 2, HelloText.Length);
         WriteDirectoryEntry(disk, root + 32, "DOCS       ", 0x10, 3, 0);
 
         WriteAscii(disk, ClusterOffset(start, 2), HelloText, HelloText.Length);

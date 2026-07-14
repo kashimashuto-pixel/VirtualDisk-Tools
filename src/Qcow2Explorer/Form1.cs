@@ -150,7 +150,7 @@ public partial class Form1 : Form
         _fileList.Columns.Add("名前", 360);
         _fileList.Columns.Add("サイズ", 120, HorizontalAlignment.Right);
         _fileList.Columns.Add("更新日時 UTC", 170);
-        _fileList.Columns.Add("種別", 120);
+        _fileList.Columns.Add("種別 / 属性", 220);
         _fileList.Columns.Add("場所", 420);
         _fileList.DoubleClick += (_, _) => OpenSelectedListItem();
         _fileList.SelectedIndexChanged += (_, _) => ShowSelectedItemProperties();
@@ -573,12 +573,11 @@ public partial class Form1 : Form
             return;
         }
 
-        if (e.Node.Nodes.Count != 1 || e.Node.Nodes[0].Tag is not DummyNodeTag)
+        if (!e.Node.Nodes.Cast<TreeNode>().Any(node => node.Tag is DummyNodeTag))
         {
             return;
         }
 
-        e.Node.Nodes.Clear();
         try
         {
             if (e.Node.Tag is PartitionNodeTag partitionTag)
@@ -620,11 +619,7 @@ public partial class Form1 : Form
             }
 
             e.Node.Tag = new DirectoryNodeTag(fs, fs.Root);
-            if (e.Node.Nodes.Count == 1 && e.Node.Nodes[0].Tag is DummyNodeTag)
-            {
-                e.Node.Nodes.Clear();
-                AddDirectoryChildren(e.Node, fs, fs.Root);
-            }
+            AddDirectoryChildren(e.Node, fs, fs.Root);
         }
 
         if (e.Node.Tag is DirectoryNodeTag directoryTag)
@@ -635,8 +630,26 @@ public partial class Form1 : Form
 
     private void AddDirectoryChildren(TreeNode treeNode, IReadOnlyFileSystem fileSystem, VfsNode directory)
     {
+        for (var index = treeNode.Nodes.Count - 1; index >= 0; index--)
+        {
+            if (treeNode.Nodes[index].Tag is DummyNodeTag)
+            {
+                treeNode.Nodes.RemoveAt(index);
+            }
+        }
+
         foreach (var child in fileSystem.ListDirectory(directory).Where(n => n.IsDirectory))
         {
+            var existing = treeNode.Nodes
+                .Cast<TreeNode>()
+                .FirstOrDefault(node => node.Tag is DirectoryNodeTag tag
+                    && ReferenceEquals(tag.FileSystem, fileSystem)
+                    && IsSameVfsNode(tag.Node, child));
+            if (existing is not null)
+            {
+                continue;
+            }
+
             var childNode = new TreeNode(child.DisplayName) { Tag = new DirectoryNodeTag(fileSystem, child) };
             childNode.Nodes.Add(CreateDummyNode());
             treeNode.Nodes.Add(childNode);
@@ -655,7 +668,7 @@ public partial class Form1 : Form
             var item = new ListViewItem(node.DisplayName) { Tag = node };
             item.SubItems.Add(node.IsDirectory ? "" : FormatBytes(node.Size));
             item.SubItems.Add(node.ModifiedUtc?.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) ?? "");
-            item.SubItems.Add(node.IsDirectory ? "Folder" : "File");
+            item.SubItems.Add(FormatNodeType(node));
             item.SubItems.Add("");
             _fileList.Items.Add(item);
         }
@@ -690,7 +703,7 @@ public partial class Form1 : Form
                 var item = new ListViewItem(node.DisplayName) { Tag = node };
                 item.SubItems.Add(node.IsDirectory ? "" : FormatBytes(node.Size));
                 item.SubItems.Add(node.ModifiedUtc?.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) ?? "");
-                item.SubItems.Add(node.IsDirectory ? "Folder" : "File");
+                item.SubItems.Add(FormatNodeType(node));
                 item.SubItems.Add(match.Path);
                 _fileList.Items.Add(item);
             }
@@ -721,6 +734,7 @@ public partial class Form1 : Form
             $"種類: {(node.IsDirectory ? "フォルダー" : "ファイル")}",
             $"サイズ: {(node.IsDirectory ? "-" : $"{node.Size:N0} bytes ({FormatBytes(node.Size)})")}",
             $"更新日時 UTC: {node.ModifiedUtc?.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) ?? "-"}",
+            $"属性: {FormatAttributes(node.Attributes)}",
             string.IsNullOrWhiteSpace(location) ? "" : $"場所: {location}",
             $"ファイルシステム: {_currentFileSystem?.Name ?? "-"}"
         }.Where(line => line.Length > 0));
@@ -744,7 +758,15 @@ public partial class Form1 : Form
         {
             Cursor = Cursors.WaitCursor;
             var source = partition.ReaderOverride ?? _reader;
-            var deleted = new NtfsFileSystem(new PartitionSliceReader(source, partition), partition, deletedOnly: true);
+            var scanPartition = partition;
+            if (_currentFileSystem is BitLockerFileSystem bitLocker
+                && bitLocker.InnerFileSystemName.Contains("NTFS", StringComparison.OrdinalIgnoreCase))
+            {
+                source = bitLocker.DecryptedReader;
+                scanPartition = bitLocker.DecryptedPartition;
+            }
+
+            var deleted = new NtfsFileSystem(new PartitionSliceReader(source, scanPartition), scanPartition, deletedOnly: true);
             PopulateFileList(deleted, deleted.Root);
             _statusLabel.Text = $"削除済みNTFSレコード: {_fileList.Items.Count:N0} 件";
             MessageBox.Show(
@@ -840,9 +862,16 @@ public partial class Form1 : Form
             return;
         }
 
+        if (_currentDirectory is not null)
+        {
+            AddDirectoryChildren(_tree.SelectedNode, _currentFileSystem, _currentDirectory);
+        }
+
         foreach (TreeNode child in _tree.SelectedNode.Nodes)
         {
-            if (child.Tag is DirectoryNodeTag tag && ReferenceEquals(tag.Node, node))
+            if (child.Tag is DirectoryNodeTag tag
+                && ReferenceEquals(tag.FileSystem, _currentFileSystem)
+                && IsSameVfsNode(tag.Node, node))
             {
                 _tree.SelectedNode = child;
                 child.Expand();
@@ -1213,6 +1242,45 @@ public partial class Form1 : Form
         }
 
         return $"{size:0.##} {suffixes[suffix]}";
+    }
+
+    private static bool IsSameVfsNode(VfsNode left, VfsNode right)
+    {
+        if (left.Metadata is string leftPath && right.Metadata is string rightPath)
+        {
+            return string.Equals(
+                leftPath.Replace('/', '\\').TrimEnd('\\'),
+                rightPath.Replace('/', '\\').TrimEnd('\\'),
+                StringComparison.OrdinalIgnoreCase);
+        }
+
+        if (left.Metadata is not null && right.Metadata is not null && left.Metadata.Equals(right.Metadata))
+        {
+            return true;
+        }
+
+        return left.IsDirectory == right.IsDirectory
+            && string.Equals(left.Name, right.Name, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string FormatNodeType(VfsNode node)
+    {
+        var type = node.IsDirectory ? "Folder" : "File";
+        var attributes = FormatAttributes(node.Attributes, includeNormal: false);
+        return attributes.Length == 0 ? type : $"{type} [{attributes}]";
+    }
+
+    private static string FormatAttributes(FileAttributes attributes, bool includeNormal = true)
+    {
+        var values = new List<string>();
+        if ((attributes & FileAttributes.Hidden) != 0) values.Add("Hidden");
+        if ((attributes & FileAttributes.System) != 0) values.Add("System");
+        if ((attributes & FileAttributes.ReadOnly) != 0) values.Add("Read-only");
+        if ((attributes & FileAttributes.Archive) != 0) values.Add("Archive");
+        if ((attributes & FileAttributes.ReparsePoint) != 0) values.Add("Reparse point");
+        if ((attributes & FileAttributes.Compressed) != 0) values.Add("Compressed");
+        if ((attributes & FileAttributes.Encrypted) != 0) values.Add("Encrypted");
+        return values.Count == 0 && includeNormal ? "Normal" : string.Join(", ", values);
     }
 
     private sealed record PartitionNodeTag(PartitionInfo Partition);
