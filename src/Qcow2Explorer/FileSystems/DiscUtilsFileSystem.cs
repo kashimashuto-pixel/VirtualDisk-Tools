@@ -46,6 +46,7 @@ public sealed class DiscUtilsFileSystem : IReadOnlyFileSystem, IDisposable
         {
             return _reader.GetFileSystemEntries(path)
                 .Select(ToNodeSafe)
+                .Where(node => !string.IsNullOrWhiteSpace(node.Name))
                 .OrderByDescending(n => n.IsDirectory)
                 .ThenBy(n => n.Name, StringComparer.CurrentCultureIgnoreCase)
                 .ToList();
@@ -101,6 +102,7 @@ public sealed class DiscUtilsFileSystem : IReadOnlyFileSystem, IDisposable
                 IsDirectory = isDirectory,
                 Size = isDirectory ? 0 : TryGetFileLength(normalized),
                 ModifiedUtc = TryGetLastWriteTimeUtc(normalized),
+                Attributes = attributes,
                 Metadata = normalized
             };
         }

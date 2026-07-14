@@ -189,7 +189,15 @@ public sealed class NtfsFileSystem : IReadOnlyFileSystem
             }
 
             var nonResident = record[attrOffset + 8] != 0;
-            if (attrType == 0x30)
+            if (attrType == 0x10 && !nonResident)
+            {
+                var value = GetResidentValue(record, attrOffset, (int)attrLength);
+                if (value is { Length: >= 36 })
+                {
+                    entry.Attributes = (FileAttributes)EndianUtilities.ReadUInt32Little(value, 32);
+                }
+            }
+            else if (attrType == 0x30)
             {
                 var value = GetResidentValue(record, attrOffset, (int)attrLength);
                 if (value is not null)
@@ -433,6 +441,7 @@ public sealed class NtfsFileSystem : IReadOnlyFileSystem
             IsDirectory = entry.IsDirectory,
             Size = entry.IsDirectory ? 0 : entry.Data?.Size ?? entry.FileNameSize,
             ModifiedUtc = entry.ModifiedUtc,
+            Attributes = entry.Attributes,
             Metadata = entry.Id
         };
     }
@@ -450,6 +459,7 @@ public sealed class NtfsFileSystem : IReadOnlyFileSystem
         public bool IsDeleted { get; init; }
         public long FileNameSize { get; set; }
         public DateTime? ModifiedUtc { get; set; }
+        public FileAttributes Attributes { get; set; }
         public NtfsDataAttribute? Data { get; set; }
     }
 }

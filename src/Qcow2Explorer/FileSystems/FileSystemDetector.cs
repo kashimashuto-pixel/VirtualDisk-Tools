@@ -248,14 +248,16 @@ public static class FileSystemDetector
                             Type = partition.Type,
                             TypeId = partition.TypeId,
                             StartLba = 0,
-                            SectorCount = checked((ulong)(decryptedReader.Length / 512))
+                            SectorCount = checked((ulong)(decryptedReader.Length / 512)),
+                            ReaderOverride = decryptedReader,
+                            LengthOverrideBytes = decryptedReader.Length
                         };
                         innerPartition.FileSystem = Detect(decryptedReader, innerPartition);
                         var innerFileSystem = OpenSupportedFileSystem(decryptedReader, innerPartition, innerPartition.FileSystem);
                         if (innerFileSystem is not null)
                         {
                             partition.FileSystem = $"BitLocker/FVE -> {innerPartition.FileSystem}";
-                            return innerFileSystem;
+                            return new BitLockerFileSystem(innerFileSystem, decryptedReader, partition, innerPartition);
                         }
 
                         error = $"BitLocker/FVE のクリアキー復号は成功しましたが、内部ファイルシステムを開けませんでした: {innerPartition.FileSystem}";
@@ -302,7 +304,14 @@ public static class FileSystemDetector
         {
             try
             {
-                return new DiscUtilsFileSystem(slice, partition, stream => new DiscNtfsFileSystem(stream), "NTFS");
+                return new DiscUtilsFileSystem(slice, partition, stream =>
+                {
+                    var ntfs = new DiscNtfsFileSystem(stream);
+                    ntfs.NtfsOptions.HideHiddenFiles = false;
+                    ntfs.NtfsOptions.HideSystemFiles = false;
+                    ntfs.NtfsOptions.HideMetafiles = false;
+                    return ntfs;
+                }, "NTFS");
             }
             catch
             {
