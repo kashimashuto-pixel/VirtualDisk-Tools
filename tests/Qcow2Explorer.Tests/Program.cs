@@ -60,8 +60,14 @@ static void RunGeneratedImageTests()
 
     var copyResult = FileSystemExporter.CopyNodes(fs, new[] { hello, docs }, copyDirectory);
     Assert(copyResult.FilesCopied == 2, "copied file count");
+    Assert(copyResult.Errors.Count == 0, "copy errors");
+    Assert(copyResult.Manifest.Count == 2, "SHA-256 manifest entries");
+    Assert(File.Exists(Path.Combine(copyDirectory, "VirtualDiskExplorer.sha256")), "SHA-256 manifest file");
     Assert(File.ReadAllText(Path.Combine(copyDirectory, "HELLO.TXT"), Encoding.ASCII) == TestImageFactory.HelloText, "copied HELLO.TXT");
     Assert(File.ReadAllText(Path.Combine(copyDirectory, "DOCS", "README.TXT"), Encoding.ASCII) == TestImageFactory.ReadmeText, "copied README.TXT");
+
+    var searchResults = FileSystemSearch.Search(fs, "readme");
+    Assert(searchResults.Count == 1 && searchResults[0].Path == "/DOCS/README.TXT", "recursive file search");
 
     Console.WriteLine("All qcow2 reader checks passed.");
     Console.WriteLine(imagePath);

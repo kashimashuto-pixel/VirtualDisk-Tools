@@ -24,6 +24,7 @@ public sealed class Qcow2Header
     public uint HeaderLength { get; init; }
     public byte CompressionType { get; init; }
     public string? BackingFileName { get; init; }
+    public string? ExternalDataFileName { get; init; }
 
     public long ClusterSize => 1L << (int)ClusterBits;
     public bool HasBackingFile => BackingFileOffset != 0 && BackingFileSize != 0;
@@ -76,6 +77,41 @@ public sealed class Qcow2Header
             throw new NotSupportedException($"cluster_bits={clusterBits} は未対応です。");
         }
 
+        string? externalDataFileName = null;
+        if (version == 3)
+        {
+            var extensionOffset = (long)headerLength;
+            var extensionLimit = backingOffset > (ulong)extensionOffset
+                ? (long)backingOffset
+                : Math.Min(1L << (int)clusterBits, stream.Length);
+            while (extensionOffset + 8 <= extensionLimit)
+            {
+                var extensionHeader = new byte[8];
+                stream.Position = extensionOffset;
+                ReadExact(stream, extensionHeader, 0, extensionHeader.Length);
+                var extensionType = EndianUtilities.ReadUInt32Big(extensionHeader, 0);
+                var extensionLength = EndianUtilities.ReadUInt32Big(extensionHeader, 4);
+                if (extensionType == 0)
+                {
+                    break;
+                }
+
+                if (extensionLength > extensionLimit - extensionOffset - 8)
+                {
+                    break;
+                }
+
+                if (extensionType == 0x44415441 && extensionLength > 0)
+                {
+                    var data = new byte[extensionLength];
+                    ReadExact(stream, data, 0, data.Length);
+                    externalDataFileName = System.Text.Encoding.UTF8.GetString(data);
+                }
+
+                extensionOffset += 8 + ((extensionLength + 7) & ~7U);
+            }
+        }
+
         return new Qcow2Header
         {
             Magic = magic,
@@ -97,7 +133,8 @@ public sealed class Qcow2Header
             RefcountOrder = version == 3 ? EndianUtilities.ReadUInt32Big(headerBuffer, 96) : 4,
             HeaderLength = headerLength,
             CompressionType = version == 3 && headerLength > 104 ? headerBuffer[104] : (byte)0,
-            BackingFileName = backingName
+            BackingFileName = backingName,
+            ExternalDataFileName = externalDataFileName
         };
     }
 
@@ -111,12 +148,14 @@ public sealed class Qcow2Header
 
         if (UsesExternalDataFile)
         {
-            warnings.Add("外部 data file を使う qcow2 は、この版では未対応です。");
+            warnings.Add(string.IsNullOrWhiteSpace(ExternalDataFileName)
+                ? "外部 data file を使用していますが、ファイル名拡張がありません。"
+                : $"外部 data file を読み取ります: {ExternalDataFileName}");
         }
 
         if (UsesExtendedL2Entries)
         {
-            warnings.Add("Extended L2 Entries を使う qcow2 は、この版では未対応です。");
+            warnings.Add("Extended L2 Entries を使用しています。32個のサブクラスタ割り当てを読み取ります。");
         }
 
         if (UnknownIncompatibleFeatures != 0)
@@ -126,7 +165,7 @@ public sealed class Qcow2Header
 
         if (HasBackingFile)
         {
-            warnings.Add($"backing file があります。未割り当て領域は backing file ではなく 0 として読みます: {BackingFileName}");
+            warnings.Add($"backing file があります。親イメージを同じ場所から読み取ります: {BackingFileName}");
         }
 
         if (IsDirty)
@@ -141,7 +180,9 @@ public sealed class Qcow2Header
 
         if (UsesNonDefaultCompression)
         {
-            warnings.Add($"非標準圧縮が指定されています。この版では圧縮クラスタの展開は未対応です: compression_type={CompressionType}");
+            warnings.Add(CompressionType == 1
+                ? "zstd 圧縮クラスタを使用しています。"
+                : $"未対応の非標準圧縮です: compression_type={CompressionType}");
         }
 
         return warnings;
@@ -149,8 +190,8 @@ public sealed class Qcow2Header
 
     public bool CanReadStandardClusters =>
         !IsEncrypted
-        && !UsesExternalDataFile
-        && !UsesExtendedL2Entries
+        && (!UsesExternalDataFile || !string.IsNullOrWhiteSpace(ExternalDataFileName))
+        && (!UsesNonDefaultCompression || CompressionType == 1)
         && UnknownIncompatibleFeatures == 0;
 
     private static void ReadExact(Stream stream, byte[] buffer, int offset, int count)
