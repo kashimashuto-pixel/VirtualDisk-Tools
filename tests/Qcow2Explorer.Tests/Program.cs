@@ -53,6 +53,7 @@ static void RunGeneratedImageTests()
     Test4KnGptParsing();
     TestLvmMetadataDiagnostics();
     TestGeneratedLvm2Image();
+    TestGeneratedLzopExt4Image();
 
     var imagePath = Path.Combine(AppContext.BaseDirectory, "sample-fat16.qcow2");
     TestImageFactory.CreateFat16Qcow2(imagePath);
@@ -254,6 +255,69 @@ static void TestGeneratedLvm2Image()
         {
             disposable.Dispose();
         }
+    }
+}
+
+static void TestGeneratedLzopExt4Image()
+{
+    var imagePath = Path.Combine(AppContext.BaseDirectory, "sample-ext4.dd.lzo");
+    TestImageFactory.CreateExt4LzopDisk(imagePath);
+
+    using var reader = DiskImageReaderFactory.Open(imagePath);
+    Assert(reader is LzopDiskImageReader, "dd.lzo reader factory");
+    Assert(reader.FormatName.Contains("lzop", StringComparison.OrdinalIgnoreCase), "dd.lzo format name");
+
+    var partition = new PartitionInfo
+    {
+        Number = 1,
+        Scheme = "WholeDisk",
+        Name = "Whole disk",
+        Type = "Unpartitioned",
+        SectorCount = checked((ulong)(reader.Length / 512))
+    };
+    partition.FileSystem = FileSystemDetector.Detect(reader, partition);
+    Assert(partition.FileSystem == "ext4", "ext4 detection inside dd.lzo");
+
+    var fs = FileSystemDetector.TryOpen(reader, partition, out var error);
+    Assert(fs is not null, error);
+    var root = fs!.ListDirectory(fs.Root);
+    var hello = root.Single(node => node.Name == "HELLO.TXT");
+    var zeros = root.Single(node => node.Name == "ZEROS.BIN");
+    Assert(
+        Encoding.ASCII.GetString(fs.ReadFile(hello, 0, (int)hello.Size)) == TestImageFactory.Ext4HelloText,
+        "ext4 text file inside dd.lzo");
+    var zeroBytes = fs.ReadFile(zeros, 0, (int)zeros.Size);
+    Assert(zeroBytes.Length == 4096 && zeroBytes.All(value => value == 0), "LZO-compressed ext4 file content");
+
+    var copyDirectory = Path.Combine(AppContext.BaseDirectory, "lzo-ext4-copy-output");
+    if (Directory.Exists(copyDirectory))
+    {
+        Directory.Delete(copyDirectory, recursive: true);
+    }
+
+    var copyResult = FileSystemExporter.CopyNodes(fs, [hello, zeros], copyDirectory);
+    Assert(copyResult.FilesCopied == 2 && copyResult.Errors.Count == 0, "copy files from LZO-compressed ext4");
+    Assert(
+        File.ReadAllText(Path.Combine(copyDirectory, "HELLO.TXT"), Encoding.ASCII) == TestImageFactory.Ext4HelloText,
+        "copied ext4 text file from dd.lzo");
+    Assert(
+        File.ReadAllBytes(Path.Combine(copyDirectory, "ZEROS.BIN")).All(value => value == 0),
+        "copied LZO-compressed ext4 zero file");
+
+    var crossBlock = new byte[8192];
+    reader.ReadAt(60 * 1024, crossBlock, 0, crossBlock.Length);
+    Assert(crossBlock.Length == 8192, "dd.lzo cross-block random read");
+
+    var damagedPath = Path.Combine(AppContext.BaseDirectory, "sample-ext4-damaged.dd.lzo");
+    TestImageFactory.CreateExt4LzopDisk(damagedPath, corruptHeaderChecksum: true);
+    try
+    {
+        using var _ = DiskImageReaderFactory.Open(damagedPath);
+        Assert(false, "damaged dd.lzo header rejection");
+    }
+    catch (InvalidDataException ex)
+    {
+        Assert(ex.Message.Contains("チェックサム", StringComparison.Ordinal), "damaged dd.lzo diagnostic");
     }
 }
 
@@ -551,6 +615,7 @@ internal static class TestImageFactory
     public const int VirtualSize = 16 * 1024 * 1024;
     public const string HelloText = "Hello from qcow2 test\r\n";
     public const string ReadmeText = "Nested FAT16 file\r\n";
+    public const string Ext4HelloText = "Hello from LZO ext4 test\n";
 
     private const int ClusterBits = 16;
     private const int ClusterSize = 1 << ClusterBits;
@@ -571,6 +636,60 @@ internal static class TestImageFactory
     public static void CreateRawFat16Disk(string path)
     {
         File.WriteAllBytes(path, CreateVirtualDisk());
+    }
+
+    public static void CreateExt4LzopDisk(string path, bool corruptHeaderChecksum = false)
+    {
+        const int blockSize = 64 * 1024;
+        const uint flags = 0x00001303;
+        var disk = CreateMinimalExt4Disk();
+        var output = new List<byte>();
+        output.AddRange([0x89, 0x4c, 0x5a, 0x4f, 0x00, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+        var header = new List<byte>();
+        AppendU16Be(header, 0x1030);
+        AppendU16Be(header, 0x20a0);
+        AppendU16Be(header, 0x0940);
+        header.Add(1);
+        header.Add(3);
+        AppendU32Be(header, flags);
+        AppendU32Be(header, 0x000081a4);
+        AppendU32Be(header, 0);
+        AppendU32Be(header, 0);
+        var name = Encoding.UTF8.GetBytes("sample-ext4.dd");
+        header.Add(checked((byte)name.Length));
+        header.AddRange(name);
+        output.AddRange(header);
+        var headerChecksum = TestCrc32(header.ToArray());
+        if (corruptHeaderChecksum)
+        {
+            headerChecksum ^= 1;
+        }
+
+        AppendU32Be(output, headerChecksum);
+
+        for (var offset = 0; offset < disk.Length; offset += blockSize)
+        {
+            var length = Math.Min(blockSize, disk.Length - offset);
+            var block = disk.AsSpan(offset, length).ToArray();
+            var compressed = block.All(value => value == 0)
+                ? EncodeLzoZeroBlock(length)
+                : block;
+            AppendU32Be(output, checked((uint)length));
+            AppendU32Be(output, checked((uint)compressed.Length));
+            AppendU32Be(output, TestAdler32(block));
+            AppendU32Be(output, TestCrc32(block));
+            if (compressed.Length < block.Length)
+            {
+                AppendU32Be(output, TestAdler32(compressed));
+                AppendU32Be(output, TestCrc32(compressed));
+            }
+
+            output.AddRange(compressed);
+        }
+
+        AppendU32Be(output, 0);
+        File.WriteAllBytes(path, output.ToArray());
     }
 
     public static void CreateLvm2Fat16Disk(string path)
@@ -925,6 +1044,160 @@ internal static class TestImageFactory
         CreateMbr(disk);
         CreateFat16Partition(disk, PartitionStartLba * BytesPerSector);
         return disk;
+    }
+
+    private static byte[] CreateMinimalExt4Disk()
+    {
+        const int size = 2 * 1024 * 1024;
+        const int blockSize = 1024;
+        const int inodeSize = 256;
+        const int inodeTableBlock = 5;
+        const int rootDirectoryBlock = 20;
+        const int textFileBlock = 21;
+        const int zeroFileBlock = 128;
+        var disk = new byte[size];
+
+        var super = blockSize;
+        WriteU32Le(disk, super + 0x00, 32);
+        WriteU32Le(disk, super + 0x04, size / blockSize);
+        WriteU32Le(disk, super + 0x14, 1);
+        WriteU32Le(disk, super + 0x18, 0);
+        WriteU32Le(disk, super + 0x20, 8192);
+        WriteU32Le(disk, super + 0x28, 32);
+        WriteU16Le(disk, super + 0x38, 0xef53);
+        WriteU16Le(disk, super + 0x58, inodeSize);
+        WriteU32Le(disk, super + 0x60, 0x40);
+        WriteU16Le(disk, super + 0xfe, 32);
+
+        var groupDescriptor = blockSize * 2;
+        WriteU32Le(disk, groupDescriptor + 8, inodeTableBlock);
+
+        var rootInode = inodeTableBlock * blockSize + inodeSize;
+        WriteExt4Inode(disk, rootInode, 0x41ed, blockSize, rootDirectoryBlock, 1);
+        var textInode = inodeTableBlock * blockSize + inodeSize * 11;
+        WriteExt4Inode(disk, textInode, 0x81a4, Ext4HelloText.Length, textFileBlock, 1);
+        var zeroInode = inodeTableBlock * blockSize + inodeSize * 12;
+        WriteExt4Inode(disk, zeroInode, 0x81a4, 4096, zeroFileBlock, 4);
+
+        var root = rootDirectoryBlock * blockSize;
+        WriteExt4DirectoryEntry(disk, root, 2, 12, ".", 2);
+        WriteExt4DirectoryEntry(disk, root + 12, 2, 12, "..", 2);
+        WriteExt4DirectoryEntry(disk, root + 24, 12, 20, "HELLO.TXT", 1);
+        WriteExt4DirectoryEntry(disk, root + 44, 13, blockSize - 44, "ZEROS.BIN", 1);
+        WriteAscii(disk, textFileBlock * blockSize, Ext4HelloText, Ext4HelloText.Length);
+        return disk;
+    }
+
+    private static void WriteExt4Inode(
+        byte[] disk,
+        int offset,
+        int mode,
+        int size,
+        int physicalBlock,
+        int blockCount)
+    {
+        WriteU16Le(disk, offset, mode);
+        WriteU32Le(disk, offset + 4, size);
+        WriteU32Le(disk, offset + 32, 0x00080000);
+        WriteU16Le(disk, offset + 40, 0xf30a);
+        WriteU16Le(disk, offset + 42, 1);
+        WriteU16Le(disk, offset + 44, 4);
+        WriteU16Le(disk, offset + 46, 0);
+        WriteU32Le(disk, offset + 52, 0);
+        WriteU16Le(disk, offset + 56, blockCount);
+        WriteU16Le(disk, offset + 58, 0);
+        WriteU32Le(disk, offset + 60, physicalBlock);
+    }
+
+    private static void WriteExt4DirectoryEntry(
+        byte[] disk,
+        int offset,
+        int inode,
+        int recordLength,
+        string name,
+        byte fileType)
+    {
+        var nameBytes = Encoding.UTF8.GetBytes(name);
+        WriteU32Le(disk, offset, inode);
+        WriteU16Le(disk, offset + 4, recordLength);
+        disk[offset + 6] = checked((byte)nameBytes.Length);
+        disk[offset + 7] = fileType;
+        Array.Copy(nameBytes, 0, disk, offset + 8, nameBytes.Length);
+    }
+
+    private static byte[] EncodeLzoZeroBlock(int length)
+    {
+        if (length < 37)
+        {
+            throw new ArgumentOutOfRangeException(nameof(length));
+        }
+
+        var compressed = new List<byte> { 21, 0, 0, 0, 0, 32 };
+        var extended = length - 4 - 33;
+        while (extended > 255)
+        {
+            compressed.Add(0);
+            extended -= 255;
+        }
+
+        if (extended == 0)
+        {
+            compressed.Add(255);
+        }
+        else
+        {
+            compressed.Add(checked((byte)extended));
+        }
+
+        compressed.Add(0);
+        compressed.Add(0);
+        compressed.Add(17);
+        compressed.Add(0);
+        compressed.Add(0);
+        return compressed.ToArray();
+    }
+
+    private static uint TestAdler32(ReadOnlySpan<byte> data)
+    {
+        const uint prime = 65521;
+        uint first = 1;
+        uint second = 0;
+        foreach (var value in data)
+        {
+            first = (first + value) % prime;
+            second = (second + first) % prime;
+        }
+
+        return (second << 16) | first;
+    }
+
+    private static uint TestCrc32(ReadOnlySpan<byte> data)
+    {
+        var crc = uint.MaxValue;
+        foreach (var value in data)
+        {
+            crc ^= value;
+            for (var bit = 0; bit < 8; bit++)
+            {
+                crc = (crc & 1) != 0 ? 0xedb88320u ^ (crc >> 1) : crc >> 1;
+            }
+        }
+
+        return ~crc;
+    }
+
+    private static void AppendU16Be(List<byte> data, ushort value)
+    {
+        data.Add((byte)(value >> 8));
+        data.Add((byte)value);
+    }
+
+    private static void AppendU32Be(List<byte> data, uint value)
+    {
+        data.Add((byte)(value >> 24));
+        data.Add((byte)(value >> 16));
+        data.Add((byte)(value >> 8));
+        data.Add((byte)value);
     }
 
     private static void CreateMbr(byte[] disk)
