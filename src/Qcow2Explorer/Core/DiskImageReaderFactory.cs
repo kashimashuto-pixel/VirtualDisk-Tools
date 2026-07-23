@@ -7,6 +7,11 @@ public static class DiskImageReaderFactory
 
     public static IDiskImageReader Open(string path)
     {
+        if (PhysicalDiskReader.IsPhysicalDiskPath(path))
+        {
+            return new PhysicalDiskReader(path);
+        }
+
         if (Directory.Exists(path))
         {
             if (ParallelsHddReader.CanOpenDirectory(path))
