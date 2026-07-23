@@ -6,14 +6,18 @@ namespace Qcow2Explorer.Reporting;
 
 public static class AnalysisReportWriter
 {
-    public static void Write(string path, IDiskImageReader reader, IReadOnlyList<PartitionInfo> partitions)
+    public static void Write(
+        string path,
+        IDiskImageReader reader,
+        IReadOnlyList<PartitionInfo> partitions,
+        IReadOnlyList<string>? analysisWarnings = null)
     {
         var report = new
         {
             generatedUtc = DateTime.UtcNow,
             application = "Virtual Disk Explorer",
             source = reader.GetHeaderRows().ToDictionary(row => row.Key, row => row.Value),
-            warnings = reader.GetWarnings(),
+            warnings = reader.GetWarnings().Concat(analysisWarnings ?? Array.Empty<string>()),
             partitions = partitions.Select(p => new
             {
                 p.Number,

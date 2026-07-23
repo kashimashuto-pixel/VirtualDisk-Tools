@@ -1,3 +1,5 @@
+using System.ComponentModel;
+using System.Diagnostics;
 using System.Globalization;
 using System.Text;
 using Qcow2Explorer.Core;
@@ -31,14 +33,19 @@ public partial class Form1 : Form
     private readonly Dictionary<int, IReadOnlyFileSystem> _fileSystems = new();
     private readonly List<IDisposable> _partitionReaders = new();
     private readonly List<ProjectedFileSystemMount> _mounts = new();
+    private readonly List<string> _analysisWarnings = new();
     private IReadOnlyFileSystem? _currentFileSystem;
     private VfsNode? _currentDirectory;
     private CancellationTokenSource? _operationCancellation;
 
-    public Form1()
+    public Form1(string? initialPath = null)
     {
         InitializeComponent();
         BuildUi();
+        if (!string.IsNullOrWhiteSpace(initialPath))
+        {
+            Shown += (_, _) => BeginInvoke(() => LoadImage(initialPath));
+        }
         FormClosing += Form1FormClosing;
         FormClosed += (_, _) =>
         {
@@ -61,12 +68,15 @@ public partial class Form1 : Form
         openButton.Click += (_, _) => OpenImageDialog();
         var openFolderButton = new ToolStripButton("フォルダ");
         openFolderButton.Click += (_, _) => OpenImageFolderDialog();
+        var openPhysicalDiskButton = new ToolStripButton("物理ディスク");
+        openPhysicalDiskButton.Click += (_, _) => OpenPhysicalDiskDialog();
         var reportButton = new ToolStripButton("解析レポート");
         reportButton.Click += (_, _) => SaveAnalysisReport();
         var snapshotButton = new ToolStripButton("スナップショット");
         snapshotButton.Click += (_, _) => SelectQcow2Snapshot();
         toolStrip.Items.Add(openButton);
         toolStrip.Items.Add(openFolderButton);
+        toolStrip.Items.Add(openPhysicalDiskButton);
         toolStrip.Items.Add(new ToolStripSeparator());
         toolStrip.Items.Add(new ToolStripLabel("ファイル"));
         toolStrip.Items.Add(_pathBox);
@@ -305,6 +315,41 @@ public partial class Form1 : Form
         }
     }
 
+    private void OpenPhysicalDiskDialog()
+    {
+        try
+        {
+            var disks = PhysicalDiskReader.Enumerate();
+            if (disks.Count == 0)
+            {
+                MessageBox.Show(this, "物理ディスクが見つかりませんでした。", "物理ディスク", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            using var dialog = new PhysicalDiskSelectionDialog(disks);
+            if (dialog.ShowDialog(this) != DialogResult.OK || dialog.SelectedDisk is not PhysicalDiskInfo disk)
+            {
+                return;
+            }
+
+            var confirmation = MessageBox.Show(
+                this,
+                $"{disk}{Environment.NewLine}{Environment.NewLine}この物理ディスクを読み取り専用で開きますか？",
+                "物理ディスクの確認",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Warning,
+                MessageBoxDefaultButton.Button2);
+            if (confirmation == DialogResult.Yes)
+            {
+                LoadImage(disk.DevicePath);
+            }
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, ex.Message, "物理ディスク列挙エラー", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
     private void LoadImage(string path)
     {
         if (!ConfirmAndDisposeMounts("新しいディスクイメージを開く前に、現在のマウントを解除します。続行しますか？"))
@@ -315,10 +360,11 @@ public partial class Form1 : Form
         try
         {
             Cursor = Cursors.WaitCursor;
+            var nextReader = DiskImageReaderFactory.Open(path);
             DisposeFileSystems();
             DisposePartitionReaders();
             _reader?.Dispose();
-            _reader = DiskImageReaderFactory.Open(path);
+            _reader = nextReader;
             _partitions.Clear();
             _pathBox.Text = path;
 
@@ -326,6 +372,11 @@ public partial class Form1 : Form
             AnalyzePartitions();
             ReadRawData();
             _statusLabel.Text = "読込完了";
+        }
+        catch (UnauthorizedAccessException ex) when (PhysicalDiskReader.IsPhysicalDiskPath(path))
+        {
+            _statusLabel.Text = "管理者権限が必要です";
+            PromptRestartAsAdministrator(path, ex.Message);
         }
         catch (Exception ex)
         {
@@ -338,10 +389,52 @@ public partial class Form1 : Form
         }
     }
 
+    private void PromptRestartAsAdministrator(string path, string detail)
+    {
+        var result = MessageBox.Show(
+            this,
+            $"{detail}{Environment.NewLine}{Environment.NewLine}管理者としてアプリを再起動し、選択した物理ディスクを開きますか？",
+            "物理ディスク",
+            MessageBoxButtons.YesNo,
+            MessageBoxIcon.Question,
+            MessageBoxDefaultButton.Button2);
+        if (result != DialogResult.Yes)
+        {
+            return;
+        }
+
+        var executable = Environment.ProcessPath;
+        if (string.IsNullOrWhiteSpace(executable))
+        {
+            MessageBox.Show(this, "実行ファイルの場所を取得できませんでした。", "管理者として再起動", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return;
+        }
+
+        try
+        {
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = executable,
+                Arguments = $"\"{path}\"",
+                UseShellExecute = true,
+                Verb = "runas"
+            });
+            Close();
+        }
+        catch (Win32Exception ex) when (ex.NativeErrorCode == 1223)
+        {
+            _statusLabel.Text = "管理者としての再起動をキャンセルしました";
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, ex.Message, "管理者として再起動できませんでした", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
     private void FillHeader()
     {
         _headerList.Items.Clear();
-        _warningText.Clear();
+        _analysisWarnings.Clear();
         if (_reader is null)
         {
             return;
@@ -354,7 +447,14 @@ public partial class Form1 : Form
             _headerList.Items.Add(item);
         }
 
-        var warnings = _reader.GetWarnings();
+        RefreshWarnings();
+    }
+
+    private void RefreshWarnings()
+    {
+        var warnings = (_reader?.GetWarnings() ?? Array.Empty<string>())
+            .Concat(_analysisWarnings)
+            .ToList();
         _warningText.Text = warnings.Count == 0
             ? "警告なし"
             : string.Join(Environment.NewLine, warnings);
@@ -381,7 +481,7 @@ public partial class Form1 : Form
 
         try
         {
-            AnalysisReportWriter.Write(dialog.FileName, _reader, _partitions);
+            AnalysisReportWriter.Write(dialog.FileName, _reader, _partitions, _analysisWarnings);
             _statusLabel.Text = $"解析レポート保存: {dialog.FileName}";
         }
         catch (Exception ex)
@@ -473,12 +573,34 @@ public partial class Form1 : Form
             AddPartitionRow(partition);
         }
 
-        if (discovered.Any(p => p.FileSystem.StartsWith("LVM2", StringComparison.OrdinalIgnoreCase)))
+        var lvmPartitions = discovered
+            .Where(partition => partition.FileSystem.StartsWith("LVM2", StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        if (lvmPartitions.Count > 0)
         {
-            foreach (var partition in LogicalVolumeDiscoverer.Discover(_reader, _partitions.Count + 1, _partitionReaders))
+            var lvmResult = LogicalVolumeDiscoverer.Discover(
+                _reader,
+                lvmPartitions,
+                _partitions.Count + 1,
+                _partitionReaders);
+            foreach (var partition in lvmResult.Volumes)
             {
                 partition.FileSystem = FileSystemDetector.Detect(_reader, partition);
                 AddPartitionRow(partition);
+            }
+
+            _analysisWarnings.AddRange(lvmResult.Diagnostics.Select(diagnostic => diagnostic.Message));
+            RefreshWarnings();
+
+            var errors = lvmResult.Diagnostics.Where(diagnostic => diagnostic.IsError).ToList();
+            if (lvmResult.Volumes.Count == 0 && errors.Count > 0)
+            {
+                MessageBox.Show(
+                    this,
+                    string.Join(Environment.NewLine, errors.Select(error => error.Message)),
+                    "LVM2を解析できませんでした",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
             }
         }
 

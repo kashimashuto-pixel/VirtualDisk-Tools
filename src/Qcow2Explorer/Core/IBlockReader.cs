@@ -6,3 +6,8 @@ public interface IBlockReader
 
     void ReadAt(long offset, byte[] buffer, int bufferOffset, int count);
 }
+
+public interface ILogicalSectorReader
+{
+    uint LogicalSectorSize { get; }
+}

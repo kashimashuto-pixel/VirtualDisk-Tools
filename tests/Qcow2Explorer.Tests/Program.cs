@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using System.Globalization;
 using System.IO.Compression;
 using System.Text;
@@ -9,6 +10,34 @@ using DiscUtils.Streams;
 using DiscXfsFileSystem = DiscUtils.Xfs.XfsFileSystem;
 using VdiDisk = DiscUtils.Vdi.Disk;
 
+if (args.Length > 0 && string.Equals(args[0], "--list-physical", StringComparison.OrdinalIgnoreCase))
+{
+    foreach (var disk in PhysicalDiskReader.Enumerate())
+    {
+        Console.WriteLine(disk);
+    }
+
+    return;
+}
+
+if (args.Length > 1 && string.Equals(args[0], "--probe-physical", StringComparison.OrdinalIgnoreCase))
+{
+    try
+    {
+        using var physical = new PhysicalDiskReader(args[1]);
+        var sector = new byte[512];
+        physical.ReadAt(0, sector, 0, sector.Length);
+        Console.WriteLine($"{physical.Path}: {physical.Length:N0} bytes, sector {physical.LogicalSectorSize:N0} bytes");
+        Console.WriteLine($"MBR signature: {sector[510]:X2} {sector[511]:X2}");
+    }
+    catch (UnauthorizedAccessException ex)
+    {
+        Console.WriteLine($"Access denied as expected without elevation: {ex.Message}");
+    }
+
+    return;
+}
+
 if (args.Length > 0)
 {
     InspectImage(args[0], args.Any(a => string.Equals(a, "--copy-smoke", StringComparison.OrdinalIgnoreCase)));
@@ -19,6 +48,12 @@ RunGeneratedImageTests();
 
 static void RunGeneratedImageTests()
 {
+    Assert(PhysicalDiskReader.IsPhysicalDiskPath(@"\\.\PhysicalDrive0"), "physical disk path detection");
+    Assert(!PhysicalDiskReader.IsPhysicalDiskPath("PhysicalDrive0"), "physical disk path rejection");
+    Test4KnGptParsing();
+    TestLvmMetadataDiagnostics();
+    TestGeneratedLvm2Image();
+
     var imagePath = Path.Combine(AppContext.BaseDirectory, "sample-fat16.qcow2");
     TestImageFactory.CreateFat16Qcow2(imagePath);
 
@@ -121,6 +156,105 @@ static void RunGeneratedImageTests()
     }
 
     RunProjFsRemountSmoke(rawFs);
+}
+
+static void Test4KnGptParsing()
+{
+    const int sectorSize = 4096;
+    var data = new byte[sectorSize * 32];
+    data[510] = 0x55;
+    data[511] = 0xaa;
+    data[446 + 4] = 0xee;
+    BinaryPrimitives.WriteUInt32LittleEndian(data.AsSpan(446 + 8, 4), 1);
+    BinaryPrimitives.WriteUInt32LittleEndian(data.AsSpan(446 + 12, 4), 31);
+
+    var header = data.AsSpan(sectorSize, 512);
+    Encoding.ASCII.GetBytes("EFI PART").CopyTo(header);
+    BinaryPrimitives.WriteUInt64LittleEndian(header[72..80], 2);
+    BinaryPrimitives.WriteUInt32LittleEndian(header[80..84], 1);
+    BinaryPrimitives.WriteUInt32LittleEndian(header[84..88], 128);
+
+    var entry = data.AsSpan(sectorSize * 2, 128);
+    Guid.Parse("0fc63daf-8483-4772-8e79-3d69d8477de4").TryWriteBytes(entry[..16]);
+    BinaryPrimitives.WriteUInt64LittleEndian(entry[32..40], 10);
+    BinaryPrimitives.WriteUInt64LittleEndian(entry[40..48], 20);
+    Encoding.Unicode.GetBytes("Linux").CopyTo(entry[56..]);
+
+    var partitions = PartitionTableReader.ReadPartitions(new MemorySectorReader(data, sectorSize));
+    Assert(partitions.Count == 1, "4Kn GPT partition count");
+    Assert(partitions[0].SectorSize == sectorSize, "4Kn GPT sector size");
+    Assert(partitions[0].StartOffset == sectorSize * 10L, "4Kn GPT partition offset");
+}
+
+static void TestLvmMetadataDiagnostics()
+{
+    const string metadata = """
+        contents = "Text Format Volume Group"
+        version = 1
+        vg_test {
+            physical_volumes {
+                pv0 {
+                    id = "pv-id-0"
+                }
+                pv1 {
+                    id = "pv-id-1"
+                }
+            }
+            logical_volumes {
+                root {
+                    id = "lv-id"
+                    segment_count = 2
+                    segment1 {
+                        type = "striped"
+                        stripe_count = 2
+                    }
+                    segment2 {
+                        type = "thin-pool"
+                    }
+                }
+            }
+        }
+        """;
+
+    var summary = LvmMetadataInspector.Summarize(7, metadata);
+    Assert(summary.PartitionNumber == 7, "LVM diagnostic partition number");
+    Assert(summary.PhysicalVolumeCount == 2, "LVM diagnostic PV count");
+    Assert(summary.LogicalVolumeCount == 1, "LVM diagnostic LV count");
+    Assert(summary.MaximumStripeCount == 2, "LVM diagnostic stripe count");
+    Assert(summary.SegmentTypes.SequenceEqual(new[] { "striped", "thin-pool" }), "LVM diagnostic segment types");
+}
+
+static void TestGeneratedLvm2Image()
+{
+    var imagePath = Path.Combine(AppContext.BaseDirectory, "sample-lvm2.img");
+    TestImageFactory.CreateLvm2Fat16Disk(imagePath);
+
+    using var reader = DiskImageReaderFactory.Open(imagePath);
+    var partitions = PartitionTableReader.ReadPartitions(reader).ToList();
+    Assert(partitions.Count == 1 && partitions[0].TypeId == "0x8E", "generated LVM2 partition");
+
+    var ownedReaders = new List<IDisposable>();
+    try
+    {
+        var result = LogicalVolumeDiscoverer.Discover(reader, partitions, 2, ownedReaders);
+        Assert(result.Volumes.Count == 1, string.Join(Environment.NewLine, result.Diagnostics.Select(item => item.Message)));
+        Assert(!result.Diagnostics.Any(item => item.IsError), string.Join(Environment.NewLine, result.Diagnostics.Select(item => item.Message)));
+
+        var volume = result.Volumes[0];
+        volume.FileSystem = FileSystemDetector.Detect(reader, volume);
+        Assert(volume.FileSystem == "FAT16", "FAT16 inside generated LVM2 LV");
+        var fs = FileSystemDetector.TryOpen(reader, volume, out var error);
+        Assert(fs is not null, error);
+        var hello = fs!.ListDirectory(fs.Root).Single(node => node.Name == "HELLO.TXT");
+        Assert(Encoding.ASCII.GetString(fs.ReadFile(hello, 0, (int)hello.Size)) == TestImageFactory.HelloText, "generated LVM2 HELLO.TXT content");
+    }
+    finally
+    {
+        foreach (var disposable in ownedReaders)
+        {
+            disposable.Dispose();
+        }
+    }
 }
 
 static IReadOnlyFileSystem AssertFat16Readable(IDiskImageReader reader, string label)
@@ -437,6 +571,119 @@ internal static class TestImageFactory
     public static void CreateRawFat16Disk(string path)
     {
         File.WriteAllBytes(path, CreateVirtualDisk());
+    }
+
+    public static void CreateLvm2Fat16Disk(string path)
+    {
+        const int lvmPartitionSectors = VirtualSize / BytesPerSector - PartitionStartLba;
+        const int metadataAreaOffset = 4096;
+        const int metadataAreaLength = 4096;
+        const int metadataTextOffset = 512;
+        const int dataAreaOffset = 1024 * 1024;
+        const int extentSizeSectors = 8;
+        const int logicalVolumeExtents = PartitionSectors * BytesPerSector / (extentSizeSectors * BytesPerSector);
+        const string pvId = "abcdef-1234-5678-90ab-cdef-1234-567890";
+        const string pvIdRaw = "abcdef1234567890abcdef1234567890";
+        const string lvId = "123456-7890-abcd-efgh-ijkl-mnop-qrstuv";
+
+        var disk = new byte[VirtualSize];
+        var partitionStart = PartitionStartLba * BytesPerSector;
+        var partitionLength = lvmPartitionSectors * BytesPerSector;
+
+        disk[446 + 4] = 0x8e;
+        WriteU32Le(disk, 446 + 8, PartitionStartLba);
+        WriteU32Le(disk, 446 + 12, lvmPartitionSectors);
+        disk[510] = 0x55;
+        disk[511] = 0xaa;
+
+        var metadata = $$"""
+            contents = "Text Format Volume Group"
+            version = 1
+            description = "Qcow2Explorer generated LVM2 test"
+            creation_host = "Qcow2Explorer"
+            creation_time = 1
+            vg_test {
+                id = "fedcba-9876-5432-10fe-dcba-9876-543210"
+                seqno = 1
+                format = "lvm2"
+                status = ["RESIZEABLE", "READ", "WRITE"]
+                flags = []
+                extent_size = {{extentSizeSectors}}
+                max_lv = 0
+                max_pv = 0
+                metadata_copies = 0
+                physical_volumes {
+                    pv0 {
+                        id = "{{pvId}}"
+                        device = "/dev/test"
+                        status = ["ALLOCATABLE"]
+                        flags = []
+                        dev_size = {{lvmPartitionSectors}}
+                        pe_start = {{dataAreaOffset / BytesPerSector}}
+                        pe_count = {{(partitionLength - dataAreaOffset) / (extentSizeSectors * BytesPerSector)}}
+                    }
+                }
+                logical_volumes {
+                    root {
+                        id = "{{lvId}}"
+                        status = ["READ", "WRITE", "VISIBLE"]
+                        flags = []
+                        creation_host = "Qcow2Explorer"
+                        creation_time = 1
+                        segment_count = 1
+                        segment1 {
+                            start_extent = 0
+                            extent_count = {{logicalVolumeExtents}}
+                            type = "striped"
+                            stripe_count = 1
+                            stripes = [
+                                "pv0", 0
+                            ]
+                        }
+                    }
+                }
+            }
+            """;
+        var metadataBytes = Encoding.ASCII.GetBytes(metadata);
+        if (metadataBytes.Length >= metadataAreaLength - metadataTextOffset)
+        {
+            throw new InvalidOperationException("Generated LVM2 metadata exceeds its test area.");
+        }
+
+        var metadataArea = partitionStart + metadataAreaOffset;
+        WriteAscii(disk, metadataArea + 4, " LVM2 x[5A%r0N*>", 16);
+        WriteU32Le(disk, metadataArea + 20, 1);
+        WriteU64Le(disk, metadataArea + 24, metadataAreaOffset);
+        WriteU64Le(disk, metadataArea + 32, metadataAreaLength);
+        WriteU64Le(disk, metadataArea + 40, metadataTextOffset);
+        WriteU64Le(disk, metadataArea + 48, metadataBytes.Length);
+        WriteU32Le(disk, metadataArea + 56, CalculateLvmCrc(metadataBytes, 0, metadataBytes.Length));
+        Array.Copy(metadataBytes, 0, disk, metadataArea + metadataTextOffset, metadataBytes.Length);
+        WriteU32Le(disk, metadataArea, CalculateLvmCrc(disk, metadataArea + 4, 508));
+
+        var label = partitionStart + BytesPerSector;
+        WriteAscii(disk, label, "LABELONE", 8);
+        WriteU64Le(disk, label + 8, 1);
+        WriteU32Le(disk, label + 20, 32);
+        WriteAscii(disk, label + 24, "LVM2 001", 8);
+
+        var pvHeader = label + 32;
+        WriteAscii(disk, pvHeader, pvIdRaw, 32);
+        WriteU64Le(disk, pvHeader + 32, partitionLength);
+        WriteU64Le(disk, pvHeader + 40, dataAreaOffset);
+        WriteU64Le(disk, pvHeader + 48, partitionLength - dataAreaOffset);
+        WriteU64Le(disk, pvHeader + 72, metadataAreaOffset);
+        WriteU64Le(disk, pvHeader + 80, metadataAreaLength);
+        WriteU32Le(disk, label + 16, CalculateLvmCrc(disk, label + 20, BytesPerSector - 20));
+
+        var fatDisk = CreateVirtualDisk();
+        Array.Copy(
+            fatDisk,
+            PartitionStartLba * BytesPerSector,
+            disk,
+            partitionStart + dataAreaOffset,
+            PartitionSectors * BytesPerSector);
+        File.WriteAllBytes(path, disk);
     }
 
     public static void CreateFat16Vdi(string path)
@@ -770,6 +1017,36 @@ internal static class TestImageFactory
         data[offset + 3] = (byte)(value >> 24);
     }
 
+    private static void WriteU32Le(byte[] data, int offset, uint value)
+    {
+        BinaryPrimitives.WriteUInt32LittleEndian(data.AsSpan(offset, sizeof(uint)), value);
+    }
+
+    private static void WriteU64Le(byte[] data, int offset, long value)
+    {
+        BinaryPrimitives.WriteUInt64LittleEndian(data.AsSpan(offset, sizeof(ulong)), checked((ulong)value));
+    }
+
+    private static uint CalculateLvmCrc(byte[] data, int offset, int length)
+    {
+        ReadOnlySpan<uint> table =
+        [
+            0x00000000, 0x1db71064, 0x3b6e20c8, 0x26d930ac,
+            0x76dc4190, 0x6b6b51f4, 0x4db26158, 0x5005713c,
+            0xedb88320, 0xf00f9344, 0xd6d6a3e8, 0xcb61b38c,
+            0x9b64c2b0, 0x86d3d2d4, 0xa00ae278, 0xbdbdf21c
+        ];
+        var crc = 0xf597a6cfu;
+        for (var i = 0; i < length; i++)
+        {
+            crc ^= data[offset + i];
+            crc = table[(int)(crc & 0xf)] ^ (crc >> 4);
+            crc = table[(int)(crc & 0xf)] ^ (crc >> 4);
+        }
+
+        return crc;
+    }
+
     private static void WriteU32Le(Span<byte> data, int offset, int value)
     {
         data[offset] = (byte)value;
@@ -816,5 +1093,31 @@ internal static class TestImageFactory
         data[offset + 5] = (byte)(value >> 16);
         data[offset + 6] = (byte)(value >> 8);
         data[offset + 7] = (byte)value;
+    }
+}
+
+internal sealed class MemorySectorReader : IBlockReader, ILogicalSectorReader
+{
+    private readonly byte[] _data;
+
+    public MemorySectorReader(byte[] data, int logicalSectorSize)
+    {
+        _data = data;
+        LogicalSectorSize = checked((uint)logicalSectorSize);
+    }
+
+    public long Length => _data.LongLength;
+    public uint LogicalSectorSize { get; }
+
+    public void ReadAt(long offset, byte[] buffer, int bufferOffset, int count)
+    {
+        Array.Clear(buffer, bufferOffset, count);
+        if (offset < 0 || offset >= Length || count <= 0)
+        {
+            return;
+        }
+
+        var available = checked((int)Math.Min(count, Length - offset));
+        Array.Copy(_data, offset, buffer, bufferOffset, available);
     }
 }
