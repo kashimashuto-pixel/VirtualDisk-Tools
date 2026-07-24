@@ -2,6 +2,7 @@ using System.Buffers.Binary;
 using System.Globalization;
 using System.IO.Compression;
 using System.Text;
+using Qcow2Explorer;
 using Qcow2Explorer.Core;
 using Qcow2Explorer.FileSystems;
 using Qcow2Explorer.Mounting;
@@ -56,6 +57,7 @@ static void RunGeneratedImageTests()
     TestGeneratedLvm2Image();
     TestGeneratedLzopExt4Image();
     TestFilePreviews();
+    TestNavigationHistory();
 
     var imagePath = Path.Combine(AppContext.BaseDirectory, "sample-fat16.qcow2");
     TestImageFactory.CreateFat16Qcow2(imagePath);
@@ -394,6 +396,25 @@ static void TestFilePreviews()
     Assert(excelPreview.Sheets.Count == 1 && excelPreview.Sheets[0].Name == "一覧", "xlsx sheet preview");
     Assert(excelPreview.Sheets[0].Rows[0][0] == "見出し", "xlsx shared string preview");
     Assert(excelPreview.Sheets[0].Rows[1][0] == "=SUM(B1:B1)", "xlsx formula preview");
+}
+
+static void TestNavigationHistory()
+{
+    var history = new NavigationHistory<object>();
+    var root = new object();
+    var child = new object();
+    var sibling = new object();
+    history.Record(root);
+    history.Record(child);
+    Assert(history.CanGoBack && !history.CanGoForward, "navigation history initial state");
+    Assert(ReferenceEquals(history.GoBack(), root), "navigation history back");
+    Assert(history.CanGoForward, "navigation history forward enabled");
+    Assert(ReferenceEquals(history.GoForward(), child), "navigation history forward");
+    history.GoBack();
+    history.Record(sibling);
+    Assert(!history.CanGoForward && ReferenceEquals(history.Current, sibling), "navigation history forward truncation");
+    history.Reset();
+    Assert(!history.CanGoBack && !history.CanGoForward && history.Current is null, "navigation history reset");
 }
 
 static byte[] CreateZip(params (string Path, string Content)[] entries)

@@ -18,6 +18,9 @@ public partial class Form1 : Form
     private readonly ToolStripProgressBar _loadProgressBar = new() { AutoSize = false, Width = 140, Visible = false };
     private readonly ToolStripTextBox _searchBox = new() { AutoSize = false, Width = 240, BorderStyle = BorderStyle.FixedSingle, ToolTipText = "現在のパーティションからファイル名を検索" };
     private readonly ToolStripButton _cancelOperationButton = new("キャンセル") { Enabled = false };
+    private readonly ToolStripButton _backNavigationButton = new("戻る") { Enabled = false, ToolTipText = "戻る (Alt+←)" };
+    private readonly ToolStripButton _forwardNavigationButton = new("進む") { Enabled = false, ToolTipText = "進む (Alt+→)" };
+    private readonly ToolStripButton _upNavigationButton = new("上へ") { Enabled = false, ToolTipText = "親フォルダーへ (Alt+↑)" };
     private readonly ListView _headerList = new() { Dock = DockStyle.Fill, View = View.Details, FullRowSelect = true, GridLines = true };
     private readonly TextBox _warningText = new() { Dock = DockStyle.Fill, Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical };
     private readonly TextBox _offsetBox = new() { Text = "0x0", Width = 140 };
@@ -39,6 +42,8 @@ public partial class Form1 : Form
     private IReadOnlyFileSystem? _currentFileSystem;
     private VfsNode? _currentDirectory;
     private CancellationTokenSource? _operationCancellation;
+    private readonly NavigationHistory<TreeNode> _navigationHistory = new();
+    private bool _isHistoryNavigation;
     private bool _isLoadingImage;
 
     public Form1(string? initialPath = null)
@@ -57,6 +62,29 @@ public partial class Form1 : Form
             DisposePartitionReaders();
             _reader?.Dispose();
         };
+    }
+
+    protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
+    {
+        if (_tree.Visible && keyData == (Keys.Alt | Keys.Up))
+        {
+            NavigateUp();
+            return true;
+        }
+
+        if (_tree.Visible && keyData == (Keys.Alt | Keys.Left))
+        {
+            NavigateBack();
+            return true;
+        }
+
+        if (_tree.Visible && keyData == (Keys.Alt | Keys.Right))
+        {
+            NavigateForward();
+            return true;
+        }
+
+        return base.ProcessCmdKey(ref msg, keyData);
     }
 
     private void BuildUi()
@@ -203,7 +231,14 @@ public partial class Form1 : Form
             }
         };
         _cancelOperationButton.Click += (_, _) => _operationCancellation?.Cancel();
+        _backNavigationButton.Click += (_, _) => NavigateBack();
+        _forwardNavigationButton.Click += (_, _) => NavigateForward();
+        _upNavigationButton.Click += (_, _) => NavigateUp();
         var explorerStrip = new ToolStrip { GripStyle = ToolStripGripStyle.Hidden };
+        explorerStrip.Items.Add(_backNavigationButton);
+        explorerStrip.Items.Add(_forwardNavigationButton);
+        explorerStrip.Items.Add(_upNavigationButton);
+        explorerStrip.Items.Add(new ToolStripSeparator());
         explorerStrip.Items.Add(new ToolStripLabel("検索"));
         explorerStrip.Items.Add(_searchBox);
         explorerStrip.Items.Add(searchButton);
@@ -703,6 +738,7 @@ public partial class Form1 : Form
     {
         _partitionGrid.Rows.Clear();
         _tree.Nodes.Clear();
+        ResetNavigationHistory();
         _fileList.Items.Clear();
         _previewText.Clear();
         if (_reader is null)
@@ -772,6 +808,7 @@ public partial class Form1 : Form
     {
         _partitionGrid.Rows.Clear();
         _tree.Nodes.Clear();
+        ResetNavigationHistory();
         _fileList.Items.Clear();
         _previewText.Clear();
 
@@ -913,6 +950,7 @@ public partial class Form1 : Form
             if (fs is null)
             {
                 _fileList.Items.Clear();
+                UpdateNavigationButtons();
                 return;
             }
 
@@ -923,7 +961,70 @@ public partial class Form1 : Form
         if (e.Node.Tag is DirectoryNodeTag directoryTag)
         {
             PopulateFileList(directoryTag.FileSystem, directoryTag.Node);
+            if (!_isHistoryNavigation)
+            {
+                _navigationHistory.Record(e.Node);
+            }
         }
+
+        UpdateNavigationButtons();
+    }
+
+    private void NavigateUp()
+    {
+        var parent = _tree.SelectedNode?.Parent;
+        if (parent is null)
+        {
+            return;
+        }
+
+        _tree.SelectedNode = parent;
+        parent.EnsureVisible();
+        UpdateNavigationButtons();
+    }
+
+    private void NavigateBack()
+    {
+        SelectHistoryNode(_navigationHistory.GoBack());
+    }
+
+    private void NavigateForward()
+    {
+        SelectHistoryNode(_navigationHistory.GoForward());
+    }
+
+    private void SelectHistoryNode(TreeNode? node)
+    {
+        if (node is null || node.TreeView != _tree)
+        {
+            UpdateNavigationButtons();
+            return;
+        }
+
+        _isHistoryNavigation = true;
+        try
+        {
+            _tree.SelectedNode = node;
+            node.EnsureVisible();
+        }
+        finally
+        {
+            _isHistoryNavigation = false;
+            UpdateNavigationButtons();
+        }
+    }
+
+    private void ResetNavigationHistory()
+    {
+        _navigationHistory.Reset();
+        UpdateNavigationButtons();
+    }
+
+    private void UpdateNavigationButtons()
+    {
+        _backNavigationButton.Enabled = _navigationHistory.CanGoBack;
+        _forwardNavigationButton.Enabled = _navigationHistory.CanGoForward;
+        _upNavigationButton.Enabled = _tree.SelectedNode?.Parent is not null;
     }
 
     private void AddDirectoryChildren(TreeNode treeNode, IReadOnlyFileSystem fileSystem, VfsNode directory)
