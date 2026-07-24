@@ -19,16 +19,18 @@ public sealed class LzopDiskImageReader : IDiskImageReader
     private const uint MaximumBlockSize = 64 * 1024 * 1024;
 
     private readonly FileStream _stream;
+    private readonly IProgress<DiskImageProgress>? _progress;
     private readonly object _sync = new();
     private readonly List<LzopBlock> _blocks = [];
     private readonly long _compressedLength;
     private byte[]? _cachedData;
     private int _cachedBlockIndex = -1;
 
-    public LzopDiskImageReader(string path)
+    public LzopDiskImageReader(string path, IProgress<DiskImageProgress>? progress = null)
     {
         Path = path;
         FormatName = "raw/dd (lzop LZO1X)";
+        _progress = progress;
         _stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
         _compressedLength = _stream.Length;
 
@@ -215,6 +217,8 @@ public sealed class LzopDiskImageReader : IDiskImageReader
     private void BuildBlockIndex()
     {
         long uncompressedOffset = 0;
+        var lastPercentage = -1;
+        ReportIndexProgress(force: true);
         while (true)
         {
             var uncompressedSize = ReadUInt32BigEndian();
@@ -266,12 +270,40 @@ public sealed class LzopDiskImageReader : IDiskImageReader
                 compressedCrc));
             uncompressedOffset = checked(uncompressedOffset + uncompressedSize);
             _stream.Position += compressedSize;
+            ReportIndexProgress(force: false);
         }
 
         Length = uncompressedOffset;
         if (_blocks.Count == 0)
         {
             throw new InvalidDataException("lzopストリームにディスクデータブロックがありません。");
+        }
+
+        _progress?.Report(new DiskImageProgress(
+            $"LZO索引作成完了: {_blocks.Count:N0}ブロック",
+            _compressedLength,
+            _compressedLength));
+
+        void ReportIndexProgress(bool force)
+        {
+            if (_progress is null)
+            {
+                return;
+            }
+
+            var percentage = _compressedLength == 0
+                ? 100
+                : (int)Math.Clamp((double)_stream.Position / _compressedLength * 100, 0, 100);
+            if (!force && percentage == lastPercentage)
+            {
+                return;
+            }
+
+            lastPercentage = percentage;
+            _progress.Report(new DiskImageProgress(
+                $"LZO索引作成中: {_blocks.Count:N0}ブロック",
+                _stream.Position,
+                _compressedLength));
         }
     }
 
@@ -283,6 +315,10 @@ public sealed class LzopDiskImageReader : IDiskImageReader
         }
 
         var block = _blocks[index];
+        _progress?.Report(new DiskImageProgress(
+            $"LZOブロック展開中: {index + 1:N0} / {_blocks.Count:N0}",
+            index + 1,
+            _blocks.Count));
         _stream.Position = block.DataOffset;
         var compressed = ReadExact(block.CompressedSize);
         VerifyChecksum(index, "圧縮データ", compressed, block.CompressedAdler32, block.CompressedCrc32);

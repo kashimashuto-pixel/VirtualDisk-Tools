@@ -14,6 +14,7 @@ public partial class Form1 : Form
 {
     private readonly ToolStripTextBox _pathBox = new() { AutoSize = false, Width = 480, ReadOnly = true };
     private readonly ToolStripLabel _statusLabel = new("ディスクイメージを開いてください");
+    private readonly ToolStripProgressBar _loadProgressBar = new() { AutoSize = false, Width = 140, Visible = false };
     private readonly ToolStripTextBox _searchBox = new() { AutoSize = false, Width = 240, BorderStyle = BorderStyle.FixedSingle, ToolTipText = "現在のパーティションからファイル名を検索" };
     private readonly ToolStripButton _cancelOperationButton = new("キャンセル") { Enabled = false };
     private readonly ListView _headerList = new() { Dock = DockStyle.Fill, View = View.Details, FullRowSelect = true, GridLines = true };
@@ -37,6 +38,7 @@ public partial class Form1 : Form
     private IReadOnlyFileSystem? _currentFileSystem;
     private VfsNode? _currentDirectory;
     private CancellationTokenSource? _operationCancellation;
+    private bool _isLoadingImage;
 
     public Form1(string? initialPath = null)
     {
@@ -44,7 +46,7 @@ public partial class Form1 : Form
         BuildUi();
         if (!string.IsNullOrWhiteSpace(initialPath))
         {
-            Shown += (_, _) => BeginInvoke(() => LoadImage(initialPath));
+            Shown += async (_, _) => await LoadImageAsync(initialPath);
         }
         FormClosing += Form1FormClosing;
         FormClosed += (_, _) =>
@@ -65,11 +67,11 @@ public partial class Form1 : Form
 
         var toolStrip = new ToolStrip { GripStyle = ToolStripGripStyle.Hidden };
         var openButton = new ToolStripButton("開く");
-        openButton.Click += (_, _) => OpenImageDialog();
+        openButton.Click += async (_, _) => await OpenImageDialogAsync();
         var openFolderButton = new ToolStripButton("フォルダ");
-        openFolderButton.Click += (_, _) => OpenImageFolderDialog();
+        openFolderButton.Click += async (_, _) => await OpenImageFolderDialogAsync();
         var openPhysicalDiskButton = new ToolStripButton("物理ディスク");
-        openPhysicalDiskButton.Click += (_, _) => OpenPhysicalDiskDialog();
+        openPhysicalDiskButton.Click += async (_, _) => await OpenPhysicalDiskDialogAsync();
         var reportButton = new ToolStripButton("解析レポート");
         reportButton.Click += (_, _) => SaveAnalysisReport();
         var snapshotButton = new ToolStripButton("スナップショット");
@@ -84,6 +86,7 @@ public partial class Form1 : Form
         toolStrip.Items.Add(snapshotButton);
         toolStrip.Items.Add(new ToolStripSeparator());
         toolStrip.Items.Add(_statusLabel);
+        toolStrip.Items.Add(_loadProgressBar);
 
         var tabs = new TabControl { Dock = DockStyle.Fill };
         tabs.TabPages.Add(CreateSummaryTab());
@@ -286,7 +289,7 @@ public partial class Form1 : Form
         return new TabPage("マウント") { Controls = { layout } };
     }
 
-    private void OpenImageDialog()
+    private async Task OpenImageDialogAsync()
     {
         using var dialog = new OpenFileDialog
         {
@@ -296,11 +299,11 @@ public partial class Form1 : Form
 
         if (dialog.ShowDialog(this) == DialogResult.OK)
         {
-            LoadImage(dialog.FileName);
+            await LoadImageAsync(dialog.FileName);
         }
     }
 
-    private void OpenImageFolderDialog()
+    private async Task OpenImageFolderDialogAsync()
     {
         using var dialog = new FolderBrowserDialog
         {
@@ -311,11 +314,11 @@ public partial class Form1 : Form
 
         if (dialog.ShowDialog(this) == DialogResult.OK)
         {
-            LoadImage(dialog.SelectedPath);
+            await LoadImageAsync(dialog.SelectedPath);
         }
     }
 
-    private void OpenPhysicalDiskDialog()
+    private async Task OpenPhysicalDiskDialogAsync()
     {
         try
         {
@@ -341,7 +344,7 @@ public partial class Form1 : Form
                 MessageBoxDefaultButton.Button2);
             if (confirmation == DialogResult.Yes)
             {
-                LoadImage(disk.DevicePath);
+                await LoadImageAsync(disk.DevicePath);
             }
         }
         catch (Exception ex)
@@ -350,27 +353,64 @@ public partial class Form1 : Form
         }
     }
 
-    private void LoadImage(string path)
+    private async Task LoadImageAsync(string path)
     {
+        if (_isLoadingImage)
+        {
+            _statusLabel.Text = "別のディスクイメージを読み込み中です";
+            return;
+        }
+
         if (!ConfirmAndDisposeMounts("新しいディスクイメージを開く前に、現在のマウントを解除します。続行しますか？"))
         {
             return;
         }
 
+        _isLoadingImage = true;
+        UseWaitCursor = true;
+        _loadProgressBar.Visible = true;
+        _loadProgressBar.Style = ProgressBarStyle.Marquee;
+        _statusLabel.Text = "ディスクイメージを開いています...";
+        ImageLoadResult? loadResult = null;
+        var adopted = false;
+
         try
         {
-            Cursor = Cursors.WaitCursor;
-            var nextReader = DiskImageReaderFactory.Open(path);
+            var rawOffset = ParseOffset(_offsetBox.Text);
+            var rawLength = (int)_lengthBox.Value;
+            var progress = new Progress<DiskImageProgress>(UpdateLoadProgress);
+            loadResult = await Task.Run(() => LoadAndAnalyzeImage(path, rawOffset, rawLength, progress));
+            if (IsDisposed)
+            {
+                return;
+            }
+
             DisposeFileSystems();
             DisposePartitionReaders();
             _reader?.Dispose();
-            _reader = nextReader;
+            _reader = loadResult.Reader;
+            _partitionReaders.AddRange(loadResult.Analysis.OwnedReaders);
+            adopted = true;
             _partitions.Clear();
             _pathBox.Text = path;
 
             FillHeader();
-            AnalyzePartitions();
-            ReadRawData();
+            _analysisWarnings.AddRange(loadResult.Analysis.Diagnostics.Select(item => item.Message));
+            ApplyPartitionAnalysis(loadResult.Analysis.Partitions);
+            RefreshWarnings();
+            _hexText.Text = loadResult.RawHex;
+
+            var errors = loadResult.Analysis.Diagnostics.Where(item => item.IsError).ToList();
+            if (loadResult.Analysis.LvmVolumeCount == 0 && errors.Count > 0)
+            {
+                MessageBox.Show(
+                    this,
+                    string.Join(Environment.NewLine, errors.Select(error => error.Message)),
+                    "LVM2を解析できませんでした",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+            }
+
             _statusLabel.Text = "読込完了";
         }
         catch (UnauthorizedAccessException ex) when (PhysicalDiskReader.IsPhysicalDiskPath(path))
@@ -385,8 +425,122 @@ public partial class Form1 : Form
         }
         finally
         {
-            Cursor = Cursors.Default;
+            if (!adopted && loadResult is not null)
+            {
+                loadResult.Dispose();
+            }
+
+            _isLoadingImage = false;
+            UseWaitCursor = false;
+            _loadProgressBar.Visible = false;
+            _loadProgressBar.Style = ProgressBarStyle.Blocks;
         }
+    }
+
+    private void UpdateLoadProgress(DiskImageProgress progress)
+    {
+        if (IsDisposed || !_isLoadingImage)
+        {
+            return;
+        }
+
+        _statusLabel.Text = progress.Message;
+        if (progress.Percentage is int percentage)
+        {
+            _loadProgressBar.Style = ProgressBarStyle.Blocks;
+            _loadProgressBar.Value = percentage;
+        }
+        else
+        {
+            _loadProgressBar.Style = ProgressBarStyle.Marquee;
+        }
+    }
+
+    private static ImageLoadResult LoadAndAnalyzeImage(
+        string path,
+        long rawOffset,
+        int rawLength,
+        IProgress<DiskImageProgress> progress)
+    {
+        IDiskImageReader? reader = null;
+        var ownedReaders = new List<IDisposable>();
+        try
+        {
+            reader = DiskImageReaderFactory.Open(path, progress);
+            var analysis = AnalyzeImage(reader, ownedReaders, progress);
+            progress.Report(new DiskImageProgress("先頭データを読み込み中..."));
+            var rawData = new byte[rawLength];
+            reader.ReadAt(rawOffset, rawData, 0, rawLength);
+            var rawHex = HexFormatter.Format(rawData, rawOffset);
+            return new ImageLoadResult(reader, analysis, rawHex);
+        }
+        catch
+        {
+            foreach (var disposable in ownedReaders)
+            {
+                disposable.Dispose();
+            }
+
+            reader?.Dispose();
+            throw;
+        }
+    }
+
+    private static ImageAnalysis AnalyzeImage(
+        IDiskImageReader reader,
+        List<IDisposable> ownedReaders,
+        IProgress<DiskImageProgress> progress)
+    {
+        progress.Report(new DiskImageProgress("パーティションテーブルを解析中..."));
+        var discovered = PartitionTableReader.ReadPartitions(reader).ToList();
+        if (discovered.Count == 0 && reader.Length >= 512)
+        {
+            discovered.Add(new PartitionInfo
+            {
+                Number = 1,
+                Scheme = "WholeDisk",
+                Name = "Whole disk",
+                Type = "Unpartitioned",
+                TypeId = "",
+                StartLba = 0,
+                SectorCount = checked((ulong)(reader.Length / 512))
+            });
+        }
+
+        for (var index = 0; index < discovered.Count; index++)
+        {
+            progress.Report(new DiskImageProgress(
+                $"ファイルシステムを検出中: {index + 1:N0} / {discovered.Count:N0}",
+                index + 1,
+                discovered.Count));
+            discovered[index].FileSystem = FileSystemDetector.Detect(reader, discovered[index]);
+        }
+
+        var allPartitions = new List<PartitionInfo>(discovered);
+        var diagnostics = new List<LvmDiagnostic>();
+        var lvmPartitions = discovered
+            .Where(partition => partition.FileSystem.StartsWith("LVM2", StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        var lvmVolumeCount = 0;
+        if (lvmPartitions.Count > 0)
+        {
+            progress.Report(new DiskImageProgress("LVM2論理ボリュームを解析中..."));
+            var lvmResult = LogicalVolumeDiscoverer.Discover(
+                reader,
+                lvmPartitions,
+                allPartitions.Count + 1,
+                ownedReaders);
+            foreach (var partition in lvmResult.Volumes)
+            {
+                partition.FileSystem = FileSystemDetector.Detect(reader, partition);
+                allPartitions.Add(partition);
+            }
+
+            diagnostics.AddRange(lvmResult.Diagnostics);
+            lvmVolumeCount = lvmResult.Volumes.Count;
+        }
+
+        return new ImageAnalysis(allPartitions, diagnostics, ownedReaders, lvmVolumeCount);
     }
 
     private void PromptRestartAsAdministrator(string path, string detail)
@@ -602,6 +756,24 @@ public partial class Form1 : Form
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Warning);
             }
+        }
+
+        if (_partitions.Count == 0)
+        {
+            _statusLabel.Text = "パーティションなし";
+        }
+    }
+
+    private void ApplyPartitionAnalysis(IReadOnlyList<PartitionInfo> partitions)
+    {
+        _partitionGrid.Rows.Clear();
+        _tree.Nodes.Clear();
+        _fileList.Items.Clear();
+        _previewText.Clear();
+
+        foreach (var partition in partitions)
+        {
+            AddPartitionRow(partition);
         }
 
         if (_partitions.Count == 0)
@@ -1408,4 +1580,25 @@ public partial class Form1 : Form
     private sealed record PartitionNodeTag(PartitionInfo Partition);
     private sealed record DirectoryNodeTag(IReadOnlyFileSystem FileSystem, VfsNode Node);
     private sealed record DummyNodeTag;
+    private sealed record ImageAnalysis(
+        IReadOnlyList<PartitionInfo> Partitions,
+        IReadOnlyList<LvmDiagnostic> Diagnostics,
+        List<IDisposable> OwnedReaders,
+        int LvmVolumeCount);
+
+    private sealed record ImageLoadResult(
+        IDiskImageReader Reader,
+        ImageAnalysis Analysis,
+        string RawHex) : IDisposable
+    {
+        public void Dispose()
+        {
+            foreach (var disposable in Analysis.OwnedReaders)
+            {
+                disposable.Dispose();
+            }
+
+            Reader.Dispose();
+        }
+    }
 }
