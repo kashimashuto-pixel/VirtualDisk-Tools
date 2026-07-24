@@ -38,28 +38,58 @@ public static class FilePreviewReader
             throw new InvalidDataException($"別窓表示の上限は{MaximumFileSize / 1024 / 1024:N0} MBです。");
         }
 
+        if (TryRead(fileName, data, out var content))
+        {
+            return content;
+        }
+
+        throw new NotSupportedException(
+            "対応する文書形式ではなく、内容もテキストとして安全に判定できませんでした。");
+    }
+
+    public static bool TryRead(string fileName, byte[] data, out FilePreviewContent content)
+    {
+        ArgumentNullException.ThrowIfNull(data);
+        if (data.Length > MaximumFileSize)
+        {
+            content = null!;
+            return false;
+        }
+
         var extension = Path.GetExtension(fileName);
         if (TextExtensions.Contains(extension))
         {
-            return new FilePreviewContent(
+            content = new FilePreviewContent(
                 "テキスト（読み取り専用）",
                 DecodeText(data),
                 []);
+            return true;
         }
 
         if (extension.Equals(".docx", StringComparison.OrdinalIgnoreCase))
         {
-            return ReadDocx(data);
+            content = ReadDocx(data);
+            return true;
         }
 
         if (extension.Equals(".xlsx", StringComparison.OrdinalIgnoreCase)
             || extension.Equals(".xlsm", StringComparison.OrdinalIgnoreCase))
         {
-            return ReadWorkbook(data);
+            content = ReadWorkbook(data);
+            return true;
         }
 
-        throw new NotSupportedException(
-            "別窓表示はテキスト、.docx、.xlsx、.xlsmに対応しています。.docと.xlsは対象外です。");
+        if (TryDecodeProbableText(data, out var text))
+        {
+            content = new FilePreviewContent(
+                "内容からテキストと判定（読み取り専用）",
+                text,
+                []);
+            return true;
+        }
+
+        content = null!;
+        return false;
     }
 
     private static FilePreviewContent ReadDocx(byte[] data)
@@ -324,6 +354,169 @@ public static class FilePreviewReader
                 return Encoding.Latin1.GetString(data);
             }
         }
+    }
+
+    private static bool TryDecodeProbableText(byte[] data, out string text)
+    {
+        if (data.Length == 0)
+        {
+            text = "";
+            return true;
+        }
+
+        if (HasTextBom(data))
+        {
+            text = DecodeText(data);
+            return IsPlausibleText(text);
+        }
+
+        var sampleLength = Math.Min(data.Length, 64 * 1024);
+        var sample = data.AsSpan(0, sampleLength).ToArray();
+        var strictUtf8 = new UTF8Encoding(false, true);
+        if (TryDecodeCandidate(strictUtf8, sample, data, out text))
+        {
+            return true;
+        }
+
+        if (LooksLikeUtf16(sample, littleEndian: true)
+            && TryDecodeCandidate(new UnicodeEncoding(false, false, true), sample, data, out text))
+        {
+            return true;
+        }
+
+        if (LooksLikeUtf16(sample, littleEndian: false)
+            && TryDecodeCandidate(new UnicodeEncoding(true, false, true), sample, data, out text))
+        {
+            return true;
+        }
+
+        Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+        var shiftJis = Encoding.GetEncoding(
+            932,
+            EncoderFallback.ExceptionFallback,
+            DecoderFallback.ExceptionFallback);
+        if (TryDecodeCandidate(shiftJis, sample, data, out text))
+        {
+            return true;
+        }
+
+        if (TryDecodeCandidate(Encoding.Latin1, sample, data, out text))
+        {
+            return true;
+        }
+
+        text = "";
+        return false;
+    }
+
+    private static bool TryDecodeCandidate(
+        Encoding encoding,
+        byte[] sample,
+        byte[] data,
+        out string text)
+    {
+        string? sampleText = null;
+        var maximumTrim = sample.Length == data.Length ? 0 : Math.Min(4, sample.Length - 1);
+        for (var trim = 0; trim <= maximumTrim; trim++)
+        {
+            try
+            {
+                sampleText = encoding.GetString(sample, 0, sample.Length - trim);
+                break;
+            }
+            catch (DecoderFallbackException)
+            {
+                // A bounded sample can end in the middle of a multibyte character.
+            }
+        }
+
+        if (sampleText is null || !IsPlausibleText(sampleText))
+        {
+            text = "";
+            return false;
+        }
+
+        try
+        {
+            text = sample.Length == data.Length
+                ? sampleText
+                : encoding.GetString(data);
+            return IsPlausibleText(text);
+        }
+        catch (DecoderFallbackException)
+        {
+            text = "";
+            return false;
+        }
+    }
+
+    private static bool IsPlausibleText(string text)
+    {
+        if (text.Length == 0)
+        {
+            return true;
+        }
+
+        var controls = 0;
+        var visible = 0;
+        foreach (var character in text)
+        {
+            if (character == '\0')
+            {
+                return false;
+            }
+
+            if (char.IsControl(character)
+                && character is not '\r' and not '\n' and not '\t' and not '\f')
+            {
+                controls++;
+            }
+            else if (!char.IsWhiteSpace(character))
+            {
+                visible++;
+            }
+        }
+
+        var maximumControls = Math.Max(1, text.Length / 100);
+        return controls <= maximumControls && (visible > 0 || text.All(char.IsWhiteSpace));
+    }
+
+    private static bool LooksLikeUtf16(byte[] sample, bool littleEndian)
+    {
+        if (sample.Length < 4)
+        {
+            return false;
+        }
+
+        var pairs = sample.Length / 2;
+        var expectedNulls = 0;
+        var otherNulls = 0;
+        for (var index = 0; index < pairs * 2; index += 2)
+        {
+            var expectedIndex = littleEndian ? index + 1 : index;
+            var otherIndex = littleEndian ? index : index + 1;
+            if (sample[expectedIndex] == 0)
+            {
+                expectedNulls++;
+            }
+
+            if (sample[otherIndex] == 0)
+            {
+                otherNulls++;
+            }
+        }
+
+        return expectedNulls >= Math.Max(2, pairs / 5)
+            && otherNulls <= Math.Max(1, pairs / 20);
+    }
+
+    private static bool HasTextBom(byte[] data)
+    {
+        var span = data.AsSpan();
+        return span.StartsWith(new byte[] { 0xef, 0xbb, 0xbf })
+            || span.StartsWith(new byte[] { 0xff, 0xfe })
+            || span.StartsWith(new byte[] { 0xfe, 0xff })
+            || span.StartsWith(new byte[] { 0x00, 0x00, 0xfe, 0xff });
     }
 
     private static bool TryParseCellReference(string? reference, out int row, out int column)

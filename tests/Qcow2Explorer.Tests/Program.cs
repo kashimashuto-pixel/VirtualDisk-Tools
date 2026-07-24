@@ -336,8 +336,13 @@ static void TestFilePreviews()
 {
     var text = FilePreviewReader.Read("notes.txt", Encoding.UTF8.GetBytes("日本語テキスト"));
     Assert(text.Text == "日本語テキスト", "UTF-8 text preview");
-    var shiftJisText = FilePreviewReader.Read("legacy.txt", [0x93, 0xfa, 0x96, 0x7b, 0x8c, 0xea]);
+    var shiftJisText = FilePreviewReader.Read("unknown.dat", [0x93, 0xfa, 0x96, 0x7b, 0x8c, 0xea]);
     Assert(shiftJisText.Text == "日本語", "Shift-JIS text preview");
+    var utf16Text = FilePreviewReader.Read("extensionless", Encoding.Unicode.GetBytes("plain text"));
+    Assert(utf16Text.Text == "plain text", "UTF-16 content detection without extension");
+    Assert(
+        !FilePreviewReader.TryRead("program.bin", [0x4d, 0x5a, 0x00, 0x02, 0x10, 0xff, 0x00, 0x01], out _),
+        "binary content preview rejection");
     Assert(FilePreviewReader.CanPreview("report.docx"), "docx preview detection");
     Assert(!FilePreviewReader.CanPreview("legacy.xls"), "legacy xls preview rejection");
 
