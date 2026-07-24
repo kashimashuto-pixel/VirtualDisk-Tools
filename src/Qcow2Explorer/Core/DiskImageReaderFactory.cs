@@ -5,7 +5,7 @@ public static class DiskImageReaderFactory
     public const string DialogFilter =
         "対応/検出ディスク (*.qcow2;*.qcow;*.vhd;*.vhdx;*.vmdk;*.vdi;*.hdd;*.hds;*.dd;*.img;*.raw;*.lzo)|*.qcow2;*.qcow;*.vhd;*.vhdx;*.vmdk;*.vdi;*.hdd;*.hds;*.dd;*.img;*.raw;*.lzo|All files (*.*)|*.*";
 
-    public static IDiskImageReader Open(string path)
+    public static IDiskImageReader Open(string path, IProgress<DiskImageProgress>? progress = null)
     {
         if (PhysicalDiskReader.IsPhysicalDiskPath(path))
         {
@@ -24,7 +24,7 @@ public static class DiskImageReaderFactory
 
         if (path.EndsWith(".lzo", StringComparison.OrdinalIgnoreCase) || IsLzop(path))
         {
-            return new LzopDiskImageReader(path);
+            return new LzopDiskImageReader(path, progress);
         }
 
         if (IsQcow2(path))

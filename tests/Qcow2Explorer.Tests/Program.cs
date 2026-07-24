@@ -263,9 +263,15 @@ static void TestGeneratedLzopExt4Image()
     var imagePath = Path.Combine(AppContext.BaseDirectory, "sample-ext4.dd.lzo");
     TestImageFactory.CreateExt4LzopDisk(imagePath);
 
-    using var reader = DiskImageReaderFactory.Open(imagePath);
+    var progressEvents = new List<DiskImageProgress>();
+    using var reader = DiskImageReaderFactory.Open(
+        imagePath,
+        new CallbackProgress<DiskImageProgress>(progressEvents.Add));
     Assert(reader is LzopDiskImageReader, "dd.lzo reader factory");
     Assert(reader.FormatName.Contains("lzop", StringComparison.OrdinalIgnoreCase), "dd.lzo format name");
+    Assert(
+        progressEvents.Any(item => item.Message.Contains("索引作成", StringComparison.Ordinal)),
+        "dd.lzo index progress");
 
     var partition = new PartitionInfo
     {
@@ -307,6 +313,9 @@ static void TestGeneratedLzopExt4Image()
     var crossBlock = new byte[8192];
     reader.ReadAt(60 * 1024, crossBlock, 0, crossBlock.Length);
     Assert(crossBlock.Length == 8192, "dd.lzo cross-block random read");
+    Assert(
+        progressEvents.Any(item => item.Message.Contains("ブロック展開", StringComparison.Ordinal)),
+        "dd.lzo decompression progress");
 
     var damagedPath = Path.Combine(AppContext.BaseDirectory, "sample-ext4-damaged.dd.lzo");
     TestImageFactory.CreateExt4LzopDisk(damagedPath, corruptHeaderChecksum: true);
@@ -1392,5 +1401,13 @@ internal sealed class MemorySectorReader : IBlockReader, ILogicalSectorReader
 
         var available = checked((int)Math.Min(count, Length - offset));
         Array.Copy(_data, offset, buffer, bufferOffset, available);
+    }
+}
+
+internal sealed class CallbackProgress<T>(Action<T> callback) : IProgress<T>
+{
+    public void Report(T value)
+    {
+        callback(value);
     }
 }
