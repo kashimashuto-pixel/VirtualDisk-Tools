@@ -6,6 +6,7 @@ using Qcow2Explorer.Core;
 using Qcow2Explorer.FileSystems;
 using Qcow2Explorer.Mounting;
 using Qcow2Explorer.Partitions;
+using Qcow2Explorer.Previewing;
 using DiscUtils.Streams;
 using DiscXfsFileSystem = DiscUtils.Xfs.XfsFileSystem;
 using VdiDisk = DiscUtils.Vdi.Disk;
@@ -54,6 +55,7 @@ static void RunGeneratedImageTests()
     TestLvmMetadataDiagnostics();
     TestGeneratedLvm2Image();
     TestGeneratedLzopExt4Image();
+    TestFilePreviews();
 
     var imagePath = Path.Combine(AppContext.BaseDirectory, "sample-fat16.qcow2");
     TestImageFactory.CreateFat16Qcow2(imagePath);
@@ -328,6 +330,81 @@ static void TestGeneratedLzopExt4Image()
     {
         Assert(ex.Message.Contains("チェックサム", StringComparison.Ordinal), "damaged dd.lzo diagnostic");
     }
+}
+
+static void TestFilePreviews()
+{
+    var text = FilePreviewReader.Read("notes.txt", Encoding.UTF8.GetBytes("日本語テキスト"));
+    Assert(text.Text == "日本語テキスト", "UTF-8 text preview");
+    var shiftJisText = FilePreviewReader.Read("legacy.txt", [0x93, 0xfa, 0x96, 0x7b, 0x8c, 0xea]);
+    Assert(shiftJisText.Text == "日本語", "Shift-JIS text preview");
+    Assert(FilePreviewReader.CanPreview("report.docx"), "docx preview detection");
+    Assert(!FilePreviewReader.CanPreview("legacy.xls"), "legacy xls preview rejection");
+
+    var docx = CreateZip(
+        ("word/document.xml", """
+            <?xml version="1.0" encoding="UTF-8"?>
+            <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+              <w:body>
+                <w:p><w:r><w:t>Word本文</w:t></w:r></w:p>
+                <w:tbl><w:tr><w:tc><w:p><w:r><w:t>表セル</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
+              </w:body>
+            </w:document>
+            """));
+    var wordPreview = FilePreviewReader.Read("report.docx", docx);
+    Assert(wordPreview.Text?.Contains("Word本文", StringComparison.Ordinal) == true, "docx paragraph preview");
+    Assert(wordPreview.Text?.Contains("表セル", StringComparison.Ordinal) == true, "docx table preview");
+
+    var xlsx = CreateZip(
+        ("xl/workbook.xml", """
+            <?xml version="1.0" encoding="UTF-8"?>
+            <workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+                      xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+              <sheets><sheet name="一覧" sheetId="1" r:id="rId1"/></sheets>
+            </workbook>
+            """),
+        ("xl/_rels/workbook.xml.rels", """
+            <?xml version="1.0" encoding="UTF-8"?>
+            <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+              <Relationship Id="rId1" Target="worksheets/sheet1.xml"
+                            Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet"/>
+            </Relationships>
+            """),
+        ("xl/sharedStrings.xml", """
+            <?xml version="1.0" encoding="UTF-8"?>
+            <sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+              <si><t>見出し</t></si>
+            </sst>
+            """),
+        ("xl/worksheets/sheet1.xml", """
+            <?xml version="1.0" encoding="UTF-8"?>
+            <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+              <sheetData>
+                <row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1"><v>123</v></c></row>
+                <row r="2"><c r="A2"><f>SUM(B1:B1)</f><v>123</v></c></row>
+              </sheetData>
+            </worksheet>
+            """));
+    var excelPreview = FilePreviewReader.Read("book.xlsx", xlsx);
+    Assert(excelPreview.Sheets.Count == 1 && excelPreview.Sheets[0].Name == "一覧", "xlsx sheet preview");
+    Assert(excelPreview.Sheets[0].Rows[0][0] == "見出し", "xlsx shared string preview");
+    Assert(excelPreview.Sheets[0].Rows[1][0] == "=SUM(B1:B1)", "xlsx formula preview");
+}
+
+static byte[] CreateZip(params (string Path, string Content)[] entries)
+{
+    using var output = new MemoryStream();
+    using (var archive = new ZipArchive(output, ZipArchiveMode.Create, leaveOpen: true))
+    {
+        foreach (var (path, content) in entries)
+        {
+            var entry = archive.CreateEntry(path, CompressionLevel.Fastest);
+            using var writer = new StreamWriter(entry.Open(), new UTF8Encoding(false));
+            writer.Write(content);
+        }
+    }
+
+    return output.ToArray();
 }
 
 static IReadOnlyFileSystem AssertFat16Readable(IDiskImageReader reader, string label)

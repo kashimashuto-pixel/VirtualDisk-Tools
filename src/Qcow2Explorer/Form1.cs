@@ -6,6 +6,7 @@ using Qcow2Explorer.Core;
 using Qcow2Explorer.FileSystems;
 using Qcow2Explorer.Mounting;
 using Qcow2Explorer.Partitions;
+using Qcow2Explorer.Previewing;
 using Qcow2Explorer.Reporting;
 
 namespace Qcow2Explorer;
@@ -165,11 +166,13 @@ public partial class Form1 : Form
         _fileList.Columns.Add("更新日時 UTC", 170);
         _fileList.Columns.Add("種別 / 属性", 220);
         _fileList.Columns.Add("場所", 420);
-        _fileList.DoubleClick += (_, _) => OpenSelectedListItem();
+        _fileList.DoubleClick += async (_, _) => await OpenSelectedListItemAsync();
         _fileList.SelectedIndexChanged += (_, _) => ShowSelectedItemProperties();
 
         var previewButton = new ToolStripButton("プレビュー");
         previewButton.Click += (_, _) => PreviewSelectedFile();
+        var windowPreviewButton = new ToolStripButton("別窓表示");
+        windowPreviewButton.Click += async (_, _) => await OpenSelectedFilePreviewAsync();
         var extractButton = new ToolStripButton("抽出");
         extractButton.Click += (_, _) => ExtractSelectedFile();
         var copyButton = new ToolStripButton("選択コピー");
@@ -207,6 +210,7 @@ public partial class Form1 : Form
         explorerStrip.Items.Add(clearSearchButton);
         explorerStrip.Items.Add(_cancelOperationButton);
         explorerStrip.Items.Add(new ToolStripSeparator());
+        explorerStrip.Items.Add(windowPreviewButton);
         explorerStrip.Items.Add(previewButton);
         explorerStrip.Items.Add(extractButton);
         explorerStrip.Items.Add(copyButton);
@@ -1132,7 +1136,7 @@ public partial class Form1 : Form
         _partitionReaders.Clear();
     }
 
-    private void OpenSelectedListItem()
+    private async Task OpenSelectedListItemAsync()
     {
         if (_fileList.SelectedItems.Count == 0 || _fileList.SelectedItems[0].Tag is not VfsNode node)
         {
@@ -1145,7 +1149,14 @@ public partial class Form1 : Form
         }
         else
         {
-            PreviewSelectedFile();
+            if (FilePreviewReader.CanPreview(node.Name))
+            {
+                await OpenSelectedFilePreviewAsync();
+            }
+            else
+            {
+                PreviewSelectedFile();
+            }
         }
     }
 
@@ -1599,6 +1610,63 @@ public partial class Form1 : Form
             }
 
             Reader.Dispose();
+        }
+    }
+
+    private async Task OpenSelectedFilePreviewAsync()
+    {
+        if (_currentFileSystem is null
+            || _fileList.SelectedItems.Count == 0
+            || _fileList.SelectedItems[0].Tag is not VfsNode node
+            || node.IsDirectory)
+        {
+            return;
+        }
+
+        if (!FilePreviewReader.CanPreview(node.Name))
+        {
+            MessageBox.Show(
+                this,
+                "別窓表示はテキスト、.docx、.xlsx、.xlsmに対応しています。.docと.xlsは対象外です。",
+                "別窓表示",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+            return;
+        }
+
+        if (node.Size < 0 || node.Size > FilePreviewReader.MaximumFileSize)
+        {
+            MessageBox.Show(
+                this,
+                $"別窓表示できるファイルサイズは{FilePreviewReader.MaximumFileSize / 1024 / 1024:N0} MBまでです。",
+                "別窓表示",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+            return;
+        }
+
+        try
+        {
+            _statusLabel.Text = $"{node.Name} を読み込み中...";
+            var fileSystem = _currentFileSystem;
+            var preview = await Task.Run(() =>
+            {
+                var data = fileSystem.ReadFile(node, 0, checked((int)node.Size));
+                return FilePreviewReader.Read(node.Name, data);
+            });
+            if (IsDisposed)
+            {
+                return;
+            }
+
+            var window = new FilePreviewForm(node.Name, preview);
+            window.Show(this);
+            _statusLabel.Text = $"{node.Name}: 別窓表示";
+        }
+        catch (Exception ex)
+        {
+            _statusLabel.Text = "別窓表示に失敗しました";
+            MessageBox.Show(this, ex.Message, "別窓表示エラー", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
     }
 }
