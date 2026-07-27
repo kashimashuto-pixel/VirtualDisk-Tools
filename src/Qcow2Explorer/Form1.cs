@@ -188,6 +188,15 @@ public partial class Form1 : Form
     {
         _tree.BeforeExpand += TreeBeforeExpand;
         _tree.AfterSelect += TreeAfterSelect;
+        _tree.KeyDown += (_, e) =>
+        {
+            if (e.KeyCode == Keys.Enter && _tree.SelectedNode is TreeNode selectedNode)
+            {
+                e.Handled = true;
+                e.SuppressKeyPress = true;
+                selectedNode.Expand();
+            }
+        };
 
         _fileList.Columns.Add("名前", 360);
         _fileList.Columns.Add("サイズ", 120, HorizontalAlignment.Right);
@@ -196,13 +205,22 @@ public partial class Form1 : Form
         _fileList.Columns.Add("場所", 420);
         _fileList.DoubleClick += async (_, _) => await OpenSelectedListItemAsync();
         _fileList.SelectedIndexChanged += (_, _) => ShowSelectedItemProperties();
+        _fileList.KeyDown += async (_, e) =>
+        {
+            if (e.KeyCode == Keys.Enter)
+            {
+                e.Handled = true;
+                e.SuppressKeyPress = true;
+                await OpenSelectedListItemAsync();
+            }
+        };
 
         var previewButton = new ToolStripButton("プレビュー");
         previewButton.Click += (_, _) => PreviewSelectedFile();
         var windowPreviewButton = new ToolStripButton("別窓表示");
         windowPreviewButton.Click += async (_, _) => await OpenSelectedFilePreviewAsync(showUnsupportedMessage: true);
         var extractButton = new ToolStripButton("抽出");
-        extractButton.Click += (_, _) => ExtractSelectedFile();
+        extractButton.Click += async (_, _) => await ExtractSelectedFileAsync();
         var copyButton = new ToolStripButton("選択コピー");
         copyButton.Click += async (_, _) => await CopySelectedItemsAsync();
         var copyFolderButton = new ToolStripButton("表示フォルダをコピー");
@@ -1307,7 +1325,7 @@ public partial class Form1 : Form
         }
     }
 
-    private void ExtractSelectedFile()
+    private async Task ExtractSelectedFileAsync()
     {
         if (_currentFileSystem is null || _fileList.SelectedItems.Count == 0 || _fileList.SelectedItems[0].Tag is not VfsNode node || node.IsDirectory)
         {
@@ -1320,33 +1338,53 @@ public partial class Form1 : Form
             return;
         }
 
+        _operationCancellation?.Cancel();
+        _operationCancellation?.Dispose();
+        using var cancellation = new CancellationTokenSource();
+        _operationCancellation = cancellation;
+        _cancelOperationButton.Enabled = true;
+        _loadProgressBar.Visible = true;
+        _loadProgressBar.Style = ProgressBarStyle.Blocks;
+        _loadProgressBar.Value = 0;
+
+        var progress = new Progress<long>(bytesCopied =>
+        {
+            var percentage = node.Size == 0
+                ? 100
+                : (int)Math.Clamp((double)bytesCopied / node.Size * 100, 0, 100);
+            _loadProgressBar.Value = percentage;
+            _statusLabel.Text =
+                $"抽出中: {node.Name} {FormatBytes(bytesCopied)} / {FormatBytes(node.Size)} ({percentage}%)";
+        });
+
         try
         {
-            Cursor = Cursors.WaitCursor;
-            using var output = new FileStream(dialog.FileName, FileMode.Create, FileAccess.Write, FileShare.None);
-            long offset = 0;
-            const int chunkSize = 1024 * 1024;
-            while (offset < node.Size)
-            {
-                var chunk = _currentFileSystem.ReadFile(node, offset, (int)Math.Min(chunkSize, node.Size - offset));
-                if (chunk.Length == 0)
-                {
-                    break;
-                }
-
-                output.Write(chunk, 0, chunk.Length);
-                offset += chunk.Length;
-            }
-
-            _statusLabel.Text = $"抽出完了: {node.Name}";
+            var fileSystem = _currentFileSystem;
+            var bytesCopied = await Task.Run(() => FileSystemExporter.ExtractFile(
+                fileSystem,
+                node,
+                dialog.FileName,
+                progress,
+                cancellation.Token));
+            _statusLabel.Text = $"抽出完了: {node.Name} ({FormatBytes(bytesCopied)})";
+        }
+        catch (OperationCanceledException)
+        {
+            _statusLabel.Text = $"抽出をキャンセルしました: {node.Name}";
         }
         catch (Exception ex)
         {
             MessageBox.Show(this, ex.Message, "抽出エラー", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            _statusLabel.Text = $"抽出失敗: {node.Name}";
         }
         finally
         {
-            Cursor = Cursors.Default;
+            if (ReferenceEquals(_operationCancellation, cancellation))
+            {
+                _operationCancellation = null;
+                _cancelOperationButton.Enabled = false;
+                _loadProgressBar.Visible = false;
+            }
         }
     }
 
