@@ -93,6 +93,67 @@ public static class FileSystemExporter
             : CopyFile(fileSystem, node, targetPath, copyRoot, progress, cancellationToken, options);
     }
 
+    public static long ExtractFile(
+        IReadOnlyFileSystem fileSystem,
+        VfsNode file,
+        string destinationPath,
+        IProgress<long>? progress = null,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(fileSystem);
+        ArgumentNullException.ThrowIfNull(file);
+        if (file.IsDirectory)
+        {
+            throw new ArgumentException("フォルダーは単一ファイルとして抽出できません。", nameof(file));
+        }
+
+        Directory.CreateDirectory(Path.GetDirectoryName(destinationPath) ?? ".");
+        long offset = 0;
+        try
+        {
+            using (var output = new FileStream(
+                destinationPath,
+                FileMode.Create,
+                FileAccess.Write,
+                FileShare.None,
+                CopyBufferSize,
+                FileOptions.SequentialScan))
+            {
+                if (file.Size == 0)
+                {
+                    progress?.Report(0);
+                }
+
+                while (offset < file.Size)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    var chunkSize = (int)Math.Min(CopyBufferSize, file.Size - offset);
+                    var chunk = fileSystem.ReadFile(file, offset, chunkSize);
+                    if (chunk.Length == 0)
+                    {
+                        throw new EndOfStreamException($"ファイルの途中で読み込みが止まりました: {file.Name}");
+                    }
+
+                    output.Write(chunk, 0, chunk.Length);
+                    offset += chunk.Length;
+                    progress?.Report(offset);
+                }
+            }
+        }
+        catch
+        {
+            TryDeletePartialFile(destinationPath);
+            throw;
+        }
+
+        if (file.ModifiedUtc.HasValue)
+        {
+            TrySetLastWriteTime(destinationPath, file.ModifiedUtc.Value, isDirectory: false);
+        }
+
+        return offset;
+    }
+
     private static CopyResult CopyDirectory(
         IReadOnlyFileSystem fileSystem,
         VfsNode directory,

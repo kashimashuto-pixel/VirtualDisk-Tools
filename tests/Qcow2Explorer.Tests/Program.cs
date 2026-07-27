@@ -106,6 +106,30 @@ static void RunGeneratedImageTests()
     Assert(File.Exists(Path.Combine(copyDirectory, "VirtualDiskExplorer.sha256")), "SHA-256 manifest file");
     Assert(File.ReadAllText(Path.Combine(copyDirectory, "HELLO.TXT"), Encoding.ASCII) == TestImageFactory.HelloText, "copied HELLO.TXT");
     Assert(File.ReadAllText(Path.Combine(copyDirectory, "DOCS", "README.TXT"), Encoding.ASCII) == TestImageFactory.ReadmeText, "copied README.TXT");
+    var extractionProgress = new List<long>();
+    var extractionPath = Path.Combine(copyDirectory, "extracted-hello.txt");
+    var extractedBytes = FileSystemExporter.ExtractFile(
+        fs,
+        hello,
+        extractionPath,
+        new CallbackProgress<long>(extractionProgress.Add));
+    Assert(extractedBytes == hello.Size, "extracted byte count");
+    Assert(extractionProgress.Count > 0 && extractionProgress[^1] == hello.Size, "extraction progress");
+    Assert(File.ReadAllText(extractionPath, Encoding.ASCII) == TestImageFactory.HelloText, "extracted file content");
+    var canceledExtractionPath = Path.Combine(copyDirectory, "canceled-extraction.txt");
+    try
+    {
+        FileSystemExporter.ExtractFile(
+            fs,
+            hello,
+            canceledExtractionPath,
+            cancellationToken: new CancellationToken(canceled: true));
+        Assert(false, "canceled extraction throws");
+    }
+    catch (OperationCanceledException)
+    {
+        Assert(!File.Exists(canceledExtractionPath), "canceled extraction removes partial file");
+    }
 
     var searchResults = FileSystemSearch.Search(fs, "readme");
     Assert(searchResults.Count == 1 && searchResults[0].Path == "/DOCS/README.TXT", "recursive file search");
