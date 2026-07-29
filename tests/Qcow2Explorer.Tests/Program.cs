@@ -1,6 +1,7 @@
 using System.Buffers.Binary;
 using System.Globalization;
 using System.IO.Compression;
+using System.Security.Cryptography;
 using System.Text;
 using Qcow2Explorer;
 using Qcow2Explorer.Core;
@@ -56,6 +57,7 @@ static void RunGeneratedImageTests()
     TestLvmMetadataDiagnostics();
     TestGeneratedLvm2Image();
     TestGeneratedLzopExt4Image();
+    TestGeneratedVmaLzopImage();
     TestFilePreviews();
     TestNavigationHistory();
 
@@ -358,6 +360,33 @@ static void TestGeneratedLzopExt4Image()
     }
 }
 
+static void TestGeneratedVmaLzopImage()
+{
+    var imagePath = Path.Combine(AppContext.BaseDirectory, "sample-fat16.vma.lzo");
+    TestImageFactory.CreateFat16VmaLzop(imagePath);
+
+    var progressEvents = new List<DiskImageProgress>();
+    using var reader = DiskImageReaderFactory.Open(
+        imagePath,
+        new CallbackProgress<DiskImageProgress>(progressEvents.Add));
+    Assert(reader is VmaDiskImageReader, "VMA.lzo reader factory");
+    var vma = (VmaDiskImageReader)reader;
+    Assert(vma.Devices.Count == 2 && vma.ActiveDevice.Name == "scsi0", "VMA largest device selection");
+    Assert(vma.Length == TestImageFactory.VirtualSize, "VMA virtual disk size");
+    Assert(
+        progressEvents.Any(item => item.Message.Contains("VMA索引作成", StringComparison.Ordinal)),
+        "VMA index progress");
+    AssertFat16Readable(vma, "VMA.lzo");
+
+    var zeroBlock = new byte[4096];
+    vma.ReadAt(12 * 1024 * 1024, zeroBlock, 0, zeroBlock.Length);
+    Assert(zeroBlock.All(value => value == 0), "VMA sparse zero block");
+
+    vma.SelectDevice(0);
+    Assert(vma.ActiveDevice.Name == "efidisk0" && vma.Length == 528 * 1024, "VMA device switching");
+    vma.SelectDevice(1);
+}
+
 static void TestFilePreviews()
 {
     var text = FilePreviewReader.Read("notes.txt", Encoding.UTF8.GetBytes("日本語テキスト"));
@@ -477,6 +506,16 @@ static void InspectImage(string imagePath, bool copySmoke)
     Console.WriteLine(imagePath);
     Console.WriteLine($"format: {reader.FormatName}");
     Console.WriteLine($"virtual size: {FormatBytes(reader.Length)}");
+    if (reader is VmaDiskImageReader vma)
+    {
+        Console.WriteLine($"VMA devices: {vma.Devices.Count}");
+        foreach (var device in vma.Devices)
+        {
+            var marker = device == vma.ActiveDevice ? "*" : " ";
+            Console.WriteLine($"{marker} device {device.Id}: {device.Name}, {FormatBytes(device.Size)}");
+        }
+    }
+
     foreach (var warning in reader.GetWarnings())
     {
         Console.WriteLine($"warning: {warning}");
@@ -776,9 +815,18 @@ internal static class TestImageFactory
 
     public static void CreateExt4LzopDisk(string path, bool corruptHeaderChecksum = false)
     {
+        WriteLzop(path, CreateMinimalExt4Disk(), "sample-ext4.dd", corruptHeaderChecksum);
+    }
+
+    public static void CreateFat16VmaLzop(string path)
+    {
+        WriteLzop(path, CreateVma(CreateVirtualDisk()), "sample-fat16.vma", corruptHeaderChecksum: false);
+    }
+
+    private static void WriteLzop(string path, byte[] disk, string originalName, bool corruptHeaderChecksum)
+    {
         const int blockSize = 64 * 1024;
         const uint flags = 0x00001303;
-        var disk = CreateMinimalExt4Disk();
         var output = new List<byte>();
         output.AddRange([0x89, 0x4c, 0x5a, 0x4f, 0x00, 0x0d, 0x0a, 0x1a, 0x0a]);
 
@@ -792,7 +840,7 @@ internal static class TestImageFactory
         AppendU32Be(header, 0x000081a4);
         AppendU32Be(header, 0);
         AppendU32Be(header, 0);
-        var name = Encoding.UTF8.GetBytes("sample-ext4.dd");
+        var name = Encoding.UTF8.GetBytes(originalName);
         header.Add(checked((byte)name.Length));
         header.AddRange(name);
         output.AddRange(header);
@@ -826,6 +874,108 @@ internal static class TestImageFactory
 
         AppendU32Be(output, 0);
         File.WriteAllBytes(path, output.ToArray());
+    }
+
+    private static byte[] CreateVma(byte[] disk)
+    {
+        const int headerSize = 13 * 1024;
+        const int blobOffset = 12 * 1024;
+        const int extentHeaderSize = 512;
+        const int blockSize = 4 * 1024;
+        const int clusterSize = 64 * 1024;
+        const int blockInfoCount = 59;
+
+        var uuid = Guid.Parse("93818867-21f5-40aa-9177-0d706569af39").ToByteArray(bigEndian: true);
+        var header = new byte[headerSize];
+        Encoding.ASCII.GetBytes("VMA\0").CopyTo(header, 0);
+        WriteU32Be(header, 4, 1);
+        uuid.CopyTo(header, 8);
+        WriteU64Be(header, 24, 1_700_000_000);
+        WriteU32Be(header, 48, blobOffset);
+
+        var efiName = Encoding.UTF8.GetBytes("efidisk0");
+        var diskName = Encoding.UTF8.GetBytes("scsi0");
+        const int efiNamePointer = 1;
+        var diskNamePointer = efiNamePointer + 2 + efiName.Length;
+        var blobSize = diskNamePointer + 2 + diskName.Length;
+        WriteU32Be(header, 52, checked((uint)blobSize));
+        WriteU32Be(header, 56, headerSize);
+        WriteU16Le(header, blobOffset + efiNamePointer, checked((ushort)efiName.Length));
+        efiName.CopyTo(header, blobOffset + efiNamePointer + 2);
+        WriteU16Le(header, blobOffset + diskNamePointer, checked((ushort)diskName.Length));
+        diskName.CopyTo(header, blobOffset + diskNamePointer + 2);
+
+        var efiDeviceInfoOffset = 4096 + 32;
+        WriteU32Be(header, efiDeviceInfoOffset, efiNamePointer);
+        WriteU64Be(header, efiDeviceInfoOffset + 8, 528 * 1024);
+        var diskDeviceInfoOffset = 4096 + 64;
+        WriteU32Be(header, diskDeviceInfoOffset, checked((uint)diskNamePointer));
+        WriteU64Be(header, diskDeviceInfoOffset + 8, checked((ulong)disk.Length));
+        WriteMd5(header, 32);
+
+        var output = new List<byte>(header);
+        var clusters = new List<(uint Number, ushort Mask, List<byte[]> Blocks)>();
+        var clusterCount = (disk.Length + clusterSize - 1) / clusterSize;
+        for (var clusterNumber = 0; clusterNumber < clusterCount; clusterNumber++)
+        {
+            ushort mask = 0;
+            var blocks = new List<byte[]>();
+            for (var blockIndex = 0; blockIndex < 16; blockIndex++)
+            {
+                var diskOffset = clusterNumber * clusterSize + blockIndex * blockSize;
+                var block = new byte[blockSize];
+                var available = Math.Min(blockSize, disk.Length - diskOffset);
+                if (available > 0)
+                {
+                    Array.Copy(disk, diskOffset, block, 0, available);
+                }
+
+                if (block.Any(value => value != 0))
+                {
+                    mask |= checked((ushort)(1 << blockIndex));
+                    blocks.Add(block);
+                }
+            }
+
+            if (mask != 0)
+            {
+                clusters.Add((checked((uint)clusterNumber), mask, blocks));
+            }
+        }
+
+        for (var clusterStart = 0; clusterStart < clusters.Count; clusterStart += blockInfoCount)
+        {
+            var extentClusters = clusters
+                .Skip(clusterStart)
+                .Take(blockInfoCount)
+                .ToList();
+            var extentHeader = new byte[extentHeaderSize];
+            Encoding.ASCII.GetBytes("VMAE").CopyTo(extentHeader, 0);
+            var blockCount = extentClusters.Sum(item => item.Blocks.Count);
+            WriteU16Be(extentHeader, 6, checked((ushort)blockCount));
+            uuid.CopyTo(extentHeader, 8);
+
+            for (var index = 0; index < extentClusters.Count; index++)
+            {
+                var item = extentClusters[index];
+                var infoOffset = 40 + index * 8;
+                WriteU16Be(extentHeader, infoOffset, item.Mask);
+                extentHeader[infoOffset + 3] = 2;
+                WriteU32Be(extentHeader, infoOffset + 4, item.Number);
+            }
+
+            WriteMd5(extentHeader, 24);
+            output.AddRange(extentHeader);
+            foreach (var item in extentClusters)
+            {
+                foreach (var block in item.Blocks)
+                {
+                    output.AddRange(block);
+                }
+            }
+        }
+
+        return output.ToArray();
     }
 
     public static void CreateLvm2Fat16Disk(string path)
@@ -1418,6 +1568,11 @@ internal static class TestImageFactory
         data[offset + 1] = (byte)(value >> 8);
     }
 
+    private static void WriteU16Be(byte[] data, int offset, ushort value)
+    {
+        BinaryPrimitives.WriteUInt16BigEndian(data.AsSpan(offset, sizeof(ushort)), value);
+    }
+
     private static void WriteU32Le(byte[] data, int offset, int value)
     {
         data[offset] = (byte)value;
@@ -1502,6 +1657,12 @@ internal static class TestImageFactory
         data[offset + 5] = (byte)(value >> 16);
         data[offset + 6] = (byte)(value >> 8);
         data[offset + 7] = (byte)value;
+    }
+
+    private static void WriteMd5(byte[] data, int checksumOffset)
+    {
+        Array.Clear(data, checksumOffset, 16);
+        MD5.HashData(data).CopyTo(data, checksumOffset);
     }
 }
 

@@ -40,6 +40,7 @@ C# / Windows Forms で作成した、読み取り専用の仮想ディスク解�
 - ProjFS による読み取り専用のフォルダ投影型マウント
 - qcow2 のdeflate/zstd圧縮クラスタ、backing file、external data file、Extended L2 Entriesの読み取り
 - qcow2内部スナップショットの一覧表示と選択
+- Proxmox VMA内の複数仮想ディスクの一覧表示と選択
 
 ## 対応ディスク形式
 
@@ -49,6 +50,10 @@ C# / Windows Forms で作成した、読み取り専用の仮想ディスク解�
 - VMDK
 - VDI
 - Parallels HDD / HDS (`.hdd` フォルダ、`.hds`)
+- Proxmox VMA (`.vma` / `.vma.lzo`)
+  - VMAヘッダーとエクステントのMD5を検証
+  - 最大容量の仮想ディスクを初期選択し、ツールバーの「VMAディスク」から格納ディスクを切り替え
+  - 疎な4 KiBブロックを元の仮想ディスク位置へ読み取り専用で復元
 - raw / dd / img
 - lzop/LZO1X圧縮された `.dd.lzo` / `.img.lzo` / `.raw.lzo` / `.lzo`
   - 全体を一時展開せず、必要なブロックだけをオンデマンド展開
@@ -112,6 +117,7 @@ ProjFS マウントは Windows の Client-ProjFS 機能を使い、選択した�
 - backing fileは相対パスまたは絶対パスから読み取ります。親イメージがない場合は開けません。
 - Extended L2 Entriesは32サブクラスタの割り当て／ゼロビットマップを読み取ります。
 - lzopの変換フィルター付きストリーム、multipartフラグ、ファイル自体を分割した複数パートは未対応です。
+- VMAのVMメモリ状態 (`vmstate`) は仮想ディスク一覧から除外します。VMA内のディスクイメージ抽出や書き戻しは行いません。
 - ext4 の journal replay は行いません。
 - SquashFS はライブラリが対応する圧縮形式のみ読み取れます。
 - Linux md RAID は検出のみです。
@@ -259,6 +265,7 @@ SOFTWARE.
 ## 参考
 
 - qcow2 形式: https://www.qemu.org/docs/master/interop/qcow2.html
+- Proxmox VMA 形式: https://github.com/proxmox/pve-qemu/blob/master/vma_spec.txt
 - Parallels HDD descriptor: https://www.qemu.org/docs/master/interop/prl-xml.html
 - Parallels expandable image: https://www.qemu.org/docs/master/interop/parallels.html
 - Home Assistant OS partition layout: https://developers.home-assistant.io/docs/operating-system/partition
