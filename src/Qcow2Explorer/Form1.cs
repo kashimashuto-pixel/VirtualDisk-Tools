@@ -30,6 +30,8 @@ public partial class Form1 : Form
     private readonly DataGridView _uefiVariableGrid = new() { Dock = DockStyle.Fill, ReadOnly = true, AllowUserToAddRows = false, AllowUserToDeleteRows = false, SelectionMode = DataGridViewSelectionMode.FullRowSelect, MultiSelect = false, AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill };
     private readonly TextBox _uefiVariableDetails = new() { Dock = DockStyle.Fill, Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Both, WordWrap = false, Font = new Font("Consolas", 10) };
     private readonly CheckBox _showInactiveUefiVariables = new() { Text = "削除済み・履歴も表示", AutoSize = true, Padding = new Padding(8, 5, 0, 0) };
+    private readonly DataGridView _tpmStateGrid = new() { Dock = DockStyle.Fill, ReadOnly = true, AllowUserToAddRows = false, AllowUserToDeleteRows = false, SelectionMode = DataGridViewSelectionMode.FullRowSelect, MultiSelect = false, AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill };
+    private readonly TextBox _tpmStateDetails = new() { Dock = DockStyle.Fill, Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Both, WordWrap = false, Font = new Font("Consolas", 10) };
     private readonly TreeView _tree = new() { Dock = DockStyle.Fill, HideSelection = false };
     private readonly ListView _fileList = new() { Dock = DockStyle.Fill, View = View.Details, FullRowSelect = true, GridLines = true, MultiSelect = true };
     private readonly TextBox _previewText = new() { Dock = DockStyle.Fill, Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Both, WordWrap = false, Font = new Font("Consolas", 10) };
@@ -49,6 +51,7 @@ public partial class Form1 : Form
     private bool _isHistoryNavigation;
     private bool _isLoadingImage;
     private UefiVariableStore? _currentUefiVariableStore;
+    private SwtpmStateStore? _currentTpmStateStore;
 
     public Form1(string? initialPath = null)
     {
@@ -129,6 +132,7 @@ public partial class Form1 : Form
         tabs.TabPages.Add(CreateRawTab());
         tabs.TabPages.Add(CreatePartitionTab());
         tabs.TabPages.Add(CreateUefiVariableTab());
+        tabs.TabPages.Add(CreateTpmStateTab());
         tabs.TabPages.Add(CreateExplorerTab());
         tabs.TabPages.Add(CreateMountTab());
 
@@ -224,6 +228,37 @@ public partial class Form1 : Form
         layout.Controls.Add(_showInactiveUefiVariables, 0, 0);
         layout.Controls.Add(split, 0, 1);
         return new TabPage("UEFI変数") { Controls = { layout } };
+    }
+
+    private TabPage CreateTpmStateTab()
+    {
+        _tpmStateGrid.Columns.Add("Slot", "スロット");
+        _tpmStateGrid.Columns.Add("Name", "状態");
+        _tpmStateGrid.Columns.Add("Offset", "オフセット");
+        _tpmStateGrid.Columns.Add("DataSize", "データ");
+        _tpmStateGrid.Columns.Add("SectionSize", "予約領域");
+        _tpmStateGrid.Columns.Add("Blob", "Blob");
+        _tpmStateGrid.Columns.Add("Encryption", "暗号化");
+        _tpmStateGrid.Columns.Add("Tlvs", "TLV");
+        _tpmStateGrid.Columns["Slot"]!.FillWeight = 45;
+        _tpmStateGrid.Columns["Name"]!.FillWeight = 150;
+        _tpmStateGrid.Columns["Offset"]!.FillWeight = 85;
+        _tpmStateGrid.Columns["DataSize"]!.FillWeight = 85;
+        _tpmStateGrid.Columns["SectionSize"]!.FillWeight = 85;
+        _tpmStateGrid.Columns["Blob"]!.FillWeight = 70;
+        _tpmStateGrid.Columns["Encryption"]!.FillWeight = 145;
+        _tpmStateGrid.Columns["Tlvs"]!.FillWeight = 55;
+        _tpmStateGrid.SelectionChanged += (_, _) => ShowSelectedTpmState();
+
+        var split = new SplitContainer
+        {
+            Dock = DockStyle.Fill,
+            Orientation = Orientation.Horizontal,
+            SplitterDistance = 250
+        };
+        split.Panel1.Controls.Add(_tpmStateGrid);
+        split.Panel2.Controls.Add(_tpmStateDetails);
+        return new TabPage("TPM状態") { Controls = { split } };
     }
 
     private TabPage CreateExplorerTab()
@@ -918,6 +953,7 @@ public partial class Form1 : Form
         }
 
         RefreshUefiVariables();
+        RefreshTpmState();
     }
 
     private void ApplyPartitionAnalysis(IReadOnlyList<PartitionInfo> partitions)
@@ -939,6 +975,7 @@ public partial class Form1 : Form
         }
 
         RefreshUefiVariables();
+        RefreshTpmState();
     }
 
     private void RefreshUefiVariables()
@@ -1019,6 +1056,77 @@ public partial class Form1 : Form
         if (_uefiVariableGrid.CurrentRow?.Tag is UefiVariable variable)
         {
             _uefiVariableDetails.Text = UefiVariableStoreReader.Describe(variable);
+        }
+    }
+
+    private void RefreshTpmState()
+    {
+        _currentTpmStateStore = null;
+        _tpmStateGrid.Rows.Clear();
+        if (_reader is null)
+        {
+            _tpmStateDetails.Text = "ディスクイメージを開いてください。";
+            return;
+        }
+
+        if (!SwtpmStateReader.TryRead(_reader, out var store, out var error) || store is null)
+        {
+            _tpmStateDetails.Text = _reader is VmaDiskImageReader vma
+                ? $"選択中のVMAデバイス「{vma.ActiveDevice.Name}」はswtpm状態ストアではありません。"
+                    + $"{Environment.NewLine}ツールバーの「VMAディスク」からtpmstateを選択してください。"
+                    + $"{Environment.NewLine}{Environment.NewLine}判定結果: {error}"
+                : $"swtpm状態ストアを検出できませんでした。{Environment.NewLine}{Environment.NewLine}判定結果: {error}";
+            return;
+        }
+
+        _currentTpmStateStore = store;
+        foreach (var section in store.Sections)
+        {
+            var blob = section.Blob;
+            var rowIndex = _tpmStateGrid.Rows.Add(
+                section.Index,
+                section.Name,
+                $"0x{section.Offset:X}",
+                $"{section.DataLength:N0} bytes",
+                $"{section.SectionLength:N0} bytes",
+                blob is null ? "不明" : $"v{blob.Version}",
+                blob is null ? "判定不可" : SwtpmStateReader.FormatEncryption(blob),
+                blob?.Tlvs.Count.ToString("N0") ?? "-");
+            _tpmStateGrid.Rows[rowIndex].Tag = section;
+        }
+
+        var deviceName = _reader is VmaDiskImageReader currentVma
+            ? currentVma.ActiveDevice.Name
+            : Path.GetFileName(_reader.Path);
+        var lines = new List<string>
+        {
+            $"デバイス: {deviceName}",
+            $"swtpm線形ストア version: {store.Version}",
+            $"ヘッダーサイズ: {store.HeaderSize:N0} bytes",
+            $"デバイスサイズ: {store.DeviceLength:N0} bytes",
+            $"割り当て済み状態数: {store.Sections.Count:N0}"
+        };
+        if (store.Warnings.Count > 0)
+        {
+            lines.Add("");
+            lines.AddRange(store.Warnings.Select(warning => $"警告: {warning}"));
+        }
+
+        _tpmStateDetails.Text = string.Join(Environment.NewLine, lines);
+        if (_tpmStateGrid.Rows.Count > 0)
+        {
+            _tpmStateGrid.CurrentCell = _tpmStateGrid.Rows[0].Cells[0];
+            _tpmStateGrid.Rows[0].Selected = true;
+            ShowSelectedTpmState();
+        }
+    }
+
+    private void ShowSelectedTpmState()
+    {
+        if (_currentTpmStateStore is not null
+            && _tpmStateGrid.CurrentRow?.Tag is SwtpmStateSection section)
+        {
+            _tpmStateDetails.Text = SwtpmStateReader.Describe(_currentTpmStateStore, section);
         }
     }
 
