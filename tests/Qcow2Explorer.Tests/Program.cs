@@ -71,6 +71,7 @@ static void RunGeneratedImageTests()
     TestGeneratedLzopExt4Image();
     TestGeneratedVmaLzopImage();
     TestGeneratedUefiVariableStore();
+    TestGeneratedSwtpmStateStore();
     TestFilePreviews();
     TestNavigationHistory();
 
@@ -423,6 +424,41 @@ static void TestGeneratedUefiVariableStore()
         standardError);
 }
 
+static void TestGeneratedSwtpmStateStore()
+{
+    var plainImage = TestImageFactory.CreateSwtpmStateStore(encrypted: false);
+    var plainReader = new MemorySectorReader(plainImage, 512);
+    Assert(
+        SwtpmStateReader.TryRead(plainReader, out var plainStore, out var plainError)
+        && plainStore is not null,
+        plainError);
+    var plainSection = plainStore!.Sections.Single();
+    Assert(plainSection.Index == 0 && plainSection.Name.Contains("permall", StringComparison.Ordinal), "swtpm permanent state");
+    Assert(plainSection.Blob is { Version: 2, StructurallyValid: true }, "swtpm plain blob structure");
+    Assert(plainSection.Blob!.Tlvs is [{ Tag: 1 }], "swtpm plain data TLV");
+    Assert(!plainSection.Blob.IsEncrypted, "swtpm plain encryption flag");
+
+    var encryptedImage = TestImageFactory.CreateSwtpmStateStore(encrypted: true);
+    var encryptedReader = new MemorySectorReader(encryptedImage, 512);
+    Assert(
+        SwtpmStateReader.TryRead(encryptedReader, out var encryptedStore, out var encryptedError)
+        && encryptedStore is not null,
+        encryptedError);
+    var encryptedBlob = encryptedStore!.Sections.Single().Blob!;
+    Assert(encryptedBlob.IsEncrypted && encryptedBlob.Uses256BitKey, "swtpm encrypted 256-bit state");
+    Assert(
+        encryptedBlob.Tlvs.Select(tlv => tlv.Tag).SequenceEqual(new ushort[] { 2, 3, 6 }),
+        "swtpm encrypted TLV sequence");
+
+    var malformedImage = TestImageFactory.CreateSwtpmStateStore(encrypted: false);
+    BinaryPrimitives.WriteUInt32LittleEndian(malformedImage.AsSpan(20, 4), uint.MaxValue);
+    var malformedReader = new MemorySectorReader(malformedImage, 512);
+    Assert(
+        !SwtpmStateReader.TryRead(malformedReader, out _, out var malformedError)
+        && malformedError.Contains("範囲", StringComparison.Ordinal),
+        "swtpm invalid section bounds");
+}
+
 static void TestFilePreviews()
 {
     var text = FilePreviewReader.Read("notes.txt", Encoding.UTF8.GetBytes("日本語テキスト"));
@@ -588,6 +624,43 @@ static void InspectImage(string imagePath, bool copySmoke, int? vmaDeviceId)
         && selectedVma.ActiveDevice.Name.Contains("efi", StringComparison.OrdinalIgnoreCase))
     {
         Console.WriteLine($"UEFI variable store: {uefiError}");
+    }
+
+    if (SwtpmStateReader.TryRead(reader, out var tpmStore, out var tpmError)
+        && tpmStore is not null)
+    {
+        Console.WriteLine($"swtpm linear store: version {tpmStore.Version}, header {tpmStore.HeaderSize:N0} bytes");
+        foreach (var section in tpmStore.Sections)
+        {
+            var blob = section.Blob;
+            Console.WriteLine(
+                $"  slot {section.Index}: {section.Name}, data {section.DataLength:N0} bytes, "
+                + $"section {section.SectionLength:N0} bytes");
+            Console.WriteLine(
+                blob is null
+                    ? "    blob: unrecognized"
+                    : $"    blob: v{blob.Version}, flags 0x{blob.Flags:X4}, "
+                        + $"encryption {SwtpmStateReader.FormatEncryption(blob)}, "
+                        + $"TLVs {blob.Tlvs.Count}, valid {blob.StructurallyValid}");
+            if (blob is not null)
+            {
+                Console.WriteLine($"    readability: {SwtpmStateReader.GetReadability(blob)}");
+                foreach (var tlv in blob.Tlvs)
+                {
+                    Console.WriteLine($"      tag {tlv.Tag}: {tlv.Name}, {tlv.Length:N0} bytes");
+                }
+            }
+        }
+
+        foreach (var warning in tpmStore.Warnings)
+        {
+            Console.WriteLine($"swtpm warning: {warning}");
+        }
+    }
+    else if (reader is VmaDiskImageReader tpmVma
+        && tpmVma.ActiveDevice.Name.Contains("tpm", StringComparison.OrdinalIgnoreCase))
+    {
+        Console.WriteLine($"swtpm linear store: {tpmError}");
     }
 
     var partitions = PartitionTableReader.ReadPartitions(reader).ToList();
@@ -947,6 +1020,58 @@ internal static class TestImageFactory
         }
 
         WriteU16Le(image, 50, unchecked((ushort)(0u - checksum)));
+        return image;
+    }
+
+    public static byte[] CreateSwtpmStateStore(bool encrypted)
+    {
+        const int imageSize = 1024 * 1024;
+        const int linearHeaderSize = 192;
+        var tlvs = new List<(ushort Tag, byte[] Data)>();
+        ushort flags;
+        if (encrypted)
+        {
+            flags = 0x0009;
+            tlvs.Add((2, Enumerable.Range(0, 48).Select(index => (byte)(index + 1)).ToArray()));
+            tlvs.Add((3, Enumerable.Repeat((byte)0xa5, 32).ToArray()));
+            tlvs.Add((6, Enumerable.Repeat((byte)0x5a, 16).ToArray()));
+        }
+        else
+        {
+            flags = 0;
+            tlvs.Add((1, Encoding.ASCII.GetBytes("synthetic libtpms permanent state")));
+        }
+
+        var blobLength = 10 + tlvs.Sum(tlv => 6 + tlv.Data.Length);
+        var sectionLength = 1;
+        while (sectionLength < blobLength)
+        {
+            sectionLength <<= 1;
+        }
+
+        var image = new byte[imageSize];
+        WriteU64Le(image, 0, 0x737774706d6c696e);
+        image[8] = 1;
+        WriteU16Le(image, 10, linearHeaderSize);
+        WriteU32Le(image, 12, linearHeaderSize);
+        WriteU32Le(image, 16, blobLength);
+        WriteU32Le(image, 20, sectionLength);
+
+        var offset = linearHeaderSize;
+        image[offset] = 2;
+        image[offset + 1] = 1;
+        WriteU16Be(image, offset + 2, 10);
+        WriteU16Be(image, offset + 4, flags);
+        WriteU32Be(image, offset + 6, checked((uint)blobLength));
+        offset += 10;
+        foreach (var tlv in tlvs)
+        {
+            WriteU16Be(image, offset, tlv.Tag);
+            WriteU32Be(image, offset + 2, checked((uint)tlv.Data.Length));
+            tlv.Data.CopyTo(image, offset + 6);
+            offset += 6 + tlv.Data.Length;
+        }
+
         return image;
     }
 

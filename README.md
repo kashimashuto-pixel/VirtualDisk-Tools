@@ -46,6 +46,11 @@ C# / Windows Forms で作成した、読み取り専用の仮想ディスク解�
   - 現行変数と削除済み・履歴レコードの表示切り替え
   - `BootOrder`、`Boot####`、Secure Boot状態、PK/KEK/db/dbx署名リストを解釈
   - X.509証明書情報と未解析データのHex表示
+- Proxmox `tpmstate` / swtpm線形状態ストアの読み取り
+  - Permanent / Volatile / Save stateの割り当て状況を表示
+  - 内部Blobのversion、フラグ、全長、TLV構成、SHA-256、先頭Hexを表示
+  - ローカル鍵・移行鍵による暗号化と128-bit / 256-bit鍵フラグを判定
+  - 暗号化されている場合は、コンテナー解析が可能でも復号にswtpmの対応鍵が必要であることを表示
 
 ## 対応ディスク形式
 
@@ -97,6 +102,12 @@ dotnet run --project tests\Qcow2Explorer.Tests\Qcow2Explorer.Tests.csproj
 dotnet run --project tests\Qcow2Explorer.Tests\Qcow2Explorer.Tests.csproj -- "<image-path>"
 ```
 
+VMA内の特定デバイスを番号で選択する場合:
+
+```powershell
+dotnet run --project tests\Qcow2Explorer.Tests\Qcow2Explorer.Tests.csproj -- "<archive.vma.lzo>" --vma-device=3
+```
+
 小さいファイルのコピー確認も行う場合:
 
 ```powershell
@@ -125,6 +136,9 @@ ProjFS マウントは Windows の Client-ProjFS 機能を使い、選択した�
 - VMAのVMメモリ状態 (`vmstate`) は仮想ディスク一覧から除外します。VMA内のディスクイメージ抽出や書き戻しは行いません。
 - UEFI変数ストアは読み取り専用です。変数、起動順序、Secure Boot鍵データの追加・削除・書き換えは行いません。
 - Secure BootのPK/KEK/dbに通常保存される公開鍵・証明書は表示できますが、署名用の秘密鍵を抽出する機能ではありません。
+- swtpm状態ストアは読み取り専用です。外側の線形ストアと内側のBlob/TLVを検証して表示しますが、TPM状態の変更や書き戻しは行いません。
+- 暗号化されたswtpm状態は、暗号方式と必要な鍵長までは判定できます。swtpmで設定されたファイル鍵または移行鍵がない場合、内部状態は復号できません。
+- 平文のTPM状態データは存在と構造を表示できますが、libtpmsのversion依存な内部構造を秘密鍵単位まで展開する機能ではありません。
 - ext4 の journal replay は行いません。
 - SquashFS はライブラリが対応する圧縮形式のみ読み取れます。
 - Linux md RAID は検出のみです。
@@ -274,6 +288,9 @@ SOFTWARE.
 - qcow2 形式: https://www.qemu.org/docs/master/interop/qcow2.html
 - Proxmox VMA 形式: https://github.com/proxmox/pve-qemu/blob/master/vma_spec.txt
 - EDK II UEFI変数形式: https://github.com/tianocore/edk2/blob/master/MdeModulePkg/Include/Guid/VariableFormat.h
+- swtpm線形ストア形式: https://github.com/stefanberger/swtpm/blob/master/src/swtpm/swtpm_nvstore_linear.h
+- swtpm Blob/TLV形式: https://github.com/stefanberger/swtpm/blob/master/src/swtpm/swtpm_nvstore.c
+- swtpm TLV定義: https://github.com/stefanberger/swtpm/blob/master/src/swtpm/tlv.h
 - EDK II Firmware Volume形式: https://github.com/tianocore/edk2/blob/master/MdePkg/Include/Pi/PiFirmwareVolume.h
 - Parallels HDD descriptor: https://www.qemu.org/docs/master/interop/prl-xml.html
 - Parallels expandable image: https://www.qemu.org/docs/master/interop/parallels.html
