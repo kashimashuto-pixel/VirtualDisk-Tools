@@ -3,7 +3,7 @@ namespace Qcow2Explorer.Core;
 public static class DiskImageReaderFactory
 {
     public const string DialogFilter =
-        "対応/検出ディスク (*.qcow2;*.qcow;*.vhd;*.vhdx;*.vmdk;*.vdi;*.hdd;*.hds;*.dd;*.img;*.raw;*.lzo)|*.qcow2;*.qcow;*.vhd;*.vhdx;*.vmdk;*.vdi;*.hdd;*.hds;*.dd;*.img;*.raw;*.lzo|All files (*.*)|*.*";
+        "対応/検出ディスク (*.qcow2;*.qcow;*.vhd;*.vhdx;*.vmdk;*.vdi;*.hdd;*.hds;*.vma;*.dd;*.img;*.raw;*.lzo)|*.qcow2;*.qcow;*.vhd;*.vhdx;*.vmdk;*.vdi;*.hdd;*.hds;*.vma;*.dd;*.img;*.raw;*.lzo|All files (*.*)|*.*";
 
     public static IDiskImageReader Open(string path, IProgress<DiskImageProgress>? progress = null)
     {
@@ -24,7 +24,15 @@ public static class DiskImageReaderFactory
 
         if (path.EndsWith(".lzo", StringComparison.OrdinalIgnoreCase) || IsLzop(path))
         {
-            return new LzopDiskImageReader(path, progress);
+            var lzop = new LzopDiskImageReader(path, progress);
+            return VmaDiskImageReader.HasMagic(lzop)
+                ? new VmaDiskImageReader(lzop, progress)
+                : lzop;
+        }
+
+        if (IsVma(path))
+        {
+            return new VmaDiskImageReader(new RawDiskImageReader(path, "Proxmox VMA container"), progress);
         }
 
         if (IsQcow2(path))
@@ -62,5 +70,13 @@ public static class DiskImageReaderFactory
         using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
         return stream.Read(magic) == magic.Length
             && magic.SequenceEqual(expected);
+    }
+
+    private static bool IsVma(string path)
+    {
+        Span<byte> magic = stackalloc byte[4];
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        return stream.Read(magic) == magic.Length
+            && magic.SequenceEqual("VMA\0"u8);
     }
 }
