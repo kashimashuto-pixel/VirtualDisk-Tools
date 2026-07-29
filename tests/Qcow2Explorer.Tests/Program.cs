@@ -43,7 +43,19 @@ if (args.Length > 1 && string.Equals(args[0], "--probe-physical", StringComparis
 
 if (args.Length > 0)
 {
-    InspectImage(args[0], args.Any(a => string.Equals(a, "--copy-smoke", StringComparison.OrdinalIgnoreCase)));
+    int? vmaDeviceId = null;
+    var vmaDeviceArgument = args.FirstOrDefault(argument =>
+        argument.StartsWith("--vma-device=", StringComparison.OrdinalIgnoreCase));
+    if (vmaDeviceArgument is not null
+        && int.TryParse(vmaDeviceArgument.AsSpan(vmaDeviceArgument.IndexOf('=') + 1), out var parsedDeviceId))
+    {
+        vmaDeviceId = parsedDeviceId;
+    }
+
+    InspectImage(
+        args[0],
+        args.Any(a => string.Equals(a, "--copy-smoke", StringComparison.OrdinalIgnoreCase)),
+        vmaDeviceId);
     return;
 }
 
@@ -58,6 +70,7 @@ static void RunGeneratedImageTests()
     TestGeneratedLvm2Image();
     TestGeneratedLzopExt4Image();
     TestGeneratedVmaLzopImage();
+    TestGeneratedUefiVariableStore();
     TestFilePreviews();
     TestNavigationHistory();
 
@@ -387,6 +400,29 @@ static void TestGeneratedVmaLzopImage()
     vma.SelectDevice(1);
 }
 
+static void TestGeneratedUefiVariableStore()
+{
+    var image = TestImageFactory.CreateUefiVariableStore();
+    var reader = new MemorySectorReader(image, 512);
+    Assert(
+        UefiVariableStoreReader.TryRead(reader, out var store, out var error) && store is not null,
+        error);
+    Assert(store!.Authenticated, "authenticated UEFI variable store");
+    Assert(store.Variables.Count == 2 && store.Variables.All(variable => variable.IsActive), "UEFI variable count");
+    Assert(store.Variables.Single(variable => variable.Name == "BootOrder").Summary == "Boot0001", "UEFI BootOrder decoding");
+    Assert(
+        store.Variables.Single(variable => variable.Name == "Boot0001").Summary.Contains("Windows Boot Manager", StringComparison.Ordinal),
+        "UEFI load option decoding");
+
+    var standardImage = TestImageFactory.CreateUefiVariableStore(authenticated: false);
+    var standardReader = new MemorySectorReader(standardImage, 512);
+    Assert(
+        UefiVariableStoreReader.TryRead(standardReader, out var standardStore, out var standardError)
+        && standardStore is not null
+        && !standardStore.Authenticated,
+        standardError);
+}
+
 static void TestFilePreviews()
 {
     var text = FilePreviewReader.Read("notes.txt", Encoding.UTF8.GetBytes("日本語テキスト"));
@@ -500,9 +536,25 @@ static IReadOnlyFileSystem AssertFat16Readable(IDiskImageReader reader, string l
     return fs;
 }
 
-static void InspectImage(string imagePath, bool copySmoke)
+static void InspectImage(string imagePath, bool copySmoke, int? vmaDeviceId)
 {
     using var reader = DiskImageReaderFactory.Open(imagePath);
+    if (reader is VmaDiskImageReader selectableVma && vmaDeviceId is int requestedDeviceId)
+    {
+        var index = selectableVma.Devices
+            .Select((device, deviceIndex) => (device, deviceIndex))
+            .Where(item => item.device.Id == requestedDeviceId)
+            .Select(item => item.deviceIndex)
+            .DefaultIfEmpty(-1)
+            .Single();
+        if (index < 0)
+        {
+            throw new ArgumentException($"VMA device {requestedDeviceId} が見つかりません。");
+        }
+
+        selectableVma.SelectDevice(index);
+    }
+
     Console.WriteLine(imagePath);
     Console.WriteLine($"format: {reader.FormatName}");
     Console.WriteLine($"virtual size: {FormatBytes(reader.Length)}");
@@ -519,6 +571,23 @@ static void InspectImage(string imagePath, bool copySmoke)
     foreach (var warning in reader.GetWarnings())
     {
         Console.WriteLine($"warning: {warning}");
+    }
+
+    if (UefiVariableStoreReader.TryRead(reader, out var uefiStore, out var uefiError)
+        && uefiStore is not null)
+    {
+        Console.WriteLine($"UEFI variable store: {(uefiStore.Authenticated ? "authenticated" : "standard")}");
+        Console.WriteLine($"UEFI variables: {uefiStore.Variables.Count}");
+        foreach (var variable in uefiStore.Variables)
+        {
+            Console.WriteLine(
+                $"  {variable.StateText,-10} {variable.Name,-24} {variable.Data.Length,8:N0} bytes  {variable.Summary}");
+        }
+    }
+    else if (reader is VmaDiskImageReader selectedVma
+        && selectedVma.ActiveDevice.Name.Contains("efi", StringComparison.OrdinalIgnoreCase))
+    {
+        Console.WriteLine($"UEFI variable store: {uefiError}");
     }
 
     var partitions = PartitionTableReader.ReadPartitions(reader).ToList();
@@ -821,6 +890,64 @@ internal static class TestImageFactory
     public static void CreateFat16VmaLzop(string path)
     {
         WriteLzop(path, CreateVma(CreateVirtualDisk()), "sample-fat16.vma", corruptHeaderChecksum: false);
+    }
+
+    public static byte[] CreateUefiVariableStore(bool authenticated = true)
+    {
+        const int imageSize = 128 * 1024;
+        const int firmwareVolumeHeaderSize = 72;
+        const int variableStoreHeaderSize = 28;
+        var image = Enumerable.Repeat((byte)0xff, imageSize).ToArray();
+        Array.Clear(image, 0, firmwareVolumeHeaderSize);
+
+        Guid.Parse("fff12b8d-7696-4c8b-a985-2747075b4f50").TryWriteBytes(image.AsSpan(16, 16));
+        WriteU64Le(image, 32, imageSize);
+        WriteU32Le(image, 40, 0x4856465f);
+        WriteU32Le(image, 44, 0x0004feff);
+        WriteU16Le(image, 48, firmwareVolumeHeaderSize);
+        image[55] = 2;
+        WriteU32Le(image, 56, 2);
+        WriteU32Le(image, 60, 64 * 1024);
+
+        var storeOffset = firmwareVolumeHeaderSize;
+        Array.Clear(image, storeOffset, variableStoreHeaderSize);
+        var storeGuid = authenticated
+            ? Guid.Parse("aaf32c78-947b-439a-a180-2e144ec37792")
+            : Guid.Parse("ddcf3616-3275-4164-98b6-fe85707ffe7d");
+        storeGuid.TryWriteBytes(image.AsSpan(storeOffset, 16));
+        WriteU32Le(image, storeOffset + 16, imageSize - storeOffset);
+        image[storeOffset + 20] = 0x5a;
+        image[storeOffset + 21] = 0xfe;
+
+        var variableOffset = storeOffset + variableStoreHeaderSize;
+        WriteUefiVariable(
+            image,
+            ref variableOffset,
+            "BootOrder",
+            Guid.Parse("8be4df61-93ca-11d2-aa0d-00e098032b8c"),
+            [0x01, 0x00],
+            authenticated);
+
+        var description = Encoding.Unicode.GetBytes("Windows Boot Manager\0");
+        var loadOption = new byte[6 + description.Length];
+        WriteU32Le(loadOption, 0, 1);
+        description.CopyTo(loadOption, 6);
+        WriteUefiVariable(
+            image,
+            ref variableOffset,
+            "Boot0001",
+            Guid.Parse("8be4df61-93ca-11d2-aa0d-00e098032b8c"),
+            loadOption,
+            authenticated);
+
+        uint checksum = 0;
+        for (var offset = 0; offset < firmwareVolumeHeaderSize; offset += 2)
+        {
+            checksum += BinaryPrimitives.ReadUInt16LittleEndian(image.AsSpan(offset, 2));
+        }
+
+        WriteU16Le(image, 50, unchecked((ushort)(0u - checksum)));
+        return image;
     }
 
     private static void WriteLzop(string path, byte[] disk, string originalName, bool corruptHeaderChecksum)
@@ -1566,6 +1693,32 @@ internal static class TestImageFactory
     {
         data[offset] = (byte)value;
         data[offset + 1] = (byte)(value >> 8);
+    }
+
+    private static void WriteUefiVariable(
+        byte[] image,
+        ref int offset,
+        string name,
+        Guid vendorGuid,
+        byte[] data,
+        bool authenticated)
+    {
+        var headerSize = authenticated ? 60 : 32;
+        offset = (offset + 3) & ~3;
+        Array.Clear(image, offset, headerSize);
+        WriteU16Le(image, offset, 0x55aa);
+        image[offset + 2] = 0x3f;
+        WriteU32Le(image, offset + 4, 7);
+        var nameBytes = Encoding.Unicode.GetBytes(name + '\0');
+        var nameSizeOffset = authenticated ? offset + 36 : offset + 8;
+        var dataSizeOffset = authenticated ? offset + 40 : offset + 12;
+        var guidOffset = authenticated ? offset + 44 : offset + 16;
+        WriteU32Le(image, nameSizeOffset, nameBytes.Length);
+        WriteU32Le(image, dataSizeOffset, data.Length);
+        vendorGuid.TryWriteBytes(image.AsSpan(guidOffset, 16));
+        nameBytes.CopyTo(image, offset + headerSize);
+        data.CopyTo(image, offset + headerSize + nameBytes.Length);
+        offset += headerSize + nameBytes.Length + data.Length;
     }
 
     private static void WriteU16Be(byte[] data, int offset, ushort value)

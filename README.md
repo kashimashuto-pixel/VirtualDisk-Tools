@@ -41,6 +41,11 @@ C# / Windows Forms で作成した、読み取り専用の仮想ディスク解�
 - qcow2 のdeflate/zstd圧縮クラスタ、backing file、external data file、Extended L2 Entriesの読み取り
 - qcow2内部スナップショットの一覧表示と選択
 - Proxmox VMA内の複数仮想ディスクの一覧表示と選択
+- Proxmox `efidisk` / EDK II OVMF変数ストアの読み取り
+  - 通常形式と認証付き形式のUEFI変数を一覧表示
+  - 現行変数と削除済み・履歴レコードの表示切り替え
+  - `BootOrder`、`Boot####`、Secure Boot状態、PK/KEK/db/dbx署名リストを解釈
+  - X.509証明書情報と未解析データのHex表示
 
 ## 対応ディスク形式
 
@@ -118,6 +123,8 @@ ProjFS マウントは Windows の Client-ProjFS 機能を使い、選択した�
 - Extended L2 Entriesは32サブクラスタの割り当て／ゼロビットマップを読み取ります。
 - lzopの変換フィルター付きストリーム、multipartフラグ、ファイル自体を分割した複数パートは未対応です。
 - VMAのVMメモリ状態 (`vmstate`) は仮想ディスク一覧から除外します。VMA内のディスクイメージ抽出や書き戻しは行いません。
+- UEFI変数ストアは読み取り専用です。変数、起動順序、Secure Boot鍵データの追加・削除・書き換えは行いません。
+- Secure BootのPK/KEK/dbに通常保存される公開鍵・証明書は表示できますが、署名用の秘密鍵を抽出する機能ではありません。
 - ext4 の journal replay は行いません。
 - SquashFS はライブラリが対応する圧縮形式のみ読み取れます。
 - Linux md RAID は検出のみです。
@@ -266,6 +273,8 @@ SOFTWARE.
 
 - qcow2 形式: https://www.qemu.org/docs/master/interop/qcow2.html
 - Proxmox VMA 形式: https://github.com/proxmox/pve-qemu/blob/master/vma_spec.txt
+- EDK II UEFI変数形式: https://github.com/tianocore/edk2/blob/master/MdeModulePkg/Include/Guid/VariableFormat.h
+- EDK II Firmware Volume形式: https://github.com/tianocore/edk2/blob/master/MdePkg/Include/Pi/PiFirmwareVolume.h
 - Parallels HDD descriptor: https://www.qemu.org/docs/master/interop/prl-xml.html
 - Parallels expandable image: https://www.qemu.org/docs/master/interop/parallels.html
 - Home Assistant OS partition layout: https://developers.home-assistant.io/docs/operating-system/partition

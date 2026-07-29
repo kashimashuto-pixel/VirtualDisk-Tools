@@ -27,6 +27,9 @@ public partial class Form1 : Form
     private readonly NumericUpDown _lengthBox = new() { Minimum = 1, Maximum = 1024 * 1024, Value = 512, Increment = 512, Width = 110 };
     private readonly TextBox _hexText = new() { Dock = DockStyle.Fill, Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Both, WordWrap = false, Font = new Font("Consolas", 10) };
     private readonly DataGridView _partitionGrid = new() { Dock = DockStyle.Fill, ReadOnly = true, AllowUserToAddRows = false, AllowUserToDeleteRows = false, SelectionMode = DataGridViewSelectionMode.FullRowSelect, MultiSelect = false, AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill };
+    private readonly DataGridView _uefiVariableGrid = new() { Dock = DockStyle.Fill, ReadOnly = true, AllowUserToAddRows = false, AllowUserToDeleteRows = false, SelectionMode = DataGridViewSelectionMode.FullRowSelect, MultiSelect = false, AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill };
+    private readonly TextBox _uefiVariableDetails = new() { Dock = DockStyle.Fill, Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Both, WordWrap = false, Font = new Font("Consolas", 10) };
+    private readonly CheckBox _showInactiveUefiVariables = new() { Text = "削除済み・履歴も表示", AutoSize = true, Padding = new Padding(8, 5, 0, 0) };
     private readonly TreeView _tree = new() { Dock = DockStyle.Fill, HideSelection = false };
     private readonly ListView _fileList = new() { Dock = DockStyle.Fill, View = View.Details, FullRowSelect = true, GridLines = true, MultiSelect = true };
     private readonly TextBox _previewText = new() { Dock = DockStyle.Fill, Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Both, WordWrap = false, Font = new Font("Consolas", 10) };
@@ -45,6 +48,7 @@ public partial class Form1 : Form
     private readonly NavigationHistory<TreeNode> _navigationHistory = new();
     private bool _isHistoryNavigation;
     private bool _isLoadingImage;
+    private UefiVariableStore? _currentUefiVariableStore;
 
     public Form1(string? initialPath = null)
     {
@@ -124,6 +128,7 @@ public partial class Form1 : Form
         tabs.TabPages.Add(CreateSummaryTab());
         tabs.TabPages.Add(CreateRawTab());
         tabs.TabPages.Add(CreatePartitionTab());
+        tabs.TabPages.Add(CreateUefiVariableTab());
         tabs.TabPages.Add(CreateExplorerTab());
         tabs.TabPages.Add(CreateMountTab());
 
@@ -185,6 +190,40 @@ public partial class Form1 : Form
         _partitionGrid.Columns.Add("Bytes", "サイズ");
         _partitionGrid.CellDoubleClick += (_, _) => ActivateSelectedPartition();
         return new TabPage("パーティション") { Controls = { _partitionGrid } };
+    }
+
+    private TabPage CreateUefiVariableTab()
+    {
+        _uefiVariableGrid.Columns.Add("Name", "名前");
+        _uefiVariableGrid.Columns.Add("Guid", "Vendor GUID");
+        _uefiVariableGrid.Columns.Add("State", "状態");
+        _uefiVariableGrid.Columns.Add("Attributes", "属性");
+        _uefiVariableGrid.Columns.Add("Size", "サイズ");
+        _uefiVariableGrid.Columns.Add("Summary", "解釈");
+        _uefiVariableGrid.Columns["Name"]!.FillWeight = 110;
+        _uefiVariableGrid.Columns["Guid"]!.FillWeight = 150;
+        _uefiVariableGrid.Columns["State"]!.FillWeight = 65;
+        _uefiVariableGrid.Columns["Attributes"]!.FillWeight = 120;
+        _uefiVariableGrid.Columns["Size"]!.FillWeight = 60;
+        _uefiVariableGrid.Columns["Summary"]!.FillWeight = 200;
+        _uefiVariableGrid.SelectionChanged += (_, _) => ShowSelectedUefiVariable();
+        _showInactiveUefiVariables.CheckedChanged += (_, _) => PopulateUefiVariableRows();
+
+        var split = new SplitContainer
+        {
+            Dock = DockStyle.Fill,
+            Orientation = Orientation.Horizontal,
+            SplitterDistance = 330
+        };
+        split.Panel1.Controls.Add(_uefiVariableGrid);
+        split.Panel2.Controls.Add(_uefiVariableDetails);
+
+        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, RowCount = 2, ColumnCount = 1 };
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 32));
+        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        layout.Controls.Add(_showInactiveUefiVariables, 0, 0);
+        layout.Controls.Add(split, 0, 1);
+        return new TabPage("UEFI変数") { Controls = { layout } };
     }
 
     private TabPage CreateExplorerTab()
@@ -877,6 +916,8 @@ public partial class Form1 : Form
         {
             _statusLabel.Text = "パーティションなし";
         }
+
+        RefreshUefiVariables();
     }
 
     private void ApplyPartitionAnalysis(IReadOnlyList<PartitionInfo> partitions)
@@ -895,6 +936,89 @@ public partial class Form1 : Form
         if (_partitions.Count == 0)
         {
             _statusLabel.Text = "パーティションなし";
+        }
+
+        RefreshUefiVariables();
+    }
+
+    private void RefreshUefiVariables()
+    {
+        _currentUefiVariableStore = null;
+        _uefiVariableGrid.Rows.Clear();
+        if (_reader is null)
+        {
+            _uefiVariableDetails.Text = "ディスクイメージを開いてください。";
+            return;
+        }
+
+        if (!UefiVariableStoreReader.TryRead(_reader, out var store, out var error) || store is null)
+        {
+            _uefiVariableDetails.Text = _reader is VmaDiskImageReader vma
+                ? $"選択中のVMAデバイス「{vma.ActiveDevice.Name}」はUEFI変数ストアではありません。"
+                    + $"{Environment.NewLine}ツールバーの「VMAディスク」からefidiskを選択してください。"
+                    + $"{Environment.NewLine}{Environment.NewLine}判定結果: {error}"
+                : $"UEFI変数ストアを検出できませんでした。{Environment.NewLine}{Environment.NewLine}判定結果: {error}";
+            return;
+        }
+
+        _currentUefiVariableStore = store;
+
+        var deviceName = _reader is VmaDiskImageReader currentVma
+            ? currentVma.ActiveDevice.Name
+            : Path.GetFileName(_reader.Path);
+        var lines = new List<string>
+        {
+            $"デバイス: {deviceName}",
+            $"Firmware Volume GUID: {store.FirmwareVolumeGuid}",
+            $"Firmware Volumeサイズ: {store.FirmwareVolumeLength:N0} bytes",
+            $"変数ストア: {(store.Authenticated ? "認証付き" : "通常")}",
+            $"現行変数数: {store.Variables.Count(variable => variable.IsActive):N0}",
+            $"全レコード数: {store.Variables.Count:N0}"
+        };
+        if (store.Warnings.Count > 0)
+        {
+            lines.Add("");
+            lines.AddRange(store.Warnings.Select(warning => $"警告: {warning}"));
+        }
+
+        _uefiVariableDetails.Text = string.Join(Environment.NewLine, lines);
+        PopulateUefiVariableRows();
+    }
+
+    private void PopulateUefiVariableRows()
+    {
+        _uefiVariableGrid.Rows.Clear();
+        if (_currentUefiVariableStore is null)
+        {
+            return;
+        }
+
+        var variables = _showInactiveUefiVariables.Checked
+            ? _currentUefiVariableStore.Variables
+            : _currentUefiVariableStore.Variables.Where(variable => variable.IsActive);
+        foreach (var variable in variables)
+        {
+            var index = _uefiVariableGrid.Rows.Add(
+                variable.Name,
+                variable.VendorGuid,
+                variable.StateText,
+                UefiVariableStoreReader.FormatAttributes(variable.Attributes),
+                $"{variable.Data.Length:N0} bytes",
+                variable.Summary);
+            _uefiVariableGrid.Rows[index].Tag = variable;
+        }
+
+        if (_uefiVariableGrid.Rows.Count > 0)
+        {
+            _uefiVariableGrid.Rows[0].Selected = true;
+        }
+    }
+
+    private void ShowSelectedUefiVariable()
+    {
+        if (_uefiVariableGrid.CurrentRow?.Tag is UefiVariable variable)
+        {
+            _uefiVariableDetails.Text = UefiVariableStoreReader.Describe(variable);
         }
     }
 
