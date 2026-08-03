@@ -35,13 +35,13 @@ public sealed class NtfsFileSystem : IReadOnlyFileSystem
         var sectorsPerCluster = boot[13];
         _clusterSize = _bytesPerSector * sectorsPerCluster;
         _mftLcn = EndianUtilities.ReadInt64Little(boot, 48);
+        var mftMirrorLcn = EndianUtilities.ReadInt64Little(boot, 56);
         var clustersPerRecord = unchecked((sbyte)boot[64]);
         _fileRecordSize = clustersPerRecord > 0
             ? clustersPerRecord * _clusterSize
             : 1 << -clustersPerRecord;
 
-        var mft0 = EndianUtilities.ReadBytes(reader, checked(_mftLcn * _clusterSize), _fileRecordSize);
-        ApplyFixup(mft0);
+        var mft0 = ReadMftRecordZero(mftMirrorLcn, out var recoveredFromMirror);
         var mftEntry = ParseFileRecord(0, mft0);
         if (mftEntry?.Data is null || mftEntry.Data.Runs.Count == 0)
         {
@@ -52,6 +52,54 @@ public sealed class NtfsFileSystem : IReadOnlyFileSystem
         _mftSize = mftEntry.Data.Size;
         Root = new VfsNode { Name = deletedOnly ? "Deleted files" : "", IsDirectory = true, Metadata = deletedOnly ? -1L : 5L };
         ScanMft();
+        if (!deletedOnly && !_entries.ContainsKey(5))
+        {
+            throw new InvalidDataException(recoveredFromMirror
+                ? "NTFS $MFT の先頭レコードは $MFTMirr から復旧できましたが、主 $MFT のルートレコードが欠落しています。元のディスクイメージまたはバックアップから再取得してください。"
+                : "NTFS $MFT のルートレコードを読み取れませんでした。");
+        }
+    }
+
+    private byte[] ReadMftRecordZero(long mftMirrorLcn, out bool recoveredFromMirror)
+    {
+        recoveredFromMirror = false;
+        var primary = EndianUtilities.ReadBytes(_reader, checked(_mftLcn * _clusterSize), _fileRecordSize);
+        if (TryPrepareFileRecord(primary))
+        {
+            return primary;
+        }
+
+        if (mftMirrorLcn <= 0)
+        {
+            throw new InvalidDataException("NTFS $MFT の先頭レコードが破損しており、$MFTMirr の位置も不正です。");
+        }
+
+        var mirror = EndianUtilities.ReadBytes(_reader, checked(mftMirrorLcn * _clusterSize), _fileRecordSize);
+        if (!TryPrepareFileRecord(mirror))
+        {
+            throw new InvalidDataException("NTFS $MFT と $MFTMirr の先頭レコードがどちらも破損しています。");
+        }
+
+        recoveredFromMirror = true;
+        return mirror;
+    }
+
+    private bool TryPrepareFileRecord(byte[] record)
+    {
+        if (record.Length < 8 || Encoding.ASCII.GetString(record, 0, 4) != "FILE")
+        {
+            return false;
+        }
+
+        try
+        {
+            ApplyFixup(record);
+            return true;
+        }
+        catch (InvalidDataException)
+        {
+            return false;
+        }
     }
 
     public string Name => "NTFS";
@@ -407,7 +455,12 @@ public sealed class NtfsFileSystem : IReadOnlyFileSystem
             var sectorEnd = i * _bytesPerSector - 2;
             if (sectorEnd + 1 >= record.Length)
             {
-                break;
+                throw new InvalidDataException("NTFS FILE record の update sequence array がレコード範囲を超えています。");
+            }
+
+            if (record[sectorEnd] != record[usaOffset] || record[sectorEnd + 1] != record[usaOffset + 1])
+            {
+                throw new InvalidDataException("NTFS FILE record の update sequence number が一致しません。");
             }
 
             record[sectorEnd] = record[usaOffset + i * 2];
