@@ -566,6 +566,9 @@ static void TestNtfsMftMirrorFallback()
         .CopyTo(volume, mftLcn * clusterSize + 5 * recordSize);
     CreateFileRecord(6, 5, "hello.txt", isDirectory: false, data: Encoding.ASCII.GetBytes("mirror recovery"), includeMftRuns: false)
         .CopyTo(volume, mftLcn * clusterSize + 6 * recordSize);
+    var deletedRecord = CreateFileRecord(7, 5, "deleted.txt", isDirectory: false, data: Encoding.ASCII.GetBytes("deleted content"), includeMftRuns: false);
+    BinaryPrimitives.WriteUInt16LittleEndian(deletedRecord.AsSpan(22, 2), 0);
+    deletedRecord.CopyTo(volume, mftLcn * clusterSize + 7 * recordSize);
 
     var reader = new MemorySectorReader(volume, bytesPerSector);
     var partition = new PartitionInfo
@@ -581,6 +584,12 @@ static void TestNtfsMftMirrorFallback()
     Assert(
         Encoding.ASCII.GetString(fileSystem.ReadFile(file, 0, (int)file.Size)) == "mirror recovery",
         "NTFS $MFTMirr fallback");
+
+    var deletedFileSystem = new NtfsFileSystem(reader, partition, deletedOnly: true);
+    var deletedFile = deletedFileSystem.ListDirectory(deletedFileSystem.Root).Single(node => node.Name == "deleted.txt");
+    Assert(
+        Encoding.ASCII.GetString(deletedFileSystem.ReadFile(deletedFile, 0, (int)deletedFile.Size)) == "deleted content",
+        "NTFS deleted-only scan uses active $MFT record 0");
 
     static byte[] CreateFileRecord(long recordNumber, long parentRecord, string name, bool isDirectory, byte[]? data, bool includeMftRuns)
     {

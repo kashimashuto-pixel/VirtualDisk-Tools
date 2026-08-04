@@ -42,7 +42,10 @@ public sealed class NtfsFileSystem : IReadOnlyFileSystem
             : 1 << -clustersPerRecord;
 
         var mft0 = ReadMftRecordZero(mftMirrorLcn, out var recoveredFromMirror);
-        var mftEntry = ParseFileRecord(0, mft0);
+        // Record 0 describes $MFT itself and is always an in-use record. Parse it
+        // regardless of the requested scan filter so deleted-only scans can first
+        // discover the data runs that contain the remaining MFT records.
+        var mftEntry = ParseFileRecord(0, mft0, applyDeletionFilter: false);
         if (mftEntry?.Data is null || mftEntry.Data.Runs.Count == 0)
         {
             throw new NotSupportedException("NTFS $MFT の data runs を読み取れませんでした。");
@@ -193,7 +196,7 @@ public sealed class NtfsFileSystem : IReadOnlyFileSystem
         return buffer;
     }
 
-    private NtfsFileEntry? ParseFileRecord(long id, byte[] record)
+    private NtfsFileEntry? ParseFileRecord(long id, byte[] record, bool applyDeletionFilter = true)
     {
         if (record.Length < 48 || Encoding.ASCII.GetString(record, 0, 4) != "FILE")
         {
@@ -202,7 +205,7 @@ public sealed class NtfsFileSystem : IReadOnlyFileSystem
 
         var flags = EndianUtilities.ReadUInt16Little(record, 22);
         var isDeleted = (flags & 0x0001) == 0;
-        if (isDeleted != _deletedOnly)
+        if (applyDeletionFilter && isDeleted != _deletedOnly)
         {
             return null;
         }
