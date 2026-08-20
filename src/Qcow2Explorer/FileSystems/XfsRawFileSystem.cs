@@ -191,6 +191,7 @@ internal sealed class XfsRawFileSystem
             ((ulong)1 << agOffsetBits) - 1,
             blockSize << dirBlockLog2,
             sbVersion == 5 && (incompatibleFeatures & 0x1) != 0 || (version & 0x8000) != 0 && (features2 & 0x0200) != 0,
+            sbVersion == 5 && (incompatibleFeatures & 0x08) != 0,
             sbVersion == 5 && (incompatibleFeatures & 0x20) != 0);
     }
 
@@ -217,6 +218,10 @@ internal sealed class XfsRawFileSystem
 
         var version = buffer[0x04];
         var dataForkOffset = version < 3 ? 0x64 : 0xb0;
+        var flags2 = version >= 3 && buffer.Length >= 0x80
+            ? EndianUtilities.ReadUInt64Big(buffer, 0x78)
+            : 0;
+        var hasBigTime = _superBlock.HasBigTime && (flags2 & 0x08) != 0;
         var forkOffset = buffer[0x52];
         var dataForkLength = forkOffset == 0
             ? buffer.Length - dataForkOffset
@@ -230,7 +235,7 @@ internal sealed class XfsRawFileSystem
             ReadUInt16Big(buffer, 0x02),
             buffer[0x05],
             ReadUInt32Big(buffer, 0x10),
-            ReadTimestamp(buffer, 0x28),
+            XfsTimestampDecoder.Decode(buffer.AsSpan(0x28, 8), hasBigTime),
             EndianUtilities.ReadUInt64Big(buffer, 0x38),
             EndianUtilities.ReadUInt64Big(buffer, 0x40),
             _superBlock.HasLargeExtentCounts
@@ -672,20 +677,6 @@ internal sealed class XfsRawFileSystem
         };
     }
 
-    private static DateTime? ReadTimestamp(byte[] buffer, int offset)
-    {
-        var seconds = EndianUtilities.ReadUInt32Big(buffer, offset);
-        var nanoseconds = EndianUtilities.ReadUInt32Big(buffer, offset + 4);
-        try
-        {
-            return DateTimeOffset.FromUnixTimeSeconds(seconds).AddTicks(nanoseconds / 100).UtcDateTime;
-        }
-        catch (ArgumentOutOfRangeException)
-        {
-            return null;
-        }
-    }
-
     private string DecodeName(byte[] buffer, int offset, int length)
     {
         return _fileNameEncoding.GetString(buffer, offset, length);
@@ -789,6 +780,7 @@ internal sealed class XfsRawFileSystem
         ulong RelativeInodeMask,
         uint DirectoryBlockSize,
         bool HasFType,
+        bool HasBigTime,
         bool HasLargeExtentCounts);
 
     private sealed record XfsInode(

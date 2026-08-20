@@ -1,11 +1,21 @@
 namespace Qcow2Explorer.Core;
 
+public enum LzopOpenMode
+{
+    OnDemand,
+    TemporaryRaw
+}
+
 public static class DiskImageReaderFactory
 {
     public const string DialogFilter =
         "対応/検出ディスク (*.qcow2;*.qcow;*.vhd;*.vhdx;*.vmdk;*.vdi;*.ova;*.hdd;*.hds;*.vma;*.dd;*.img;*.raw;*.lzo)|*.qcow2;*.qcow;*.vhd;*.vhdx;*.vmdk;*.vdi;*.ova;*.hdd;*.hds;*.vma;*.dd;*.img;*.raw;*.lzo|All files (*.*)|*.*";
 
-    public static IDiskImageReader Open(string path, IProgress<DiskImageProgress>? progress = null)
+    public static IDiskImageReader Open(
+        string path,
+        IProgress<DiskImageProgress>? progress = null,
+        LzopOpenMode lzopOpenMode = LzopOpenMode.OnDemand,
+        string? lzopTemporaryDirectory = null)
     {
         if (PhysicalDiskReader.IsPhysicalDiskPath(path))
         {
@@ -24,10 +34,21 @@ public static class DiskImageReaderFactory
 
         if (path.EndsWith(".lzo", StringComparison.OrdinalIgnoreCase) || IsLzop(path))
         {
-            var lzop = new LzopDiskImageReader(path, progress);
-            return VmaDiskImageReader.HasMagic(lzop)
-                ? new VmaDiskImageReader(lzop, progress)
-                : lzop;
+            IDiskImageReader lzop = lzopOpenMode == LzopOpenMode.TemporaryRaw
+                ? TemporaryLzopDiskImageReader.Open(path, progress, lzopTemporaryDirectory)
+                : new LzopDiskImageReader(path, progress);
+            bool isVma;
+            try
+            {
+                isVma = VmaDiskImageReader.HasMagic(lzop);
+            }
+            catch
+            {
+                lzop.Dispose();
+                throw;
+            }
+
+            return isVma ? new VmaDiskImageReader(lzop, progress) : lzop;
         }
 
         if (IsVma(path))
@@ -53,6 +74,17 @@ public static class DiskImageReaderFactory
             ".dd" or ".img" or ".raw" => new RawDiskImageReader(path),
             _ => new RawDiskImageReader(path, "raw/dd (拡張子未判定)")
         };
+    }
+
+    public static bool IsLzopFile(string path)
+    {
+        if (PhysicalDiskReader.IsPhysicalDiskPath(path) || Directory.Exists(path))
+        {
+            return false;
+        }
+
+        return path.EndsWith(".lzo", StringComparison.OrdinalIgnoreCase)
+            || (File.Exists(path) && IsLzop(path));
     }
 
     private static bool IsQcow2(string path)

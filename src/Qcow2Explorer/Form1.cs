@@ -19,6 +19,7 @@ public partial class Form1 : Form
     private readonly ToolStripTextBox _searchBox = new() { AutoSize = false, Width = 240, BorderStyle = BorderStyle.FixedSingle, ToolTipText = "現在のパーティションからファイル名を検索" };
     private readonly ToolStripButton _cancelSearchButton = new("検索キャンセル") { Enabled = false };
     private readonly ToolStripButton _cancelCopyButton = new("コピーキャンセル") { Enabled = false };
+    private readonly ToolStripProgressBar _copyProgressBar = new() { AutoSize = false, Width = 120, Visible = false };
     private readonly ToolStripButton _backNavigationButton = new("戻る") { Enabled = false, ToolTipText = "戻る (Alt+←)" };
     private readonly ToolStripButton _forwardNavigationButton = new("進む") { Enabled = false, ToolTipText = "進む (Alt+→)" };
     private readonly ToolStripButton _upNavigationButton = new("上へ") { Enabled = false, ToolTipText = "親フォルダーへ (Alt+↑)" };
@@ -47,9 +48,11 @@ public partial class Form1 : Form
     private readonly List<string> _analysisWarnings = new();
     private IReadOnlyFileSystem? _currentFileSystem;
     private VfsNode? _currentDirectory;
+    private string _currentDirectoryPath = "/";
     private CancellationTokenSource? _searchCancellation;
     private readonly HashSet<CancellationTokenSource> _copyCancellations = [];
     private readonly SemaphoreSlim _copyExecutionGate = new(1, 1);
+    private CancellationTokenSource? _copyProgressOwner;
     private readonly NavigationHistory<TreeNode> _navigationHistory = new();
     private bool _isHistoryNavigation;
     private bool _isLoadingImage;
@@ -290,6 +293,27 @@ public partial class Form1 : Form
         _fileList.Columns.Add("場所", 420);
         _fileList.DoubleClick += async (_, _) => await OpenSelectedListItemAsync();
         _fileList.SelectedIndexChanged += (_, _) => ShowSelectedItemProperties();
+        _fileList.MouseDown += (_, e) =>
+        {
+            if (e.Button == MouseButtons.Right && _fileList.GetItemAt(e.X, e.Y) is ListViewItem item)
+            {
+                _fileList.SelectedItems.Clear();
+                item.Selected = true;
+                item.Focused = true;
+            }
+        };
+        var fileListContextMenu = new ContextMenuStrip();
+        var showContainingFolderItem = new ToolStripMenuItem("保存されているフォルダーを表示");
+        showContainingFolderItem.Click += (_, _) => ShowSelectedItemContainingDirectory();
+        fileListContextMenu.Items.Add(showContainingFolderItem);
+        fileListContextMenu.Opening += (_, _) =>
+        {
+            showContainingFolderItem.Enabled = _currentFileSystem is not null
+                && _fileList.SelectedItems.Count == 1
+                && _fileList.SelectedItems[0].Tag is VfsNode
+                && GetListItemPath(_fileList.SelectedItems[0]).Length > 0;
+        };
+        _fileList.ContextMenuStrip = fileListContextMenu;
         _fileList.KeyDown += async (_, e) =>
         {
             if (e.KeyCode == Keys.Enter)
@@ -321,7 +345,7 @@ public partial class Form1 : Form
             _searchBox.Clear();
             if (_currentFileSystem is not null && _currentDirectory is not null)
             {
-                PopulateFileList(_currentFileSystem, _currentDirectory);
+                PopulateFileList(_currentFileSystem, _currentDirectory, _currentDirectoryPath);
             }
         };
         _searchBox.KeyDown += async (_, e) =>
@@ -352,6 +376,7 @@ public partial class Form1 : Form
         explorerStrip.Items.Add(previewButton);
         explorerStrip.Items.Add(copyButton);
         explorerStrip.Items.Add(copyFolderButton);
+        explorerStrip.Items.Add(_copyProgressBar);
         explorerStrip.Items.Add(_cancelCopyButton);
         explorerStrip.Items.Add(deletedButton);
         explorerStrip.Items.Add(new ToolStripSeparator());
@@ -495,12 +520,165 @@ public partial class Form1 : Form
         }
     }
 
+    private LzopOpenSelection? SelectLzopOpenMode(string path)
+    {
+        using var dialog = new Form
+        {
+            Text = "LZO読み込みモード",
+            Width = 660,
+            Height = 420,
+            StartPosition = FormStartPosition.CenterParent,
+            FormBorderStyle = FormBorderStyle.FixedDialog,
+            MinimizeBox = false,
+            MaximizeBox = false,
+            ShowInTaskbar = false
+        };
+
+        var introduction = new Label
+        {
+            AutoSize = true,
+            MaximumSize = new Size(600, 0),
+            Text = $"LZO圧縮ディスクを開きます。用途に合わせて読み込み方法を選択してください。{Environment.NewLine}{path}"
+        };
+        var fastMode = new RadioButton
+        {
+            AutoSize = true,
+            Checked = true,
+            Text = "高速モード（推奨）"
+        };
+        var fastDescription = new Label
+        {
+            AutoSize = true,
+            MaximumSize = new Size(580, 0),
+            Margin = new Padding(24, 0, 0, 8),
+            Text = "最初に全体を一時RAWへ展開します。以後の検索・表示・コピーが高速になります。仮想ディスクと同程度の一時空き容量が必要です。"
+        };
+        var temporaryPathLabel = new Label
+        {
+            AutoSize = true,
+            Margin = new Padding(24, 0, 0, 2),
+            Text = "一時ファイルの保存先"
+        };
+        var temporaryPathBox = new TextBox
+        {
+            Dock = DockStyle.Fill,
+            ReadOnly = true,
+            Text = System.IO.Path.GetTempPath()
+        };
+        var browseTemporaryPathButton = new Button
+        {
+            AutoSize = true,
+            Text = "参照..."
+        };
+        browseTemporaryPathButton.Click += (_, _) =>
+        {
+            using var folderDialog = new FolderBrowserDialog
+            {
+                Description = "LZO高速モードの一時ファイル保存先を選択してください",
+                UseDescriptionForTitle = true,
+                SelectedPath = temporaryPathBox.Text,
+                ShowNewFolderButton = true
+            };
+            if (folderDialog.ShowDialog(dialog) == DialogResult.OK)
+            {
+                temporaryPathBox.Text = folderDialog.SelectedPath;
+            }
+        };
+        var temporaryPathPanel = new TableLayoutPanel
+        {
+            AutoSize = true,
+            Dock = DockStyle.Fill,
+            ColumnCount = 2,
+            RowCount = 1,
+            Margin = new Padding(24, 0, 0, 8)
+        };
+        temporaryPathPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        temporaryPathPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        temporaryPathPanel.Controls.Add(temporaryPathBox, 0, 0);
+        temporaryPathPanel.Controls.Add(browseTemporaryPathButton, 1, 0);
+        var onDemandMode = new RadioButton
+        {
+            AutoSize = true,
+            Text = "省容量モード"
+        };
+        var onDemandDescription = new Label
+        {
+            AutoSize = true,
+            MaximumSize = new Size(580, 0),
+            Margin = new Padding(24, 0, 0, 8),
+            Text = "必要なLZOブロックだけを随時展開します。一時容量をほとんど使いませんが、コピーやランダムアクセスに時間がかかる場合があります。"
+        };
+        var cleanupDescription = new Label
+        {
+            AutoSize = true,
+            MaximumSize = new Size(600, 0),
+            Text = "高速モードの一時RAWは、別のイメージへ切り替えるかアプリを終了すると削除されます。"
+        };
+        fastMode.CheckedChanged += (_, _) =>
+        {
+            temporaryPathBox.Enabled = fastMode.Checked;
+            browseTemporaryPathButton.Enabled = fastMode.Checked;
+        };
+
+        var okButton = new Button { Text = "開く", DialogResult = DialogResult.OK, Width = 90 };
+        var cancelButton = new Button { Text = "キャンセル", DialogResult = DialogResult.Cancel, Width = 90 };
+        var buttons = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            FlowDirection = FlowDirection.RightToLeft,
+            WrapContents = false,
+            AutoSize = true
+        };
+        buttons.Controls.Add(cancelButton);
+        buttons.Controls.Add(okButton);
+
+        var layout = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            AutoSize = true,
+            ColumnCount = 1,
+            RowCount = 9,
+            Padding = new Padding(16)
+        };
+        layout.Controls.Add(introduction, 0, 0);
+        layout.Controls.Add(fastMode, 0, 1);
+        layout.Controls.Add(fastDescription, 0, 2);
+        layout.Controls.Add(temporaryPathLabel, 0, 3);
+        layout.Controls.Add(temporaryPathPanel, 0, 4);
+        layout.Controls.Add(onDemandMode, 0, 5);
+        layout.Controls.Add(onDemandDescription, 0, 6);
+        layout.Controls.Add(cleanupDescription, 0, 7);
+        layout.Controls.Add(buttons, 0, 8);
+        dialog.Controls.Add(layout);
+        dialog.AcceptButton = okButton;
+        dialog.CancelButton = cancelButton;
+
+        return dialog.ShowDialog(this) == DialogResult.OK
+            ? fastMode.Checked
+                ? new LzopOpenSelection(LzopOpenMode.TemporaryRaw, temporaryPathBox.Text)
+                : new LzopOpenSelection(LzopOpenMode.OnDemand, null)
+            : null;
+    }
+
     private async Task LoadImageAsync(string path)
     {
         if (_isLoadingImage)
         {
             _statusLabel.Text = "別のディスクイメージを読み込み中です";
             return;
+        }
+
+        var lzopSelection = new LzopOpenSelection(LzopOpenMode.OnDemand, null);
+        if (DiskImageReaderFactory.IsLzopFile(path))
+        {
+            var selectedMode = SelectLzopOpenMode(path);
+            if (selectedMode is null)
+            {
+                _statusLabel.Text = "LZOイメージの読み込みをキャンセルしました";
+                return;
+            }
+
+            lzopSelection = selectedMode;
         }
 
         if (!ConfirmAndDisposeMounts("新しいディスクイメージを開く前に、現在のマウントを解除します。続行しますか？"))
@@ -521,7 +699,13 @@ public partial class Form1 : Form
             var rawOffset = ParseOffset(_offsetBox.Text);
             var rawLength = (int)_lengthBox.Value;
             var progress = new Progress<DiskImageProgress>(UpdateLoadProgress);
-            loadResult = await Task.Run(() => LoadAndAnalyzeImage(path, rawOffset, rawLength, progress));
+            loadResult = await Task.Run(() => LoadAndAnalyzeImage(
+                path,
+                rawOffset,
+                rawLength,
+                progress,
+                lzopSelection.Mode,
+                lzopSelection.TemporaryDirectory));
             if (IsDisposed)
             {
                 return;
@@ -602,13 +786,15 @@ public partial class Form1 : Form
         string path,
         long rawOffset,
         int rawLength,
-        IProgress<DiskImageProgress> progress)
+        IProgress<DiskImageProgress> progress,
+        LzopOpenMode lzopOpenMode,
+        string? lzopTemporaryDirectory)
     {
         IDiskImageReader? reader = null;
         var ownedReaders = new List<IDisposable>();
         try
         {
-            reader = DiskImageReaderFactory.Open(path, progress);
+            reader = DiskImageReaderFactory.Open(path, progress, lzopOpenMode, lzopTemporaryDirectory);
             var analysis = AnalyzeImage(reader, ownedReaders, progress);
             progress.Report(new DiskImageProgress("先頭データを読み込み中..."));
             var rawData = new byte[rawLength];
@@ -1329,7 +1515,7 @@ public partial class Form1 : Form
 
         if (e.Node.Tag is DirectoryNodeTag directoryTag)
         {
-            PopulateFileList(directoryTag.FileSystem, directoryTag.Node);
+            PopulateFileList(directoryTag.FileSystem, directoryTag.Node, GetTreeNodePath(e.Node));
             if (!_isHistoryNavigation)
             {
                 _navigationHistory.Record(e.Node);
@@ -1424,10 +1610,11 @@ public partial class Form1 : Form
         }
     }
 
-    private void PopulateFileList(IReadOnlyFileSystem fileSystem, VfsNode directory)
+    private void PopulateFileList(IReadOnlyFileSystem fileSystem, VfsNode directory, string directoryPath)
     {
         _currentFileSystem = fileSystem;
         _currentDirectory = directory;
+        _currentDirectoryPath = VirtualPath.Normalize(directoryPath);
         _fileList.Items.Clear();
         _previewText.Clear();
 
@@ -1437,7 +1624,7 @@ public partial class Form1 : Form
             item.SubItems.Add(node.IsDirectory ? "" : FormatBytes(node.Size));
             item.SubItems.Add(node.ModifiedUtc?.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) ?? "");
             item.SubItems.Add(FormatNodeType(node));
-            item.SubItems.Add("");
+            item.SubItems.Add(VirtualPath.Combine(_currentDirectoryPath, node.DisplayName));
             _fileList.Items.Add(item);
         }
     }
@@ -1513,7 +1700,7 @@ public partial class Form1 : Form
             return;
         }
 
-        var location = _fileList.SelectedItems[0].SubItems.Count > 4 ? _fileList.SelectedItems[0].SubItems[4].Text : "";
+        var location = GetListItemPath(_fileList.SelectedItems[0]);
         _previewText.Text = string.Join(Environment.NewLine, new[]
         {
             $"名前: {node.DisplayName}",
@@ -1553,7 +1740,7 @@ public partial class Form1 : Form
             }
 
             var deleted = new NtfsFileSystem(new PartitionSliceReader(source, scanPartition), scanPartition, deletedOnly: true);
-            PopulateFileList(deleted, deleted.Root);
+            PopulateFileList(deleted, deleted.Root, "/");
             _statusLabel.Text = $"削除済みNTFSレコード: {_fileList.Items.Count:N0} 件";
             MessageBox.Show(
                 this,
@@ -1675,6 +1862,102 @@ public partial class Form1 : Form
         newNode.Expand();
     }
 
+    private void ShowSelectedItemContainingDirectory()
+    {
+        if (_currentFileSystem is null
+            || _fileList.SelectedItems.Count != 1
+            || _fileList.SelectedItems[0].Tag is not VfsNode selectedNode)
+        {
+            return;
+        }
+
+        var selectedPath = GetListItemPath(_fileList.SelectedItems[0]);
+        if (selectedPath.Length == 0)
+        {
+            return;
+        }
+
+        try
+        {
+            var fileSystem = _currentFileSystem;
+            var directoryPath = VirtualPath.GetParent(selectedPath);
+            var rootTreeNode = _tree.Nodes
+                .Cast<TreeNode>()
+                .FirstOrDefault(node => node.Tag is DirectoryNodeTag tag
+                    && ReferenceEquals(tag.FileSystem, fileSystem)
+                    && IsSameVfsNode(tag.Node, fileSystem.Root));
+            if (rootTreeNode is null)
+            {
+                throw new InvalidOperationException("対象パーティションのルートフォルダーが見つかりません。");
+            }
+
+            var targetTreeNode = rootTreeNode;
+            var targetDirectory = fileSystem.Root;
+            foreach (var segment in VirtualPath.Split(directoryPath))
+            {
+                AddDirectoryChildren(targetTreeNode, fileSystem, targetDirectory);
+                var childTreeNode = targetTreeNode.Nodes
+                    .Cast<TreeNode>()
+                    .FirstOrDefault(node => node.Tag is DirectoryNodeTag tag
+                        && ReferenceEquals(tag.FileSystem, fileSystem)
+                        && string.Equals(tag.Node.DisplayName, segment, StringComparison.Ordinal));
+                if (childTreeNode?.Tag is not DirectoryNodeTag childTag)
+                {
+                    throw new DirectoryNotFoundException($"フォルダーが見つかりません: {directoryPath}");
+                }
+
+                targetTreeNode = childTreeNode;
+                targetDirectory = childTag.Node;
+            }
+
+            if (ReferenceEquals(_tree.SelectedNode, targetTreeNode))
+            {
+                PopulateFileList(fileSystem, targetDirectory, directoryPath);
+            }
+            else
+            {
+                _tree.SelectedNode = targetTreeNode;
+            }
+
+            targetTreeNode.Expand();
+            targetTreeNode.EnsureVisible();
+
+            var targetItem = _fileList.Items
+                .Cast<ListViewItem>()
+                .FirstOrDefault(item => item.Tag is VfsNode node
+                    && string.Equals(GetListItemPath(item), selectedPath, StringComparison.Ordinal)
+                    && IsSameVfsNode(node, selectedNode));
+            if (targetItem is not null)
+            {
+                targetItem.Selected = true;
+                targetItem.Focused = true;
+                targetItem.EnsureVisible();
+            }
+
+            _statusLabel.Text = $"保存フォルダーを表示: {directoryPath}";
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, ex.Message, "保存フォルダーを表示", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+    }
+
+    private static string GetListItemPath(ListViewItem item)
+    {
+        return item.SubItems.Count > 4 ? item.SubItems[4].Text : "";
+    }
+
+    private static string GetTreeNodePath(TreeNode node)
+    {
+        var segments = new Stack<string>();
+        for (var current = node; current.Parent is not null; current = current.Parent)
+        {
+            segments.Push(current.Text);
+        }
+
+        return segments.Count == 0 ? "/" : "/" + string.Join('/', segments);
+    }
+
     private void PreviewSelectedFile()
     {
         if (_currentFileSystem is null || _fileList.SelectedItems.Count == 0 || _fileList.SelectedItems[0].Tag is not VfsNode node || node.IsDirectory)
@@ -1744,8 +2027,17 @@ public partial class Form1 : Form
         _cancelCopyButton.Enabled = true;
         var progress = new Progress<CopyProgress>(p =>
         {
-            if (_copyCancellations.Contains(cancellation))
+            if (ReferenceEquals(_copyProgressOwner, cancellation))
             {
+                if (p.TotalBytes > 0)
+                {
+                    _copyProgressBar.Style = ProgressBarStyle.Blocks;
+                    _copyProgressBar.Value = (int)Math.Clamp(
+                        (double)p.BytesCopied / p.TotalBytes * 100,
+                        _copyProgressBar.Minimum,
+                        _copyProgressBar.Maximum);
+                }
+
                 var name = Path.GetFileName(p.CurrentPath);
                 var transferred = p.TotalBytes > 0
                     ? $"{FormatBytes(p.BytesCopied)} / {FormatBytes(p.TotalBytes)}"
@@ -1777,6 +2069,11 @@ public partial class Form1 : Form
             CopyResult result;
             try
             {
+                _copyProgressOwner = cancellation;
+                _copyProgressBar.Value = 0;
+                _copyProgressBar.Style = ProgressBarStyle.Marquee;
+                _copyProgressBar.MarqueeAnimationSpeed = 30;
+                _copyProgressBar.Visible = true;
                 _statusLabel.Text = $"コピー準備中 ({_copyCancellations.Count:N0}件): 合計サイズを計算しています...";
                 result = await Task.Run(() => FileSystemExporter.CopyNodes(
                     fileSystem,
@@ -1807,6 +2104,14 @@ public partial class Form1 : Form
         finally
         {
             _copyCancellations.Remove(cancellation);
+            if (ReferenceEquals(_copyProgressOwner, cancellation))
+            {
+                _copyProgressOwner = null;
+                _copyProgressBar.Value = 0;
+                _copyProgressBar.Style = ProgressBarStyle.Marquee;
+                _copyProgressBar.Visible = _copyCancellations.Count > 0;
+            }
+
             cancellation.Dispose();
             _cancelCopyButton.Enabled = _copyCancellations.Count > 0;
             if (_copyCancellations.Count > 0)
@@ -2107,6 +2412,7 @@ public partial class Form1 : Form
     private sealed record PartitionNodeTag(PartitionInfo Partition);
     private sealed record DirectoryNodeTag(IReadOnlyFileSystem FileSystem, VfsNode Node);
     private sealed record DummyNodeTag;
+    private sealed record LzopOpenSelection(LzopOpenMode Mode, string? TemporaryDirectory);
     private sealed record ImageAnalysis(
         IReadOnlyList<PartitionInfo> Partitions,
         IReadOnlyList<LvmDiagnostic> Diagnostics,

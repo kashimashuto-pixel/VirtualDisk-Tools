@@ -29,7 +29,12 @@ public sealed class VmaDiskImageReader : IDiskImageReader
         _source = source;
         _progress = progress;
         Path = source.Path;
-        FormatName = source is LzopDiskImageReader ? "Proxmox VMA (lzop LZO1X)" : "Proxmox VMA";
+        FormatName = source switch
+        {
+            TemporaryLzopDiskImageReader => "Proxmox VMA (lzop高速モード)",
+            LzopDiskImageReader => "Proxmox VMA (lzop LZO1X)",
+            _ => "Proxmox VMA"
+        };
 
         try
         {

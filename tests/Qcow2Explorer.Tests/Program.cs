@@ -68,6 +68,7 @@ static void RunGeneratedImageTests()
 {
     Assert(PhysicalDiskReader.IsPhysicalDiskPath(@"\\.\PhysicalDrive0"), "physical disk path detection");
     Assert(!PhysicalDiskReader.IsPhysicalDiskPath("PhysicalDrive0"), "physical disk path rejection");
+    TestXfsTimestampDecoding();
     Test4KnGptParsing();
     TestLvmMetadataDiagnostics();
     TestGeneratedLvm2Image();
@@ -77,6 +78,7 @@ static void RunGeneratedImageTests()
     TestGeneratedSwtpmStateStore();
     TestFilePreviews();
     TestNavigationHistory();
+    TestVirtualPaths();
     TestNtfsMftMirrorFallback();
 
     var imagePath = Path.Combine(AppContext.BaseDirectory, "sample-fat16.qcow2");
@@ -270,6 +272,37 @@ static void CreateVmdk(string vmdkPath, string rawPath)
     raw.CopyTo(disk.Content);
 }
 
+static void TestXfsTimestampDecoding()
+{
+    const long bigTimeEpochOffset = 2_147_483_648;
+    const uint bigTimeNanoseconds = 123_456_700;
+    var bigTimeSeconds = new DateTimeOffset(2026, 8, 20, 9, 23, 9, TimeSpan.Zero).ToUnixTimeSeconds();
+    var bigTimeEncoded = checked((ulong)(bigTimeSeconds + bigTimeEpochOffset) * 1_000_000_000UL + bigTimeNanoseconds);
+    Span<byte> bigTimeData = stackalloc byte[8];
+    BinaryPrimitives.WriteUInt64BigEndian(bigTimeData, bigTimeEncoded);
+    var decodedBigTime = XfsTimestampDecoder.Decode(bigTimeData, bigTime: true);
+    var expectedBigTime = DateTimeOffset.FromUnixTimeSeconds(bigTimeSeconds)
+        .AddTicks(bigTimeNanoseconds / 100)
+        .UtcDateTime;
+    Assert(decodedBigTime == expectedBigTime, "XFS bigtime timestamp decoding");
+
+    var incorrectlyDecodedYear = DateTimeOffset
+        .FromUnixTimeSeconds(BinaryPrimitives.ReadUInt32BigEndian(bigTimeData))
+        .Year;
+    Assert(incorrectlyDecodedYear == 1999, "XFS bigtime regression fixture");
+
+    const int legacySeconds = -315_619_200;
+    const uint legacyNanoseconds = 987_654_300;
+    Span<byte> legacyData = stackalloc byte[8];
+    BinaryPrimitives.WriteInt32BigEndian(legacyData, legacySeconds);
+    BinaryPrimitives.WriteUInt32BigEndian(legacyData[4..], legacyNanoseconds);
+    var decodedLegacy = XfsTimestampDecoder.Decode(legacyData, bigTime: false);
+    var expectedLegacy = DateTimeOffset.FromUnixTimeSeconds(legacySeconds)
+        .AddTicks(legacyNanoseconds / 100)
+        .UtcDateTime;
+    Assert(decodedLegacy == expectedLegacy, "XFS signed legacy timestamp decoding");
+}
+
 static void Test4KnGptParsing()
 {
     const int sectorSize = 4096;
@@ -428,6 +461,47 @@ static void TestGeneratedLzopExt4Image()
         progressEvents.Any(item => item.Message.Contains("ブロック展開", StringComparison.Ordinal)),
         "dd.lzo decompression progress");
 
+    var fastProgressEvents = new List<DiskImageProgress>();
+    var fastTemporaryRoot = Path.Combine(AppContext.BaseDirectory, "lzo-fast-temporary-root");
+    if (Directory.Exists(fastTemporaryRoot))
+    {
+        Directory.Delete(fastTemporaryRoot, recursive: true);
+    }
+
+    string temporaryRawPath;
+    using (var fastReader = DiskImageReaderFactory.Open(
+        imagePath,
+        new CallbackProgress<DiskImageProgress>(fastProgressEvents.Add),
+        LzopOpenMode.TemporaryRaw,
+        fastTemporaryRoot))
+    {
+        Assert(fastReader is TemporaryLzopDiskImageReader, "dd.lzo temporary raw reader factory");
+        var temporaryReader = (TemporaryLzopDiskImageReader)fastReader;
+        temporaryRawPath = temporaryReader.TemporaryPath;
+        Assert(File.Exists(temporaryRawPath), "dd.lzo temporary raw exists while open");
+        Assert(
+            temporaryRawPath.StartsWith(Path.GetFullPath(fastTemporaryRoot) + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase),
+            "dd.lzo selected temporary root");
+        Assert(new FileInfo(temporaryRawPath).Length == reader.Length, "dd.lzo temporary raw length");
+        Assert(fastReader.Length == reader.Length, "dd.lzo fast mode virtual length");
+
+        var expected = new byte[8192];
+        var actual = new byte[8192];
+        reader.ReadAt(60 * 1024, expected, 0, expected.Length);
+        fastReader.ReadAt(60 * 1024, actual, 0, actual.Length);
+        Assert(actual.SequenceEqual(expected), "dd.lzo fast mode raw data");
+        Assert(
+            fastProgressEvents.Any(item => item.Message.Contains("一時RAWへ展開", StringComparison.Ordinal)),
+            "dd.lzo temporary raw progress");
+        Assert(
+            fastProgressEvents.Any(item => item.Message.Contains("事前確保", StringComparison.Ordinal)),
+            "dd.lzo temporary raw preallocation progress");
+    }
+
+    Assert(!Directory.Exists(Path.GetDirectoryName(temporaryRawPath)), "dd.lzo temporary raw cleanup");
+    Assert(Directory.Exists(fastTemporaryRoot), "dd.lzo selected temporary root is preserved");
+    Directory.Delete(fastTemporaryRoot);
+
     var damagedPath = Path.Combine(AppContext.BaseDirectory, "sample-ext4-damaged.dd.lzo");
     TestImageFactory.CreateExt4LzopDisk(damagedPath, corruptHeaderChecksum: true);
     try
@@ -466,6 +540,13 @@ static void TestGeneratedVmaLzopImage()
     vma.SelectDevice(0);
     Assert(vma.ActiveDevice.Name == "efidisk0" && vma.Length == 528 * 1024, "VMA device switching");
     vma.SelectDevice(1);
+
+    using var fastReader = DiskImageReaderFactory.Open(
+        imagePath,
+        lzopOpenMode: LzopOpenMode.TemporaryRaw);
+    Assert(fastReader is VmaDiskImageReader, "VMA.lzo temporary raw reader factory");
+    Assert(fastReader.FormatName.Contains("高速モード", StringComparison.Ordinal), "VMA.lzo fast mode format name");
+    AssertFat16Readable(fastReader, "VMA.lzo fast mode");
 }
 
 static void TestGeneratedUefiVariableStore()
@@ -607,6 +688,17 @@ static void TestNavigationHistory()
     Assert(!history.CanGoForward && ReferenceEquals(history.Current, sibling), "navigation history forward truncation");
     history.Reset();
     Assert(!history.CanGoBack && !history.CanGoForward && history.Current is null, "navigation history reset");
+}
+
+static void TestVirtualPaths()
+{
+    Assert(VirtualPath.Normalize("") == "/", "virtual path empty normalization");
+    Assert(VirtualPath.Normalize("//backup//images/") == "/backup/images", "virtual path normalization");
+    Assert(VirtualPath.Combine("/", "disk.qcow2") == "/disk.qcow2", "virtual path root combination");
+    Assert(VirtualPath.Combine("/backup", "disk.qcow2") == "/backup/disk.qcow2", "virtual path nested combination");
+    Assert(VirtualPath.GetParent("/disk.qcow2") == "/", "virtual path root parent");
+    Assert(VirtualPath.GetParent("/backup/images/disk.qcow2") == "/backup/images", "virtual path nested parent");
+    Assert(VirtualPath.Split("/backup/images").SequenceEqual(["backup", "images"]), "virtual path split");
 }
 
 static void TestNtfsMftMirrorFallback()
