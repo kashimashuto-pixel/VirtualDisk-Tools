@@ -1,0 +1,35 @@
+name: Windows build and tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up .NET 10
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Restore dependencies
+        run: dotnet restore Qcow2Explorer.sln
+
+      - name: Verify formatting
+        run: dotnet format Qcow2Explorer.sln --no-restore --verify-no-changes
+
+      - name: Build
+        run: dotnet build Qcow2Explorer.sln --configuration Debug --no-restore
+
+      - name: Run generated-image tests
+        run: dotnet run --project tests\Qcow2Explorer.Tests\Qcow2Explorer.Tests.csproj --configuration Debug --no-build

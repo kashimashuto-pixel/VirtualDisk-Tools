@@ -3,7 +3,9 @@ namespace Qcow2Explorer.Core;
 public enum LzopOpenMode
 {
     OnDemand,
-    TemporaryRaw
+    TemporaryRaw,
+    CachedRaw,
+    SavedRaw
 }
 
 public static class DiskImageReaderFactory
@@ -16,7 +18,8 @@ public static class DiskImageReaderFactory
         IProgress<DiskImageProgress>? progress = null,
         LzopOpenMode lzopOpenMode = LzopOpenMode.OnDemand,
         string? lzopTemporaryDirectory = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        bool overwriteSavedRaw = false)
     {
         cancellationToken.ThrowIfCancellationRequested();
         if (PhysicalDiskReader.IsPhysicalDiskPath(path))
@@ -36,9 +39,28 @@ public static class DiskImageReaderFactory
 
         if (path.EndsWith(".lzo", StringComparison.OrdinalIgnoreCase) || IsLzop(path))
         {
-            IDiskImageReader lzop = lzopOpenMode == LzopOpenMode.TemporaryRaw
-                ? TemporaryLzopDiskImageReader.Open(path, progress, lzopTemporaryDirectory, cancellationToken)
-                : new LzopDiskImageReader(path, progress, cancellationToken);
+            IDiskImageReader lzop = lzopOpenMode switch
+            {
+                LzopOpenMode.TemporaryRaw => TemporaryLzopDiskImageReader.Open(
+                    path,
+                    progress,
+                    lzopTemporaryDirectory,
+                    cancellationToken),
+                LzopOpenMode.CachedRaw => TemporaryLzopDiskImageReader.OpenCached(
+                    path,
+                    progress,
+                    lzopTemporaryDirectory,
+                    cancellationToken),
+                LzopOpenMode.SavedRaw when !string.IsNullOrWhiteSpace(lzopTemporaryDirectory) =>
+                    TemporaryLzopDiskImageReader.OpenSavedRaw(
+                        path,
+                        lzopTemporaryDirectory,
+                        overwriteSavedRaw,
+                        progress,
+                        cancellationToken),
+                LzopOpenMode.SavedRaw => throw new ArgumentException("RAW保存先を指定してください。", nameof(lzopTemporaryDirectory)),
+                _ => new LzopDiskImageReader(path, progress, cancellationToken)
+            };
             bool isVma;
             try
             {

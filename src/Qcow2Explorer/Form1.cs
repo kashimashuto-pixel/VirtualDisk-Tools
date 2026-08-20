@@ -532,8 +532,8 @@ public partial class Form1 : Form
         using var dialog = new Form
         {
             Text = "LZO読み込みモード",
-            Width = 660,
-            Height = 420,
+            Width = 720,
+            Height = 520,
             StartPosition = FormStartPosition.CenterParent,
             FormBorderStyle = FormBorderStyle.FixedDialog,
             MinimizeBox = false,
@@ -560,28 +560,84 @@ public partial class Form1 : Form
             Margin = new Padding(24, 0, 0, 8),
             Text = "最初に全体を一時RAWへ展開します。以後の検索・表示・コピーが高速になります。仮想ディスクと同程度の一時空き容量が必要です。"
         };
+        var retentionLabel = new Label
+        {
+            AutoSize = true,
+            Margin = new Padding(24, 0, 0, 2),
+            Text = "展開したRAWの扱い"
+        };
+        var retentionBox = new ComboBox
+        {
+            DropDownStyle = ComboBoxStyle.DropDownList,
+            Margin = new Padding(24, 0, 0, 8),
+            Width = 400
+        };
+        retentionBox.Items.AddRange(
+        [
+            "イメージを閉じると削除",
+            "検証済みキャッシュとして保持・再利用（推奨）",
+            "指定場所へ通常RAWとして保存"
+        ]);
+        retentionBox.SelectedIndex = 1;
         var temporaryPathLabel = new Label
         {
             AutoSize = true,
             Margin = new Padding(24, 0, 0, 2),
-            Text = "一時ファイルの保存先"
+            Text = "キャッシュ保存先"
         };
         var temporaryPathBox = new TextBox
         {
             Dock = DockStyle.Fill,
             ReadOnly = true,
-            Text = System.IO.Path.GetTempPath()
+            Text = LzopRawCacheManager.DefaultCacheRoot
         };
         var browseTemporaryPathButton = new Button
         {
             AutoSize = true,
             Text = "参照..."
         };
+        var manageCacheButton = new Button
+        {
+            AutoSize = true,
+            Text = "キャッシュ管理..."
+        };
+        var storagePaths = new[]
+        {
+            System.IO.Path.GetTempPath(),
+            LzopRawCacheManager.DefaultCacheRoot,
+            System.IO.Path.ChangeExtension(System.IO.Path.GetFullPath(path), ".raw")
+        };
+        var selectedRetentionIndex = retentionBox.SelectedIndex;
+        var overwriteSavedRaw = false;
         browseTemporaryPathButton.Click += (_, _) =>
         {
+            if (retentionBox.SelectedIndex == 2)
+            {
+                using var saveDialog = new SaveFileDialog
+                {
+                    Title = "展開したRAWの保存先を選択してください",
+                    Filter = "RAW disk image (*.raw;*.img;*.dd)|*.raw;*.img;*.dd|All files (*.*)|*.*",
+                    FileName = System.IO.Path.GetFileName(temporaryPathBox.Text),
+                    InitialDirectory = System.IO.Path.GetDirectoryName(temporaryPathBox.Text),
+                    AddExtension = true,
+                    DefaultExt = "raw",
+                    OverwritePrompt = true
+                };
+                if (saveDialog.ShowDialog(dialog) == DialogResult.OK)
+                {
+                    temporaryPathBox.Text = saveDialog.FileName;
+                    storagePaths[2] = saveDialog.FileName;
+                    overwriteSavedRaw = File.Exists(saveDialog.FileName);
+                }
+
+                return;
+            }
+
             using var folderDialog = new FolderBrowserDialog
             {
-                Description = "LZO高速モードの一時ファイル保存先を選択してください",
+                Description = retentionBox.SelectedIndex == 1
+                    ? "LZO高速モードのキャッシュ保存先を選択してください"
+                    : "LZO高速モードの一時ファイル保存先を選択してください",
                 UseDescriptionForTitle = true,
                 SelectedPath = temporaryPathBox.Text,
                 ShowNewFolderButton = true
@@ -589,20 +645,24 @@ public partial class Form1 : Form
             if (folderDialog.ShowDialog(dialog) == DialogResult.OK)
             {
                 temporaryPathBox.Text = folderDialog.SelectedPath;
+                storagePaths[retentionBox.SelectedIndex] = folderDialog.SelectedPath;
             }
         };
+        manageCacheButton.Click += (_, _) => ShowLzopCacheManager(temporaryPathBox.Text);
         var temporaryPathPanel = new TableLayoutPanel
         {
             AutoSize = true,
             Dock = DockStyle.Fill,
-            ColumnCount = 2,
+            ColumnCount = 3,
             RowCount = 1,
             Margin = new Padding(24, 0, 0, 8)
         };
         temporaryPathPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         temporaryPathPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        temporaryPathPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         temporaryPathPanel.Controls.Add(temporaryPathBox, 0, 0);
         temporaryPathPanel.Controls.Add(browseTemporaryPathButton, 1, 0);
+        temporaryPathPanel.Controls.Add(manageCacheButton, 2, 0);
         var onDemandMode = new RadioButton
         {
             AutoSize = true,
@@ -619,12 +679,37 @@ public partial class Form1 : Form
         {
             AutoSize = true,
             MaximumSize = new Size(600, 0),
-            Text = "高速モードの一時RAWは、別のイメージへ切り替えるかアプリを終了すると削除されます。"
+            Text = "キャッシュは元LZOのパス、サイズ、更新日時、SHA-256、RAWサイズ、完了状態を検証してから再利用します。"
+        };
+        retentionBox.SelectedIndexChanged += (_, _) =>
+        {
+            if (selectedRetentionIndex >= 0)
+            {
+                storagePaths[selectedRetentionIndex] = temporaryPathBox.Text;
+            }
+
+            selectedRetentionIndex = retentionBox.SelectedIndex;
+            temporaryPathBox.Text = storagePaths[selectedRetentionIndex];
+            temporaryPathLabel.Text = selectedRetentionIndex switch
+            {
+                0 => "一時ファイルの保存先",
+                1 => "キャッシュ保存先",
+                _ => "通常RAWの保存先"
+            };
+            cleanupDescription.Text = selectedRetentionIndex switch
+            {
+                0 => "一時RAWは、別のイメージへ切り替えるかアプリを終了すると削除されます。",
+                1 => "キャッシュは元LZOのパス、サイズ、更新日時、SHA-256、RAWサイズ、完了状態を検証してから再利用します。",
+                _ => "展開したRAWは指定場所に残ります。不要になった場合は手動で削除してください。"
+            };
+            manageCacheButton.Enabled = fastMode.Checked && selectedRetentionIndex == 1;
         };
         fastMode.CheckedChanged += (_, _) =>
         {
             temporaryPathBox.Enabled = fastMode.Checked;
             browseTemporaryPathButton.Enabled = fastMode.Checked;
+            retentionBox.Enabled = fastMode.Checked;
+            manageCacheButton.Enabled = fastMode.Checked && retentionBox.SelectedIndex == 1;
         };
 
         var okButton = new Button { Text = "開く", DialogResult = DialogResult.OK, Width = 90 };
@@ -644,27 +729,188 @@ public partial class Form1 : Form
             Dock = DockStyle.Fill,
             AutoSize = true,
             ColumnCount = 1,
-            RowCount = 9,
+            RowCount = 11,
             Padding = new Padding(16)
         };
         layout.Controls.Add(introduction, 0, 0);
         layout.Controls.Add(fastMode, 0, 1);
         layout.Controls.Add(fastDescription, 0, 2);
-        layout.Controls.Add(temporaryPathLabel, 0, 3);
-        layout.Controls.Add(temporaryPathPanel, 0, 4);
-        layout.Controls.Add(onDemandMode, 0, 5);
-        layout.Controls.Add(onDemandDescription, 0, 6);
-        layout.Controls.Add(cleanupDescription, 0, 7);
-        layout.Controls.Add(buttons, 0, 8);
+        layout.Controls.Add(retentionLabel, 0, 3);
+        layout.Controls.Add(retentionBox, 0, 4);
+        layout.Controls.Add(temporaryPathLabel, 0, 5);
+        layout.Controls.Add(temporaryPathPanel, 0, 6);
+        layout.Controls.Add(onDemandMode, 0, 7);
+        layout.Controls.Add(onDemandDescription, 0, 8);
+        layout.Controls.Add(cleanupDescription, 0, 9);
+        layout.Controls.Add(buttons, 0, 10);
         dialog.Controls.Add(layout);
         dialog.AcceptButton = okButton;
         dialog.CancelButton = cancelButton;
+        dialog.FormClosing += (_, e) =>
+        {
+            if (dialog.DialogResult != DialogResult.OK || !fastMode.Checked || retentionBox.SelectedIndex != 2)
+            {
+                return;
+            }
+
+            var sourcePath = System.IO.Path.GetFullPath(path);
+            var rawPath = System.IO.Path.GetFullPath(temporaryPathBox.Text);
+            if (string.Equals(sourcePath, rawPath, StringComparison.OrdinalIgnoreCase))
+            {
+                MessageBox.Show(dialog, "元LZOファイルと同じ場所へRAWを保存できません。", "RAW保存先", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                e.Cancel = true;
+                return;
+            }
+
+            if (File.Exists(rawPath) && !overwriteSavedRaw)
+            {
+                overwriteSavedRaw = MessageBox.Show(
+                    dialog,
+                    $"{rawPath}{Environment.NewLine}{Environment.NewLine}既存ファイルを、展開完了後に置き換えますか？",
+                    "RAWファイルの上書き",
+                    MessageBoxButtons.YesNo,
+                    MessageBoxIcon.Warning,
+                    MessageBoxDefaultButton.Button2) == DialogResult.Yes;
+                e.Cancel = !overwriteSavedRaw;
+            }
+        };
 
         return dialog.ShowDialog(this) == DialogResult.OK
             ? fastMode.Checked
-                ? new LzopOpenSelection(LzopOpenMode.TemporaryRaw, temporaryPathBox.Text)
-                : new LzopOpenSelection(LzopOpenMode.OnDemand, null)
+                ? new LzopOpenSelection(
+                    retentionBox.SelectedIndex switch
+                    {
+                        1 => LzopOpenMode.CachedRaw,
+                        2 => LzopOpenMode.SavedRaw,
+                        _ => LzopOpenMode.TemporaryRaw
+                    },
+                    temporaryPathBox.Text,
+                    overwriteSavedRaw)
+                : new LzopOpenSelection(LzopOpenMode.OnDemand, null, OverwriteSavedRaw: false)
             : null;
+    }
+
+    private void ShowLzopCacheManager(string cacheRoot)
+    {
+        using var dialog = new Form
+        {
+            Text = "LZO RAWキャッシュ管理",
+            Width = 900,
+            Height = 480,
+            StartPosition = FormStartPosition.CenterParent,
+            FormBorderStyle = FormBorderStyle.Sizable,
+            MinimizeBox = false,
+            ShowInTaskbar = false
+        };
+        var rootLabel = new Label
+        {
+            AutoEllipsis = true,
+            Dock = DockStyle.Top,
+            Height = 44,
+            Padding = new Padding(10, 10, 10, 4),
+            Text = $"保存先: {Path.GetFullPath(cacheRoot)}"
+        };
+        var list = new ListView
+        {
+            Dock = DockStyle.Fill,
+            View = View.Details,
+            FullRowSelect = true,
+            GridLines = true,
+            MultiSelect = true
+        };
+        list.Columns.Add("元LZO", 410);
+        list.Columns.Add("状態", 80);
+        list.Columns.Add("RAWサイズ", 110);
+        list.Columns.Add("最終利用", 150);
+        var summary = new Label { AutoSize = true, Padding = new Padding(8, 9, 8, 0) };
+        var deleteButton = new Button { AutoSize = true, Text = "選択したキャッシュを削除" };
+        var deleteUnusableButton = new Button { AutoSize = true, Text = "未完成・破損を削除" };
+        var closeButton = new Button { AutoSize = true, Text = "閉じる", DialogResult = DialogResult.OK };
+        var buttons = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Bottom,
+            Height = 50,
+            FlowDirection = FlowDirection.RightToLeft,
+            WrapContents = false,
+            Padding = new Padding(8)
+        };
+        buttons.Controls.Add(closeButton);
+        buttons.Controls.Add(deleteButton);
+        buttons.Controls.Add(deleteUnusableButton);
+        buttons.Controls.Add(summary);
+        dialog.Controls.Add(list);
+        dialog.Controls.Add(rootLabel);
+        dialog.Controls.Add(buttons);
+        dialog.AcceptButton = closeButton;
+
+        void RefreshEntries()
+        {
+            list.BeginUpdate();
+            list.Items.Clear();
+            var entries = LzopRawCacheManager.GetEntries(cacheRoot);
+            foreach (var entry in entries)
+            {
+                var item = new ListViewItem(entry.SourcePath) { Tag = entry };
+                item.SubItems.Add(entry.Status);
+                item.SubItems.Add(FormatBytes(entry.StoredBytes));
+                item.SubItems.Add(entry.LastUsedUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture));
+                list.Items.Add(item);
+            }
+
+            list.EndUpdate();
+            summary.Text = $"{entries.Count:N0}件 / {FormatBytes(entries.Sum(entry => entry.StoredBytes))}";
+            deleteButton.Enabled = list.SelectedItems.Count > 0;
+            deleteUnusableButton.Enabled = entries.Any(entry => !entry.IsUsable);
+        }
+
+        bool DeleteEntries(IEnumerable<LzopRawCacheEntry> entries)
+        {
+            foreach (var entry in entries)
+            {
+                if (!LzopRawCacheManager.TryDelete(entry.CacheId, cacheRoot, out var error))
+                {
+                    MessageBox.Show(dialog, error, "キャッシュ削除エラー", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        list.SelectedIndexChanged += (_, _) => deleteButton.Enabled = list.SelectedItems.Count > 0;
+        deleteButton.Click += (_, _) =>
+        {
+            var selected = list.SelectedItems.Cast<ListViewItem>()
+                .Select(item => (LzopRawCacheEntry)item.Tag!)
+                .ToList();
+            if (selected.Count == 0
+                || MessageBox.Show(
+                    dialog,
+                    $"選択した{selected.Count:N0}件のRAWキャッシュを削除しますか？",
+                    "キャッシュ削除",
+                    MessageBoxButtons.YesNo,
+                    MessageBoxIcon.Warning,
+                    MessageBoxDefaultButton.Button2) != DialogResult.Yes)
+            {
+                return;
+            }
+
+            if (DeleteEntries(selected))
+            {
+                RefreshEntries();
+            }
+        };
+        deleteUnusableButton.Click += (_, _) =>
+        {
+            var unusable = LzopRawCacheManager.GetEntries(cacheRoot).Where(entry => !entry.IsUsable).ToList();
+            if (unusable.Count > 0 && DeleteEntries(unusable))
+            {
+                RefreshEntries();
+            }
+        };
+
+        RefreshEntries();
+        dialog.ShowDialog(this);
     }
 
     private async Task LoadImageAsync(string path)
@@ -675,7 +921,7 @@ public partial class Form1 : Form
             return;
         }
 
-        var lzopSelection = new LzopOpenSelection(LzopOpenMode.OnDemand, null);
+        var lzopSelection = new LzopOpenSelection(LzopOpenMode.OnDemand, null, OverwriteSavedRaw: false);
         if (DiskImageReaderFactory.IsLzopFile(path))
         {
             var selectedMode = SelectLzopOpenMode(path);
@@ -716,7 +962,8 @@ public partial class Form1 : Form
                 progress,
                 lzopSelection.Mode,
                 lzopSelection.TemporaryDirectory,
-                loadCancellation.Token),
+                loadCancellation.Token,
+                lzopSelection.OverwriteSavedRaw),
                 loadCancellation.Token);
             loadCancellation.Token.ThrowIfCancellationRequested();
             if (IsDisposed)
@@ -837,7 +1084,8 @@ public partial class Form1 : Form
         IProgress<DiskImageProgress> progress,
         LzopOpenMode lzopOpenMode,
         string? lzopTemporaryDirectory,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool overwriteSavedRaw)
     {
         IDiskImageReader? reader = null;
         var ownedReaders = new List<IDisposable>();
@@ -849,7 +1097,8 @@ public partial class Form1 : Form
                 progress,
                 lzopOpenMode,
                 lzopTemporaryDirectory,
-                cancellationToken);
+                cancellationToken,
+                overwriteSavedRaw);
             var analysis = AnalyzeImage(reader, ownedReaders, progress, cancellationToken);
             progress.Report(new DiskImageProgress("先頭データを読み込み中..."));
             cancellationToken.ThrowIfCancellationRequested();
@@ -2639,7 +2888,10 @@ public partial class Form1 : Form
     private sealed record PartitionNodeTag(PartitionInfo Partition);
     private sealed record DirectoryNodeTag(IReadOnlyFileSystem FileSystem, VfsNode Node);
     private sealed record DummyNodeTag;
-    private sealed record LzopOpenSelection(LzopOpenMode Mode, string? TemporaryDirectory);
+    private sealed record LzopOpenSelection(
+        LzopOpenMode Mode,
+        string? TemporaryDirectory,
+        bool OverwriteSavedRaw);
     private sealed record ImageAnalysis(
         IReadOnlyList<PartitionInfo> Partitions,
         IReadOnlyList<LvmDiagnostic> Diagnostics,
