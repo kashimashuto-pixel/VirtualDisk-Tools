@@ -6,8 +6,11 @@ public static class PartitionTableReader
 {
     private static readonly HashSet<byte> ExtendedTypes = new() { 0x05, 0x0f, 0x85 };
 
-    public static IReadOnlyList<PartitionInfo> ReadPartitions(IBlockReader disk)
+    public static IReadOnlyList<PartitionInfo> ReadPartitions(
+        IBlockReader disk,
+        CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         var sectorSize = disk is ILogicalSectorReader sectorReader
             ? sectorReader.LogicalSectorSize
             : 512U;
@@ -17,15 +20,19 @@ public static class PartitionTableReader
             return Array.Empty<PartitionInfo>();
         }
 
-        if (HasProtectiveMbr(mbr) && TryReadGpt(disk, sectorSize, out var gptPartitions))
+        if (HasProtectiveMbr(mbr) && TryReadGpt(disk, sectorSize, cancellationToken, out var gptPartitions))
         {
             return gptPartitions;
         }
 
-        return ReadMbrPartitions(disk, mbr, sectorSize);
+        return ReadMbrPartitions(disk, mbr, sectorSize, cancellationToken);
     }
 
-    private static IReadOnlyList<PartitionInfo> ReadMbrPartitions(IBlockReader disk, byte[] mbr, uint sectorSize)
+    private static IReadOnlyList<PartitionInfo> ReadMbrPartitions(
+        IBlockReader disk,
+        byte[] mbr,
+        uint sectorSize,
+        CancellationToken cancellationToken)
     {
         var partitions = new List<PartitionInfo>();
         var number = 1;
@@ -33,6 +40,7 @@ public static class PartitionTableReader
 
         for (var i = 0; i < 4; i++)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var entryOffset = 446 + i * 16;
             var type = mbr[entryOffset + 4];
             var start = EndianUtilities.ReadUInt32Little(mbr, entryOffset + 8);
@@ -53,19 +61,26 @@ public static class PartitionTableReader
 
         if (extendedBase.HasValue)
         {
-            ReadExtendedPartitions(disk, extendedBase.Value, partitions, ref number, sectorSize);
+            ReadExtendedPartitions(disk, extendedBase.Value, partitions, ref number, sectorSize, cancellationToken);
         }
 
         return partitions;
     }
 
-    private static void ReadExtendedPartitions(IBlockReader disk, ulong extendedBase, List<PartitionInfo> partitions, ref int number, uint sectorSize)
+    private static void ReadExtendedPartitions(
+        IBlockReader disk,
+        ulong extendedBase,
+        List<PartitionInfo> partitions,
+        ref int number,
+        uint sectorSize,
+        CancellationToken cancellationToken)
     {
         var currentEbr = extendedBase;
         var visited = new HashSet<ulong>();
 
         while (currentEbr != 0 && visited.Add(currentEbr) && currentEbr < (ulong)(disk.Length / sectorSize))
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var sector = EndianUtilities.ReadBytes(disk, checked((long)(currentEbr * sectorSize)), 512);
             if (sector[510] != 0x55 || sector[511] != 0xaa)
             {
@@ -128,7 +143,11 @@ public static class PartitionTableReader
         return false;
     }
 
-    private static bool TryReadGpt(IBlockReader disk, uint sectorSize, out IReadOnlyList<PartitionInfo> partitions)
+    private static bool TryReadGpt(
+        IBlockReader disk,
+        uint sectorSize,
+        CancellationToken cancellationToken,
+        out IReadOnlyList<PartitionInfo> partitions)
     {
         partitions = Array.Empty<PartitionInfo>();
         if (disk.Length < sectorSize * 2L)
@@ -157,6 +176,7 @@ public static class PartitionTableReader
 
         for (uint i = 0; i < entriesToRead; i++)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var entryOffset = checked((long)(entryLba * sectorSize + i * entrySize));
             var entry = EndianUtilities.ReadBytes(disk, entryOffset, checked((int)entrySize));
             var typeGuid = new Guid(entry.AsSpan(0, 16));

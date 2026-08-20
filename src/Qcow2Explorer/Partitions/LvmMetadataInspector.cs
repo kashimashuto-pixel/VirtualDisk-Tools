@@ -11,12 +11,14 @@ public static partial class LvmMetadataInspector
 
     public static LvmMetadataInspectionResult Inspect(
         IBlockReader disk,
-        IReadOnlyList<PartitionInfo> partitions)
+        IReadOnlyList<PartitionInfo> partitions,
+        CancellationToken cancellationToken = default)
     {
         var summaries = new List<LvmMetadataSummary>();
         var errors = new List<string>();
         foreach (var partition in partitions)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             try
             {
                 var reader = new PartitionSliceReader(partition.ReaderOverride ?? disk, partition);
@@ -24,7 +26,9 @@ public static partial class LvmMetadataInspector
                 var offsets = new[] { 0L, Math.Max(0, reader.Length - length) }.Distinct();
                 foreach (var offset in offsets)
                 {
+                    cancellationToken.ThrowIfCancellationRequested();
                     var data = EndianUtilities.ReadBytes(reader, offset, length);
+                    cancellationToken.ThrowIfCancellationRequested();
                     var metadata = ExtractMetadata(Encoding.ASCII.GetString(data));
                     if (metadata is null)
                     {
@@ -34,6 +38,10 @@ public static partial class LvmMetadataInspector
                     summaries.Add(Summarize(partition.Number, metadata));
                     break;
                 }
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
             }
             catch (Exception ex)
             {

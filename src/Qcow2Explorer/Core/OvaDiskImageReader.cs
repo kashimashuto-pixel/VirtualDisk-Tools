@@ -46,27 +46,39 @@ public sealed class OvaDiskImageReader : IDiskImageReader
     public int ActiveDiskIndex { get; private set; }
     public OvaDiskInfo ActiveDisk => Disks[ActiveDiskIndex];
 
-    public static OvaDiskImageReader Open(string path, IProgress<DiskImageProgress>? progress = null)
+    public static OvaDiskImageReader Open(
+        string path,
+        IProgress<DiskImageProgress>? progress = null,
+        CancellationToken cancellationToken = default,
+        string? temporaryRoot = null)
     {
+        temporaryRoot = string.IsNullOrWhiteSpace(temporaryRoot)
+            ? System.IO.Path.GetTempPath()
+            : System.IO.Path.GetFullPath(temporaryRoot);
+        Directory.CreateDirectory(temporaryRoot);
         var temporaryDirectory = System.IO.Path.Combine(
-            System.IO.Path.GetTempPath(),
+            temporaryRoot,
             $"VirtualDiskExplorer-ova-{Guid.NewGuid():N}");
         Directory.CreateDirectory(temporaryDirectory);
 
         IDiskImageReader? activeReader = null;
         try
         {
+            cancellationToken.ThrowIfCancellationRequested();
             progress?.Report(new DiskImageProgress("OVAアーカイブを展開中..."));
-            var extractedFiles = ExtractArchive(path, temporaryDirectory, progress);
+            var extractedFiles = ExtractArchive(path, temporaryDirectory, progress, cancellationToken);
             var warnings = new List<string>();
-            var disks = DiscoverDisks(extractedFiles, warnings);
+            var disks = DiscoverDisks(extractedFiles, warnings, cancellationToken);
             if (disks.Count == 0)
             {
                 throw new InvalidDataException("OVA内にOVFから参照された対応仮想ディスク、またはVMDKが見つかりませんでした。");
             }
 
             var activeDiskIndex = FindDefaultDisk(disks);
-            activeReader = DiskImageReaderFactory.Open(disks[activeDiskIndex].ExtractedPath, progress);
+            activeReader = DiskImageReaderFactory.Open(
+                disks[activeDiskIndex].ExtractedPath,
+                progress,
+                cancellationToken: cancellationToken);
             if (disks.Count > 1)
             {
                 warnings.Add($"OVAには仮想ディスクが{disks.Count:N0}個あります。現在は「{disks[activeDiskIndex].ArchivePath}」を表示しています。");
@@ -136,7 +148,8 @@ public sealed class OvaDiskImageReader : IDiskImageReader
     private static Dictionary<string, string> ExtractArchive(
         string path,
         string destination,
-        IProgress<DiskImageProgress>? progress)
+        IProgress<DiskImageProgress>? progress,
+        CancellationToken cancellationToken)
     {
         var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         var destinationRoot = System.IO.Path.GetFullPath(destination) + System.IO.Path.DirectorySeparatorChar;
@@ -145,6 +158,7 @@ public sealed class OvaDiskImageReader : IDiskImageReader
         TarEntry? entry;
         while ((entry = reader.GetNextEntry()) is not null)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             if (entry.EntryType is not (TarEntryType.RegularFile or TarEntryType.V7RegularFile or TarEntryType.ContiguousFile))
             {
                 continue;
@@ -170,7 +184,22 @@ public sealed class OvaDiskImageReader : IDiskImageReader
 
             Directory.CreateDirectory(System.IO.Path.GetDirectoryName(extractedPath)!);
             using var output = new FileStream(extractedPath, FileMode.CreateNew, FileAccess.Write, FileShare.None);
-            entry.DataStream?.CopyTo(output);
+            if (entry.DataStream is not null)
+            {
+                var buffer = new byte[1024 * 1024];
+                int count;
+                while ((count = entry.DataStream.Read(buffer, 0, buffer.Length)) > 0)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    output.Write(buffer, 0, count);
+                    progress?.Report(new DiskImageProgress(
+                        $"OVAを展開中: {archivePath}",
+                        Math.Min(archive.Position, archive.Length),
+                        archive.Length));
+                }
+            }
+
+            cancellationToken.ThrowIfCancellationRequested();
             progress?.Report(new DiskImageProgress(
                 $"OVAを展開中: {archivePath}",
                 Math.Min(archive.Position, archive.Length),
@@ -182,8 +211,10 @@ public sealed class OvaDiskImageReader : IDiskImageReader
 
     private static IReadOnlyList<OvaDiskInfo> DiscoverDisks(
         IReadOnlyDictionary<string, string> extractedFiles,
-        List<string> warnings)
+        List<string> warnings,
+        CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         var ovf = extractedFiles.FirstOrDefault(file =>
             file.Key.EndsWith(".ovf", StringComparison.OrdinalIgnoreCase));
         if (!string.IsNullOrEmpty(ovf.Key))
@@ -191,19 +222,23 @@ public sealed class OvaDiskImageReader : IDiskImageReader
             try
             {
                 var document = XDocument.Load(ovf.Value, LoadOptions.None);
-                var fileReferences = document.Descendants()
-                    .Where(element => element.Name.LocalName == "File")
-                    .Select(element => new
+                cancellationToken.ThrowIfCancellationRequested();
+                var fileReferences = new Dictionary<string, string>(StringComparer.Ordinal);
+                foreach (var element in document.Descendants().Where(element => element.Name.LocalName == "File"))
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    var id = AttributeValue(element, "id");
+                    var href = AttributeValue(element, "href");
+                    if (!string.IsNullOrWhiteSpace(id) && !string.IsNullOrWhiteSpace(href))
                     {
-                        Id = AttributeValue(element, "id"),
-                        Href = AttributeValue(element, "href")
-                    })
-                    .Where(file => !string.IsNullOrWhiteSpace(file.Id) && !string.IsNullOrWhiteSpace(file.Href))
-                    .ToDictionary(file => file.Id!, file => NormalizeArchivePath(Uri.UnescapeDataString(file.Href!)), StringComparer.Ordinal);
+                        fileReferences.Add(id, NormalizeArchivePath(Uri.UnescapeDataString(href)));
+                    }
+                }
 
                 var disks = new List<OvaDiskInfo>();
                 foreach (var diskElement in document.Descendants().Where(element => element.Name.LocalName == "Disk"))
                 {
+                    cancellationToken.ThrowIfCancellationRequested();
                     var fileRef = AttributeValue(diskElement, "fileRef");
                     if (fileRef is null || !fileReferences.TryGetValue(fileRef, out var href))
                     {
@@ -228,16 +263,23 @@ public sealed class OvaDiskImageReader : IDiskImageReader
                     return disks;
                 }
             }
-            catch (Exception ex) when (ex is not OutOfMemoryException)
+            catch (Exception ex) when (ex is not (OutOfMemoryException or OperationCanceledException))
             {
                 warnings.Add($"OVF記述の解析に失敗したため、アーカイブ内のディスクを拡張子で検出しました: {ex.Message}");
             }
         }
 
-        return extractedFiles
-            .Where(file => IsSupportedDisk(file.Value))
-            .Select(file => new OvaDiskInfo(file.Key, file.Value, new FileInfo(file.Value).Length))
-            .ToList();
+        var fallbackDisks = new List<OvaDiskInfo>();
+        foreach (var file in extractedFiles)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (IsSupportedDisk(file.Value))
+            {
+                fallbackDisks.Add(new OvaDiskInfo(file.Key, file.Value, new FileInfo(file.Value).Length));
+            }
+        }
+
+        return fallbackDisks;
     }
 
     private static string? AttributeValue(XElement element, string localName) =>

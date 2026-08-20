@@ -15,8 +15,10 @@ public static class DiskImageReaderFactory
         string path,
         IProgress<DiskImageProgress>? progress = null,
         LzopOpenMode lzopOpenMode = LzopOpenMode.OnDemand,
-        string? lzopTemporaryDirectory = null)
+        string? lzopTemporaryDirectory = null,
+        CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         if (PhysicalDiskReader.IsPhysicalDiskPath(path))
         {
             return new PhysicalDiskReader(path);
@@ -35,12 +37,12 @@ public static class DiskImageReaderFactory
         if (path.EndsWith(".lzo", StringComparison.OrdinalIgnoreCase) || IsLzop(path))
         {
             IDiskImageReader lzop = lzopOpenMode == LzopOpenMode.TemporaryRaw
-                ? TemporaryLzopDiskImageReader.Open(path, progress, lzopTemporaryDirectory)
-                : new LzopDiskImageReader(path, progress);
+                ? TemporaryLzopDiskImageReader.Open(path, progress, lzopTemporaryDirectory, cancellationToken)
+                : new LzopDiskImageReader(path, progress, cancellationToken);
             bool isVma;
             try
             {
-                isVma = VmaDiskImageReader.HasMagic(lzop);
+                isVma = VmaDiskImageReader.HasMagic(lzop, cancellationToken);
             }
             catch
             {
@@ -48,17 +50,20 @@ public static class DiskImageReaderFactory
                 throw;
             }
 
-            return isVma ? new VmaDiskImageReader(lzop, progress) : lzop;
+            return isVma ? new VmaDiskImageReader(lzop, progress, cancellationToken) : lzop;
         }
 
         if (IsVma(path))
         {
-            return new VmaDiskImageReader(new RawDiskImageReader(path, "Proxmox VMA container"), progress);
+            return new VmaDiskImageReader(
+                new RawDiskImageReader(path, "Proxmox VMA container"),
+                progress,
+                cancellationToken);
         }
 
         if (path.EndsWith(".ova", StringComparison.OrdinalIgnoreCase))
         {
-            return OvaDiskImageReader.Open(path, progress);
+            return OvaDiskImageReader.Open(path, progress, cancellationToken);
         }
 
         if (IsQcow2(path))

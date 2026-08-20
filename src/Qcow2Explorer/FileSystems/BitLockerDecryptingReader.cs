@@ -3,13 +3,14 @@ using Qcow2Explorer.Core;
 
 namespace Qcow2Explorer.FileSystems;
 
-public sealed class BitLockerDecryptingReader : IBlockReader
+public sealed class BitLockerDecryptingReader : IBlockReader, IDisposable
 {
     private const int SectorSize = 512;
     private readonly IBlockReader _reader;
     private readonly BitLockerMetadata _metadata;
     private readonly byte[] _dataKey;
     private readonly byte[] _tweakKey;
+    private bool _disposed;
 
     public BitLockerDecryptingReader(IBlockReader reader, BitLockerMetadata metadata, byte[] fvek)
     {
@@ -26,6 +27,7 @@ public sealed class BitLockerDecryptingReader : IBlockReader
 
     public void ReadAt(long offset, byte[] buffer, int bufferOffset, int count)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
         ArgumentOutOfRangeException.ThrowIfNegative(offset);
         ArgumentNullException.ThrowIfNull(buffer);
         if (bufferOffset < 0 || count < 0 || bufferOffset + count > buffer.Length)
@@ -55,12 +57,31 @@ public sealed class BitLockerDecryptingReader : IBlockReader
         }
     }
 
+    public void Dispose()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        _disposed = true;
+        CryptographicOperations.ZeroMemory(_dataKey);
+        CryptographicOperations.ZeroMemory(_tweakKey);
+    }
+
     private byte[] ReadAndDecryptSector(long logicalSector)
     {
         var encryptedSector = new byte[SectorSize];
-        var encryptedOffset = GetEncryptedOffsetForLogicalSector(logicalSector);
-        _reader.ReadAt(encryptedOffset, encryptedSector, 0, encryptedSector.Length);
-        return DecryptXtsSector(encryptedSector, checked((ulong)(encryptedOffset / SectorSize)));
+        try
+        {
+            var encryptedOffset = GetEncryptedOffsetForLogicalSector(logicalSector);
+            _reader.ReadAt(encryptedOffset, encryptedSector, 0, encryptedSector.Length);
+            return DecryptXtsSector(encryptedSector, checked((ulong)(encryptedOffset / SectorSize)));
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(encryptedSector);
+        }
     }
 
     private long GetEncryptedOffsetForLogicalSector(long logicalSector)
@@ -141,13 +162,21 @@ public sealed class BitLockerDecryptingReader : IBlockReader
     {
         var inputArray = input.ToArray();
         var outputArray = new byte[inputArray.Length];
-        var bytes = transform.TransformBlock(inputArray, 0, inputArray.Length, outputArray, 0);
-        if (bytes != inputArray.Length)
+        try
         {
-            throw new CryptographicException("AES block transform failed.");
-        }
+            var bytes = transform.TransformBlock(inputArray, 0, inputArray.Length, outputArray, 0);
+            if (bytes != inputArray.Length)
+            {
+                throw new CryptographicException("AES block transform failed.");
+            }
 
-        outputArray.CopyTo(output);
+            outputArray.CopyTo(output);
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(inputArray);
+            CryptographicOperations.ZeroMemory(outputArray);
+        }
     }
 
     private static void MultiplyByX(Span<byte> tweak)
@@ -179,6 +208,12 @@ public static class BitLockerUnlock
         decryptedReader = null;
         error = "";
 
+        byte[]? clearKey = null;
+        byte[]? vmkEntryBytes = null;
+        byte[]? vmk = null;
+        byte[]? fvekEntryBytes = null;
+        byte[]? fvek = null;
+
         try
         {
             var clearProtector = metadata.KeyProtectors.FirstOrDefault(p => p.ProtectionType == BitLockerProtectionType.ClearKey);
@@ -197,11 +232,11 @@ public static class BitLockerUnlock
                 return false;
             }
 
-            var clearKey = ExtractKeyData(clearKeyEntry.Data, "clear key");
-            var vmkEntryBytes = DecryptAesCcmEntry(clearKey, encryptedVmkEntry.Data);
-            var vmk = ExtractKeyFromDecryptedEntry(vmkEntryBytes, "VMK");
-            var fvekEntryBytes = DecryptAesCcmEntry(vmk, encryptedFvekEntry.Data);
-            var fvek = ExtractKeyFromDecryptedEntry(fvekEntryBytes, "FVEK");
+            clearKey = ExtractKeyData(clearKeyEntry.Data, "clear key");
+            vmkEntryBytes = DecryptAesCcmEntry(clearKey, encryptedVmkEntry.Data);
+            vmk = ExtractKeyFromDecryptedEntry(vmkEntryBytes, "VMK");
+            fvekEntryBytes = DecryptAesCcmEntry(vmk, encryptedFvekEntry.Data);
+            fvek = ExtractKeyFromDecryptedEntry(fvekEntryBytes, "FVEK");
 
             decryptedReader = new BitLockerDecryptingReader(encryptedReader, metadata, fvek);
             return true;
@@ -211,6 +246,120 @@ public static class BitLockerUnlock
             error = ex.Message;
             return false;
         }
+        finally
+        {
+            ZeroKey(clearKey);
+            ZeroKey(vmkEntryBytes);
+            ZeroKey(vmk);
+            ZeroKey(fvekEntryBytes);
+            ZeroKey(fvek);
+        }
+    }
+
+    public static bool TryCreateReaderWithRecoveryKey(
+        IBlockReader encryptedReader,
+        BitLockerMetadata metadata,
+        ReadOnlySpan<byte> recoveryPasswordKey,
+        out IBlockReader? decryptedReader,
+        out string error,
+        CancellationToken cancellationToken = default)
+    {
+        decryptedReader = null;
+        error = "";
+
+        if (recoveryPasswordKey.Length != BitLockerRecoveryPassword.IntermediateKeySize)
+        {
+            error = $"BitLocker回復パスワードの中間キーは{BitLockerRecoveryPassword.IntermediateKeySize} bytesである必要があります。";
+            return false;
+        }
+
+        var recoveryProtectors = metadata.KeyProtectors
+            .Where(protector => protector.ProtectionType == BitLockerProtectionType.RecoveryPassword)
+            .ToList();
+        if (recoveryProtectors.Count == 0)
+        {
+            error = "回復パスワード保護子がありません。";
+            return false;
+        }
+
+        var encryptedFvekEntry = metadata.Entries.FirstOrDefault(
+            entry => entry.EntryType == 0x0003 && entry.ValueType == 0x0005);
+        if (encryptedFvekEntry is null)
+        {
+            error = "暗号化FVEKエントリがありません。";
+            return false;
+        }
+
+        var usableProtectorCount = 0;
+        foreach (var protector in recoveryProtectors)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var stretchEntry = protector.Properties.FirstOrDefault(entry => entry.ValueType == 0x0003);
+            if (stretchEntry is null || stretchEntry.Data.Length < 20)
+            {
+                continue;
+            }
+
+            var stretchMethod = EndianUtilities.ReadUInt32Little(stretchEntry.Data, 0);
+            if (stretchMethod is not (0x1000 or 0x1001))
+            {
+                continue;
+            }
+
+            var encryptedVmkEntry = stretchEntry.Children.FirstOrDefault(entry => entry.ValueType == 0x0005)
+                ?? protector.Properties.FirstOrDefault(entry => entry.ValueType == 0x0005);
+            if (encryptedVmkEntry is null)
+            {
+                continue;
+            }
+
+            usableProtectorCount++;
+            byte[]? stretchedKey = null;
+            byte[]? vmkEntryBytes = null;
+            byte[]? vmk = null;
+            byte[]? fvekEntryBytes = null;
+            byte[]? fvek = null;
+            try
+            {
+                stretchedKey = BitLockerRecoveryPassword.DeriveStretchedKey(
+                    recoveryPasswordKey,
+                    stretchEntry.Data.AsSpan(4, BitLockerRecoveryPassword.SaltSize),
+                    cancellationToken);
+                vmkEntryBytes = DecryptAesCcmEntry(stretchedKey, encryptedVmkEntry.Data);
+                vmk = ExtractKeyFromDecryptedEntry(vmkEntryBytes, "VMK");
+                fvekEntryBytes = DecryptAesCcmEntry(vmk, encryptedFvekEntry.Data);
+                fvek = ExtractKeyFromDecryptedEntry(fvekEntryBytes, "FVEK");
+                decryptedReader = new BitLockerDecryptingReader(encryptedReader, metadata, fvek);
+                return true;
+            }
+            catch (CryptographicException)
+            {
+                // A validly formatted password can belong to a different recovery protector.
+            }
+            catch (InvalidDataException ex)
+            {
+                error = ex.Message;
+            }
+            catch (NotSupportedException ex)
+            {
+                error = ex.Message;
+            }
+            finally
+            {
+                ZeroKey(stretchedKey);
+                ZeroKey(vmkEntryBytes);
+                ZeroKey(vmk);
+                ZeroKey(fvekEntryBytes);
+                ZeroKey(fvek);
+            }
+        }
+
+        error = usableProtectorCount == 0
+            ? "回復パスワード保護子にstretch keyまたは暗号化VMKがありません。"
+            : string.IsNullOrWhiteSpace(error)
+                ? "回復パスワードがこのBitLocker保護子と一致しません。"
+                : error;
+        return false;
     }
 
     public static bool TryCreateReaderWithRawFvek(
@@ -225,7 +374,16 @@ public static class BitLockerUnlock
 
         try
         {
-            decryptedReader = new BitLockerDecryptingReader(encryptedReader, metadata, fvek.ToArray());
+            var keyCopy = fvek.ToArray();
+            try
+            {
+                decryptedReader = new BitLockerDecryptingReader(encryptedReader, metadata, keyCopy);
+            }
+            finally
+            {
+                CryptographicOperations.ZeroMemory(keyCopy);
+            }
+
             return true;
         }
         catch (Exception ex) when (ex is InvalidDataException or NotSupportedException or CryptographicException)
@@ -244,12 +402,12 @@ public static class BitLockerUnlock
 
         if (metadata.HasClearKeyProtector)
         {
-            return "クリアキー保護子があります。VMK/FVEK 解除処理を追加すれば自動復号できる可能性があります。";
+            return "クリアキー保護子があります。対応形式であれば自動解除します。";
         }
 
         if (metadata.HasRecoveryPasswordProtector)
         {
-            return "回復パスワード保護子があります。48 桁の回復キーが必要です。";
+            return "回復パスワード保護子があります。48桁の回復パスワードを入力して解除できます。";
         }
 
         return "対応する解除キーが必要です。TPM のみの保護子はオフライン復号できません。";
@@ -310,8 +468,15 @@ public static class BitLockerUnlock
             if (size == entryBytes.Length && valueType == 0x0001)
             {
                 var keyData = new byte[entryBytes.Length - 8];
-                Array.Copy(entryBytes, 8, keyData, 0, keyData.Length);
-                return ExtractKeyData(keyData, name);
+                try
+                {
+                    Array.Copy(entryBytes, 8, keyData, 0, keyData.Length);
+                    return ExtractKeyData(keyData, name);
+                }
+                finally
+                {
+                    CryptographicOperations.ZeroMemory(keyData);
+                }
             }
         }
 
@@ -338,5 +503,13 @@ public static class BitLockerUnlock
         }
 
         return key;
+    }
+
+    private static void ZeroKey(byte[]? key)
+    {
+        if (key is not null)
+        {
+            CryptographicOperations.ZeroMemory(key);
+        }
     }
 }

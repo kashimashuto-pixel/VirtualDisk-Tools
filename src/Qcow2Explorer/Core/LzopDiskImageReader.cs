@@ -20,17 +20,22 @@ public sealed class LzopDiskImageReader : IDiskImageReader
 
     private readonly FileStream _stream;
     private readonly IProgress<DiskImageProgress>? _progress;
+    private readonly CancellationToken _cancellationToken;
     private readonly object _sync = new();
     private readonly List<LzopBlock> _blocks = [];
     private readonly long _compressedLength;
     private byte[]? _cachedData;
     private int _cachedBlockIndex = -1;
 
-    public LzopDiskImageReader(string path, IProgress<DiskImageProgress>? progress = null)
+    public LzopDiskImageReader(
+        string path,
+        IProgress<DiskImageProgress>? progress = null,
+        CancellationToken cancellationToken = default)
     {
         Path = path;
         FormatName = "raw/dd (lzop LZO1X)";
         _progress = progress;
+        _cancellationToken = cancellationToken;
         _stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
         _compressedLength = _stream.Length;
 
@@ -109,6 +114,7 @@ public sealed class LzopDiskImageReader : IDiskImageReader
         {
             while (remaining > 0)
             {
+                _cancellationToken.ThrowIfCancellationRequested();
                 var index = FindBlock(offset);
                 var block = _blocks[index];
                 var data = GetBlock(index);
@@ -129,6 +135,7 @@ public sealed class LzopDiskImageReader : IDiskImageReader
 
     private void ReadHeader()
     {
+        _cancellationToken.ThrowIfCancellationRequested();
         var magic = ReadExact(Magic.Length);
         if (!magic.AsSpan().SequenceEqual(Magic))
         {
@@ -184,8 +191,8 @@ public sealed class LzopDiskImageReader : IDiskImageReader
         var expectedHeaderChecksum = ReadUInt32BigEndian();
         var headerBytes = ReadRange(headerStart, checked((int)(checksumOffset - headerStart)));
         var actualHeaderChecksum = (Flags & FlagHeaderCrc32) != 0
-            ? LzopChecksums.Crc32(headerBytes)
-            : LzopChecksums.Adler32(headerBytes);
+            ? LzopChecksums.Crc32(headerBytes, _cancellationToken)
+            : LzopChecksums.Adler32(headerBytes, _cancellationToken);
         if (actualHeaderChecksum != expectedHeaderChecksum)
         {
             throw new InvalidDataException(
@@ -205,8 +212,8 @@ public sealed class LzopDiskImageReader : IDiskImageReader
             var expectedExtraChecksum = ReadUInt32BigEndian();
             var extraBytes = ReadRange(extraStart, checked((int)(sizeof(uint) + extraLength)));
             var actualExtraChecksum = (Flags & FlagHeaderCrc32) != 0
-                ? LzopChecksums.Crc32(extraBytes)
-                : LzopChecksums.Adler32(extraBytes);
+                ? LzopChecksums.Crc32(extraBytes, _cancellationToken)
+                : LzopChecksums.Adler32(extraBytes, _cancellationToken);
             if (actualExtraChecksum != expectedExtraChecksum)
             {
                 throw new InvalidDataException("lzop追加ヘッダーのチェックサムが一致しません。");
@@ -221,6 +228,7 @@ public sealed class LzopDiskImageReader : IDiskImageReader
         ReportIndexProgress(force: true);
         while (true)
         {
+            _cancellationToken.ThrowIfCancellationRequested();
             var uncompressedSize = ReadUInt32BigEndian();
             if (uncompressedSize == 0)
             {
@@ -273,6 +281,7 @@ public sealed class LzopDiskImageReader : IDiskImageReader
             ReportIndexProgress(force: false);
         }
 
+        _cancellationToken.ThrowIfCancellationRequested();
         Length = uncompressedOffset;
         if (_blocks.Count == 0)
         {
@@ -309,6 +318,7 @@ public sealed class LzopDiskImageReader : IDiskImageReader
 
     private byte[] GetBlock(int index)
     {
+        _cancellationToken.ThrowIfCancellationRequested();
         if (_cachedBlockIndex == index && _cachedData is not null)
         {
             return _cachedData;
@@ -334,7 +344,7 @@ public sealed class LzopDiskImageReader : IDiskImageReader
             int written;
             try
             {
-                written = Lzo1xDecoder.Decompress(compressed, data);
+                written = Lzo1xDecoder.Decompress(compressed, data, _cancellationToken);
             }
             catch (Exception ex) when (ex is InvalidDataException or OverflowException)
             {
@@ -354,7 +364,7 @@ public sealed class LzopDiskImageReader : IDiskImageReader
         return data;
     }
 
-    private static void VerifyChecksum(
+    private void VerifyChecksum(
         int index,
         string label,
         byte[] data,
@@ -363,7 +373,7 @@ public sealed class LzopDiskImageReader : IDiskImageReader
     {
         if (expectedAdler is uint adler)
         {
-            var actual = LzopChecksums.Adler32(data);
+            var actual = LzopChecksums.Adler32(data, _cancellationToken);
             if (actual != adler)
             {
                 throw new InvalidDataException(
@@ -373,7 +383,7 @@ public sealed class LzopDiskImageReader : IDiskImageReader
 
         if (expectedCrc is uint crc)
         {
-            var actual = LzopChecksums.Crc32(data);
+            var actual = LzopChecksums.Crc32(data, _cancellationToken);
             if (actual != crc)
             {
                 throw new InvalidDataException(
@@ -427,6 +437,7 @@ public sealed class LzopDiskImageReader : IDiskImageReader
         var total = 0;
         while (total < data.Length)
         {
+            _cancellationToken.ThrowIfCancellationRequested();
             var read = _stream.Read(data, total, data.Length - total);
             if (read == 0)
             {
@@ -441,6 +452,7 @@ public sealed class LzopDiskImageReader : IDiskImageReader
 
     private byte ReadByte()
     {
+        _cancellationToken.ThrowIfCancellationRequested();
         var value = _stream.ReadByte();
         if (value < 0)
         {
@@ -475,13 +487,14 @@ internal static class LzopChecksums
 {
     private static readonly uint[] CrcTable = CreateCrcTable();
 
-    public static uint Adler32(ReadOnlySpan<byte> data)
+    public static uint Adler32(ReadOnlySpan<byte> data, CancellationToken cancellationToken = default)
     {
         const uint prime = 65521;
         uint first = 1;
         uint second = 0;
         while (!data.IsEmpty)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var chunkLength = Math.Min(data.Length, 5552);
             foreach (var value in data[..chunkLength])
             {
@@ -497,11 +510,18 @@ internal static class LzopChecksums
         return (second << 16) | first;
     }
 
-    public static uint Crc32(ReadOnlySpan<byte> data)
+    public static uint Crc32(ReadOnlySpan<byte> data, CancellationToken cancellationToken = default)
     {
         var crc = uint.MaxValue;
-        foreach (var value in data)
+        const int cancellationInterval = 16 * 1024;
+        for (var index = 0; index < data.Length; index++)
         {
+            if (index % cancellationInterval == 0)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+            }
+
+            var value = data[index];
             crc = CrcTable[(crc ^ value) & 0xff] ^ (crc >> 8);
         }
 

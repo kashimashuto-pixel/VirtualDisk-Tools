@@ -7,8 +7,12 @@ namespace Qcow2Explorer.FileSystems;
 
 public static class FileSystemDetector
 {
-    public static string Detect(IBlockReader disk, PartitionInfo partition)
+    public static string Detect(
+        IBlockReader disk,
+        PartitionInfo partition,
+        CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         if (partition.LengthBytes < 512)
         {
             return "";
@@ -16,6 +20,7 @@ public static class FileSystemDetector
 
         var slice = new PartitionSliceReader(disk, partition);
         var boot = EndianUtilities.ReadBytes(slice, 0, 512);
+        cancellationToken.ThrowIfCancellationRequested();
         var oem = EndianUtilities.ReadAscii(boot, 3, 8);
         if (oem == "-FVE-FS-")
         {
@@ -52,6 +57,7 @@ public static class FileSystemDetector
         if (partition.LengthBytes > 2048)
         {
             var super = EndianUtilities.ReadBytes(slice, 1024, 1024);
+            cancellationToken.ThrowIfCancellationRequested();
             if (EndianUtilities.ReadUInt16Little(super, 0x38) == 0xef53)
             {
                 var incompat = EndianUtilities.ReadUInt32Little(super, 0x60);
@@ -59,7 +65,7 @@ public static class FileSystemDetector
             }
         }
 
-        var blockLayer = DetectBlockLayer(slice);
+        var blockLayer = DetectBlockLayer(slice, cancellationToken);
         if (!string.IsNullOrWhiteSpace(blockLayer))
         {
             return blockLayer;
@@ -179,12 +185,13 @@ public static class FileSystemDetector
         return $"SquashFS ({compression}, 検出のみ)";
     }
 
-    private static string DetectBlockLayer(IBlockReader reader)
+    private static string DetectBlockLayer(IBlockReader reader, CancellationToken cancellationToken)
     {
         if (reader.Length >= 2048)
         {
             for (var sector = 0; sector < 4; sector++)
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 var label = EndianUtilities.ReadBytes(reader, sector * 512L, 512);
                 if (EndianUtilities.ReadAscii(label, 0, 8) == "LABELONE"
                     && EndianUtilities.ReadAscii(label, 24, 8).StartsWith("LVM2", StringComparison.Ordinal))
@@ -196,6 +203,7 @@ public static class FileSystemDetector
 
         if (reader.Length >= 8192)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             if (HasMdMagic(reader, 0) || HasMdMagic(reader, 4096) || HasMdMagic(reader, Math.Max(0, reader.Length - 4096)))
             {
                 return "Linux md RAID (検出のみ)";
@@ -218,6 +226,24 @@ public static class FileSystemDetector
 
     public static IReadOnlyFileSystem? TryOpen(IBlockReader disk, PartitionInfo partition, out string error)
     {
+        return TryOpenCore(disk, partition, ReadOnlySpan<byte>.Empty, out error);
+    }
+
+    public static IReadOnlyFileSystem? TryOpen(
+        IBlockReader disk,
+        PartitionInfo partition,
+        ReadOnlySpan<byte> recoveryPasswordKey,
+        out string error)
+    {
+        return TryOpenCore(disk, partition, recoveryPasswordKey, out error);
+    }
+
+    private static IReadOnlyFileSystem? TryOpenCore(
+        IBlockReader disk,
+        PartitionInfo partition,
+        ReadOnlySpan<byte> recoveryPasswordKey,
+        out string error)
+    {
         error = "";
         try
         {
@@ -237,31 +263,62 @@ public static class FileSystemDetector
             {
                 if (BitLockerMetadataReader.TryRead(slice, out var metadata, out var metadataError) && metadata is not null)
                 {
-                    if (BitLockerUnlock.TryCreateReaderWithClearKey(slice, metadata, out var decryptedReader, out var unlockError)
-                        && decryptedReader is not null)
+                    var unlocked = BitLockerUnlock.TryCreateReaderWithClearKey(
+                        slice,
+                        metadata,
+                        out var decryptedReader,
+                        out var unlockError);
+                    if (!unlocked && recoveryPasswordKey.Length > 0)
                     {
-                        var innerPartition = new PartitionInfo
-                        {
-                            Number = partition.Number,
-                            Scheme = "BitLocker",
-                            Name = partition.Name,
-                            Type = partition.Type,
-                            TypeId = partition.TypeId,
-                            StartLba = 0,
-                            SectorCount = checked((ulong)(decryptedReader.Length / 512)),
-                            ReaderOverride = decryptedReader,
-                            LengthOverrideBytes = decryptedReader.Length
-                        };
-                        innerPartition.FileSystem = Detect(decryptedReader, innerPartition);
-                        var innerFileSystem = OpenSupportedFileSystem(decryptedReader, innerPartition, innerPartition.FileSystem);
-                        if (innerFileSystem is not null)
-                        {
-                            partition.FileSystem = $"BitLocker/FVE -> {innerPartition.FileSystem}";
-                            return new BitLockerFileSystem(innerFileSystem, decryptedReader, partition, innerPartition);
-                        }
+                        unlocked = BitLockerUnlock.TryCreateReaderWithRecoveryKey(
+                            slice,
+                            metadata,
+                            recoveryPasswordKey,
+                            out decryptedReader,
+                            out unlockError);
+                    }
 
-                        error = $"BitLocker/FVE のクリアキー復号は成功しましたが、内部ファイルシステムを開けませんでした: {innerPartition.FileSystem}";
-                        return null;
+                    if (unlocked && decryptedReader is not null)
+                    {
+                        var ownershipTransferred = false;
+                        try
+                        {
+                            var innerPartition = new PartitionInfo
+                            {
+                                Number = partition.Number,
+                                Scheme = "BitLocker",
+                                Name = partition.Name,
+                                Type = partition.Type,
+                                TypeId = partition.TypeId,
+                                StartLba = 0,
+                                SectorCount = checked((ulong)(decryptedReader.Length / 512)),
+                                ReaderOverride = decryptedReader,
+                                LengthOverrideBytes = decryptedReader.Length
+                            };
+                            innerPartition.FileSystem = Detect(decryptedReader, innerPartition);
+                            var innerFileSystem = OpenSupportedFileSystem(decryptedReader, innerPartition, innerPartition.FileSystem);
+                            if (innerFileSystem is not null)
+                            {
+                                partition.FileSystem = $"BitLocker/FVE -> {innerPartition.FileSystem}";
+                                var bitLockerFileSystem = new BitLockerFileSystem(
+                                    innerFileSystem,
+                                    decryptedReader,
+                                    partition,
+                                    innerPartition);
+                                ownershipTransferred = true;
+                                return bitLockerFileSystem;
+                            }
+
+                            error = $"BitLocker/FVE の解除は成功しましたが、内部ファイルシステムを開けませんでした: {innerPartition.FileSystem}";
+                            return null;
+                        }
+                        finally
+                        {
+                            if (!ownershipTransferred && decryptedReader is IDisposable disposable)
+                            {
+                                disposable.Dispose();
+                            }
+                        }
                     }
 
                     error = string.Join(Environment.NewLine, new[]

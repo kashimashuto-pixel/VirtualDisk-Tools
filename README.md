@@ -18,7 +18,8 @@ C# / Windows Forms で作成した、読み取り専用の仮想ディスク解�
   - XFS（従来形式・bigtimeの更新日時に対応）
   - ext2 / ext3 / ext4
   - SquashFS
-  - BitLocker/FVE はクリアキーを検出できる場合のみ内部 FS を読み取り
+  - BitLocker/FVE はクリアキーの自動解除と48桁回復パスワードによる解除に対応
+  - 回復パスワードは8組の6桁ブロックを検証し、VMK/FVEKを解除して内部FSを読み取り
 - LVM2 論理ボリュームの検出と読み取り
   - 通常のlinear構成（LVMメタデータ上は`striped`、`stripe_count = 1`）を読み取り
   - 読めない場合は不足PV、未対応segment type、複数stripe、メタデータ未検出、または内部例外を警告欄と解析レポートへ表示
@@ -29,6 +30,9 @@ C# / Windows Forms で作成した、読み取り専用の仮想ディスク解�
   - 一覧の「場所」に仮想ディスク内のフルパスを表示
   - 一覧または検索結果を右クリックして、保存されているフォルダーへ移動可能
 - パーティション全体のファイル名検索（最大5,000件、キャンセル可能）
+- イメージ読み込みのキャンセル
+  - LZO索引・一時RAW展開、OVA展開、VMA索引、パーティション／ファイルシステム解析を安全に中止
+  - キャンセルまたは失敗時は作成途中の専用一時フォルダーを削除し、現在表示中のイメージを維持
 - ファイルの Hex プレビュー
 - エクスプローラー一覧でEnterを押すと、フォルダーを開くかファイルをプレビュー
 - テキスト、Word (`.docx`)、Excel (`.xlsx` / `.xlsm`) の読み取り専用別窓プレビュー
@@ -153,7 +157,8 @@ ProjFS マウントは Windows の Client-ProjFS 機能を使い、選択した�
 - ext4 の journal replay は行いません。
 - SquashFS はライブラリが対応する圧縮形式のみ読み取れます。
 - Linux md RAID は検出のみです。
-- BitLockerはクリアキーまたは生FVEKを扱う内部処理がありますが、48桁の回復パスワード入力には未対応です。
+- BitLockerはAES-XTS（128/256）に対応します。TPM単独保護、パスワード保護、スタートアップキー、AES-CBC/Elephant Diffuserは未対応です。
+- BitLocker回復パスワード、VMK、FVEKは設定・ログ・解析レポートへ保存しません。不要になったキー配列は可能な範囲で消去します。
 - NTFSの主 `$MFT` 先頭レコードが破損している場合は `$MFTMirr` から復旧を試みます。ルートレコードなど主MFTの必須データ自体が欠落しているイメージは、元ディスクまたはバックアップからの再取得が必要です。
 - NTFS削除済みファイルはMFTに残っている情報を表示します。削除後に再利用されたクラスタの内容は復旧できません。
 - LVM2 は、現在の入力内に必要なPVがすべてあり、LVが単一stripeのlinear相当である構成を読み取ります。
@@ -314,3 +319,5 @@ SOFTWARE.
 - 物理ディスクサイズ取得: https://learn.microsoft.com/en-us/windows/win32/api/winioctl/ni-winioctl-ioctl_disk_get_length_info
 - lzop形式: https://www.lzop.org/
 - LZO1Xデコーダ移植元: https://github.com/AxioDL/lzokay
+- BitLocker回復パスワードの検証規則: https://learn.microsoft.com/en-us/windows/win32/secprov/protectkeywithnumericalpassword-win32-encryptablevolume
+- BitLocker/FVEメタデータ・鍵導出形式: https://github.com/libyal/libbde/blob/main/documentation/BitLocker%20Drive%20Encryption%20%28BDE%29%20format.asciidoc

@@ -12,8 +12,10 @@ public static class LogicalVolumeDiscoverer
         IBlockReader disk,
         IReadOnlyList<PartitionInfo> lvmPartitions,
         int firstNumber,
-        List<IDisposable> ownedReaders)
+        List<IDisposable> ownedReaders,
+        CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         EnsureRegistered();
 
         var volumes = new List<PartitionInfo>();
@@ -23,12 +25,13 @@ public static class LogicalVolumeDiscoverer
 
         try
         {
-            var metadataInspection = LvmMetadataInspector.Inspect(disk, lvmPartitions);
+            var metadataInspection = LvmMetadataInspector.Inspect(disk, lvmPartitions, cancellationToken);
             var metadataSummaries = metadataInspection.Summaries;
             diagnostics.AddRange(metadataInspection.Errors.Select(error => new LvmDiagnostic(error, true)));
             AppendMetadataDiagnostics(metadataSummaries, lvmPartitions.Count, diagnostics);
 
             var manager = new VolumeManager(diskStream);
+            cancellationToken.ThrowIfCancellationRequested();
             var physicalVolumes = manager.GetPhysicalVolumes();
             var lvmPhysicalVolumes = physicalVolumes
                 .Where(LogicalVolumeManager.HandlesPhysicalVolume)
@@ -40,10 +43,12 @@ public static class LogicalVolumeDiscoverer
             var logicalVolumes = manager.GetLogicalVolumes()
                 .Where(volume => volume.PhysicalVolume is null)
                 .ToList();
+            cancellationToken.ThrowIfCancellationRequested();
 
             var number = firstNumber;
             foreach (var volume in logicalVolumes)
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 try
                 {
                     var stream = volume.Open();
@@ -64,6 +69,10 @@ public static class LogicalVolumeDiscoverer
                         ReaderOverride = reader,
                         LengthOverrideBytes = volume.Length
                     });
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
                 }
                 catch (Exception ex)
                 {
@@ -89,6 +98,10 @@ public static class LogicalVolumeDiscoverer
                     $"LVM2: {volumes.Count:N0}個のLogical Volumeを読み取り対象として追加しました。",
                     false));
             }
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
         }
         catch (Exception ex)
         {

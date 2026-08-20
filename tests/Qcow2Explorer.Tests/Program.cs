@@ -68,6 +68,7 @@ static void RunGeneratedImageTests()
 {
     Assert(PhysicalDiskReader.IsPhysicalDiskPath(@"\\.\PhysicalDrive0"), "physical disk path detection");
     Assert(!PhysicalDiskReader.IsPhysicalDiskPath("PhysicalDrive0"), "physical disk path rejection");
+    TestBitLockerRecoveryPasswordUnlock();
     TestXfsTimestampDecoding();
     Test4KnGptParsing();
     TestLvmMetadataDiagnostics();
@@ -199,6 +200,29 @@ static void RunGeneratedImageTests()
     using var rawReader = DiskImageReaderFactory.Open(rawImagePath);
     Assert(rawReader.FormatName.StartsWith("raw", StringComparison.OrdinalIgnoreCase), "raw image factory");
     var rawFs = AssertFat16Readable(rawReader, "raw");
+    using (var cancellation = new CancellationTokenSource())
+    {
+        cancellation.Cancel();
+        try
+        {
+            _ = PartitionTableReader.ReadPartitions(rawReader, cancellation.Token);
+            Assert(false, "partition analysis cancellation throws");
+        }
+        catch (OperationCanceledException)
+        {
+        }
+
+        var rawPartition = PartitionTableReader.ReadPartitions(rawReader).Single();
+        try
+        {
+            _ = FileSystemDetector.Detect(rawReader, rawPartition, cancellation.Token);
+            Assert(false, "file system detection cancellation throws");
+        }
+        catch (OperationCanceledException)
+        {
+        }
+    }
+
     Console.WriteLine(rawImagePath);
 
     var vdiImagePath = Path.Combine(AppContext.BaseDirectory, "sample-fat16.vdi");
@@ -222,6 +246,38 @@ static void RunGeneratedImageTests()
         AssertFat16Readable(ovaReader, "OVA");
     }
 
+    var ovaCancellationRoot = Path.Combine(AppContext.BaseDirectory, "ova-cancellation-temporary-root");
+    if (Directory.Exists(ovaCancellationRoot))
+    {
+        Directory.Delete(ovaCancellationRoot, recursive: true);
+    }
+
+    using (var cancellation = new CancellationTokenSource())
+    {
+        try
+        {
+            using var _ = OvaDiskImageReader.Open(
+                ovaImagePath,
+                new CallbackProgress<DiskImageProgress>(item =>
+                {
+                    if (item.Message.Contains("disk.vmdk", StringComparison.Ordinal))
+                    {
+                        cancellation.Cancel();
+                    }
+                }),
+                cancellation.Token,
+                ovaCancellationRoot);
+            Assert(false, "OVA extraction cancellation throws");
+        }
+        catch (OperationCanceledException)
+        {
+        }
+    }
+
+    Assert(Directory.Exists(ovaCancellationRoot), "OVA cancellation temporary root is preserved");
+    Assert(!Directory.EnumerateFileSystemEntries(ovaCancellationRoot).Any(), "OVA cancellation temporary files cleanup");
+    Directory.Delete(ovaCancellationRoot);
+
     Console.WriteLine(ovaImagePath);
 
     var hddImagePath = Path.Combine(AppContext.BaseDirectory, "sample-fat16.hdd");
@@ -241,6 +297,359 @@ static void RunGeneratedImageTests()
     }
 
     RunProjFsRemountSmoke(rawFs);
+}
+
+static void TestBitLockerRecoveryPasswordUnlock()
+{
+    const string recoveryPassword = "471207-278498-422125-177177-561902-537405-468006-693451";
+    const string expectedIntermediateKey = "55A7E662E795EB3E8AC7D7BE32A641F6";
+    const string expectedStretchedKey = "5E39D3E56A4E477FB569BB49B3E8C3B2C9D864EE5D75BD658B8E2720E49000D4";
+
+    Assert(
+        BitLockerRecoveryPassword.TryDecode(recoveryPassword, out var intermediateKey, out var decodeError),
+        decodeError);
+    Assert(Convert.ToHexString(intermediateKey) == expectedIntermediateKey, "BitLocker recovery password decoding");
+    Assert(
+        BitLockerRecoveryPassword.TryDecode(recoveryPassword.Replace('-', ' '), out var spacedKey, out _)
+        && spacedKey.SequenceEqual(intermediateKey),
+        "BitLocker recovery password accepts spaces");
+    CryptographicOperations.ZeroMemory(spacedKey);
+
+    Assert(
+        !BitLockerRecoveryPassword.TryDecode(
+            "471208-278498-422125-177177-561902-537405-468006-693451",
+            out _,
+            out var checksumError)
+        && checksumError.Contains("第1ブロック", StringComparison.Ordinal),
+        "BitLocker recovery password checksum rejection");
+    Assert(
+        !BitLockerRecoveryPassword.TryDecode(
+            "999999-278498-422125-177177-561902-537405-468006-693451",
+            out _,
+            out var rangeError)
+        && rangeError.Contains("720885", StringComparison.Ordinal),
+        "BitLocker recovery password range rejection");
+    Assert(
+        !BitLockerRecoveryPassword.TryDecode("471207-invalid", out _, out _),
+        "BitLocker recovery password character rejection");
+
+    var salt = Enumerable.Range(0, BitLockerRecoveryPassword.SaltSize).Select(value => (byte)value).ToArray();
+    var stretchedKey = BitLockerRecoveryPassword.DeriveStretchedKey(intermediateKey, salt);
+    Assert(Convert.ToHexString(stretchedKey) == expectedStretchedKey, "BitLocker stretch-key derivation");
+    try
+    {
+        _ = BitLockerRecoveryPassword.DeriveStretchedKey(
+            intermediateKey,
+            salt,
+            new CancellationToken(canceled: true));
+        Assert(false, "BitLocker stretch-key cancellation throws");
+    }
+    catch (OperationCanceledException)
+    {
+    }
+
+    var clearKey = Enumerable.Range(0x20, 32).Select(value => (byte)value).ToArray();
+    var vmk = Enumerable.Range(0x60, 32).Select(value => (byte)value).ToArray();
+    var fvek = Enumerable.Range(0xa0, 32).Select(value => (byte)value).ToArray();
+    var plaintext = Enumerable.Range(0, 1024).Select(value => (byte)(value * 37 + 11)).ToArray();
+    var encryptedVolume = EncryptBitLockerXts(plaintext, fvek);
+    var encryptedFvek = new BitLockerMetadataEntry
+    {
+        EntryType = 0x0003,
+        ValueType = 0x0005,
+        Data = EncryptBitLockerAesCcm(vmk, CreateBitLockerKeyData(0x8004, fvek), nonceSeed: 0x31)
+    };
+    var encryptedRecoveryVmk = new BitLockerMetadataEntry
+    {
+        EntryType = 0x0003,
+        ValueType = 0x0005,
+        Data = EncryptBitLockerAesCcm(stretchedKey, CreateBitLockerKeyData(0x2000, vmk), nonceSeed: 0x11)
+    };
+    var stretchData = new byte[4 + BitLockerRecoveryPassword.SaltSize];
+    BinaryPrimitives.WriteUInt32LittleEndian(stretchData, 0x1000);
+    salt.CopyTo(stretchData, 4);
+    var recoveryProtector = new BitLockerKeyProtector
+    {
+        Identifier = Guid.Parse("8c7486c7-4d57-4f27-9548-025be1c2088f"),
+        ProtectionType = BitLockerProtectionType.RecoveryPassword,
+        RawProtectionType = 0x0800,
+        Properties =
+        [
+            new BitLockerMetadataEntry
+            {
+                EntryType = 0x0003,
+                ValueType = 0x0003,
+                Data = stretchData,
+                Children = [encryptedRecoveryVmk]
+            }
+        ]
+    };
+    var recoveryMetadata = new BitLockerMetadata
+    {
+        EncryptedVolumeSize = encryptedVolume.Length,
+        EncryptionMethod = 0x8004,
+        KeyProtectors = [recoveryProtector],
+        Entries = [encryptedFvek]
+    };
+    var metadataImage = CreateBitLockerMetadataTestImage(
+        recoveryProtector.Identifier,
+        stretchData,
+        encryptedRecoveryVmk.Data,
+        encryptedFvek.Data);
+    Assert(
+        BitLockerMetadataReader.TryRead(
+            new MemorySectorReader(metadataImage, 512),
+            out var parsedMetadata,
+            out var metadataError),
+        metadataError);
+    Assert(
+        parsedMetadata is { HasRecoveryPasswordProtector: true }
+        && parsedMetadata.KeyProtectors.Single().Properties.Single(entry => entry.ValueType == 0x0003)
+            .Children.Single().ValueType == 0x0005,
+        "BitLocker recovery protector metadata parsing");
+
+    var encryptedReader = new MemorySectorReader(encryptedVolume, 512);
+    Assert(
+        BitLockerUnlock.TryCreateReaderWithRecoveryKey(
+            encryptedReader,
+            recoveryMetadata,
+            intermediateKey,
+            out var recoveryReader,
+            out var recoveryError),
+        recoveryError);
+    Assert(recoveryReader is not null, "BitLocker recovery reader created");
+    var recovered = new byte[plaintext.Length];
+    recoveryReader!.ReadAt(0, recovered, 0, recovered.Length);
+    Assert(recovered.SequenceEqual(plaintext), "BitLocker recovery password AES-CCM and XTS unlock");
+
+    ((IDisposable)recoveryReader).Dispose();
+    try
+    {
+        recoveryReader.ReadAt(0, new byte[1], 0, 1);
+        Assert(false, "disposed BitLocker reader rejects reads");
+    }
+    catch (ObjectDisposedException)
+    {
+    }
+
+    const string wrongRecoveryPassword = "000000-000000-000000-000000-000000-000000-000000-000000";
+    Assert(BitLockerRecoveryPassword.TryDecode(wrongRecoveryPassword, out var wrongKey, out _), "valid alternate recovery password");
+    Assert(
+        !BitLockerUnlock.TryCreateReaderWithRecoveryKey(
+            encryptedReader,
+            recoveryMetadata,
+            wrongKey,
+            out _,
+            out var wrongPasswordError),
+        "wrong BitLocker recovery password rejection");
+    Assert(
+        !wrongPasswordError.Contains(wrongRecoveryPassword, StringComparison.Ordinal)
+        && !wrongPasswordError.Contains(Convert.ToHexString(intermediateKey), StringComparison.OrdinalIgnoreCase)
+        && !wrongPasswordError.Contains(Convert.ToHexString(fvek), StringComparison.OrdinalIgnoreCase),
+        "BitLocker errors do not expose passwords or keys");
+
+    var clearProtector = new BitLockerKeyProtector
+    {
+        Identifier = Guid.Parse("bc79bc9f-ff72-492b-ad3f-2f3e748a8e31"),
+        ProtectionType = BitLockerProtectionType.ClearKey,
+        RawProtectionType = 0x0000,
+        Properties =
+        [
+            new BitLockerMetadataEntry
+            {
+                EntryType = 0x0003,
+                ValueType = 0x0001,
+                Data = CreateBitLockerKeyData(0x2000, clearKey)
+            },
+            new BitLockerMetadataEntry
+            {
+                EntryType = 0x0003,
+                ValueType = 0x0005,
+                Data = EncryptBitLockerAesCcm(clearKey, CreateBitLockerKeyData(0x2000, vmk), nonceSeed: 0x21)
+            }
+        ]
+    };
+    var clearMetadata = new BitLockerMetadata
+    {
+        EncryptedVolumeSize = encryptedVolume.Length,
+        EncryptionMethod = 0x8004,
+        KeyProtectors = [clearProtector],
+        Entries = [encryptedFvek]
+    };
+    Assert(
+        BitLockerUnlock.TryCreateReaderWithClearKey(
+            encryptedReader,
+            clearMetadata,
+            out var clearReader,
+            out var clearError),
+        clearError);
+    var clearRecovered = new byte[plaintext.Length];
+    clearReader!.ReadAt(0, clearRecovered, 0, clearRecovered.Length);
+    Assert(clearRecovered.SequenceEqual(plaintext), "BitLocker clear-key regression");
+    ((IDisposable)clearReader).Dispose();
+
+    CryptographicOperations.ZeroMemory(intermediateKey);
+    CryptographicOperations.ZeroMemory(wrongKey);
+    CryptographicOperations.ZeroMemory(stretchedKey);
+    CryptographicOperations.ZeroMemory(clearKey);
+    CryptographicOperations.ZeroMemory(vmk);
+    CryptographicOperations.ZeroMemory(fvek);
+    CryptographicOperations.ZeroMemory(recovered);
+    CryptographicOperations.ZeroMemory(clearRecovered);
+}
+
+static byte[] CreateBitLockerKeyData(uint method, byte[] key)
+{
+    var data = new byte[4 + key.Length];
+    BinaryPrimitives.WriteUInt32LittleEndian(data, method);
+    key.CopyTo(data, 4);
+    return data;
+}
+
+static byte[] CreateBitLockerMetadataTestImage(
+    Guid protectorIdentifier,
+    byte[] stretchData,
+    byte[] encryptedVmkData,
+    byte[] encryptedFvekData)
+{
+    const int metadataBlockOffset = 4096;
+    var encryptedVmkEntry = CreateBitLockerMetadataEntry(0x0003, 0x0005, encryptedVmkData);
+    var stretchPayload = new byte[stretchData.Length + encryptedVmkEntry.Length];
+    stretchData.CopyTo(stretchPayload, 0);
+    encryptedVmkEntry.CopyTo(stretchPayload, stretchData.Length);
+    var stretchEntry = CreateBitLockerMetadataEntry(0x0003, 0x0003, stretchPayload);
+    var protectorPayload = new byte[28 + stretchEntry.Length];
+    protectorIdentifier.ToByteArray().CopyTo(protectorPayload, 0);
+    BinaryPrimitives.WriteUInt16LittleEndian(protectorPayload.AsSpan(26), 0x0800);
+    stretchEntry.CopyTo(protectorPayload, 28);
+    var protectorEntry = CreateBitLockerMetadataEntry(0x0002, 0x0008, protectorPayload);
+    var fvekEntry = CreateBitLockerMetadataEntry(0x0003, 0x0005, encryptedFvekData);
+
+    const int metadataHeaderSize = 48;
+    var metadataSize = metadataHeaderSize + protectorEntry.Length + fvekEntry.Length;
+    var image = new byte[metadataBlockOffset + 64 + metadataSize + 512];
+    Encoding.ASCII.GetBytes("-FVE-FS-").CopyTo(image, 3);
+    BinaryPrimitives.WriteUInt64LittleEndian(image.AsSpan(176), metadataBlockOffset);
+
+    Encoding.ASCII.GetBytes("-FVE-FS-").CopyTo(image, metadataBlockOffset);
+    BinaryPrimitives.WriteUInt16LittleEndian(image.AsSpan(metadataBlockOffset + 10), 2);
+    BinaryPrimitives.WriteUInt64LittleEndian(image.AsSpan(metadataBlockOffset + 16), checked((ulong)image.Length));
+    BinaryPrimitives.WriteUInt32LittleEndian(image.AsSpan(metadataBlockOffset + 28), 1);
+    BinaryPrimitives.WriteUInt64LittleEndian(image.AsSpan(metadataBlockOffset + 32), metadataBlockOffset);
+
+    var metadataOffset = metadataBlockOffset + 64;
+    BinaryPrimitives.WriteUInt32LittleEndian(image.AsSpan(metadataOffset), checked((uint)metadataSize));
+    BinaryPrimitives.WriteUInt32LittleEndian(image.AsSpan(metadataOffset + 4), 2);
+    BinaryPrimitives.WriteUInt32LittleEndian(image.AsSpan(metadataOffset + 8), metadataHeaderSize);
+    Guid.Parse("511c4978-8ba7-4da5-a4f8-63d8f37460e2").ToByteArray().CopyTo(image, metadataOffset + 16);
+    BinaryPrimitives.WriteUInt32LittleEndian(image.AsSpan(metadataOffset + 36), 0x8004);
+    protectorEntry.CopyTo(image, metadataOffset + metadataHeaderSize);
+    fvekEntry.CopyTo(image, metadataOffset + metadataHeaderSize + protectorEntry.Length);
+    return image;
+}
+
+static byte[] CreateBitLockerMetadataEntry(ushort entryType, ushort valueType, byte[] data)
+{
+    var result = new byte[8 + data.Length];
+    BinaryPrimitives.WriteUInt16LittleEndian(result, checked((ushort)result.Length));
+    BinaryPrimitives.WriteUInt16LittleEndian(result.AsSpan(2), entryType);
+    BinaryPrimitives.WriteUInt16LittleEndian(result.AsSpan(4), valueType);
+    BinaryPrimitives.WriteUInt16LittleEndian(result.AsSpan(6), 1);
+    data.CopyTo(result, 8);
+    return result;
+}
+
+static byte[] EncryptBitLockerAesCcm(byte[] key, byte[] plaintext, byte nonceSeed)
+{
+    var result = new byte[12 + 16 + plaintext.Length];
+    for (var index = 0; index < 12; index++)
+    {
+        result[index] = checked((byte)(nonceSeed + index));
+    }
+
+#pragma warning disable SYSLIB0053
+    using var aesCcm = new AesCcm(key);
+#pragma warning restore SYSLIB0053
+    aesCcm.Encrypt(result.AsSpan(0, 12), plaintext, result.AsSpan(28), result.AsSpan(12, 16));
+    return result;
+}
+
+static byte[] EncryptBitLockerXts(byte[] plaintext, byte[] fvek)
+{
+    Assert(plaintext.Length % 512 == 0, "BitLocker XTS test data sector alignment");
+    Assert(fvek.Length == 32, "BitLocker XTS-128 test FVEK length");
+    using var dataAes = Aes.Create();
+    using var tweakAes = Aes.Create();
+    dataAes.Mode = tweakAes.Mode = CipherMode.ECB;
+    dataAes.Padding = tweakAes.Padding = PaddingMode.None;
+    dataAes.Key = fvek[..16];
+    tweakAes.Key = fvek[16..32];
+    using var dataEncryptor = dataAes.CreateEncryptor();
+    using var tweakEncryptor = tweakAes.CreateEncryptor();
+
+    var ciphertext = new byte[plaintext.Length];
+    Span<byte> tweakInput = stackalloc byte[16];
+    Span<byte> tweak = stackalloc byte[16];
+    Span<byte> input = stackalloc byte[16];
+    Span<byte> encrypted = stackalloc byte[16];
+    for (var sectorOffset = 0; sectorOffset < plaintext.Length; sectorOffset += 512)
+    {
+        tweakInput.Clear();
+        BinaryPrimitives.WriteUInt64LittleEndian(tweakInput, checked((ulong)(sectorOffset / 512)));
+        TransformBitLockerTestBlock(tweakEncryptor, tweakInput, tweak);
+        for (var blockOffset = 0; blockOffset < 512; blockOffset += 16)
+        {
+            for (var index = 0; index < 16; index++)
+            {
+                input[index] = (byte)(plaintext[sectorOffset + blockOffset + index] ^ tweak[index]);
+            }
+
+            TransformBitLockerTestBlock(dataEncryptor, input, encrypted);
+            for (var index = 0; index < 16; index++)
+            {
+                ciphertext[sectorOffset + blockOffset + index] = (byte)(encrypted[index] ^ tweak[index]);
+            }
+
+            MultiplyBitLockerTestTweak(tweak);
+        }
+    }
+
+    return ciphertext;
+}
+
+static void TransformBitLockerTestBlock(ICryptoTransform transform, ReadOnlySpan<byte> input, Span<byte> output)
+{
+    var inputArray = input.ToArray();
+    var outputArray = new byte[inputArray.Length];
+    try
+    {
+        Assert(
+            transform.TransformBlock(inputArray, 0, inputArray.Length, outputArray, 0) == inputArray.Length,
+            "BitLocker test AES block transform");
+        outputArray.CopyTo(output);
+    }
+    finally
+    {
+        CryptographicOperations.ZeroMemory(inputArray);
+        CryptographicOperations.ZeroMemory(outputArray);
+    }
+}
+
+static void MultiplyBitLockerTestTweak(Span<byte> tweak)
+{
+    var carry = 0;
+    for (var index = 0; index < tweak.Length; index++)
+    {
+        var value = tweak[index];
+        var nextCarry = value >> 7;
+        tweak[index] = (byte)((value << 1) | carry);
+        carry = nextCarry;
+    }
+
+    if (carry != 0)
+    {
+        tweak[0] ^= 0x87;
+    }
 }
 
 static void CreateOva(string ovaPath, string diskPath)
@@ -502,6 +911,60 @@ static void TestGeneratedLzopExt4Image()
     Assert(Directory.Exists(fastTemporaryRoot), "dd.lzo selected temporary root is preserved");
     Directory.Delete(fastTemporaryRoot);
 
+    using (var cancellation = new CancellationTokenSource())
+    {
+        try
+        {
+            using var _ = DiskImageReaderFactory.Open(
+                imagePath,
+                new CallbackProgress<DiskImageProgress>(item =>
+                {
+                    if (item.Message.Contains("LZO索引作成中", StringComparison.Ordinal))
+                    {
+                        cancellation.Cancel();
+                    }
+                }),
+                cancellationToken: cancellation.Token);
+            Assert(false, "dd.lzo index cancellation throws");
+        }
+        catch (OperationCanceledException)
+        {
+        }
+    }
+
+    var cancellationTemporaryRoot = Path.Combine(AppContext.BaseDirectory, "lzo-cancellation-temporary-root");
+    if (Directory.Exists(cancellationTemporaryRoot))
+    {
+        Directory.Delete(cancellationTemporaryRoot, recursive: true);
+    }
+
+    using (var cancellation = new CancellationTokenSource())
+    {
+        try
+        {
+            using var _ = DiskImageReaderFactory.Open(
+                imagePath,
+                new CallbackProgress<DiskImageProgress>(item =>
+                {
+                    if (item.Message.Contains("一時RAWへ展開中", StringComparison.Ordinal))
+                    {
+                        cancellation.Cancel();
+                    }
+                }),
+                LzopOpenMode.TemporaryRaw,
+                cancellationTemporaryRoot,
+                cancellation.Token);
+            Assert(false, "dd.lzo load cancellation throws");
+        }
+        catch (OperationCanceledException)
+        {
+        }
+    }
+
+    Assert(Directory.Exists(cancellationTemporaryRoot), "dd.lzo cancellation temporary root is preserved");
+    Assert(!Directory.EnumerateFileSystemEntries(cancellationTemporaryRoot).Any(), "dd.lzo cancellation temporary files cleanup");
+    Directory.Delete(cancellationTemporaryRoot);
+
     var damagedPath = Path.Combine(AppContext.BaseDirectory, "sample-ext4-damaged.dd.lzo");
     TestImageFactory.CreateExt4LzopDisk(damagedPath, corruptHeaderChecksum: true);
     try
@@ -547,6 +1010,25 @@ static void TestGeneratedVmaLzopImage()
     Assert(fastReader is VmaDiskImageReader, "VMA.lzo temporary raw reader factory");
     Assert(fastReader.FormatName.Contains("高速モード", StringComparison.Ordinal), "VMA.lzo fast mode format name");
     AssertFat16Readable(fastReader, "VMA.lzo fast mode");
+
+    using var cancellation = new CancellationTokenSource();
+    try
+    {
+        using var _ = DiskImageReaderFactory.Open(
+            imagePath,
+            new CallbackProgress<DiskImageProgress>(item =>
+            {
+                if (item.Message.Contains("VMA索引作成中", StringComparison.Ordinal))
+                {
+                    cancellation.Cancel();
+                }
+            }),
+            cancellationToken: cancellation.Token);
+        Assert(false, "VMA index cancellation throws");
+    }
+    catch (OperationCanceledException)
+    {
+    }
 }
 
 static void TestGeneratedUefiVariableStore()
