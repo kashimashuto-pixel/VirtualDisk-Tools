@@ -911,6 +911,147 @@ static void TestGeneratedLzopExt4Image()
     Assert(Directory.Exists(fastTemporaryRoot), "dd.lzo selected temporary root is preserved");
     Directory.Delete(fastTemporaryRoot);
 
+    var cacheSourcePath = Path.Combine(AppContext.BaseDirectory, "sample-ext4-cache-source.dd.lzo");
+    File.Copy(imagePath, cacheSourcePath, overwrite: true);
+    var cacheRoot = Path.Combine(AppContext.BaseDirectory, "lzo-fast-cache-root");
+    if (Directory.Exists(cacheRoot))
+    {
+        Directory.Delete(cacheRoot, recursive: true);
+    }
+
+    string cachedRawPath;
+    var firstCacheProgress = new List<DiskImageProgress>();
+    using (var firstCachedReader = DiskImageReaderFactory.Open(
+        cacheSourcePath,
+        new CallbackProgress<DiskImageProgress>(firstCacheProgress.Add),
+        LzopOpenMode.CachedRaw,
+        cacheRoot))
+    {
+        Assert(firstCachedReader is TemporaryLzopDiskImageReader, "dd.lzo cached raw reader factory");
+        var cachedReader = (TemporaryLzopDiskImageReader)firstCachedReader;
+        cachedRawPath = cachedReader.TemporaryPath;
+        Assert(!cachedReader.CacheReused && cachedReader.IsPersistent, "dd.lzo first cache expansion");
+        Assert(File.Exists(cachedRawPath), "dd.lzo cache raw created");
+        Assert(
+            firstCacheProgress.Any(item => item.Message.Contains("RAWキャッシュへ展開中", StringComparison.Ordinal)),
+            "dd.lzo cache expansion progress");
+    }
+
+    Assert(File.Exists(cachedRawPath), "dd.lzo cache persists after reader disposal");
+    var cacheEntries = LzopRawCacheManager.GetEntries(cacheRoot);
+    Assert(cacheEntries is [{ IsUsable: true, Completed: true }], "dd.lzo usable cache metadata");
+    var orphanCacheDirectory = Path.Combine(cacheRoot, "orphan-cache-fixture");
+    Directory.CreateDirectory(orphanCacheDirectory);
+    File.WriteAllBytes(Path.Combine(orphanCacheDirectory, "disk.raw.partial"), new byte[32]);
+    var orphanEntry = LzopRawCacheManager.GetEntries(cacheRoot).Single(entry => !entry.IsUsable);
+    Assert(orphanEntry.SourcePath == "(メタデータなし)", "dd.lzo orphan cache detection");
+    Assert(
+        LzopRawCacheManager.TryDelete(orphanEntry.CacheId, cacheRoot, out var orphanDeleteError),
+        orphanDeleteError);
+
+    var reuseProgress = new List<DiskImageProgress>();
+    using (var reusedReader = DiskImageReaderFactory.Open(
+        cacheSourcePath,
+        new CallbackProgress<DiskImageProgress>(reuseProgress.Add),
+        LzopOpenMode.CachedRaw,
+        cacheRoot))
+    {
+        var cachedReader = (TemporaryLzopDiskImageReader)reusedReader;
+        Assert(cachedReader.CacheReused, "dd.lzo unchanged cache reuse");
+        Assert(cachedReader.TemporaryPath == cachedRawPath, "dd.lzo stable cache raw path");
+        Assert(
+            reuseProgress.Any(item => item.Message.Contains("キャッシュを再利用", StringComparison.Ordinal)),
+            "dd.lzo cache reuse progress");
+    }
+
+    var metadataPath = Path.Combine(Path.GetDirectoryName(cachedRawPath)!, "cache.json");
+    var metadataJson = File.ReadAllText(metadataPath);
+    var incompleteJson = metadataJson.Replace("\"Completed\": true", "\"Completed\": false", StringComparison.Ordinal);
+    Assert(incompleteJson != metadataJson, "dd.lzo cache completion fixture");
+    File.WriteAllText(metadataPath, incompleteJson, new UTF8Encoding(false));
+    using (var rebuiltReader = DiskImageReaderFactory.Open(
+        cacheSourcePath,
+        lzopOpenMode: LzopOpenMode.CachedRaw,
+        lzopTemporaryDirectory: cacheRoot))
+    {
+        Assert(
+            rebuiltReader is TemporaryLzopDiskImageReader { CacheReused: false },
+            "dd.lzo incomplete cache rejection");
+    }
+
+    using (var stream = new FileStream(cachedRawPath, FileMode.Open, FileAccess.Write, FileShare.None))
+    {
+        stream.SetLength(stream.Length - 512);
+    }
+
+    using (var repairedReader = DiskImageReaderFactory.Open(
+        cacheSourcePath,
+        lzopOpenMode: LzopOpenMode.CachedRaw,
+        lzopTemporaryDirectory: cacheRoot))
+    {
+        Assert(
+            repairedReader is TemporaryLzopDiskImageReader { CacheReused: false },
+            "dd.lzo truncated cache rejection");
+        Assert(repairedReader.Length == reader.Length, "dd.lzo truncated cache rebuild");
+    }
+
+    File.SetLastWriteTimeUtc(cacheSourcePath, File.GetLastWriteTimeUtc(cacheSourcePath).AddSeconds(2));
+    using (var changedSourceReader = DiskImageReaderFactory.Open(
+        cacheSourcePath,
+        lzopOpenMode: LzopOpenMode.CachedRaw,
+        lzopTemporaryDirectory: cacheRoot))
+    {
+        Assert(
+            changedSourceReader is TemporaryLzopDiskImageReader { CacheReused: false },
+            "dd.lzo changed source invalidates cache");
+    }
+
+    var savedRawPath = Path.Combine(AppContext.BaseDirectory, "sample-ext4-saved.raw");
+    File.Delete(savedRawPath);
+    using (var savedRawReader = DiskImageReaderFactory.Open(
+        cacheSourcePath,
+        lzopOpenMode: LzopOpenMode.SavedRaw,
+        lzopTemporaryDirectory: savedRawPath))
+    {
+        Assert(savedRawReader.Length == reader.Length, "dd.lzo saved raw virtual length");
+        Assert(File.Exists(savedRawPath), "dd.lzo saved raw created");
+    }
+
+    Assert(File.Exists(savedRawPath), "dd.lzo saved raw persists after disposal");
+    try
+    {
+        using var _ = DiskImageReaderFactory.Open(
+            cacheSourcePath,
+            lzopOpenMode: LzopOpenMode.SavedRaw,
+            lzopTemporaryDirectory: savedRawPath);
+        Assert(false, "dd.lzo saved raw overwrite requires confirmation");
+    }
+    catch (IOException)
+    {
+    }
+
+    using (var overwrittenRawReader = DiskImageReaderFactory.Open(
+        cacheSourcePath,
+        lzopOpenMode: LzopOpenMode.SavedRaw,
+        lzopTemporaryDirectory: savedRawPath,
+        overwriteSavedRaw: true))
+    {
+        Assert(overwrittenRawReader.Length == reader.Length, "dd.lzo confirmed saved raw overwrite");
+    }
+
+    File.Delete(savedRawPath);
+    cacheEntries = LzopRawCacheManager.GetEntries(cacheRoot);
+    Assert(cacheEntries.Count == 1, "dd.lzo cache manager entry count");
+    Assert(
+        !LzopRawCacheManager.TryDelete("..", cacheRoot, out _),
+        "dd.lzo cache manager rejects parent deletion");
+    Assert(
+        LzopRawCacheManager.TryDelete(cacheEntries[0].CacheId, cacheRoot, out var cacheDeleteError),
+        cacheDeleteError);
+    Assert(!Directory.EnumerateFileSystemEntries(cacheRoot).Any(), "dd.lzo cache manager deletion");
+    Directory.Delete(cacheRoot);
+    File.Delete(cacheSourcePath);
+
     using (var cancellation = new CancellationTokenSource())
     {
         try
@@ -964,6 +1105,39 @@ static void TestGeneratedLzopExt4Image()
     Assert(Directory.Exists(cancellationTemporaryRoot), "dd.lzo cancellation temporary root is preserved");
     Assert(!Directory.EnumerateFileSystemEntries(cancellationTemporaryRoot).Any(), "dd.lzo cancellation temporary files cleanup");
     Directory.Delete(cancellationTemporaryRoot);
+
+    var cancellationCacheRoot = Path.Combine(AppContext.BaseDirectory, "lzo-cancellation-cache-root");
+    if (Directory.Exists(cancellationCacheRoot))
+    {
+        Directory.Delete(cancellationCacheRoot, recursive: true);
+    }
+
+    using (var cancellation = new CancellationTokenSource())
+    {
+        try
+        {
+            using var _ = DiskImageReaderFactory.Open(
+                imagePath,
+                new CallbackProgress<DiskImageProgress>(item =>
+                {
+                    if (item.Message.Contains("RAWキャッシュへ展開中", StringComparison.Ordinal))
+                    {
+                        cancellation.Cancel();
+                    }
+                }),
+                LzopOpenMode.CachedRaw,
+                cancellationCacheRoot,
+                cancellation.Token);
+            Assert(false, "dd.lzo cache load cancellation throws");
+        }
+        catch (OperationCanceledException)
+        {
+        }
+    }
+
+    Assert(Directory.Exists(cancellationCacheRoot), "dd.lzo cancellation cache root is preserved");
+    Assert(!Directory.EnumerateFileSystemEntries(cancellationCacheRoot).Any(), "dd.lzo cancellation cache cleanup");
+    Directory.Delete(cancellationCacheRoot);
 
     var damagedPath = Path.Combine(AppContext.BaseDirectory, "sample-ext4-damaged.dd.lzo");
     TestImageFactory.CreateExt4LzopDisk(damagedPath, corruptHeaderChecksum: true);
