@@ -1,9 +1,16 @@
+using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
 
 namespace Qcow2Explorer.FileSystems;
 
-public sealed record CopyProgress(string CurrentPath, long BytesCopied, int FilesCopied, int DirectoriesCreated);
+public sealed record CopyProgress(
+    string CurrentPath,
+    long BytesCopied,
+    long TotalBytes,
+    int FilesCopied,
+    int DirectoriesCreated,
+    TimeSpan Elapsed);
 
 public sealed record CopyOptions(bool ContinueOnError = true);
 
@@ -40,14 +47,18 @@ public static class FileSystemExporter
         CopyOptions? options = null)
     {
         options ??= new CopyOptions();
+        var nodeList = nodes.ToList();
         Directory.CreateDirectory(destinationDirectory);
+        var progressState = new CopyProgressState(
+            progress,
+            CalculateTotalBytes(fileSystem, nodeList, cancellationToken, options));
         var result = CopyResult.Empty;
-        foreach (var node in nodes)
+        foreach (var node in nodeList)
         {
             cancellationToken.ThrowIfCancellationRequested();
             try
             {
-                result = result.Add(CopyNodeCore(fileSystem, node, destinationDirectory, progress, cancellationToken, options));
+                result = result.Add(CopyNodeCore(fileSystem, node, destinationDirectory, progressState, cancellationToken, options));
             }
             catch (Exception ex) when (options.ContinueOnError && ex is not OperationCanceledException)
             {
@@ -67,14 +78,18 @@ public static class FileSystemExporter
         IProgress<CopyProgress>? progress = null,
         CancellationToken cancellationToken = default)
     {
-        return CopyNodeCore(fileSystem, node, destinationDirectory, progress, cancellationToken, new CopyOptions());
+        var options = new CopyOptions();
+        var progressState = new CopyProgressState(
+            progress,
+            CalculateTotalBytes(fileSystem, [node], cancellationToken, options));
+        return CopyNodeCore(fileSystem, node, destinationDirectory, progressState, cancellationToken, options);
     }
 
     private static CopyResult CopyNodeCore(
         IReadOnlyFileSystem fileSystem,
         VfsNode node,
         string destinationDirectory,
-        IProgress<CopyProgress>? progress = null,
+        CopyProgressState progress,
         CancellationToken cancellationToken = default,
         CopyOptions? options = null)
     {
@@ -91,13 +106,13 @@ public static class FileSystemExporter
         IReadOnlyFileSystem fileSystem,
         VfsNode directory,
         string destinationPath,
-        IProgress<CopyProgress>? progress,
+        CopyProgressState progress,
         CancellationToken cancellationToken,
         CopyOptions options)
     {
         Directory.CreateDirectory(destinationPath);
         var result = new CopyResult(0, 1, 0, Array.Empty<CopyError>());
-        progress?.Report(new CopyProgress(destinationPath, 0, 0, 1));
+        progress.Report(destinationPath, bytesCopied: 0, filesCopied: 0, directoriesCreated: 1);
 
         foreach (var child in fileSystem.ListDirectory(directory))
         {
@@ -124,7 +139,7 @@ public static class FileSystemExporter
         IReadOnlyFileSystem fileSystem,
         VfsNode file,
         string destinationPath,
-        IProgress<CopyProgress>? progress,
+        CopyProgressState progress,
         CancellationToken cancellationToken)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(destinationPath) ?? ".");
@@ -136,7 +151,7 @@ public static class FileSystemExporter
             {
                 if (file.Size == 0)
                 {
-                    progress?.Report(new CopyProgress(destinationPath, 0, 1, 0));
+                    progress.Report(destinationPath, bytesCopied: 0, filesCopied: 1, directoriesCreated: 0);
                 }
 
                 while (offset < file.Size)
@@ -151,7 +166,7 @@ public static class FileSystemExporter
 
                     output.Write(chunk, 0, chunk.Length);
                     offset += chunk.Length;
-                    progress?.Report(new CopyProgress(destinationPath, offset, 0, 0));
+                    progress.Report(destinationPath, chunk.Length, filesCopied: 0, directoriesCreated: 0);
                 }
             }
         }
@@ -166,8 +181,47 @@ public static class FileSystemExporter
             TrySetLastWriteTime(destinationPath, file.ModifiedUtc.Value, isDirectory: false);
         }
 
+        if (file.Size > 0)
+        {
+            progress.Report(destinationPath, bytesCopied: 0, filesCopied: 1, directoriesCreated: 0);
+        }
+
         return new CopyResult(1, 0, file.Size, Array.Empty<CopyError>());
     }
+
+    private static long CalculateTotalBytes(
+        IReadOnlyFileSystem fileSystem,
+        IEnumerable<VfsNode> nodes,
+        CancellationToken cancellationToken,
+        CopyOptions options)
+    {
+        long totalBytes = 0;
+        foreach (var node in nodes)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!node.IsDirectory)
+            {
+                totalBytes = AddSaturating(totalBytes, Math.Max(0, node.Size));
+                continue;
+            }
+
+            try
+            {
+                totalBytes = AddSaturating(
+                    totalBytes,
+                    CalculateTotalBytes(fileSystem, fileSystem.ListDirectory(node), cancellationToken, options));
+            }
+            catch (Exception ex) when (options.ContinueOnError && ex is not OperationCanceledException)
+            {
+                // The copy pass records the directory error; an unreadable subtree contributes no known bytes.
+            }
+        }
+
+        return totalBytes;
+    }
+
+    private static long AddSaturating(long left, long right) =>
+        right > long.MaxValue - left ? long.MaxValue : left + right;
 
     private static CopyResult ErrorResult(VfsNode node, string destinationPath, Exception exception)
     {
@@ -263,5 +317,27 @@ public static class FileSystemExporter
         return baseName is "CON" or "PRN" or "AUX" or "NUL"
             or "COM1" or "COM2" or "COM3" or "COM4" or "COM5" or "COM6" or "COM7" or "COM8" or "COM9"
             or "LPT1" or "LPT2" or "LPT3" or "LPT4" or "LPT5" or "LPT6" or "LPT7" or "LPT8" or "LPT9";
+    }
+
+    private sealed class CopyProgressState(IProgress<CopyProgress>? progress, long totalBytes)
+    {
+        private readonly Stopwatch _stopwatch = Stopwatch.StartNew();
+        private long _bytesCopied;
+        private int _filesCopied;
+        private int _directoriesCreated;
+
+        public void Report(string currentPath, long bytesCopied, int filesCopied, int directoriesCreated)
+        {
+            _bytesCopied = AddSaturating(_bytesCopied, bytesCopied);
+            _filesCopied += filesCopied;
+            _directoriesCreated += directoriesCreated;
+            progress?.Report(new CopyProgress(
+                currentPath,
+                _bytesCopied,
+                totalBytes,
+                _filesCopied,
+                _directoriesCreated,
+                _stopwatch.Elapsed));
+        }
     }
 }

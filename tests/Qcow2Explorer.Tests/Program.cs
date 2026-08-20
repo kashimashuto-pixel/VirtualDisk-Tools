@@ -119,9 +119,21 @@ static void RunGeneratedImageTests()
         Directory.Delete(copyDirectory, recursive: true);
     }
 
-    var copyResult = FileSystemExporter.CopyNodes(fs, new[] { hello, docs }, copyDirectory);
+    var copyProgress = new List<CopyProgress>();
+    var copyResult = FileSystemExporter.CopyNodes(
+        fs,
+        new[] { hello, docs },
+        copyDirectory,
+        new CallbackProgress<CopyProgress>(copyProgress.Add));
     Assert(copyResult.FilesCopied == 2, "copied file count");
     Assert(copyResult.Errors.Count == 0, "copy errors");
+    Assert(copyProgress.Count > 0, "copy progress events");
+    Assert(copyProgress.All(item => item.TotalBytes == hello.Size + readme.Size), "copy progress total bytes");
+    Assert(copyProgress[^1].BytesCopied == hello.Size + readme.Size, "copy progress completed bytes");
+    Assert(
+        copyProgress.Zip(copyProgress.Skip(1), (left, right) => left.BytesCopied <= right.BytesCopied).All(value => value),
+        "copy progress bytes are cumulative");
+    Assert(copyProgress.All(item => item.Elapsed >= TimeSpan.Zero), "copy progress elapsed time");
     Assert(!File.Exists(Path.Combine(copyDirectory, "VirtualDiskExplorer.sha256")), "SHA-256 manifest is not created");
     Assert(File.ReadAllText(Path.Combine(copyDirectory, "HELLO.TXT"), Encoding.ASCII) == TestImageFactory.HelloText, "copied HELLO.TXT");
     Assert(File.ReadAllText(Path.Combine(copyDirectory, "DOCS", "README.TXT"), Encoding.ASCII) == TestImageFactory.ReadmeText, "copied README.TXT");

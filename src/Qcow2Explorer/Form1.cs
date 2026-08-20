@@ -1747,7 +1747,22 @@ public partial class Form1 : Form
             if (_copyCancellations.Contains(cancellation))
             {
                 var name = Path.GetFileName(p.CurrentPath);
-                _statusLabel.Text = $"コピー中 ({_copyCancellations.Count:N0}件): {name} {FormatBytes(p.BytesCopied)}";
+                var transferred = p.TotalBytes > 0
+                    ? $"{FormatBytes(p.BytesCopied)} / {FormatBytes(p.TotalBytes)}"
+                    : FormatBytes(p.BytesCopied);
+                var performance = "速度計測中";
+                if (p.BytesCopied > 0 && p.Elapsed.TotalSeconds >= 0.1)
+                {
+                    var bytesPerSecond = p.BytesCopied / p.Elapsed.TotalSeconds;
+                    var formattedSpeed = FormatBytes((long)Math.Min(bytesPerSecond, long.MaxValue));
+                    var remainingBytes = Math.Max(0, p.TotalBytes - p.BytesCopied);
+                    performance = remainingBytes > 0 && bytesPerSecond > 0
+                        ? $"{formattedSpeed}/秒、残り約{FormatDuration(remainingBytes / bytesPerSecond)}"
+                        : $"{formattedSpeed}/秒";
+                }
+
+                _statusLabel.Text =
+                    $"コピー中 ({_copyCancellations.Count:N0}件): {name} {transferred}、{performance}";
             }
         });
 
@@ -1762,6 +1777,7 @@ public partial class Form1 : Form
             CopyResult result;
             try
             {
+                _statusLabel.Text = $"コピー準備中 ({_copyCancellations.Count:N0}件): 合計サイズを計算しています...";
                 result = await Task.Run(() => FileSystemExporter.CopyNodes(
                     fileSystem,
                     nodes,
@@ -2021,6 +2037,32 @@ public partial class Form1 : Form
         }
 
         return $"{size:0.##} {suffixes[suffix]}";
+    }
+
+    private static string FormatDuration(double seconds)
+    {
+        seconds = Math.Max(1, Math.Ceiling(seconds));
+        if (seconds < 60)
+        {
+            return $"{seconds:0}秒";
+        }
+
+        if (seconds < 60 * 60)
+        {
+            var minutes = (int)(seconds / 60);
+            var remainingSeconds = (int)(seconds % 60);
+            return $"{minutes:N0}分{remainingSeconds:N0}秒";
+        }
+
+        if (seconds < 24 * 60 * 60)
+        {
+            var hours = (int)(seconds / (60 * 60));
+            var minutes = (int)(seconds % (60 * 60) / 60);
+            return $"{hours:N0}時間{minutes:N0}分";
+        }
+
+        var days = Math.Min(seconds / (24 * 60 * 60), 9999);
+        return $"{days:0.#}日";
     }
 
     private static bool IsSameVfsNode(VfsNode left, VfsNode right)
