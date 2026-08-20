@@ -17,7 +17,8 @@ public partial class Form1 : Form
     private readonly ToolStripLabel _statusLabel = new("ディスクイメージを開いてください");
     private readonly ToolStripProgressBar _loadProgressBar = new() { AutoSize = false, Width = 140, Visible = false };
     private readonly ToolStripTextBox _searchBox = new() { AutoSize = false, Width = 240, BorderStyle = BorderStyle.FixedSingle, ToolTipText = "現在のパーティションからファイル名を検索" };
-    private readonly ToolStripButton _cancelOperationButton = new("キャンセル") { Enabled = false };
+    private readonly ToolStripButton _cancelSearchButton = new("検索キャンセル") { Enabled = false };
+    private readonly ToolStripButton _cancelCopyButton = new("コピーキャンセル") { Enabled = false };
     private readonly ToolStripButton _backNavigationButton = new("戻る") { Enabled = false, ToolTipText = "戻る (Alt+←)" };
     private readonly ToolStripButton _forwardNavigationButton = new("進む") { Enabled = false, ToolTipText = "進む (Alt+→)" };
     private readonly ToolStripButton _upNavigationButton = new("上へ") { Enabled = false, ToolTipText = "親フォルダーへ (Alt+↑)" };
@@ -46,7 +47,9 @@ public partial class Form1 : Form
     private readonly List<string> _analysisWarnings = new();
     private IReadOnlyFileSystem? _currentFileSystem;
     private VfsNode? _currentDirectory;
-    private CancellationTokenSource? _operationCancellation;
+    private CancellationTokenSource? _searchCancellation;
+    private readonly HashSet<CancellationTokenSource> _copyCancellations = [];
+    private readonly SemaphoreSlim _copyExecutionGate = new(1, 1);
     private readonly NavigationHistory<TreeNode> _navigationHistory = new();
     private bool _isHistoryNavigation;
     private bool _isLoadingImage;
@@ -64,6 +67,8 @@ public partial class Form1 : Form
         FormClosing += Form1FormClosing;
         FormClosed += (_, _) =>
         {
+            _searchCancellation?.Cancel();
+            CancelCopyOperations();
             DisposeMounts();
             DisposeFileSystems();
             DisposePartitionReaders();
@@ -299,9 +304,7 @@ public partial class Form1 : Form
         previewButton.Click += (_, _) => PreviewSelectedFile();
         var windowPreviewButton = new ToolStripButton("別窓表示");
         windowPreviewButton.Click += async (_, _) => await OpenSelectedFilePreviewAsync(showUnsupportedMessage: true);
-        var extractButton = new ToolStripButton("抽出");
-        extractButton.Click += async (_, _) => await ExtractSelectedFileAsync();
-        var copyButton = new ToolStripButton("選択コピー");
+        var copyButton = new ToolStripButton("選択項目をコピー");
         copyButton.Click += async (_, _) => await CopySelectedItemsAsync();
         var copyFolderButton = new ToolStripButton("表示フォルダをコピー");
         copyFolderButton.Click += async (_, _) => await CopyCurrentDirectoryAsync();
@@ -314,6 +317,7 @@ public partial class Form1 : Form
         var clearSearchButton = new ToolStripButton("クリア");
         clearSearchButton.Click += (_, _) =>
         {
+            _searchCancellation?.Cancel();
             _searchBox.Clear();
             if (_currentFileSystem is not null && _currentDirectory is not null)
             {
@@ -328,7 +332,8 @@ public partial class Form1 : Form
                 await SearchCurrentFileSystemAsync();
             }
         };
-        _cancelOperationButton.Click += (_, _) => _operationCancellation?.Cancel();
+        _cancelSearchButton.Click += (_, _) => _searchCancellation?.Cancel();
+        _cancelCopyButton.Click += (_, _) => CancelCopyOperations();
         _backNavigationButton.Click += (_, _) => NavigateBack();
         _forwardNavigationButton.Click += (_, _) => NavigateForward();
         _upNavigationButton.Click += (_, _) => NavigateUp();
@@ -341,13 +346,13 @@ public partial class Form1 : Form
         explorerStrip.Items.Add(_searchBox);
         explorerStrip.Items.Add(searchButton);
         explorerStrip.Items.Add(clearSearchButton);
-        explorerStrip.Items.Add(_cancelOperationButton);
+        explorerStrip.Items.Add(_cancelSearchButton);
         explorerStrip.Items.Add(new ToolStripSeparator());
         explorerStrip.Items.Add(windowPreviewButton);
         explorerStrip.Items.Add(previewButton);
-        explorerStrip.Items.Add(extractButton);
         explorerStrip.Items.Add(copyButton);
         explorerStrip.Items.Add(copyFolderButton);
+        explorerStrip.Items.Add(_cancelCopyButton);
         explorerStrip.Items.Add(deletedButton);
         explorerStrip.Items.Add(new ToolStripSeparator());
         explorerStrip.Items.Add(mountButton);
@@ -1444,19 +1449,30 @@ public partial class Form1 : Form
             return;
         }
 
-        _operationCancellation?.Cancel();
-        _operationCancellation?.Dispose();
-        _operationCancellation = new CancellationTokenSource();
-        var token = _operationCancellation.Token;
-        _cancelOperationButton.Enabled = true;
+        _searchCancellation?.Cancel();
+        using var cancellation = new CancellationTokenSource();
+        _searchCancellation = cancellation;
+        var token = cancellation.Token;
+        _cancelSearchButton.Enabled = true;
         _statusLabel.Text = "検索中...";
-        var progress = new Progress<int>(count => _statusLabel.Text = $"検索中: {count:N0} フォルダー");
+        var progress = new Progress<int>(count =>
+        {
+            if (ReferenceEquals(_searchCancellation, cancellation))
+            {
+                _statusLabel.Text = $"検索中: {count:N0} フォルダー";
+            }
+        });
 
         try
         {
             var fileSystem = _currentFileSystem;
             var query = _searchBox.Text.Trim();
             var matches = await Task.Run(() => FileSystemSearch.Search(fileSystem, query, progress, token), token);
+            if (!ReferenceEquals(_searchCancellation, cancellation))
+            {
+                return;
+            }
+
             _fileList.BeginUpdate();
             _fileList.Items.Clear();
             _previewText.Clear();
@@ -1475,11 +1491,18 @@ public partial class Form1 : Form
         }
         catch (OperationCanceledException)
         {
-            _statusLabel.Text = "検索をキャンセルしました";
+            if (ReferenceEquals(_searchCancellation, cancellation))
+            {
+                _statusLabel.Text = "検索をキャンセルしました";
+            }
         }
         finally
         {
-            _cancelOperationButton.Enabled = false;
+            if (ReferenceEquals(_searchCancellation, cancellation))
+            {
+                _searchCancellation = null;
+                _cancelSearchButton.Enabled = false;
+            }
         }
     }
 
@@ -1671,69 +1694,6 @@ public partial class Form1 : Form
         }
     }
 
-    private async Task ExtractSelectedFileAsync()
-    {
-        if (_currentFileSystem is null || _fileList.SelectedItems.Count == 0 || _fileList.SelectedItems[0].Tag is not VfsNode node || node.IsDirectory)
-        {
-            return;
-        }
-
-        using var dialog = new SaveFileDialog { FileName = node.Name, Title = "ファイルを抽出" };
-        if (dialog.ShowDialog(this) != DialogResult.OK)
-        {
-            return;
-        }
-
-        _operationCancellation?.Cancel();
-        _operationCancellation?.Dispose();
-        using var cancellation = new CancellationTokenSource();
-        _operationCancellation = cancellation;
-        _cancelOperationButton.Enabled = true;
-        _loadProgressBar.Visible = true;
-        _loadProgressBar.Style = ProgressBarStyle.Blocks;
-        _loadProgressBar.Value = 0;
-
-        var progress = new Progress<long>(bytesCopied =>
-        {
-            var percentage = node.Size == 0
-                ? 100
-                : (int)Math.Clamp((double)bytesCopied / node.Size * 100, 0, 100);
-            _loadProgressBar.Value = percentage;
-            _statusLabel.Text =
-                $"抽出中: {node.Name} {FormatBytes(bytesCopied)} / {FormatBytes(node.Size)} ({percentage}%)";
-        });
-
-        try
-        {
-            var fileSystem = _currentFileSystem;
-            var bytesCopied = await Task.Run(() => FileSystemExporter.ExtractFile(
-                fileSystem,
-                node,
-                dialog.FileName,
-                progress,
-                cancellation.Token));
-            _statusLabel.Text = $"抽出完了: {node.Name} ({FormatBytes(bytesCopied)})";
-        }
-        catch (OperationCanceledException)
-        {
-            _statusLabel.Text = $"抽出をキャンセルしました: {node.Name}";
-        }
-        catch (Exception ex)
-        {
-            MessageBox.Show(this, ex.Message, "抽出エラー", MessageBoxButtons.OK, MessageBoxIcon.Error);
-            _statusLabel.Text = $"抽出失敗: {node.Name}";
-        }
-        finally
-        {
-            if (ReferenceEquals(_operationCancellation, cancellation))
-            {
-                _operationCancellation = null;
-                _cancelOperationButton.Enabled = false;
-                _loadProgressBar.Visible = false;
-            }
-        }
-    }
-
     private async Task CopySelectedItemsAsync()
     {
         if (_currentFileSystem is null)
@@ -1778,32 +1738,46 @@ public partial class Form1 : Form
             return;
         }
 
+        var destinationPath = dialog.SelectedPath;
+        var cancellation = new CancellationTokenSource();
+        _copyCancellations.Add(cancellation);
+        _cancelCopyButton.Enabled = true;
         var progress = new Progress<CopyProgress>(p =>
         {
-            var name = Path.GetFileName(p.CurrentPath);
-            _statusLabel.Text = $"コピー中: {name} {FormatBytes(p.BytesCopied)}";
+            if (_copyCancellations.Contains(cancellation))
+            {
+                var name = Path.GetFileName(p.CurrentPath);
+                _statusLabel.Text = $"コピー中 ({_copyCancellations.Count:N0}件): {name} {FormatBytes(p.BytesCopied)}";
+            }
         });
 
         try
         {
-            _operationCancellation?.Cancel();
-            _operationCancellation?.Dispose();
-            _operationCancellation = new CancellationTokenSource();
-            _cancelOperationButton.Enabled = true;
-            var result = await Task.Run(() => FileSystemExporter.CopyNodes(
-                fileSystem,
-                nodes,
-                dialog.SelectedPath,
-                progress,
-                _operationCancellation.Token,
-                new CopyOptions(ContinueOnError: true, CreateSha256Manifest: true)));
-            _statusLabel.Text = $"コピー完了: {result.FilesCopied:N0} files, {FormatBytes(result.BytesCopied)}";
-            MessageBox.Show(
-                this,
-                $"コピーが完了しました。{Environment.NewLine}ファイル: {result.FilesCopied:N0}{Environment.NewLine}フォルダ: {result.DirectoriesCreated:N0}{Environment.NewLine}サイズ: {FormatBytes(result.BytesCopied)}{Environment.NewLine}エラー: {result.Errors.Count:N0}{Environment.NewLine}{Environment.NewLine}SHA-256一覧もコピー先へ保存しました。",
-                "コピー完了",
-                MessageBoxButtons.OK,
-                MessageBoxIcon.Information);
+            if (_copyCancellations.Count > 1)
+            {
+                _statusLabel.Text = $"コピー待機中: {_copyCancellations.Count:N0}件";
+            }
+
+            await _copyExecutionGate.WaitAsync(cancellation.Token);
+            CopyResult result;
+            try
+            {
+                result = await Task.Run(() => FileSystemExporter.CopyNodes(
+                    fileSystem,
+                    nodes,
+                    destinationPath,
+                    progress,
+                    cancellation.Token,
+                    new CopyOptions(ContinueOnError: true)), cancellation.Token);
+            }
+            finally
+            {
+                _copyExecutionGate.Release();
+            }
+
+            _statusLabel.Text = result.Errors.Count == 0
+                ? $"コピー完了: {result.FilesCopied:N0} files, {FormatBytes(result.BytesCopied)}"
+                : $"コピー完了: {result.FilesCopied:N0} files, エラー {result.Errors.Count:N0}件";
         }
         catch (OperationCanceledException)
         {
@@ -1816,7 +1790,26 @@ public partial class Form1 : Form
         }
         finally
         {
-            _cancelOperationButton.Enabled = false;
+            _copyCancellations.Remove(cancellation);
+            cancellation.Dispose();
+            _cancelCopyButton.Enabled = _copyCancellations.Count > 0;
+            if (_copyCancellations.Count > 0)
+            {
+                _statusLabel.Text = $"コピー処理中: {_copyCancellations.Count:N0}件";
+            }
+        }
+    }
+
+    private void CancelCopyOperations()
+    {
+        foreach (var cancellation in _copyCancellations.ToArray())
+        {
+            cancellation.Cancel();
+        }
+
+        if (_copyCancellations.Count > 0)
+        {
+            _statusLabel.Text = $"コピーをキャンセル中: {_copyCancellations.Count:N0}件";
         }
     }
 

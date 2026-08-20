@@ -122,33 +122,42 @@ static void RunGeneratedImageTests()
     var copyResult = FileSystemExporter.CopyNodes(fs, new[] { hello, docs }, copyDirectory);
     Assert(copyResult.FilesCopied == 2, "copied file count");
     Assert(copyResult.Errors.Count == 0, "copy errors");
-    Assert(copyResult.Manifest.Count == 2, "SHA-256 manifest entries");
-    Assert(File.Exists(Path.Combine(copyDirectory, "VirtualDiskExplorer.sha256")), "SHA-256 manifest file");
+    Assert(!File.Exists(Path.Combine(copyDirectory, "VirtualDiskExplorer.sha256")), "SHA-256 manifest is not created");
     Assert(File.ReadAllText(Path.Combine(copyDirectory, "HELLO.TXT"), Encoding.ASCII) == TestImageFactory.HelloText, "copied HELLO.TXT");
     Assert(File.ReadAllText(Path.Combine(copyDirectory, "DOCS", "README.TXT"), Encoding.ASCII) == TestImageFactory.ReadmeText, "copied README.TXT");
-    var extractionProgress = new List<long>();
-    var extractionPath = Path.Combine(copyDirectory, "extracted-hello.txt");
-    var extractedBytes = FileSystemExporter.ExtractFile(
-        fs,
-        hello,
-        extractionPath,
-        new CallbackProgress<long>(extractionProgress.Add));
-    Assert(extractedBytes == hello.Size, "extracted byte count");
-    Assert(extractionProgress.Count > 0 && extractionProgress[^1] == hello.Size, "extraction progress");
-    Assert(File.ReadAllText(extractionPath, Encoding.ASCII) == TestImageFactory.HelloText, "extracted file content");
-    var canceledExtractionPath = Path.Combine(copyDirectory, "canceled-extraction.txt");
+    var canceledCopyDirectory = Path.Combine(copyDirectory, "canceled-copy");
     try
     {
-        FileSystemExporter.ExtractFile(
+        FileSystemExporter.CopyNodes(
             fs,
-            hello,
-            canceledExtractionPath,
+            new[] { hello },
+            canceledCopyDirectory,
             cancellationToken: new CancellationToken(canceled: true));
-        Assert(false, "canceled extraction throws");
+        Assert(false, "canceled copy throws");
     }
     catch (OperationCanceledException)
     {
-        Assert(!File.Exists(canceledExtractionPath), "canceled extraction removes partial file");
+        Assert(!File.Exists(Path.Combine(canceledCopyDirectory, "HELLO.TXT")), "canceled copy does not create a file");
+    }
+
+    var interruptibleFileSystem = new InterruptibleCopyFileSystem();
+    var interruptedCopyDirectory = Path.Combine(copyDirectory, "interrupted-copy");
+    using var copyCancellation = new CancellationTokenSource();
+    try
+    {
+        FileSystemExporter.CopyNode(
+            interruptibleFileSystem,
+            interruptibleFileSystem.LargeFile,
+            interruptedCopyDirectory,
+            new CallbackProgress<CopyProgress>(_ => copyCancellation.Cancel()),
+            copyCancellation.Token);
+        Assert(false, "interrupted copy throws");
+    }
+    catch (OperationCanceledException)
+    {
+        Assert(
+            !File.Exists(Path.Combine(interruptedCopyDirectory, interruptibleFileSystem.LargeFile.Name)),
+            "interrupted copy removes partial file");
     }
 
     var searchResults = FileSystemSearch.Search(fs, "readme");
@@ -2137,4 +2146,20 @@ internal sealed class CallbackProgress<T>(Action<T> callback) : IProgress<T>
     {
         callback(value);
     }
+}
+
+internal sealed class InterruptibleCopyFileSystem : IReadOnlyFileSystem
+{
+    public string Name => "Interruptible copy test";
+    public PartitionInfo Partition { get; } = new();
+    public VfsNode Root { get; } = new() { IsDirectory = true };
+    public VfsNode LargeFile { get; } = new()
+    {
+        Name = "large-copy.bin",
+        Size = 3L * 1024 * 1024
+    };
+
+    public IReadOnlyList<VfsNode> ListDirectory(VfsNode directory) => Array.Empty<VfsNode>();
+
+    public byte[] ReadFile(VfsNode file, long offset, int count) => new byte[count];
 }

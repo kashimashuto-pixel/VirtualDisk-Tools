@@ -1,4 +1,3 @@
-using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 
@@ -6,20 +5,17 @@ namespace Qcow2Explorer.FileSystems;
 
 public sealed record CopyProgress(string CurrentPath, long BytesCopied, int FilesCopied, int DirectoriesCreated);
 
-public sealed record CopyOptions(bool ContinueOnError = true, bool CreateSha256Manifest = true);
+public sealed record CopyOptions(bool ContinueOnError = true);
 
 public sealed record CopyError(string SourceName, string DestinationPath, string Message);
-
-public sealed record CopyManifestEntry(string RelativePath, long Size, string Sha256);
 
 public sealed record CopyResult(
     int FilesCopied,
     int DirectoriesCreated,
     long BytesCopied,
-    IReadOnlyList<CopyError> Errors,
-    IReadOnlyList<CopyManifestEntry> Manifest)
+    IReadOnlyList<CopyError> Errors)
 {
-    public static CopyResult Empty { get; } = new(0, 0, 0, Array.Empty<CopyError>(), Array.Empty<CopyManifestEntry>());
+    public static CopyResult Empty { get; } = new(0, 0, 0, Array.Empty<CopyError>());
 
     public CopyResult Add(CopyResult other)
     {
@@ -27,8 +23,7 @@ public sealed record CopyResult(
             FilesCopied + other.FilesCopied,
             DirectoriesCreated + other.DirectoriesCreated,
             BytesCopied + other.BytesCopied,
-            Errors.Concat(other.Errors).ToArray(),
-            Manifest.Concat(other.Manifest).ToArray());
+            Errors.Concat(other.Errors).ToArray());
     }
 }
 
@@ -52,7 +47,7 @@ public static class FileSystemExporter
             cancellationToken.ThrowIfCancellationRequested();
             try
             {
-                result = result.Add(CopyNode(fileSystem, node, destinationDirectory, destinationDirectory, progress, cancellationToken, options));
+                result = result.Add(CopyNodeCore(fileSystem, node, destinationDirectory, progress, cancellationToken, options));
             }
             catch (Exception ex) when (options.ContinueOnError && ex is not OperationCanceledException)
             {
@@ -60,7 +55,7 @@ public static class FileSystemExporter
             }
         }
 
-        WriteResultFiles(destinationDirectory, result, options);
+        WriteResultFiles(destinationDirectory, result);
 
         return result;
     }
@@ -72,14 +67,13 @@ public static class FileSystemExporter
         IProgress<CopyProgress>? progress = null,
         CancellationToken cancellationToken = default)
     {
-        return CopyNode(fileSystem, node, destinationDirectory, destinationDirectory, progress, cancellationToken, new CopyOptions());
+        return CopyNodeCore(fileSystem, node, destinationDirectory, progress, cancellationToken, new CopyOptions());
     }
 
-    public static CopyResult CopyNode(
+    private static CopyResult CopyNodeCore(
         IReadOnlyFileSystem fileSystem,
         VfsNode node,
         string destinationDirectory,
-        string copyRoot,
         IProgress<CopyProgress>? progress = null,
         CancellationToken cancellationToken = default,
         CopyOptions? options = null)
@@ -89,82 +83,20 @@ public static class FileSystemExporter
         var targetName = string.IsNullOrWhiteSpace(node.Name) ? "root" : SanitizeFileName(node.Name);
         var targetPath = GetAvailablePath(Path.Combine(destinationDirectory, targetName), node.IsDirectory);
         return node.IsDirectory
-            ? CopyDirectory(fileSystem, node, targetPath, copyRoot, progress, cancellationToken, options)
-            : CopyFile(fileSystem, node, targetPath, copyRoot, progress, cancellationToken, options);
-    }
-
-    public static long ExtractFile(
-        IReadOnlyFileSystem fileSystem,
-        VfsNode file,
-        string destinationPath,
-        IProgress<long>? progress = null,
-        CancellationToken cancellationToken = default)
-    {
-        ArgumentNullException.ThrowIfNull(fileSystem);
-        ArgumentNullException.ThrowIfNull(file);
-        if (file.IsDirectory)
-        {
-            throw new ArgumentException("フォルダーは単一ファイルとして抽出できません。", nameof(file));
-        }
-
-        Directory.CreateDirectory(Path.GetDirectoryName(destinationPath) ?? ".");
-        long offset = 0;
-        try
-        {
-            using (var output = new FileStream(
-                destinationPath,
-                FileMode.Create,
-                FileAccess.Write,
-                FileShare.None,
-                CopyBufferSize,
-                FileOptions.SequentialScan))
-            {
-                if (file.Size == 0)
-                {
-                    progress?.Report(0);
-                }
-
-                while (offset < file.Size)
-                {
-                    cancellationToken.ThrowIfCancellationRequested();
-                    var chunkSize = (int)Math.Min(CopyBufferSize, file.Size - offset);
-                    var chunk = fileSystem.ReadFile(file, offset, chunkSize);
-                    if (chunk.Length == 0)
-                    {
-                        throw new EndOfStreamException($"ファイルの途中で読み込みが止まりました: {file.Name}");
-                    }
-
-                    output.Write(chunk, 0, chunk.Length);
-                    offset += chunk.Length;
-                    progress?.Report(offset);
-                }
-            }
-        }
-        catch
-        {
-            TryDeletePartialFile(destinationPath);
-            throw;
-        }
-
-        if (file.ModifiedUtc.HasValue)
-        {
-            TrySetLastWriteTime(destinationPath, file.ModifiedUtc.Value, isDirectory: false);
-        }
-
-        return offset;
+            ? CopyDirectory(fileSystem, node, targetPath, progress, cancellationToken, options)
+            : CopyFile(fileSystem, node, targetPath, progress, cancellationToken);
     }
 
     private static CopyResult CopyDirectory(
         IReadOnlyFileSystem fileSystem,
         VfsNode directory,
         string destinationPath,
-        string copyRoot,
         IProgress<CopyProgress>? progress,
         CancellationToken cancellationToken,
         CopyOptions options)
     {
         Directory.CreateDirectory(destinationPath);
-        var result = new CopyResult(0, 1, 0, Array.Empty<CopyError>(), Array.Empty<CopyManifestEntry>());
+        var result = new CopyResult(0, 1, 0, Array.Empty<CopyError>());
         progress?.Report(new CopyProgress(destinationPath, 0, 0, 1));
 
         foreach (var child in fileSystem.ListDirectory(directory))
@@ -172,7 +104,7 @@ public static class FileSystemExporter
             cancellationToken.ThrowIfCancellationRequested();
             try
             {
-                result = result.Add(CopyNode(fileSystem, child, destinationPath, copyRoot, progress, cancellationToken, options));
+                result = result.Add(CopyNodeCore(fileSystem, child, destinationPath, progress, cancellationToken, options));
             }
             catch (Exception ex) when (options.ContinueOnError && ex is not OperationCanceledException)
             {
@@ -192,15 +124,12 @@ public static class FileSystemExporter
         IReadOnlyFileSystem fileSystem,
         VfsNode file,
         string destinationPath,
-        string copyRoot,
         IProgress<CopyProgress>? progress,
-        CancellationToken cancellationToken,
-        CopyOptions options)
+        CancellationToken cancellationToken)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(destinationPath) ?? ".");
 
         long offset = 0;
-        using var hash = options.CreateSha256Manifest ? IncrementalHash.CreateHash(HashAlgorithmName.SHA256) : null;
         try
         {
             using (var output = new FileStream(destinationPath, FileMode.CreateNew, FileAccess.Write, FileShare.Read))
@@ -221,7 +150,6 @@ public static class FileSystemExporter
                     }
 
                     output.Write(chunk, 0, chunk.Length);
-                    hash?.AppendData(chunk);
                     offset += chunk.Length;
                     progress?.Report(new CopyProgress(destinationPath, offset, 0, 0));
                 }
@@ -238,27 +166,17 @@ public static class FileSystemExporter
             TrySetLastWriteTime(destinationPath, file.ModifiedUtc.Value, isDirectory: false);
         }
 
-        var manifest = options.CreateSha256Manifest
-            ? new[] { new CopyManifestEntry(Path.GetRelativePath(copyRoot, destinationPath), file.Size, Convert.ToHexString(hash!.GetHashAndReset()).ToLowerInvariant()) }
-            : Array.Empty<CopyManifestEntry>();
-        return new CopyResult(1, 0, file.Size, Array.Empty<CopyError>(), manifest);
+        return new CopyResult(1, 0, file.Size, Array.Empty<CopyError>());
     }
 
     private static CopyResult ErrorResult(VfsNode node, string destinationPath, Exception exception)
     {
         return new CopyResult(0, 0, 0,
-            new[] { new CopyError(node.DisplayName, destinationPath, exception.Message) },
-            Array.Empty<CopyManifestEntry>());
+            new[] { new CopyError(node.DisplayName, destinationPath, exception.Message) });
     }
 
-    private static void WriteResultFiles(string destinationDirectory, CopyResult result, CopyOptions options)
+    private static void WriteResultFiles(string destinationDirectory, CopyResult result)
     {
-        if (options.CreateSha256Manifest && result.Manifest.Count > 0)
-        {
-            var lines = result.Manifest.Select(entry => $"{entry.Sha256} *{entry.RelativePath}");
-            File.WriteAllLines(Path.Combine(destinationDirectory, "VirtualDiskExplorer.sha256"), lines, new UTF8Encoding(false));
-        }
-
         if (result.Errors.Count > 0)
         {
             var json = JsonSerializer.Serialize(result.Errors, new JsonSerializerOptions { WriteIndented = true });
