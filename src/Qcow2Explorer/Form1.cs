@@ -114,6 +114,8 @@ public partial class Form1 : Form
         snapshotButton.Click += (_, _) => SelectQcow2Snapshot();
         var vmaDiskButton = new ToolStripButton("VMAディスク");
         vmaDiskButton.Click += (_, _) => SelectVmaDisk();
+        var ovaDiskButton = new ToolStripButton("OVAディスク");
+        ovaDiskButton.Click += (_, _) => SelectOvaDisk();
         toolStrip.Items.Add(openButton);
         toolStrip.Items.Add(openFolderButton);
         toolStrip.Items.Add(openPhysicalDiskButton);
@@ -123,6 +125,7 @@ public partial class Form1 : Form
         toolStrip.Items.Add(reportButton);
         toolStrip.Items.Add(snapshotButton);
         toolStrip.Items.Add(vmaDiskButton);
+        toolStrip.Items.Add(ovaDiskButton);
         toolStrip.Items.Add(new ToolStripSeparator());
         toolStrip.Items.Add(_statusLabel);
         toolStrip.Items.Add(_loadProgressBar);
@@ -881,6 +884,60 @@ public partial class Form1 : Form
         FillHeader();
         AnalyzePartitions();
         _statusLabel.Text = $"VMAディスクを選択しました: {vma.ActiveDevice.Name}";
+    }
+
+    private void SelectOvaDisk()
+    {
+        if (_reader is not OvaDiskImageReader ova)
+        {
+            MessageBox.Show(this, "現在のイメージはOVAではありません。", "OVAディスク", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        using var dialog = new Form
+        {
+            Text = "OVA内の仮想ディスク",
+            Width = 680,
+            Height = 380,
+            StartPosition = FormStartPosition.CenterParent,
+            MinimizeBox = false,
+            MaximizeBox = false
+        };
+        var list = new ListBox { Dock = DockStyle.Fill };
+        foreach (var disk in ova.Disks)
+        {
+            list.Items.Add(disk);
+        }
+
+        list.SelectedIndex = ova.ActiveDiskIndex;
+        var ok = new Button { Text = "選択", DialogResult = DialogResult.OK, Width = 90 };
+        var cancel = new Button { Text = "キャンセル", DialogResult = DialogResult.Cancel, Width = 90 };
+        var buttons = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Bottom,
+            Height = 46,
+            FlowDirection = FlowDirection.RightToLeft,
+            Padding = new Padding(8)
+        };
+        buttons.Controls.Add(cancel);
+        buttons.Controls.Add(ok);
+        dialog.Controls.Add(list);
+        dialog.Controls.Add(buttons);
+        dialog.AcceptButton = ok;
+        dialog.CancelButton = cancel;
+
+        if (dialog.ShowDialog(this) != DialogResult.OK || list.SelectedIndex < 0 || list.SelectedIndex == ova.ActiveDiskIndex)
+        {
+            return;
+        }
+
+        DisposeFileSystems();
+        DisposePartitionReaders();
+        _partitions.Clear();
+        ova.SelectDisk(list.SelectedIndex);
+        FillHeader();
+        AnalyzePartitions();
+        _statusLabel.Text = $"OVAディスクを選択しました: {ova.ActiveDisk.ArchivePath}";
     }
 
     private void AnalyzePartitions()

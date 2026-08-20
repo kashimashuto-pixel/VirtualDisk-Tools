@@ -3,7 +3,7 @@ namespace Qcow2Explorer.Core;
 public static class DiskImageReaderFactory
 {
     public const string DialogFilter =
-        "対応/検出ディスク (*.qcow2;*.qcow;*.vhd;*.vhdx;*.vmdk;*.vdi;*.hdd;*.hds;*.vma;*.dd;*.img;*.raw;*.lzo)|*.qcow2;*.qcow;*.vhd;*.vhdx;*.vmdk;*.vdi;*.hdd;*.hds;*.vma;*.dd;*.img;*.raw;*.lzo|All files (*.*)|*.*";
+        "対応/検出ディスク (*.qcow2;*.qcow;*.vhd;*.vhdx;*.vmdk;*.vdi;*.ova;*.hdd;*.hds;*.vma;*.dd;*.img;*.raw;*.lzo)|*.qcow2;*.qcow;*.vhd;*.vhdx;*.vmdk;*.vdi;*.ova;*.hdd;*.hds;*.vma;*.dd;*.img;*.raw;*.lzo|All files (*.*)|*.*";
 
     public static IDiskImageReader Open(string path, IProgress<DiskImageProgress>? progress = null)
     {
@@ -33,6 +33,11 @@ public static class DiskImageReaderFactory
         if (IsVma(path))
         {
             return new VmaDiskImageReader(new RawDiskImageReader(path, "Proxmox VMA container"), progress);
+        }
+
+        if (path.EndsWith(".ova", StringComparison.OrdinalIgnoreCase))
+        {
+            return OvaDiskImageReader.Open(path, progress);
         }
 
         if (IsQcow2(path))

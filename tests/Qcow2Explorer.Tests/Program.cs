@@ -1,6 +1,7 @@
 using System.Buffers.Binary;
 using System.Globalization;
 using System.IO.Compression;
+using System.Formats.Tar;
 using System.Security.Cryptography;
 using System.Text;
 using Qcow2Explorer;
@@ -12,6 +13,8 @@ using Qcow2Explorer.Previewing;
 using DiscUtils.Streams;
 using DiscXfsFileSystem = DiscUtils.Xfs.XfsFileSystem;
 using VdiDisk = DiscUtils.Vdi.Disk;
+using VmdkDisk = DiscUtils.Vmdk.Disk;
+using VmdkDiskCreateType = DiscUtils.Vmdk.DiskCreateType;
 
 if (args.Length > 0 && string.Equals(args[0], "--list-physical", StringComparison.OrdinalIgnoreCase))
 {
@@ -185,6 +188,19 @@ static void RunGeneratedImageTests()
 
     Console.WriteLine(vdiImagePath);
 
+    var vmdkImagePath = Path.Combine(AppContext.BaseDirectory, "sample-fat16.vmdk");
+    CreateVmdk(vmdkImagePath, rawImagePath);
+    var ovaImagePath = Path.Combine(AppContext.BaseDirectory, "sample-fat16.ova");
+    CreateOva(ovaImagePath, vmdkImagePath);
+    using (var ovaReader = DiskImageReaderFactory.Open(ovaImagePath))
+    {
+        Assert(ovaReader is OvaDiskImageReader, "OVA image factory");
+        Assert(ovaReader.FormatName.StartsWith("OVA", StringComparison.OrdinalIgnoreCase), "OVA format name");
+        AssertFat16Readable(ovaReader, "OVA");
+    }
+
+    Console.WriteLine(ovaImagePath);
+
     var hddImagePath = Path.Combine(AppContext.BaseDirectory, "sample-fat16.hdd");
     TestImageFactory.CreateParallelsHdd(hddImagePath);
     using (var hddReader = DiskImageReaderFactory.Open(hddImagePath))
@@ -202,6 +218,35 @@ static void RunGeneratedImageTests()
     }
 
     RunProjFsRemountSmoke(rawFs);
+}
+
+static void CreateOva(string ovaPath, string diskPath)
+{
+    const string diskName = "disk.vmdk";
+    var diskLength = new FileInfo(diskPath).Length;
+    var ovf = $"""
+        <?xml version="1.0" encoding="UTF-8"?>
+        <Envelope xmlns="http://schemas.dmtf.org/ovf/envelope/1" xmlns:ovf="http://schemas.dmtf.org/ovf/envelope/1">
+          <References><File ovf:id="disk-file" ovf:href="{diskName}" /></References>
+          <DiskSection><Disk ovf:diskId="disk-1" ovf:fileRef="disk-file" ovf:capacity="{diskLength}" /></DiskSection>
+        </Envelope>
+        """;
+
+    using var output = new FileStream(ovaPath, FileMode.Create, FileAccess.Write, FileShare.None);
+    using var writer = new TarWriter(output, TarEntryFormat.Pax, leaveOpen: false);
+    using var ovfStream = new MemoryStream(Encoding.UTF8.GetBytes(ovf));
+    var ovfEntry = new PaxTarEntry(TarEntryType.RegularFile, "appliance.ovf") { DataStream = ovfStream };
+    writer.WriteEntry(ovfEntry);
+    using var diskStream = new FileStream(diskPath, FileMode.Open, FileAccess.Read, FileShare.Read);
+    var diskEntry = new PaxTarEntry(TarEntryType.RegularFile, diskName) { DataStream = diskStream };
+    writer.WriteEntry(diskEntry);
+}
+
+static void CreateVmdk(string vmdkPath, string rawPath)
+{
+    using var disk = VmdkDisk.Initialize(vmdkPath, new FileInfo(rawPath).Length, VmdkDiskCreateType.MonolithicSparse);
+    using var raw = new FileStream(rawPath, FileMode.Open, FileAccess.Read, FileShare.Read);
+    raw.CopyTo(disk.Content);
 }
 
 static void Test4KnGptParsing()

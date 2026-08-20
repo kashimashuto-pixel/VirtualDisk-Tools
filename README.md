@@ -59,6 +59,9 @@ C# / Windows Forms で作成した、読み取り専用の仮想ディスク解�
 - VHDX
 - VMDK
 - VDI
+- OVA (`.ova`)
+  - tarアーカイブを安全な一時フォルダへ展開し、OVFが参照するVMDKなどを既存の読み取り処理で解析
+  - 複数の仮想ディスクを含む場合は、ツールバーの「OVAディスク」から切り替え
 - Parallels HDD / HDS (`.hdd` フォルダ、`.hds`)
 - Proxmox VMA (`.vma` / `.vma.lzo`)
   - VMAヘッダーとエクステントのMD5を検証
@@ -148,6 +151,7 @@ ProjFS マウントは Windows の Client-ProjFS 機能を使い、選択した�
 - LVM2 は、現在の入力内に必要なPVがすべてあり、LVが単一stripeのlinear相当である構成を読み取ります。
 - 複数ディスクにまたがり一部PVが入力されていないVG、複数stripe、thin/snapshot/cache/mirror/RAID segmentは未対応です。検出できたメタデータから該当理由を表示します。
 - Parallels HDD は単一 Storage の Plain / Compressed image を読み取ります。split image、未知の image type、仕様外の拡張は未対応です。
+- OVAは読み取り中に内容を一時フォルダへ展開するため、アーカイブ内のファイル容量と同程度の空き容量が必要です。一時ファイルはイメージを閉じると削除します。
 - ProjFS マウントはフォルダ投影型です。Windows のドライブ文字としての実マウントではありません。
 - Office別窓プレビューは内容確認用です。Wordの画像・厳密なレイアウト・変更履歴、Excelの書式・グラフ・マクロ実行には対応しません。
 - 旧バイナリOffice形式の `.doc` / `.xls` は別窓プレビュー対象外です。
