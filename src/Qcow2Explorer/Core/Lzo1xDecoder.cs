@@ -3,8 +3,12 @@ namespace Qcow2Explorer.Core;
 // Derived from AxioDL/lzokay, Copyright (c) 2018 Jack Andersen, MIT License.
 internal static class Lzo1xDecoder
 {
-    public static int Decompress(ReadOnlySpan<byte> source, Span<byte> destination)
+    public static int Decompress(
+        ReadOnlySpan<byte> source,
+        Span<byte> destination,
+        CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         if (source.Length < 3)
         {
             throw new InvalidDataException("LZO1Xブロックが短すぎます。");
@@ -18,17 +22,18 @@ internal static class Lzo1xDecoder
         if (source[input] >= 22)
         {
             var length = source[input++] - 17;
-            CopyLiterals(source, destination, ref input, ref output, length);
+            CopyLiterals(source, destination, ref input, ref output, length, cancellationToken);
             state = 4;
         }
         else if (source[input] >= 18)
         {
             state = source[input++] - 17;
-            CopyLiterals(source, destination, ref input, ref output, state);
+            CopyLiterals(source, destination, ref input, ref output, state, cancellationToken);
         }
 
         while (true)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             RequireInput(source, input, 1);
             var instruction = source[input++];
             int match;
@@ -46,7 +51,7 @@ internal static class Lzo1xDecoder
                 matchLength = (instruction & 0x1f) + 2;
                 if (matchLength == 2)
                 {
-                    matchLength += ReadExtendedLength(source, ref input, 31);
+                    matchLength += ReadExtendedLength(source, ref input, 31, cancellationToken);
                 }
 
                 RequireInput(source, input, 2);
@@ -60,7 +65,7 @@ internal static class Lzo1xDecoder
                 matchLength = (instruction & 0x7) + 2;
                 if (matchLength == 2)
                 {
-                    matchLength += ReadExtendedLength(source, ref input, 7);
+                    matchLength += ReadExtendedLength(source, ref input, 7, cancellationToken);
                 }
 
                 RequireInput(source, input, 2);
@@ -80,10 +85,10 @@ internal static class Lzo1xDecoder
                 var length = instruction + 3;
                 if (length == 3)
                 {
-                    length += ReadExtendedLength(source, ref input, 15);
+                    length += ReadExtendedLength(source, ref input, 15, cancellationToken);
                 }
 
-                CopyLiterals(source, destination, ref input, ref output, length);
+                CopyLiterals(source, destination, ref input, ref output, length, cancellationToken);
                 state = 4;
                 continue;
             }
@@ -111,6 +116,11 @@ internal static class Lzo1xDecoder
             RequireOutput(destination, output, checked(matchLength + nextState));
             for (var index = 0; index < matchLength; index++)
             {
+                if ((index & 0x3fff) == 0)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                }
+
                 destination[output++] = destination[match++];
             }
 
@@ -137,11 +147,16 @@ internal static class Lzo1xDecoder
         return output;
     }
 
-    private static int ReadExtendedLength(ReadOnlySpan<byte> source, ref int input, int basis)
+    private static int ReadExtendedLength(
+        ReadOnlySpan<byte> source,
+        ref int input,
+        int basis,
+        CancellationToken cancellationToken)
     {
         var zeroCount = 0;
         while (true)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             RequireInput(source, input, 1);
             var value = source[input++];
             if (value != 0)
@@ -158,13 +173,16 @@ internal static class Lzo1xDecoder
         Span<byte> destination,
         ref int input,
         ref int output,
-        int length)
+        int length,
+        CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         RequireInput(source, input, length);
         RequireOutput(destination, output, length);
         source.Slice(input, length).CopyTo(destination[output..]);
         input += length;
         output += length;
+        cancellationToken.ThrowIfCancellationRequested();
     }
 
     private static void RequireInput(ReadOnlySpan<byte> source, int offset, int count)

@@ -18,16 +18,21 @@ public sealed class VmaDiskImageReader : IDiskImageReader
 
     private readonly IDiskImageReader _source;
     private readonly IProgress<DiskImageProgress>? _progress;
+    private readonly CancellationToken _cancellationToken;
     private readonly Dictionary<byte, Dictionary<uint, VmaClusterMap>> _clusterMaps = [];
     private readonly List<string> _warnings = [];
     private long _extentCount;
     private long _storedBlockCount;
     private int _activeDeviceIndex;
 
-    public VmaDiskImageReader(IDiskImageReader source, IProgress<DiskImageProgress>? progress = null)
+    public VmaDiskImageReader(
+        IDiskImageReader source,
+        IProgress<DiskImageProgress>? progress = null,
+        CancellationToken cancellationToken = default)
     {
         _source = source;
         _progress = progress;
+        _cancellationToken = cancellationToken;
         Path = source.Path;
         FormatName = source switch
         {
@@ -59,8 +64,9 @@ public sealed class VmaDiskImageReader : IDiskImageReader
     public int ActiveDeviceIndex => _activeDeviceIndex;
     public VmaDevice ActiveDevice => Devices[_activeDeviceIndex];
 
-    public static bool HasMagic(IBlockReader reader)
+    public static bool HasMagic(IBlockReader reader, CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         if (reader.Length < HeaderMagic.Length)
         {
             return false;
@@ -144,6 +150,7 @@ public sealed class VmaDiskImageReader : IDiskImageReader
         var remaining = checked((int)Math.Min(count, Length - offset));
         while (remaining > 0)
         {
+            _cancellationToken.ThrowIfCancellationRequested();
             var clusterNumber = checked((uint)(offset / ClusterSize));
             var inCluster = checked((int)(offset % ClusterSize));
             var blockIndex = inCluster / BlockSize;
@@ -168,6 +175,7 @@ public sealed class VmaDiskImageReader : IDiskImageReader
 
     private void ReadHeader()
     {
+        _cancellationToken.ThrowIfCancellationRequested();
         if (_source.Length < FixedHeaderSize)
         {
             throw new InvalidDataException("VMAヘッダーが途中で終了しています。");
@@ -210,6 +218,7 @@ public sealed class VmaDiskImageReader : IDiskImageReader
         var devices = new List<VmaDevice>();
         for (var deviceId = 1; deviceId < 256; deviceId++)
         {
+            _cancellationToken.ThrowIfCancellationRequested();
             var infoOffset = 4096 + deviceId * 32;
             var namePointer = BinaryPrimitives.ReadUInt32BigEndian(header.AsSpan(infoOffset, 4));
             var sizeValue = BinaryPrimitives.ReadUInt64BigEndian(header.AsSpan(infoOffset + 8, 8));
@@ -255,6 +264,7 @@ public sealed class VmaDiskImageReader : IDiskImageReader
 
         while (position < _source.Length)
         {
+            _cancellationToken.ThrowIfCancellationRequested();
             if (_source.Length - position < ExtentHeaderSize)
             {
                 throw new InvalidDataException($"VMA末尾に不完全なエクステントがあります: offset=0x{position:X}");
@@ -278,6 +288,7 @@ public sealed class VmaDiskImageReader : IDiskImageReader
 
             for (var entryIndex = 0; entryIndex < BlocksPerExtent; entryIndex++)
             {
+                _cancellationToken.ThrowIfCancellationRequested();
                 var infoOffset = 40 + entryIndex * 8;
                 var mask = BinaryPrimitives.ReadUInt16BigEndian(header.AsSpan(infoOffset, 2));
                 var deviceId = header[infoOffset + 3];
@@ -381,6 +392,7 @@ public sealed class VmaDiskImageReader : IDiskImageReader
 
     private byte[] ReadExactAt(long offset, int count)
     {
+        _cancellationToken.ThrowIfCancellationRequested();
         if (offset < 0 || count < 0 || offset > _source.Length - count)
         {
             throw new EndOfStreamException($"VMAデータが途中で終了しています: offset=0x{offset:X}, length={count:N0}");
@@ -388,6 +400,7 @@ public sealed class VmaDiskImageReader : IDiskImageReader
 
         var data = new byte[count];
         _source.ReadAt(offset, data, 0, count);
+        _cancellationToken.ThrowIfCancellationRequested();
         return data;
     }
 

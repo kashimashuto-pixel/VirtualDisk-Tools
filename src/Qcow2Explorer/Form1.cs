@@ -1,6 +1,7 @@
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Globalization;
+using System.Security.Cryptography;
 using System.Text;
 using Qcow2Explorer.Core;
 using Qcow2Explorer.FileSystems;
@@ -16,6 +17,7 @@ public partial class Form1 : Form
     private readonly ToolStripTextBox _pathBox = new() { AutoSize = false, Width = 480, ReadOnly = true };
     private readonly ToolStripLabel _statusLabel = new("ディスクイメージを開いてください");
     private readonly ToolStripProgressBar _loadProgressBar = new() { AutoSize = false, Width = 140, Visible = false };
+    private readonly ToolStripButton _cancelLoadButton = new("読み込みキャンセル") { Enabled = false };
     private readonly ToolStripTextBox _searchBox = new() { AutoSize = false, Width = 240, BorderStyle = BorderStyle.FixedSingle, ToolTipText = "現在のパーティションからファイル名を検索" };
     private readonly ToolStripButton _cancelSearchButton = new("検索キャンセル") { Enabled = false };
     private readonly ToolStripButton _cancelCopyButton = new("コピーキャンセル") { Enabled = false };
@@ -50,12 +52,14 @@ public partial class Form1 : Form
     private VfsNode? _currentDirectory;
     private string _currentDirectoryPath = "/";
     private CancellationTokenSource? _searchCancellation;
+    private CancellationTokenSource? _loadCancellation;
     private readonly HashSet<CancellationTokenSource> _copyCancellations = [];
     private readonly SemaphoreSlim _copyExecutionGate = new(1, 1);
     private CancellationTokenSource? _copyProgressOwner;
     private readonly NavigationHistory<TreeNode> _navigationHistory = new();
     private bool _isHistoryNavigation;
     private bool _isLoadingImage;
+    private bool _closeAfterLoadCancellation;
     private UefiVariableStore? _currentUefiVariableStore;
     private SwtpmStateStore? _currentTpmStateStore;
 
@@ -70,6 +74,7 @@ public partial class Form1 : Form
         FormClosing += Form1FormClosing;
         FormClosed += (_, _) =>
         {
+            _loadCancellation?.Cancel();
             _searchCancellation?.Cancel();
             CancelCopyOperations();
             DisposeMounts();
@@ -137,6 +142,8 @@ public partial class Form1 : Form
         toolStrip.Items.Add(new ToolStripSeparator());
         toolStrip.Items.Add(_statusLabel);
         toolStrip.Items.Add(_loadProgressBar);
+        _cancelLoadButton.Click += (_, _) => CancelImageLoad();
+        toolStrip.Items.Add(_cancelLoadButton);
 
         var tabs = new TabControl { Dock = DockStyle.Fill };
         tabs.TabPages.Add(CreateSummaryTab());
@@ -687,9 +694,12 @@ public partial class Form1 : Form
         }
 
         _isLoadingImage = true;
+        var loadCancellation = new CancellationTokenSource();
+        _loadCancellation = loadCancellation;
         UseWaitCursor = true;
         _loadProgressBar.Visible = true;
         _loadProgressBar.Style = ProgressBarStyle.Marquee;
+        _cancelLoadButton.Enabled = true;
         _statusLabel.Text = "ディスクイメージを開いています...";
         ImageLoadResult? loadResult = null;
         var adopted = false;
@@ -705,7 +715,10 @@ public partial class Form1 : Form
                 rawLength,
                 progress,
                 lzopSelection.Mode,
-                lzopSelection.TemporaryDirectory));
+                lzopSelection.TemporaryDirectory,
+                loadCancellation.Token),
+                loadCancellation.Token);
+            loadCancellation.Token.ThrowIfCancellationRequested();
             if (IsDisposed)
             {
                 return;
@@ -744,6 +757,13 @@ public partial class Form1 : Form
             _statusLabel.Text = "管理者権限が必要です";
             PromptRestartAsAdministrator(path, ex.Message);
         }
+        catch (OperationCanceledException) when (loadCancellation.IsCancellationRequested)
+        {
+            if (!IsDisposed)
+            {
+                _statusLabel.Text = "ディスクイメージの読み込みをキャンセルしました";
+            }
+        }
         catch (Exception ex)
         {
             _statusLabel.Text = "読込失敗";
@@ -756,11 +776,39 @@ public partial class Form1 : Form
                 loadResult.Dispose();
             }
 
+            if (ReferenceEquals(_loadCancellation, loadCancellation))
+            {
+                _loadCancellation = null;
+            }
+
+            loadCancellation.Dispose();
             _isLoadingImage = false;
-            UseWaitCursor = false;
-            _loadProgressBar.Visible = false;
-            _loadProgressBar.Style = ProgressBarStyle.Blocks;
+            if (!IsDisposed)
+            {
+                UseWaitCursor = false;
+                _loadProgressBar.Visible = false;
+                _loadProgressBar.Style = ProgressBarStyle.Blocks;
+                _cancelLoadButton.Enabled = false;
+                if (_closeAfterLoadCancellation)
+                {
+                    _closeAfterLoadCancellation = false;
+                    BeginInvoke(new Action(Close));
+                }
+            }
         }
+    }
+
+    private void CancelImageLoad()
+    {
+        var cancellation = _loadCancellation;
+        if (cancellation is null || cancellation.IsCancellationRequested)
+        {
+            return;
+        }
+
+        cancellation.Cancel();
+        _cancelLoadButton.Enabled = false;
+        _statusLabel.Text = "ディスクイメージの読み込みをキャンセル中...";
     }
 
     private void UpdateLoadProgress(DiskImageProgress progress)
@@ -788,17 +836,26 @@ public partial class Form1 : Form
         int rawLength,
         IProgress<DiskImageProgress> progress,
         LzopOpenMode lzopOpenMode,
-        string? lzopTemporaryDirectory)
+        string? lzopTemporaryDirectory,
+        CancellationToken cancellationToken)
     {
         IDiskImageReader? reader = null;
         var ownedReaders = new List<IDisposable>();
         try
         {
-            reader = DiskImageReaderFactory.Open(path, progress, lzopOpenMode, lzopTemporaryDirectory);
-            var analysis = AnalyzeImage(reader, ownedReaders, progress);
+            cancellationToken.ThrowIfCancellationRequested();
+            reader = DiskImageReaderFactory.Open(
+                path,
+                progress,
+                lzopOpenMode,
+                lzopTemporaryDirectory,
+                cancellationToken);
+            var analysis = AnalyzeImage(reader, ownedReaders, progress, cancellationToken);
             progress.Report(new DiskImageProgress("先頭データを読み込み中..."));
+            cancellationToken.ThrowIfCancellationRequested();
             var rawData = new byte[rawLength];
             reader.ReadAt(rawOffset, rawData, 0, rawLength);
+            cancellationToken.ThrowIfCancellationRequested();
             var rawHex = HexFormatter.Format(rawData, rawOffset);
             return new ImageLoadResult(reader, analysis, rawHex);
         }
@@ -817,10 +874,12 @@ public partial class Form1 : Form
     private static ImageAnalysis AnalyzeImage(
         IDiskImageReader reader,
         List<IDisposable> ownedReaders,
-        IProgress<DiskImageProgress> progress)
+        IProgress<DiskImageProgress> progress,
+        CancellationToken cancellationToken)
     {
         progress.Report(new DiskImageProgress("パーティションテーブルを解析中..."));
-        var discovered = PartitionTableReader.ReadPartitions(reader).ToList();
+        cancellationToken.ThrowIfCancellationRequested();
+        var discovered = PartitionTableReader.ReadPartitions(reader, cancellationToken).ToList();
         if (discovered.Count == 0 && reader.Length >= 512)
         {
             discovered.Add(new PartitionInfo
@@ -837,11 +896,12 @@ public partial class Form1 : Form
 
         for (var index = 0; index < discovered.Count; index++)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             progress.Report(new DiskImageProgress(
                 $"ファイルシステムを検出中: {index + 1:N0} / {discovered.Count:N0}",
                 index + 1,
                 discovered.Count));
-            discovered[index].FileSystem = FileSystemDetector.Detect(reader, discovered[index]);
+            discovered[index].FileSystem = FileSystemDetector.Detect(reader, discovered[index], cancellationToken);
         }
 
         var allPartitions = new List<PartitionInfo>(discovered);
@@ -857,10 +917,12 @@ public partial class Form1 : Form
                 reader,
                 lvmPartitions,
                 allPartitions.Count + 1,
-                ownedReaders);
+                ownedReaders,
+                cancellationToken);
             foreach (var partition in lvmResult.Volumes)
             {
-                partition.FileSystem = FileSystemDetector.Detect(reader, partition);
+                cancellationToken.ThrowIfCancellationRequested();
+                partition.FileSystem = FileSystemDetector.Detect(reader, partition, cancellationToken);
                 allPartitions.Add(partition);
             }
 
@@ -1775,6 +1837,47 @@ public partial class Form1 : Form
         try
         {
             var fs = FileSystemDetector.TryOpen(_reader, partition, out var error);
+            if (fs is null && TryReadBitLockerRecoveryMetadata(partition, out var metadata))
+            {
+                Cursor = Cursors.Default;
+                while (TryPromptForBitLockerRecoveryPassword(metadata, out var recoveryPasswordKey))
+                {
+                    try
+                    {
+                        Cursor = Cursors.WaitCursor;
+                        fs = FileSystemDetector.TryOpen(_reader, partition, recoveryPasswordKey, out error);
+                    }
+                    finally
+                    {
+                        CryptographicOperations.ZeroMemory(recoveryPasswordKey);
+                    }
+
+                    if (fs is not null)
+                    {
+                        break;
+                    }
+
+                    Cursor = Cursors.Default;
+                    var retry = MessageBox.Show(
+                        this,
+                        $"{error}{Environment.NewLine}{Environment.NewLine}回復パスワードを再入力しますか？",
+                        "BitLocker解除失敗",
+                        MessageBoxButtons.RetryCancel,
+                        MessageBoxIcon.Warning);
+                    if (retry != DialogResult.Retry)
+                    {
+                        _statusLabel.Text = "BitLocker解除をキャンセルしました";
+                        return null;
+                    }
+                }
+
+                if (fs is null)
+                {
+                    _statusLabel.Text = "BitLocker解除をキャンセルしました";
+                    return null;
+                }
+            }
+
             if (fs is null)
             {
                 MessageBox.Show(this, error, "ファイルシステム未対応", MessageBoxButtons.OK, MessageBoxIcon.Information);
@@ -1789,6 +1892,119 @@ public partial class Form1 : Form
         {
             Cursor = Cursors.Default;
         }
+    }
+
+    private bool TryReadBitLockerRecoveryMetadata(PartitionInfo partition, out BitLockerMetadata metadata)
+    {
+        metadata = null!;
+        if (_reader is null
+            || !partition.FileSystem.StartsWith("BitLocker/FVE", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var slice = new PartitionSliceReader(_reader, partition);
+        if (!BitLockerMetadataReader.TryRead(slice, out var parsed, out _)
+            || parsed is null
+            || !parsed.HasRecoveryPasswordProtector)
+        {
+            return false;
+        }
+
+        metadata = parsed;
+        return true;
+    }
+
+    private bool TryPromptForBitLockerRecoveryPassword(
+        BitLockerMetadata metadata,
+        out byte[] recoveryPasswordKey)
+    {
+        recoveryPasswordKey = Array.Empty<byte>();
+        byte[]? decodedKey = null;
+
+        using var dialog = new Form
+        {
+            Text = "BitLocker回復パスワード",
+            ClientSize = new Size(620, 230),
+            FormBorderStyle = FormBorderStyle.FixedDialog,
+            MaximizeBox = false,
+            MinimizeBox = false,
+            ShowInTaskbar = false,
+            StartPosition = FormStartPosition.CenterParent
+        };
+        var protectorIds = metadata.KeyProtectors
+            .Where(protector => protector.ProtectionType == BitLockerProtectionType.RecoveryPassword)
+            .Select(protector => protector.Identifier.ToString("B"))
+            .Distinct(StringComparer.OrdinalIgnoreCase);
+        var explanation = new Label
+        {
+            AutoSize = false,
+            Location = new Point(16, 14),
+            Size = new Size(588, 62),
+            Text = $"このボリュームはBitLockerで保護されています。48桁の回復パスワードを入力してください。{Environment.NewLine}" +
+                $"形式: 000000-000000-000000-000000-000000-000000-000000-000000{Environment.NewLine}" +
+                $"回復キーID: {string.Join(", ", protectorIds)}"
+        };
+        var passwordBox = new TextBox
+        {
+            Location = new Point(16, 88),
+            Size = new Size(588, 27),
+            UseSystemPasswordChar = true,
+            MaxLength = 96
+        };
+        var showPassword = new CheckBox
+        {
+            AutoSize = true,
+            Location = new Point(16, 126),
+            Text = "入力内容を表示"
+        };
+        var okButton = new Button
+        {
+            Location = new Point(420, 178),
+            Size = new Size(88, 32),
+            Text = "解除"
+        };
+        var cancelButton = new Button
+        {
+            DialogResult = DialogResult.Cancel,
+            Location = new Point(516, 178),
+            Size = new Size(88, 32),
+            Text = "キャンセル"
+        };
+
+        showPassword.CheckedChanged += (_, _) => passwordBox.UseSystemPasswordChar = !showPassword.Checked;
+        okButton.Click += (_, _) =>
+        {
+            if (!BitLockerRecoveryPassword.TryDecode(passwordBox.Text, out var candidate, out var validationError))
+            {
+                MessageBox.Show(dialog, validationError, "回復パスワードの確認", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                passwordBox.Focus();
+                passwordBox.SelectAll();
+                return;
+            }
+
+            decodedKey = candidate;
+            dialog.DialogResult = DialogResult.OK;
+            dialog.Close();
+        };
+        dialog.FormClosed += (_, _) => passwordBox.Clear();
+        dialog.Controls.AddRange([explanation, passwordBox, showPassword, okButton, cancelButton]);
+        dialog.AcceptButton = okButton;
+        dialog.CancelButton = cancelButton;
+        dialog.Shown += (_, _) => passwordBox.Focus();
+
+        if (dialog.ShowDialog(this) != DialogResult.OK || decodedKey is null)
+        {
+            if (decodedKey is not null)
+            {
+                CryptographicOperations.ZeroMemory(decodedKey);
+            }
+
+            return false;
+        }
+
+        recoveryPasswordKey = decodedKey;
+        return true;
     }
 
     private void DisposeFileSystems()
@@ -2311,7 +2527,18 @@ public partial class Form1 : Form
         if (!ConfirmAndDisposeMounts("アプリ終了前にマウントを解除します。続行しますか？"))
         {
             e.Cancel = true;
+            return;
         }
+
+        if (_isLoadingImage)
+        {
+            _closeAfterLoadCancellation = true;
+            CancelImageLoad();
+            e.Cancel = true;
+            return;
+        }
+
+        _loadCancellation?.Cancel();
     }
 
     private static TreeNode CreateDummyNode()

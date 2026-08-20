@@ -34,7 +34,8 @@ public sealed class TemporaryLzopDiskImageReader : IDiskImageReader
     public static TemporaryLzopDiskImageReader Open(
         string path,
         IProgress<DiskImageProgress>? progress = null,
-        string? temporaryRoot = null)
+        string? temporaryRoot = null,
+        CancellationToken cancellationToken = default)
     {
         var sourcePath = System.IO.Path.GetFullPath(path);
         temporaryRoot = string.IsNullOrWhiteSpace(temporaryRoot)
@@ -50,7 +51,8 @@ public sealed class TemporaryLzopDiskImageReader : IDiskImageReader
         RawDiskImageReader? rawReader = null;
         try
         {
-            using var lzop = new LzopDiskImageReader(sourcePath, progress);
+            using var lzop = new LzopDiskImageReader(sourcePath, progress, cancellationToken);
+            cancellationToken.ThrowIfCancellationRequested();
             EnsureTemporarySpace(temporaryDirectory, lzop.Length);
             progress?.Report(new DiskImageProgress(
                 "LZO高速モード: 一時RAWの領域を事前確保しています...",
@@ -75,8 +77,10 @@ public sealed class TemporaryLzopDiskImageReader : IDiskImageReader
                 long offset = 0;
                 while (offset < lzop.Length)
                 {
+                    cancellationToken.ThrowIfCancellationRequested();
                     var count = (int)Math.Min(buffer.Length, lzop.Length - offset);
                     lzop.ReadAt(offset, buffer, 0, count);
+                    cancellationToken.ThrowIfCancellationRequested();
                     output.Write(buffer, 0, count);
                     offset += count;
                     progress?.Report(new DiskImageProgress(
@@ -86,6 +90,7 @@ public sealed class TemporaryLzopDiskImageReader : IDiskImageReader
                 }
             }
 
+            cancellationToken.ThrowIfCancellationRequested();
             rawReader = new RawDiskImageReader(temporaryPath, "raw/dd (lzop高速モード一時展開)");
             return new TemporaryLzopDiskImageReader(
                 sourcePath,

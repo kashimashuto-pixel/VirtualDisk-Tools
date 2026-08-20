@@ -32,9 +32,19 @@ public sealed class BitLockerFileSystem : IReadOnlyFileSystem, IDisposable
 
     public void Dispose()
     {
-        if (_inner is IDisposable disposable)
+        try
         {
-            disposable.Dispose();
+            if (_inner is IDisposable disposable)
+            {
+                disposable.Dispose();
+            }
+        }
+        finally
+        {
+            if (DecryptedReader is IDisposable readerDisposable)
+            {
+                readerDisposable.Dispose();
+            }
         }
     }
 }
