@@ -273,12 +273,71 @@ public static class BitLockerUnlock
             return false;
         }
 
+        return TryCreateReaderWithStretchProtector(
+            encryptedReader,
+            metadata,
+            BitLockerProtectionType.RecoveryPassword,
+            recoveryPasswordKey,
+            inputIsInitialHash: false,
+            "回復パスワード",
+            out decryptedReader,
+            out error,
+            cancellationToken);
+    }
+
+    public static bool TryCreateReaderWithPassword(
+        IBlockReader encryptedReader,
+        BitLockerMetadata metadata,
+        ReadOnlySpan<char> password,
+        out IBlockReader? decryptedReader,
+        out string error,
+        CancellationToken cancellationToken = default)
+    {
+        decryptedReader = null;
+        if (!BitLockerPassword.TryDeriveInitialHash(password, out var initialHash, out error))
+        {
+            return false;
+        }
+
+        try
+        {
+            return TryCreateReaderWithStretchProtector(
+                encryptedReader,
+                metadata,
+                BitLockerProtectionType.Password,
+                initialHash,
+                inputIsInitialHash: true,
+                "パスワード",
+                out decryptedReader,
+                out error,
+                cancellationToken);
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(initialHash);
+        }
+    }
+
+    private static bool TryCreateReaderWithStretchProtector(
+        IBlockReader encryptedReader,
+        BitLockerMetadata metadata,
+        BitLockerProtectionType protectionType,
+        ReadOnlySpan<byte> keyMaterial,
+        bool inputIsInitialHash,
+        string credentialName,
+        out IBlockReader? decryptedReader,
+        out string error,
+        CancellationToken cancellationToken)
+    {
+        decryptedReader = null;
+        error = "";
+
         var recoveryProtectors = metadata.KeyProtectors
-            .Where(protector => protector.ProtectionType == BitLockerProtectionType.RecoveryPassword)
+            .Where(protector => protector.ProtectionType == protectionType)
             .ToList();
         if (recoveryProtectors.Count == 0)
         {
-            error = "回復パスワード保護子がありません。";
+            error = $"{credentialName}保護子がありません。";
             return false;
         }
 
@@ -321,10 +380,15 @@ public static class BitLockerUnlock
             byte[]? fvek = null;
             try
             {
-                stretchedKey = BitLockerRecoveryPassword.DeriveStretchedKey(
-                    recoveryPasswordKey,
-                    stretchEntry.Data.AsSpan(4, BitLockerRecoveryPassword.SaltSize),
-                    cancellationToken);
+                stretchedKey = inputIsInitialHash
+                    ? BitLockerRecoveryPassword.DeriveStretchedKeyFromInitialHash(
+                        keyMaterial,
+                        stretchEntry.Data.AsSpan(4, BitLockerRecoveryPassword.SaltSize),
+                        cancellationToken)
+                    : BitLockerRecoveryPassword.DeriveStretchedKey(
+                        keyMaterial,
+                        stretchEntry.Data.AsSpan(4, BitLockerRecoveryPassword.SaltSize),
+                        cancellationToken);
                 vmkEntryBytes = DecryptAesCcmEntry(stretchedKey, encryptedVmkEntry.Data);
                 vmk = ExtractKeyFromDecryptedEntry(vmkEntryBytes, "VMK");
                 fvekEntryBytes = DecryptAesCcmEntry(vmk, encryptedFvekEntry.Data);
@@ -355,9 +419,9 @@ public static class BitLockerUnlock
         }
 
         error = usableProtectorCount == 0
-            ? "回復パスワード保護子にstretch keyまたは暗号化VMKがありません。"
+            ? $"{credentialName}保護子にstretch keyまたは暗号化VMKがありません。"
             : string.IsNullOrWhiteSpace(error)
-                ? "回復パスワードがこのBitLocker保護子と一致しません。"
+                ? $"{credentialName}がこのBitLocker保護子と一致しません。"
                 : error;
         return false;
     }
@@ -408,6 +472,11 @@ public static class BitLockerUnlock
         if (metadata.HasRecoveryPasswordProtector)
         {
             return "回復パスワード保護子があります。48桁の回復パスワードを入力して解除できます。";
+        }
+
+        if (metadata.HasPasswordProtector)
+        {
+            return "パスワード保護子があります。BitLockerパスワードを入力して解除できます。";
         }
 
         return "対応する解除キーが必要です。TPM のみの保護子はオフライン復号できません。";

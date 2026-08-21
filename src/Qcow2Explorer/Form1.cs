@@ -2086,19 +2086,22 @@ public partial class Form1 : Form
         try
         {
             var fs = FileSystemDetector.TryOpen(_reader, partition, out var error);
-            if (fs is null && TryReadBitLockerRecoveryMetadata(partition, out var metadata))
+            if (fs is null && TryReadBitLockerUnlockMetadata(partition, out var metadata))
             {
                 Cursor = Cursors.Default;
-                while (TryPromptForBitLockerRecoveryPassword(metadata, out var recoveryPasswordKey))
+                while (TryPromptForBitLockerCredential(metadata, out var recoveryPasswordKey, out var password))
                 {
                     try
                     {
                         Cursor = Cursors.WaitCursor;
-                        fs = FileSystemDetector.TryOpen(_reader, partition, recoveryPasswordKey, out error);
+                        fs = recoveryPasswordKey.Length > 0
+                            ? FileSystemDetector.TryOpen(_reader, partition, recoveryPasswordKey, out error)
+                            : FileSystemDetector.TryOpenWithBitLockerPassword(_reader, partition, password, out error);
                     }
                     finally
                     {
                         CryptographicOperations.ZeroMemory(recoveryPasswordKey);
+                        Array.Clear(password);
                     }
 
                     if (fs is not null)
@@ -2109,7 +2112,7 @@ public partial class Form1 : Form
                     Cursor = Cursors.Default;
                     var retry = MessageBox.Show(
                         this,
-                        $"{error}{Environment.NewLine}{Environment.NewLine}回復パスワードを再入力しますか？",
+                        $"{error}{Environment.NewLine}{Environment.NewLine}解除情報を再入力しますか？",
                         "BitLocker解除失敗",
                         MessageBoxButtons.RetryCancel,
                         MessageBoxIcon.Warning);
@@ -2143,7 +2146,7 @@ public partial class Form1 : Form
         }
     }
 
-    private bool TryReadBitLockerRecoveryMetadata(PartitionInfo partition, out BitLockerMetadata metadata)
+    private bool TryReadBitLockerUnlockMetadata(PartitionInfo partition, out BitLockerMetadata metadata)
     {
         metadata = null!;
         if (_reader is null
@@ -2155,7 +2158,7 @@ public partial class Form1 : Form
         var slice = new PartitionSliceReader(_reader, partition);
         if (!BitLockerMetadataReader.TryRead(slice, out var parsed, out _)
             || parsed is null
-            || !parsed.HasRecoveryPasswordProtector)
+            || (!parsed.HasRecoveryPasswordProtector && !parsed.HasPasswordProtector))
         {
             return false;
         }
@@ -2164,24 +2167,27 @@ public partial class Form1 : Form
         return true;
     }
 
-    private bool TryPromptForBitLockerRecoveryPassword(
+    private bool TryPromptForBitLockerCredential(
         BitLockerMetadata metadata,
-        out byte[] recoveryPasswordKey)
+        out byte[] recoveryPasswordKey,
+        out char[] password)
     {
         recoveryPasswordKey = Array.Empty<byte>();
+        password = Array.Empty<char>();
         byte[]? decodedKey = null;
+        char[]? passwordCharacters = null;
 
         using var dialog = new Form
         {
-            Text = "BitLocker回復パスワード",
-            ClientSize = new Size(620, 230),
+            Text = "BitLocker解除",
+            ClientSize = new Size(620, 270),
             FormBorderStyle = FormBorderStyle.FixedDialog,
             MaximizeBox = false,
             MinimizeBox = false,
             ShowInTaskbar = false,
             StartPosition = FormStartPosition.CenterParent
         };
-        var protectorIds = metadata.KeyProtectors
+        var recoveryProtectorIds = metadata.KeyProtectors
             .Where(protector => protector.ProtectionType == BitLockerProtectionType.RecoveryPassword)
             .Select(protector => protector.Identifier.ToString("B"))
             .Distinct(StringComparer.OrdinalIgnoreCase);
@@ -2189,14 +2195,26 @@ public partial class Form1 : Form
         {
             AutoSize = false,
             Location = new Point(16, 14),
-            Size = new Size(588, 62),
-            Text = $"このボリュームはBitLockerで保護されています。48桁の回復パスワードを入力してください。{Environment.NewLine}" +
-                $"形式: 000000-000000-000000-000000-000000-000000-000000-000000{Environment.NewLine}" +
-                $"回復キーID: {string.Join(", ", protectorIds)}"
+            Size = new Size(588, 62)
         };
+        var credentialType = new ComboBox
+        {
+            DropDownStyle = ComboBoxStyle.DropDownList,
+            Location = new Point(16, 82),
+            Size = new Size(240, 28)
+        };
+        if (metadata.HasRecoveryPasswordProtector)
+        {
+            credentialType.Items.Add("48桁の回復パスワード");
+        }
+        if (metadata.HasPasswordProtector)
+        {
+            credentialType.Items.Add("BitLockerパスワード");
+        }
+        credentialType.SelectedIndex = 0;
         var passwordBox = new TextBox
         {
-            Location = new Point(16, 88),
+            Location = new Point(16, 120),
             Size = new Size(588, 27),
             UseSystemPasswordChar = true,
             MaxLength = 96
@@ -2204,55 +2222,92 @@ public partial class Form1 : Form
         var showPassword = new CheckBox
         {
             AutoSize = true,
-            Location = new Point(16, 126),
+            Location = new Point(16, 158),
             Text = "入力内容を表示"
         };
         var okButton = new Button
         {
-            Location = new Point(420, 178),
+            Location = new Point(420, 218),
             Size = new Size(88, 32),
             Text = "解除"
         };
         var cancelButton = new Button
         {
             DialogResult = DialogResult.Cancel,
-            Location = new Point(516, 178),
+            Location = new Point(516, 218),
             Size = new Size(88, 32),
             Text = "キャンセル"
         };
 
+        bool UsesRecoveryPassword() => credentialType.SelectedItem?.ToString()?.StartsWith("48", StringComparison.Ordinal) == true;
+        void UpdateCredentialExplanation()
+        {
+            var recovery = UsesRecoveryPassword();
+            explanation.Text = recovery
+                ? $"このボリュームはBitLockerで保護されています。48桁の回復パスワードを入力してください。{Environment.NewLine}" +
+                    $"形式: 000000-000000-000000-000000-000000-000000-000000-000000{Environment.NewLine}" +
+                    $"回復キーID: {string.Join(", ", recoveryProtectorIds)}"
+                : $"このボリュームはBitLockerで保護されています。設定したBitLockerパスワードを入力してください。{Environment.NewLine}" +
+                    "パスワードは保存・ログ出力されません。";
+            passwordBox.MaxLength = recovery ? 96 : short.MaxValue;
+            passwordBox.Clear();
+        }
+
+        credentialType.SelectedIndexChanged += (_, _) => UpdateCredentialExplanation();
         showPassword.CheckedChanged += (_, _) => passwordBox.UseSystemPasswordChar = !showPassword.Checked;
         okButton.Click += (_, _) =>
         {
-            if (!BitLockerRecoveryPassword.TryDecode(passwordBox.Text, out var candidate, out var validationError))
+            if (UsesRecoveryPassword())
             {
-                MessageBox.Show(dialog, validationError, "回復パスワードの確認", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                passwordBox.Focus();
-                passwordBox.SelectAll();
-                return;
-            }
+                if (!BitLockerRecoveryPassword.TryDecode(passwordBox.Text, out var candidate, out var validationError))
+                {
+                    MessageBox.Show(dialog, validationError, "回復パスワードの確認", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    passwordBox.Focus();
+                    passwordBox.SelectAll();
+                    return;
+                }
 
-            decodedKey = candidate;
+                decodedKey = candidate;
+            }
+            else
+            {
+                if (!BitLockerPassword.TryDeriveInitialHash(passwordBox.Text, out var validationHash, out var validationError))
+                {
+                    MessageBox.Show(dialog, validationError, "パスワードの確認", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    passwordBox.Focus();
+                    passwordBox.SelectAll();
+                    return;
+                }
+
+                CryptographicOperations.ZeroMemory(validationHash);
+                passwordCharacters = passwordBox.Text.ToCharArray();
+            }
             dialog.DialogResult = DialogResult.OK;
             dialog.Close();
         };
         dialog.FormClosed += (_, _) => passwordBox.Clear();
-        dialog.Controls.AddRange([explanation, passwordBox, showPassword, okButton, cancelButton]);
+        dialog.Controls.AddRange([explanation, credentialType, passwordBox, showPassword, okButton, cancelButton]);
         dialog.AcceptButton = okButton;
         dialog.CancelButton = cancelButton;
         dialog.Shown += (_, _) => passwordBox.Focus();
+        UpdateCredentialExplanation();
 
-        if (dialog.ShowDialog(this) != DialogResult.OK || decodedKey is null)
+        if (dialog.ShowDialog(this) != DialogResult.OK || decodedKey is null && passwordCharacters is null)
         {
             if (decodedKey is not null)
             {
                 CryptographicOperations.ZeroMemory(decodedKey);
             }
+            if (passwordCharacters is not null)
+            {
+                Array.Clear(passwordCharacters);
+            }
 
             return false;
         }
 
-        recoveryPasswordKey = decodedKey;
+        recoveryPasswordKey = decodedKey ?? Array.Empty<byte>();
+        password = passwordCharacters ?? Array.Empty<char>();
         return true;
     }
 
