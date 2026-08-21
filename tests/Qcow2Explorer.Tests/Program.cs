@@ -83,6 +83,7 @@ static void RunGeneratedImageTests()
     TestBitLockerRecoveryPasswordUnlock();
     TestBitLockerPasswordUnlock();
     TestBitLockerStartupKeyUnlock();
+    TestLuks1Unlock();
     TestXfsTimestampDecoding();
     Test4KnGptParsing();
     TestLvmMetadataDiagnostics();
@@ -625,6 +626,96 @@ static void TestBitLockerStartupKeyUnlock()
     CryptographicOperations.ZeroMemory(invalidSizeCopy);
 }
 
+static void TestLuks1Unlock()
+{
+    const string passphrase = "LUKS1 synthetic passphrase";
+    var masterKey = Enumerable.Range(0, 64).Select(value => (byte)(0x40 + value)).ToArray();
+    var passwordSalt = Enumerable.Range(0, 32).Select(value => (byte)(0x10 + value)).ToArray();
+    var digestSalt = Enumerable.Range(0, 32).Select(value => (byte)(0x80 + value)).ToArray();
+    var plaintext = Enumerable.Range(0, 1536).Select(value => (byte)(value * 13 + 5)).ToArray();
+    var image = CreateLuks1TestImage(passphrase, masterKey, passwordSalt, digestSalt, plaintext);
+    var encryptedReader = new MemorySectorReader(image, 512);
+    Assert(
+        Luks1MetadataReader.TryRead(encryptedReader, out var metadata, out var metadataError),
+        metadataError);
+    Assert(
+        metadata is
+        {
+            CipherName: "aes",
+            CipherMode: "xts-plain64",
+            HashSpec: "sha256",
+            KeyBytes: 64
+        }
+        && metadata.ActiveKeySlots.Select(slot => slot.Index).SequenceEqual([0]),
+        "LUKS1 header and active key slot parsing");
+    Assert(
+        Luks1Unlock.TryCreateReader(
+            encryptedReader,
+            metadata!,
+            passphrase,
+            out var decryptedReader,
+            out var unlockError),
+        unlockError);
+    Assert(decryptedReader is not null, "LUKS1 decrypting reader created");
+    ValidateBitLockerReaderReads(decryptedReader!, plaintext, "LUKS1 AES-XTS/plain64 unlock");
+    ((IDisposable)decryptedReader!).Dispose();
+    try
+    {
+        decryptedReader.ReadAt(0, new byte[1], 0, 1);
+        Assert(false, "disposed LUKS1 reader rejects reads");
+    }
+    catch (ObjectDisposedException)
+    {
+    }
+
+    const string wrongPassphrase = "wrong LUKS1 passphrase";
+    Assert(
+        !Luks1Unlock.TryCreateReader(
+            encryptedReader,
+            metadata!,
+            wrongPassphrase,
+            out _,
+            out var wrongPassphraseError)
+        && !wrongPassphraseError.Contains(passphrase, StringComparison.Ordinal)
+        && !wrongPassphraseError.Contains(wrongPassphrase, StringComparison.Ordinal)
+        && !wrongPassphraseError.Contains(Convert.ToHexString(masterKey), StringComparison.OrdinalIgnoreCase),
+        "wrong LUKS1 passphrase fails without exposing secrets");
+
+    var invalidStripes = image.ToArray();
+    BinaryPrimitives.WriteUInt32BigEndian(invalidStripes.AsSpan(208 + 44), 3999);
+    Assert(
+        !Luks1MetadataReader.TryRead(new MemorySectorReader(invalidStripes, 512), out _, out var stripesError)
+        && stripesError.Contains("stripe", StringComparison.OrdinalIgnoreCase),
+        "LUKS1 non-standard AF stripe rejection");
+
+    var overlappingKeySlots = image.ToArray();
+    BinaryPrimitives.WriteUInt32BigEndian(
+        overlappingKeySlots.AsSpan(208 + 48 + 40),
+        BinaryPrimitives.ReadUInt32BigEndian(overlappingKeySlots.AsSpan(208 + 40)));
+    Assert(
+        !Luks1MetadataReader.TryRead(new MemorySectorReader(overlappingKeySlots, 512), out _, out var overlapError)
+        && overlapError.Contains("重複", StringComparison.Ordinal),
+        "LUKS1 overlapping key material rejection");
+
+    var excessiveIterations = image.ToArray();
+    BinaryPrimitives.WriteUInt32BigEndian(
+        excessiveIterations.AsSpan(208 + 4),
+        checked((uint)Luks1MetadataReader.MaximumPbkdf2Iterations + 1));
+    Assert(
+        !Luks1MetadataReader.TryRead(new MemorySectorReader(excessiveIterations, 512), out _, out var iterationsError)
+        && iterationsError.Contains("反復回数", StringComparison.Ordinal),
+        "LUKS1 excessive PBKDF2 iteration rejection");
+
+    CryptographicOperations.ZeroMemory(masterKey);
+    CryptographicOperations.ZeroMemory(passwordSalt);
+    CryptographicOperations.ZeroMemory(digestSalt);
+    CryptographicOperations.ZeroMemory(plaintext);
+    CryptographicOperations.ZeroMemory(image);
+    CryptographicOperations.ZeroMemory(invalidStripes);
+    CryptographicOperations.ZeroMemory(overlappingKeySlots);
+    CryptographicOperations.ZeroMemory(excessiveIterations);
+}
+
 static void TestBitLockerXtsUnlockVariant(
     uint encryptionMethod,
     int fvekLength,
@@ -1088,6 +1179,140 @@ static byte[] CreateBitLockerStartupKeyFile(Guid identifier, byte[] externalKey)
     identifier.ToByteArray().CopyTo(bek, 16);
     externalKeyEntry.CopyTo(bek, 48);
     return bek;
+}
+
+static byte[] CreateLuks1TestImage(
+    string passphrase,
+    byte[] masterKey,
+    byte[] passwordSalt,
+    byte[] digestSalt,
+    byte[] plaintext)
+{
+    const int payloadOffsetSectors = 4096;
+    const int keyMaterialOffsetSectors = 8;
+    const int iterations = 1000;
+    const int stripes = 4000;
+    Assert(masterKey.Length == 64, "LUKS1 synthetic master key length");
+    Assert(plaintext.Length % 512 == 0, "LUKS1 synthetic payload alignment");
+
+    var passphraseBytes = Encoding.UTF8.GetBytes(passphrase);
+    var derivedKey = new byte[masterKey.Length];
+    var masterDigest = new byte[20];
+    var splitKey = CreateLuks1AntiForensicSplit(masterKey, stripes);
+    try
+    {
+        Rfc2898DeriveBytes.Pbkdf2(
+            passphraseBytes,
+            passwordSalt,
+            derivedKey,
+            iterations,
+            HashAlgorithmName.SHA256);
+        Rfc2898DeriveBytes.Pbkdf2(
+            masterKey,
+            digestSalt,
+            masterDigest,
+            iterations,
+            HashAlgorithmName.SHA256);
+        var encryptedKeyMaterial = EncryptBitLockerXts(splitKey, derivedKey);
+        var encryptedPayload = EncryptBitLockerXts(plaintext, masterKey);
+        try
+        {
+            var image = new byte[payloadOffsetSectors * 512 + encryptedPayload.Length];
+            new byte[] { (byte)'L', (byte)'U', (byte)'K', (byte)'S', 0xba, 0xbe }.CopyTo(image, 0);
+            BinaryPrimitives.WriteUInt16BigEndian(image.AsSpan(6), 1);
+            Encoding.ASCII.GetBytes("aes").CopyTo(image, 8);
+            Encoding.ASCII.GetBytes("xts-plain64").CopyTo(image, 40);
+            Encoding.ASCII.GetBytes("sha256").CopyTo(image, 72);
+            BinaryPrimitives.WriteUInt32BigEndian(image.AsSpan(104), payloadOffsetSectors);
+            BinaryPrimitives.WriteUInt32BigEndian(image.AsSpan(108), checked((uint)masterKey.Length));
+            masterDigest.CopyTo(image, 112);
+            digestSalt.CopyTo(image, 132);
+            BinaryPrimitives.WriteUInt32BigEndian(image.AsSpan(164), iterations);
+            Encoding.ASCII.GetBytes("bf48ce02-7014-4d68-86f4-9f068704bd21").CopyTo(image, 168);
+
+            const int keyMaterialSectors = 500;
+            for (var index = 0; index < 8; index++)
+            {
+                var slotOffset = 208 + index * 48;
+                BinaryPrimitives.WriteUInt32BigEndian(
+                    image.AsSpan(slotOffset),
+                    index == 0 ? 0x00ac71f3u : 0x0000deadu);
+                BinaryPrimitives.WriteUInt32BigEndian(
+                    image.AsSpan(slotOffset + 4),
+                    index == 0 ? checked((uint)iterations) : 0u);
+                if (index == 0)
+                {
+                    passwordSalt.CopyTo(image, slotOffset + 8);
+                }
+
+                BinaryPrimitives.WriteUInt32BigEndian(
+                    image.AsSpan(slotOffset + 40),
+                    checked((uint)(keyMaterialOffsetSectors + index * 504)));
+                BinaryPrimitives.WriteUInt32BigEndian(image.AsSpan(slotOffset + 44), stripes);
+            }
+
+            Assert(encryptedKeyMaterial.Length / 512 == keyMaterialSectors, "LUKS1 synthetic key material sectors");
+            encryptedKeyMaterial.CopyTo(image, keyMaterialOffsetSectors * 512);
+            encryptedPayload.CopyTo(image, payloadOffsetSectors * 512);
+            return image;
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(encryptedKeyMaterial);
+            CryptographicOperations.ZeroMemory(encryptedPayload);
+        }
+    }
+    finally
+    {
+        CryptographicOperations.ZeroMemory(passphraseBytes);
+        CryptographicOperations.ZeroMemory(derivedKey);
+        CryptographicOperations.ZeroMemory(masterDigest);
+        CryptographicOperations.ZeroMemory(splitKey);
+    }
+}
+
+static byte[] CreateLuks1AntiForensicSplit(byte[] masterKey, int stripes)
+{
+    var result = new byte[checked(masterKey.Length * stripes)];
+    var accumulator = new byte[masterKey.Length];
+    var digest = new byte[32];
+    try
+    {
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        Span<byte> blockIndex = stackalloc byte[4];
+        for (var stripe = 0; stripe < stripes - 1; stripe++)
+        {
+            var stripeData = result.AsSpan(stripe * masterKey.Length, masterKey.Length);
+            for (var index = 0; index < stripeData.Length; index++)
+            {
+                stripeData[index] = checked((byte)((stripe * 31 + index * 17 + 11) & 0xff));
+                accumulator[index] ^= stripeData[index];
+            }
+
+            for (var offset = 0; offset < accumulator.Length; offset += digest.Length)
+            {
+                BinaryPrimitives.WriteUInt32BigEndian(blockIndex, checked((uint)(offset / digest.Length)));
+                hash.AppendData(blockIndex);
+                hash.AppendData(accumulator.AsSpan(offset, Math.Min(digest.Length, accumulator.Length - offset)));
+                Assert(hash.TryGetHashAndReset(digest, out var bytesWritten) && bytesWritten == digest.Length, "LUKS1 test AF hash");
+                digest.AsSpan(0, Math.Min(digest.Length, accumulator.Length - offset))
+                    .CopyTo(accumulator.AsSpan(offset));
+            }
+        }
+
+        var finalStripe = result.AsSpan((stripes - 1) * masterKey.Length, masterKey.Length);
+        for (var index = 0; index < masterKey.Length; index++)
+        {
+            finalStripe[index] = (byte)(masterKey[index] ^ accumulator[index]);
+        }
+
+        return result;
+    }
+    finally
+    {
+        CryptographicOperations.ZeroMemory(accumulator);
+        CryptographicOperations.ZeroMemory(digest);
+    }
 }
 
 static byte[] EncryptBitLockerAesCcm(byte[] key, byte[] plaintext, byte nonceSeed)

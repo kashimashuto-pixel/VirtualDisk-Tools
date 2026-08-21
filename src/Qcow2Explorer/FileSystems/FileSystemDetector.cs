@@ -1,5 +1,6 @@
 using Qcow2Explorer.Core;
 using Qcow2Explorer.Partitions;
+using System.Security.Cryptography;
 using DiscExFatFileSystem = DiscUtils.ExFat.ExFatFileSystem;
 using DiscNtfsFileSystem = DiscUtils.Ntfs.NtfsFileSystem;
 
@@ -25,6 +26,16 @@ public static class FileSystemDetector
         if (oem == "-FVE-FS-")
         {
             return "BitLocker/FVE";
+        }
+
+        if (Luks1MetadataReader.HasLuksMagic(boot))
+        {
+            return EndianUtilities.ReadUInt16Big(boot, 6) switch
+            {
+                1 => "LUKS1",
+                2 => "LUKS2 (検出のみ)",
+                var version => $"LUKS{version} (検出のみ)"
+            };
         }
 
         if (oem == "NTFS")
@@ -226,7 +237,14 @@ public static class FileSystemDetector
 
     public static IReadOnlyFileSystem? TryOpen(IBlockReader disk, PartitionInfo partition, out string error)
     {
-        return TryOpenCore(disk, partition, ReadOnlySpan<byte>.Empty, ReadOnlySpan<char>.Empty, null, out error);
+        return TryOpenCore(
+            disk,
+            partition,
+            ReadOnlySpan<byte>.Empty,
+            ReadOnlySpan<char>.Empty,
+            null,
+            ReadOnlySpan<char>.Empty,
+            out error);
     }
 
     public static IReadOnlyFileSystem? TryOpen(
@@ -235,7 +253,14 @@ public static class FileSystemDetector
         ReadOnlySpan<byte> recoveryPasswordKey,
         out string error)
     {
-        return TryOpenCore(disk, partition, recoveryPasswordKey, ReadOnlySpan<char>.Empty, null, out error);
+        return TryOpenCore(
+            disk,
+            partition,
+            recoveryPasswordKey,
+            ReadOnlySpan<char>.Empty,
+            null,
+            ReadOnlySpan<char>.Empty,
+            out error);
     }
 
     public static IReadOnlyFileSystem? TryOpenWithBitLockerPassword(
@@ -244,7 +269,14 @@ public static class FileSystemDetector
         ReadOnlySpan<char> password,
         out string error)
     {
-        return TryOpenCore(disk, partition, ReadOnlySpan<byte>.Empty, password, null, out error);
+        return TryOpenCore(
+            disk,
+            partition,
+            ReadOnlySpan<byte>.Empty,
+            password,
+            null,
+            ReadOnlySpan<char>.Empty,
+            out error);
     }
 
     public static IReadOnlyFileSystem? TryOpenWithBitLockerStartupKey(
@@ -254,7 +286,30 @@ public static class FileSystemDetector
         out string error)
     {
         ArgumentNullException.ThrowIfNull(startupKey);
-        return TryOpenCore(disk, partition, ReadOnlySpan<byte>.Empty, ReadOnlySpan<char>.Empty, startupKey, out error);
+        return TryOpenCore(
+            disk,
+            partition,
+            ReadOnlySpan<byte>.Empty,
+            ReadOnlySpan<char>.Empty,
+            startupKey,
+            ReadOnlySpan<char>.Empty,
+            out error);
+    }
+
+    public static IReadOnlyFileSystem? TryOpenWithLuksPassphrase(
+        IBlockReader disk,
+        PartitionInfo partition,
+        ReadOnlySpan<char> passphrase,
+        out string error)
+    {
+        return TryOpenCore(
+            disk,
+            partition,
+            ReadOnlySpan<byte>.Empty,
+            ReadOnlySpan<char>.Empty,
+            null,
+            passphrase,
+            out error);
     }
 
     private static IReadOnlyFileSystem? TryOpenCore(
@@ -263,6 +318,7 @@ public static class FileSystemDetector
         ReadOnlySpan<byte> recoveryPasswordKey,
         ReadOnlySpan<char> password,
         BitLockerStartupKey? startupKey,
+        ReadOnlySpan<char> luksPassphrase,
         out string error)
     {
         error = "";
@@ -377,12 +433,86 @@ public static class FileSystemDetector
                 return null;
             }
 
+            if (string.Equals(detected, "LUKS1", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!Luks1MetadataReader.TryRead(slice, out var metadata, out var metadataError) || metadata is null)
+                {
+                    error = $"LUKS1ボリュームですが、ヘッダーを読めませんでした: {metadataError}";
+                    return null;
+                }
+
+                if (luksPassphrase.IsEmpty)
+                {
+                    error = string.Join(Environment.NewLine, new[]
+                    {
+                        "LUKS1暗号化ボリュームです。",
+                        $"暗号方式: {metadata.CipherName}-{metadata.CipherMode}",
+                        $"ハッシュ: {metadata.HashSpec}",
+                        $"有効key slot: {string.Join(", ", metadata.ActiveKeySlots.Select(slot => slot.Index))}",
+                        "パスフレーズを入力して解除できます。"
+                    });
+                    return null;
+                }
+
+                if (!Luks1Unlock.TryCreateReader(
+                    slice,
+                    metadata,
+                    luksPassphrase,
+                    out var decryptedReader,
+                    out var unlockError)
+                    || decryptedReader is null)
+                {
+                    error = unlockError;
+                    return null;
+                }
+
+                var ownershipTransferred = false;
+                try
+                {
+                    var innerPartition = new PartitionInfo
+                    {
+                        Number = partition.Number,
+                        Scheme = "LUKS1",
+                        Name = partition.Name,
+                        Type = partition.Type,
+                        TypeId = partition.TypeId,
+                        StartLba = 0,
+                        SectorCount = checked((ulong)(decryptedReader.Length / 512)),
+                        ReaderOverride = decryptedReader,
+                        LengthOverrideBytes = decryptedReader.Length
+                    };
+                    innerPartition.FileSystem = Detect(decryptedReader, innerPartition);
+                    var innerFileSystem = OpenSupportedFileSystem(decryptedReader, innerPartition, innerPartition.FileSystem);
+                    if (innerFileSystem is null)
+                    {
+                        error = $"LUKS1の解除は成功しましたが、内部ファイルシステムを開けませんでした: {innerPartition.FileSystem}";
+                        return null;
+                    }
+
+                    partition.FileSystem = $"LUKS1 -> {innerPartition.FileSystem}";
+                    var luksFileSystem = new Luks1FileSystem(
+                        innerFileSystem,
+                        decryptedReader,
+                        partition,
+                        innerPartition);
+                    ownershipTransferred = true;
+                    return luksFileSystem;
+                }
+                finally
+                {
+                    if (!ownershipTransferred && decryptedReader is IDisposable disposable)
+                    {
+                        disposable.Dispose();
+                    }
+                }
+            }
+
             error = string.IsNullOrWhiteSpace(detected)
                 ? "対応ファイルシステムを検出できませんでした。"
                 : $"{detected} は検出のみで、ファイル一覧表示は未対応です。";
             return null;
         }
-        catch (Exception ex) when (ex is IOException or InvalidDataException or NotSupportedException or ArgumentOutOfRangeException)
+        catch (Exception ex) when (ex is IOException or InvalidDataException or NotSupportedException or ArgumentOutOfRangeException or CryptographicException)
         {
             error = ex.Message;
             return null;
