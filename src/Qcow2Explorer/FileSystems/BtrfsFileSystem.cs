@@ -222,7 +222,7 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
             var length = checked((int)(overlapEnd - overlapStart));
             if (extent.Type == BtrfsFileExtentType.Inline)
             {
-                if (extent.Compression is not 0 and not 1)
+                if (extent.Compression is not 0 and not 1 and not 2)
                 {
                     throw new NotSupportedException($"未対応のBtrfs inline圧縮方式です: {extent.Compression}");
                 }
@@ -237,9 +237,9 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
                     var logical = checked(extent.DiskBytenr + extent.ExtentOffset + sourceOffset);
                     ReadVerifiedData(logical, output, destinationOffset, length);
                 }
-                else if (extent.Compression == 1)
+                else if (extent.Compression is 1 or 2)
                 {
-                    var decoded = ReadZlibExtent(extent);
+                    var decoded = ReadCompressedExtent(extent);
                     var decodedOffset = checked((int)(extent.ExtentOffset + sourceOffset));
                     decoded.AsSpan(decodedOffset, length).CopyTo(output.AsSpan(destinationOffset, length));
                 }
@@ -686,7 +686,7 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
         return entries;
     }
 
-    private static BtrfsFileExtent ParseFileExtent(BtrfsLeafItem item)
+    private BtrfsFileExtent ParseFileExtent(BtrfsLeafItem item)
     {
         var data = item.Data;
         if (data.Length < 21)
@@ -712,6 +712,10 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
             if (compression == 1)
             {
                 inlineData = DecodeZlib(inlineData, ramBytes, "Btrfs inline zlib extent");
+            }
+            else if (compression == 2)
+            {
+                inlineData = DecodeLzo(inlineData, ramBytes, "Btrfs inline LZO extent", allowSectorPadding: false);
             }
 
             return new BtrfsFileExtent(
@@ -817,7 +821,7 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
         }
     }
 
-    private byte[] ReadZlibExtent(BtrfsFileExtent extent)
+    private byte[] ReadCompressedExtent(BtrfsFileExtent extent)
     {
         var key = new BtrfsCompressedExtentKey(
             extent.DiskBytenr,
@@ -834,7 +838,12 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
 
         var compressed = new byte[checked((int)extent.DiskBytes)];
         ReadVerifiedData(extent.DiskBytenr, compressed, 0, compressed.Length);
-        var decoded = DecodeZlib(compressed, extent.RamBytes, "Btrfs zlib extent");
+        var decoded = extent.Compression switch
+        {
+            1 => DecodeZlib(compressed, extent.RamBytes, "Btrfs zlib extent"),
+            2 => DecodeLzo(compressed, extent.RamBytes, "Btrfs LZO extent", allowSectorPadding: true),
+            _ => throw new NotSupportedException($"未対応のBtrfs圧縮方式です: {extent.Compression}")
+        };
         lock (_decodedExtentCacheLock)
         {
             if (_decodedExtentCache.TryGetValue(key, out var cached))
@@ -880,6 +889,133 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
         catch (InvalidDataException ex) when (!ex.Message.StartsWith(label, StringComparison.Ordinal))
         {
             throw new InvalidDataException($"{label}を展開できませんでした: {ex.Message}", ex);
+        }
+
+        return output;
+    }
+
+    private byte[] DecodeLzo(
+        byte[] compressed,
+        ulong decodedLength,
+        string label,
+        bool allowSectorPadding)
+    {
+        if (decodedLength == 0 || decodedLength > MaximumDecodedExtentSize)
+        {
+            throw new InvalidDataException($"{label}の展開後サイズが不正です: {decodedLength:N0}");
+        }
+
+        if (compressed.Length < 11)
+        {
+            throw new InvalidDataException($"{label}が短すぎます。");
+        }
+
+        var totalLengthValue = EndianUtilities.ReadUInt32Little(compressed, 0);
+        if (totalLengthValue < 11 || totalLengthValue > compressed.Length)
+        {
+            throw new InvalidDataException(
+                $"{label}のtotal lengthが不正です: total={totalLengthValue:N0}, input={compressed.Length:N0}");
+        }
+
+        var totalLength = checked((int)totalLengthValue);
+        if (allowSectorPadding)
+        {
+            var allocatedLength = checked((totalLength + _sectorSize - 1) / _sectorSize * _sectorSize);
+            if (allocatedLength != compressed.Length)
+            {
+                throw new InvalidDataException(
+                    $"{label}の割当サイズが不正です: total={totalLength:N0}, allocated={compressed.Length:N0}");
+            }
+        }
+        else if (totalLength != compressed.Length)
+        {
+            throw new InvalidDataException(
+                $"{label}のinline sizeが一致しません: total={totalLength:N0}, input={compressed.Length:N0}");
+        }
+
+        if (compressed.AsSpan(totalLength).IndexOfAnyExcept((byte)0) >= 0)
+        {
+            throw new InvalidDataException($"{label}の割当末尾paddingがゼロではありません。");
+        }
+
+        var output = new byte[checked((int)decodedLength)];
+        var inputOffset = sizeof(uint);
+        var outputOffset = 0;
+        var segmentCount = 0;
+        var maximumSegmentLength = checked(_sectorSize + _sectorSize / 16 + 67);
+        while (inputOffset < totalLength)
+        {
+            var withinSector = inputOffset % _sectorSize;
+            if (withinSector > _sectorSize - sizeof(uint) || inputOffset > totalLength - sizeof(uint))
+            {
+                throw new InvalidDataException($"{label}のsegment header位置が不正です: {inputOffset:N0}");
+            }
+
+            var segmentLengthValue = EndianUtilities.ReadUInt32Little(compressed, inputOffset);
+            inputOffset += sizeof(uint);
+            if (segmentLengthValue == 0
+                || segmentLengthValue > maximumSegmentLength
+                || segmentLengthValue > totalLength - inputOffset)
+            {
+                throw new InvalidDataException(
+                    $"{label}のsegment lengthが不正です: {segmentLengthValue:N0}");
+            }
+
+            var segmentLength = checked((int)segmentLengthValue);
+            var expectedOutputLength = Math.Min(_sectorSize, output.Length - outputOffset);
+            if (expectedOutputLength <= 0)
+            {
+                throw new InvalidDataException($"{label}のsegment数が展開後サイズを超えています。");
+            }
+
+            try
+            {
+                var written = Lzo1xDecoder.Decompress(
+                    compressed.AsSpan(inputOffset, segmentLength),
+                    output.AsSpan(outputOffset, expectedOutputLength));
+                if (written != expectedOutputLength)
+                {
+                    throw new InvalidDataException(
+                        $"{label}のsegment展開サイズが一致しません: "
+                        + $"expected={expectedOutputLength:N0}, actual={written:N0}");
+                }
+            }
+            catch (InvalidDataException ex) when (!ex.Message.StartsWith(label, StringComparison.Ordinal))
+            {
+                throw new InvalidDataException($"{label}のsegmentを展開できませんでした: {ex.Message}", ex);
+            }
+
+            inputOffset += segmentLength;
+            outputOffset += expectedOutputLength;
+            segmentCount++;
+            if (inputOffset >= totalLength)
+            {
+                break;
+            }
+
+            var bytesLeftInSector = _sectorSize - inputOffset % _sectorSize;
+            if (bytesLeftInSector is > 0 and < sizeof(uint))
+            {
+                if (inputOffset > totalLength - bytesLeftInSector
+                    || compressed.AsSpan(inputOffset, bytesLeftInSector).IndexOfAnyExcept((byte)0) >= 0)
+                {
+                    throw new InvalidDataException($"{label}のsegment paddingが不正です。");
+                }
+
+                inputOffset += bytesLeftInSector;
+            }
+        }
+
+        if (inputOffset != totalLength || outputOffset != output.Length)
+        {
+            throw new InvalidDataException(
+                $"{label}の最終サイズが一致しません: input={inputOffset:N0}/{totalLength:N0}, "
+                + $"output={outputOffset:N0}/{output.Length:N0}");
+        }
+
+        if (!allowSectorPadding && segmentCount != 1)
+        {
+            throw new InvalidDataException($"{label}には複数segmentを格納できません。");
         }
 
         return output;

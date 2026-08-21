@@ -110,12 +110,13 @@
 - 合成fixtureで階層・sector境界・スパース領域・時刻と、superblock/tree/data破損の拒否を自動テスト
 - `mkfs.btrfs -m single -d single`由来fixtureを生成し、`btrfs check --readonly`と実イメージ回帰で確認
 - zlib圧縮extentを128 KiBの展開上限、CRC32C先行検証、部分読出しキャッシュ付きで追加し、圧縮stream破損も拒否
+- LZO圧縮extentの全体／segment長、4 KiB境界padding、128 KiB展開上限を検証し、通常・inline extentと破損payloadを回帰テスト
 
 ## 次回の推奨作業
 
 ### 1. Btrfs対応の第2段階
 
-- LZO、zstd圧縮extentを方式ごとに追加し、展開上限と破損入力を検証する
+- zstd圧縮extentを追加し、展開上限と破損入力を検証する
 - subvolume/root refとdefault subvolumeを安全に辿る
 - backup superblock利用は、世代整合性と誤復旧防止の設計後に追加する
 
