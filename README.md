@@ -16,7 +16,7 @@ C# / Windows Forms で作成した、読み取り専用の仮想ディスク解�
   - NTFS
   - exFAT
   - XFS（従来形式・bigtimeの更新日時に対応）
-  - Btrfs（単一デバイス・single profile、subvolume／snapshot／default subvolume、backup superblock復旧、インライン／通常／スパース／zlib・LZO・zstd圧縮extent、CRC32C検証に対応）
+  - Btrfs（単一／複数デバイスのsingle profile、subvolume／snapshot／default subvolume、backup superblock復旧、インライン／通常／スパース／zlib・LZO・zstd圧縮extent、CRC32C検証に対応。複数イメージ指定UIは今後対応）
   - ext2 / ext3 / ext4
   - SquashFS
   - BitLocker/FVE はクリアキーの自動解除、48桁回復パスワード、通常パスワード、スタートアップキー（`.BEK`）による解除に対応
@@ -186,7 +186,7 @@ ProjFS マウントは Windows の Client-ProjFS 機能を使い、選択した�
 - 暗号化されたswtpm状態は、暗号方式と必要な鍵長までは判定できます。swtpmで設定されたファイル鍵または移行鍵がない場合、内部状態は復号できません。
 - 平文のTPM状態データは存在と構造を表示できますが、libtpmsのversion依存な内部構造を秘密鍵単位まで展開する機能ではありません。
 - ext4 の journal replay は行いません。
-- Btrfsは単一デバイスのsingle profileを読み取り専用で扱い、subvolume、snapshot、default subvolumeとzlib・LZO・zstd圧縮extentを読み取れます。snapshot内に残る入れ子subvolume境界は、元subvolumeへ誤接続せず空ディレクトリとして表示します。RAID、暗号化extent、書き込みは未対応です。
+- Btrfsは単一／複数デバイスのsingle profileを読み取り専用で扱い、DEVICE_ITEM、devid、FSID、device UUIDとstripeを相互検証します。複数デバイス用コアAPIは利用できますが、複数RAWイメージを一組として指定するUIは今後対応です。subvolume、snapshot、default subvolumeとzlib・LZO・zstd圧縮extentを読み取れ、snapshot内に残る入れ子subvolume境界は元subvolumeへ誤接続せず空ディレクトリとして表示します。RAID、暗号化extent、書き込みは未対応です。
 - Btrfsのsuperblock、metadata tree block、checksum treeに記録されたdata sectorのCRC32Cを検証し、不一致は読み取りを中止します。primary superblockが壊れている場合だけ、公式mirror位置（64 MiB／256 GiB）の検証済みbackupへ復旧し、primaryが有効なら常にprimaryを優先します。
 - SquashFS はライブラリが対応する圧縮形式のみ読み取れます。
 - Linux md RAID は検出のみです。

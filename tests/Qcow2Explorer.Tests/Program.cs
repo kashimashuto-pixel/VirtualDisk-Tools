@@ -92,6 +92,7 @@ static void RunGeneratedImageTests()
     TestGeneratedLvm2Image();
     TestGeneratedLzopExt4Image();
     TestGeneratedBtrfsImage();
+    TestGeneratedBtrfsMultiDeviceImage();
     TestGeneratedEwfE01Image();
     TestRealImageRegressionRunner();
     TestGeneratedVmaLzopImage();
@@ -646,6 +647,149 @@ static void TestGeneratedBtrfsImage()
         var fs = FileSystemDetector.TryOpen(reader, partition, out var error);
         Assert(fs is null, "corrupt Btrfs primary and backup are rejected");
         Assert(error.Contains("primary/backup", StringComparison.Ordinal), "corrupt Btrfs superblock diagnostic");
+    }
+}
+
+static void TestGeneratedBtrfsMultiDeviceImage()
+{
+    var firstPath = Path.Combine(AppContext.BaseDirectory, "synthetic-btrfs-multi-1.raw");
+    var secondPath = Path.Combine(AppContext.BaseDirectory, "synthetic-btrfs-multi-2.raw");
+    _ = BtrfsTestImageFactory.CreateMultiDevice(firstPath, secondPath);
+    using (var first = DiskImageReaderFactory.Open(firstPath))
+    using (var second = DiskImageReaderFactory.Open(secondPath))
+    {
+        var firstPartition = PartitionTableReader.ReadPartitions(first).Single();
+        var secondPartition = PartitionTableReader.ReadPartitions(second).Single();
+        var fs = new BtrfsFileSystem(
+            [
+                new PartitionSliceReader(first, firstPartition),
+                new PartitionSliceReader(second, secondPartition),
+            ],
+            firstPartition);
+        var entries = fs.ListDirectory(fs.Root);
+        var regular = entries.Single(node => node.Name == "regular.bin");
+        var zlib = entries.Single(node => node.Name == "zlib.bin");
+        Assert(
+            fs.ReadFile(regular, 0, checked((int)regular.Size))
+                .SequenceEqual(BtrfsTestImageFactory.RegularData),
+            "generated multi-device Btrfs cross-device data");
+        Assert(
+            fs.ReadFile(zlib, 65530, 32).All(value => value == 0),
+            "generated multi-device Btrfs compressed data");
+
+        var reversed = new BtrfsFileSystem(
+            [
+                new PartitionSliceReader(second, secondPartition),
+                new PartitionSliceReader(first, firstPartition),
+            ],
+            secondPartition);
+        var reversedRegular = reversed.ListDirectory(reversed.Root)
+            .Single(node => node.Name == "regular.bin");
+        Assert(
+            reversed.ReadFile(reversedRegular, 4090, 32)
+                .SequenceEqual(BtrfsTestImageFactory.RegularData.AsSpan(4090, 32).ToArray()),
+            "generated multi-device Btrfs device-order independence");
+    }
+
+    using (var first = DiskImageReaderFactory.Open(firstPath))
+    {
+        var partition = PartitionTableReader.ReadPartitions(first).Single();
+        try
+        {
+            _ = new BtrfsFileSystem([new PartitionSliceReader(first, partition)], partition);
+            Assert(false, "missing Btrfs device is rejected");
+        }
+        catch (InvalidDataException ex)
+        {
+            Assert(
+                ex.Message.Contains("不足", StringComparison.Ordinal)
+                    && ex.Message.Contains("devid=2", StringComparison.Ordinal),
+                "missing Btrfs device diagnostic");
+        }
+    }
+
+    var differentFirstPath = Path.Combine(AppContext.BaseDirectory, "synthetic-btrfs-other-fs-1.raw");
+    var differentSecondPath = Path.Combine(AppContext.BaseDirectory, "synthetic-btrfs-other-fs-2.raw");
+    _ = BtrfsTestImageFactory.CreateMultiDevice(
+        differentFirstPath,
+        differentSecondPath,
+        differentSecondFileSystem: true);
+    using (var first = DiskImageReaderFactory.Open(differentFirstPath))
+    using (var second = DiskImageReaderFactory.Open(differentSecondPath))
+    {
+        var firstPartition = PartitionTableReader.ReadPartitions(first).Single();
+        var secondPartition = PartitionTableReader.ReadPartitions(second).Single();
+        try
+        {
+            _ = new BtrfsFileSystem(
+                [
+                    new PartitionSliceReader(first, firstPartition),
+                    new PartitionSliceReader(second, secondPartition),
+                ],
+                firstPartition);
+            Assert(false, "different Btrfs filesystem device is rejected");
+        }
+        catch (InvalidDataException ex)
+        {
+            Assert(ex.Message.Contains("別のBtrfs", StringComparison.Ordinal), "different Btrfs FSID diagnostic");
+        }
+    }
+
+    var duplicateFirstPath = Path.Combine(AppContext.BaseDirectory, "synthetic-btrfs-duplicate-1.raw");
+    var duplicateSecondPath = Path.Combine(AppContext.BaseDirectory, "synthetic-btrfs-duplicate-2.raw");
+    _ = BtrfsTestImageFactory.CreateMultiDevice(
+        duplicateFirstPath,
+        duplicateSecondPath,
+        duplicateDeviceId: true);
+    using (var first = DiskImageReaderFactory.Open(duplicateFirstPath))
+    using (var second = DiskImageReaderFactory.Open(duplicateSecondPath))
+    {
+        var firstPartition = PartitionTableReader.ReadPartitions(first).Single();
+        var secondPartition = PartitionTableReader.ReadPartitions(second).Single();
+        try
+        {
+            _ = new BtrfsFileSystem(
+                [
+                    new PartitionSliceReader(first, firstPartition),
+                    new PartitionSliceReader(second, secondPartition),
+                ],
+                firstPartition);
+            Assert(false, "duplicate Btrfs devid is rejected");
+        }
+        catch (InvalidDataException ex)
+        {
+            Assert(ex.Message.Contains("重複", StringComparison.Ordinal), "duplicate Btrfs devid diagnostic");
+        }
+    }
+
+    var stripeFirstPath = Path.Combine(AppContext.BaseDirectory, "synthetic-btrfs-stripe-uuid-1.raw");
+    var stripeSecondPath = Path.Combine(AppContext.BaseDirectory, "synthetic-btrfs-stripe-uuid-2.raw");
+    _ = BtrfsTestImageFactory.CreateMultiDevice(
+        stripeFirstPath,
+        stripeSecondPath,
+        corruptDataStripeUuid: true);
+    using (var first = DiskImageReaderFactory.Open(stripeFirstPath))
+    using (var second = DiskImageReaderFactory.Open(stripeSecondPath))
+    {
+        var firstPartition = PartitionTableReader.ReadPartitions(first).Single();
+        var secondPartition = PartitionTableReader.ReadPartitions(second).Single();
+        try
+        {
+            _ = new BtrfsFileSystem(
+                [
+                    new PartitionSliceReader(first, firstPartition),
+                    new PartitionSliceReader(second, secondPartition),
+                ],
+                firstPartition);
+            Assert(false, "Btrfs stripe UUID mismatch is rejected");
+        }
+        catch (InvalidDataException ex)
+        {
+            Assert(
+                ex.Message.Contains("stripe", StringComparison.Ordinal)
+                    && ex.Message.Contains("UUID", StringComparison.Ordinal),
+                "Btrfs stripe UUID diagnostic");
+        }
     }
 }
 
