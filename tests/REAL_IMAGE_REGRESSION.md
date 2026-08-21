@@ -32,6 +32,21 @@ wsl --distribution Ubuntu-24.04 --user root -- sh -lc `
 
 スクリプトは、2045年の更新日時を持つXFS bigtime RAWと、そのRAWを圧縮したLZOを生成します。
 
+### Btrfs single profile
+
+WSL 2のUbuntu 24.04へ`btrfs-progs`をインストールし、単一デバイス・single profileのRAW fixtureを生成します。
+
+```powershell
+wsl --distribution Ubuntu-24.04 --user root -- sh -lc `
+  "apt-get update && apt-get install -y btrfs-progs util-linux"
+
+.\tools\New-BtrfsRegressionFixture.ps1 `
+  -OutputPath .\.tmp\real-images\btrfs-single.raw
+```
+
+スクリプトはインラインファイル、通常extent、スパースファイル、zlib圧縮ファイルを作成し、`btrfs check --readonly`と各ファイルのSHA-256を表示します。
+既存fixtureは上書きせず、生成物とローカルmanifestはGitへ追加しません。
+
 ### BitLocker XTS-AES
 
 BitLocker fixtureの生成は管理者PowerShellで実行します。
@@ -175,6 +190,47 @@ fixture本体とローカルmanifestはコミットしないでください。
               "path": "/fixture.txt",
               "expectedDirectory": false,
               "sha256": "REPLACE_WITH_64_HEX_CHARACTERS"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Btrfs single fixture",
+      "path": "%VDT_FIXTURE_ROOT%\\btrfs-single.raw",
+      "sha256": "REPLACE_WITH_64_HEX_CHARACTERS",
+      "expectedFormatContains": "raw/dd",
+      "expectedPartitionCount": 1,
+      "partitions": [
+        {
+          "number": 1,
+          "expectedFileSystem": "Btrfs",
+          "files": [
+            {
+              "path": "/hello.txt",
+              "expectedDirectory": false,
+              "expectedLength": 17,
+              "sha256": "1E7E7CAE2B00EF869EE050726D5D1747FDE1CBCE9726DAC9E05C088046EEA037",
+              "expectedModifiedUtc": "2046-02-03T04:05:06Z",
+              "timestampToleranceSeconds": 0
+            },
+            {
+              "path": "/nested/regular.bin",
+              "expectedDirectory": false,
+              "expectedLength": 131072,
+              "sha256": "FA43239BCEE7B97CA62F007CC68487560A39E19F74F3DDE7486DB3F98DF8E471"
+            },
+            {
+              "path": "/compressed-zlib.bin",
+              "expectedDirectory": false,
+              "expectedLength": 262144,
+              "sha256": "8A39D2ABD3999AB73C34DB2476849CDDF303CE389B35826850F9A700589B4A90"
+            },
+            {
+              "path": "/sparse.bin",
+              "expectedDirectory": false,
+              "expectedLength": 1048588,
+              "sha256": "EC33A976122A647689AE42EFAFF7F114E6F5460B313690EB212C96EADA0C375C"
             }
           ]
         }
