@@ -66,6 +66,23 @@ BitLocker fixtureの生成は管理者PowerShellで実行します。
 生成後は`Get-FileHash -Algorithm SHA256`でイメージのハッシュを取得し、ローカルmanifestへ登録します。
 fixture本体、manifest、回復パスワード、通常パスワード、`.BEK`をコミットしないでください。
 
+### LUKS1 AES-XTS
+
+WSL 2のUbuntu 24.04へ`cryptsetup`をインストールし、LUKS1 + ext4のRAW fixtureを生成します。
+
+```powershell
+wsl --distribution Ubuntu-24.04 --user root -- sh -lc `
+  "apt-get update && apt-get install -y cryptsetup e2fsprogs util-linux"
+
+.\tools\New-Luks1RegressionFixture.ps1 `
+  -OutputPath .\.tmp\real-images\luks1-xts256.raw `
+  -PassphraseEnvironmentVariable VDT_LUKS1_PASSPHRASE
+```
+
+スクリプトはランダムなパスフレーズを生成し、cryptsetupでLUKS1の生成・解除を確認してから、値を指定したユーザー環境変数へ保存します。パスフレーズ自体は出力しません。
+fixtureを高速に再生成するためPBKDF2の短いiteration targetを使用しており、実運用向けのセキュリティ設定例ではありません。
+ローカルmanifestでは`"luksPassphraseEnvironmentVariable": "VDT_LUKS1_PASSPHRASE"`を指定します。fixture、manifest、パスフレーズをコミットしないでください。
+
 ## Manifest例
 
 ```json
@@ -131,4 +148,5 @@ fixture本体、manifest、回復パスワード、通常パスワード、`.BEK
 
 BitLockerの回復パスワード・通常パスワード・`.BEK`パスはmanifestへ直接書かず、指定した環境変数から実行時だけ読み込みます。
 ランナーは入力イメージのSHA-256を先に照合し、回復キー・パスワード・外部キーを使用後に消去します。
+LUKS1パスフレーズも環境変数から実行時だけ読み込み、使用後に文字配列を消去します。
 LZOキャッシュcaseでは、初回展開時間と再利用時間を表示し、任意でキャンセル後に部分ファイルが残らないことも確認します。

@@ -21,6 +21,7 @@ C# / Windows Forms で作成した、読み取り専用の仮想ディスク解�
   - BitLocker/FVE はクリアキーの自動解除、48桁回復パスワード、通常パスワード、スタートアップキー（`.BEK`）による解除に対応
   - 回復パスワードは8組の6桁ブロックを検証し、VMK/FVEKを解除して内部FSを読み取り
   - `.BEK`はヘッダー・外部キー・保護子IDを検証し、対応するVMK/FVEKだけを解除
+  - LUKS1 はAES-XTS/plain64、PBKDF2（SHA-1/SHA-256/SHA-512）、標準4000 AF stripesのパスフレーズ解除に対応
 - LVM2 論理ボリュームの検出と読み取り
   - 通常のlinear構成（LVMメタデータ上は`striped`、`stripe_count = 1`）を読み取り
   - 読めない場合は不足PV、未対応segment type、複数stripe、メタデータ未検出、または内部例外を警告欄と解析レポートへ表示
@@ -166,7 +167,7 @@ ProjFS マウントは Windows の Client-ProjFS 機能を使い、選択した�
 
 - 読み取り専用です。ディスクイメージや内部ファイルシステムへの書き込みはしません。
 - 物理ディスクを開くには管理者権限が必要です。使用中ディスクの一貫したスナップショットは作成しません。
-- 暗号化qcow2（AES/LUKS）は未対応です。
+- qcow2コンテナー自体の暗号化機能は未対応です。パーティションとして格納された対応形式のLUKS1は読み取れます。
 - qcow2 external data fileは、ヘッダー拡張にファイル名があり、同じPCから参照できる場合に読み取ります。
 - backing fileは相対パスまたは絶対パスから読み取ります。親イメージがない場合は開けません。
 - Extended L2 Entriesは32サブクラスタの割り当て／ゼロビットマップを読み取ります。
@@ -184,6 +185,8 @@ ProjFS マウントは Windows の Client-ProjFS 機能を使い、選択した�
 - Linux md RAID は検出のみです。
 - BitLockerはAES-XTS（128/256）に対応します。TPM単独保護、TPMとの複合保護、AES-CBC/Elephant Diffuserは未対応です。
 - BitLocker回復パスワード、通常パスワード、スタートアップキー、VMK、FVEKは設定・ログ・解析レポートへ保存しません。不要になったキー配列は可能な範囲で消去します。
+- LUKS1はAES-XTS/plain64の256/512-bit合成キーに対応します。LUKS2、detached header、AES-CBC、ESSIV、plain/plain64以外のIV方式は未対応です。
+- LUKS1パスフレーズとmaster keyは設定・ログ・解析レポートへ保存せず、一時配列と復号リーダーのキーを使用後に消去します。
 - NTFSの主 `$MFT` 先頭レコードが破損している場合は `$MFTMirr` から復旧を試みます。ルートレコードなど主MFTの必須データ自体が欠落しているイメージは、元ディスクまたはバックアップからの再取得が必要です。
 - NTFS削除済みファイルはMFTに残っている情報を表示します。削除後に再利用されたクラスタの内容は復旧できません。
 - LVM2 は、現在の入力内に必要なPVがすべてあり、LVが単一stripeのlinear相当である構成を読み取ります。
@@ -347,3 +350,4 @@ SOFTWARE.
 - BitLocker回復パスワードの検証規則: https://learn.microsoft.com/en-us/windows/win32/secprov/protectkeywithnumericalpassword-win32-encryptablevolume
 - BitLockerスタートアップキー保護子: https://learn.microsoft.com/en-us/powershell/module/bitlocker/add-bitlockerkeyprotector
 - BitLocker/FVEメタデータ・鍵導出形式: https://github.com/libyal/libbde/blob/main/documentation/BitLocker%20Drive%20Encryption%20%28BDE%29%20format.asciidoc
+- LUKS1 on-disk format: https://cdn.kernel.org/pub/linux/utils/cryptsetup/LUKS_docs/on-disk-format.pdf

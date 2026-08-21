@@ -52,6 +52,15 @@
 - パスワード・外部キー・VMK・FVEKを使用後に消去し、設定・ログ・解析レポートへ保存しない
 - Windows生成のXTS-AES 256 VHDXと`.BEK`で、Windows自身の解除と実イメージ回帰を確認
 
+### LUKS1パスフレーズ対応
+
+- version 1ヘッダー、8個のkey slot、payload/key material境界をbig-endianで厳格に検証
+- AES-XTS/plain64の256/512-bit合成キーと512-byte sectorを読み取り専用で復号
+- PBKDF2（SHA-1/SHA-256/SHA-512）、master key digest照合、標準4000 AF stripesのmergeに対応
+- 伏字表示・表示切替・再試行を備えたパスフレーズ入力ダイアログを追加
+- パスフレーズ、key slot派生キー、master keyを保存・ログ出力せず、使用後に一時配列を消去
+- cryptsetup 2.7生成LUKS1 + ext4 fixtureをcryptsetup自身と本アプリの双方で解除して検証
+
 ### LZO高速モードのキャッシュ再利用
 
 - 「終了時に削除」「検証済みキャッシュとして保持・再利用」「指定場所へ通常RAWとして保存」を選択可能
@@ -71,10 +80,10 @@
 
 ## 次回の推奨作業
 
-### 1. LUKS1対応の仕様調査と最小実装
+### 1. LUKS2対応の仕様調査と段階実装
 
-- cryptsetupの一次仕様と生成fixtureでLUKS1ヘッダー、key slot、payload offsetを検証する
-- まずPBKDF2-HMAC-SHA256とAES-XTS/plain64の単一key slotを読み取り専用で解除する
+- cryptsetupの一次仕様と生成fixtureでbinary header、JSON metadata、keyslot area、segmentを検証する
+- まず単一crypt segment、LUKS2 keyslot、PBKDF2またはArgon2id、AES-XTS/plain64を読み取り専用で解除する
 - パスフレーズを設定・ログ・解析レポートへ保存せず、一時配列を使用後に消去する
 - 合成テストとLinux生成fixtureの両方で内部ファイルシステム読み取りを確認する
 
@@ -90,8 +99,8 @@
 
 利用目的に応じ、次の順で検討します。
 
-1. LUKS1/LUKS2
-   - Linux暗号化パーティションとLUKS暗号化qcow2を対象とする
+1. LUKS2
+   - Linux暗号化パーティションを対象とする
    - パスフレーズを保存・ログ出力しない
 2. E01/EWF
    - フォレンジック用途向け

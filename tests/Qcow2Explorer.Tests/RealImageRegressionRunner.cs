@@ -233,6 +233,7 @@ internal static class RealImageRegressionRunner
         partition.FileSystem = FileSystemDetector.Detect(reader, partition);
         byte[] recoveryKey = [];
         char[] passwordCharacters = [];
+        char[] luksPassphraseCharacters = [];
         BitLockerStartupKey? startupKey = null;
         IReadOnlyFileSystem? fileSystem = null;
         try
@@ -241,6 +242,7 @@ internal static class RealImageRegressionRunner
                 || !string.IsNullOrWhiteSpace(expectation.RecoveryPasswordEnvironmentVariable)
                 || !string.IsNullOrWhiteSpace(expectation.PasswordEnvironmentVariable)
                 || !string.IsNullOrWhiteSpace(expectation.StartupKeyPathEnvironmentVariable)
+                || !string.IsNullOrWhiteSpace(expectation.LuksPassphraseEnvironmentVariable)
                 || expectation.ExpectedFileSystem.Contains("->", StringComparison.Ordinal);
             if (shouldOpen)
             {
@@ -249,7 +251,8 @@ internal static class RealImageRegressionRunner
                     {
                         expectation.RecoveryPasswordEnvironmentVariable,
                         expectation.PasswordEnvironmentVariable,
-                        expectation.StartupKeyPathEnvironmentVariable
+                        expectation.StartupKeyPathEnvironmentVariable,
+                        expectation.LuksPassphraseEnvironmentVariable
                     }.Count(value => !string.IsNullOrWhiteSpace(value)) <= 1,
                     caseName,
                     "only one BitLocker credential environment variable can be set");
@@ -286,6 +289,15 @@ internal static class RealImageRegressionRunner
                         caseName,
                         $"BitLocker startup key validation failed: {startupKeyError}");
                 }
+                else if (!string.IsNullOrWhiteSpace(expectation.LuksPassphraseEnvironmentVariable))
+                {
+                    var passphrase = Environment.GetEnvironmentVariable(expectation.LuksPassphraseEnvironmentVariable);
+                    Require(
+                        !string.IsNullOrEmpty(passphrase),
+                        caseName,
+                        $"environment variable '{expectation.LuksPassphraseEnvironmentVariable}' is not set");
+                    luksPassphraseCharacters = passphrase!.ToCharArray();
+                }
 
                 fileSystem = recoveryKey.Length > 0
                     ? FileSystemDetector.TryOpen(reader, partition, recoveryKey, out var openError)
@@ -293,7 +305,9 @@ internal static class RealImageRegressionRunner
                         ? FileSystemDetector.TryOpenWithBitLockerPassword(reader, partition, passwordCharacters, out openError)
                         : startupKey is not null
                             ? FileSystemDetector.TryOpenWithBitLockerStartupKey(reader, partition, startupKey, out openError)
-                        : FileSystemDetector.TryOpen(reader, partition, out openError);
+                            : luksPassphraseCharacters.Length > 0
+                                ? FileSystemDetector.TryOpenWithLuksPassphrase(reader, partition, luksPassphraseCharacters, out openError)
+                                : FileSystemDetector.TryOpen(reader, partition, out openError);
                 Require(fileSystem is not null, caseName, $"partition #{partition.Number} open failed: {openError}");
             }
 
@@ -322,6 +336,11 @@ internal static class RealImageRegressionRunner
             if (passwordCharacters.Length > 0)
             {
                 Array.Clear(passwordCharacters);
+            }
+
+            if (luksPassphraseCharacters.Length > 0)
+            {
+                Array.Clear(luksPassphraseCharacters);
             }
 
             startupKey?.Dispose();
@@ -477,6 +496,7 @@ internal sealed class RealImagePartitionExpectation
     public string RecoveryPasswordEnvironmentVariable { get; set; } = "";
     public string PasswordEnvironmentVariable { get; set; } = "";
     public string StartupKeyPathEnvironmentVariable { get; set; } = "";
+    public string LuksPassphraseEnvironmentVariable { get; set; } = "";
     public List<RealImageFileExpectation> Files { get; set; } = [];
 }
 

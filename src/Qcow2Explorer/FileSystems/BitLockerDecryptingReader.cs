@@ -76,7 +76,11 @@ public sealed class BitLockerDecryptingReader : IBlockReader, IDisposable
         {
             var encryptedOffset = GetEncryptedOffsetForLogicalSector(logicalSector);
             _reader.ReadAt(encryptedOffset, encryptedSector, 0, encryptedSector.Length);
-            return DecryptXtsSector(encryptedSector, checked((ulong)(encryptedOffset / SectorSize)));
+            return AesXtsSectorCipher.DecryptSector(
+                encryptedSector,
+                _dataKey,
+                _tweakKey,
+                checked((ulong)(encryptedOffset / SectorSize)));
         }
         finally
         {
@@ -96,45 +100,6 @@ public sealed class BitLockerDecryptingReader : IBlockReader, IDisposable
         return logicalOffset;
     }
 
-    private byte[] DecryptXtsSector(byte[] ciphertext, ulong sectorNumber)
-    {
-        if (ciphertext.Length % 16 != 0)
-        {
-            throw new InvalidDataException("XTS-AES 復号は 16 byte 単位のセクタだけに対応しています。");
-        }
-
-        using var dataAes = CreateEcbAes(_dataKey);
-        using var tweakAes = CreateEcbAes(_tweakKey);
-        using var dataDecryptor = dataAes.CreateDecryptor();
-        using var tweakEncryptor = tweakAes.CreateEncryptor();
-
-        Span<byte> tweakInput = stackalloc byte[16];
-        BitConverter.TryWriteBytes(tweakInput, sectorNumber);
-        Span<byte> tweak = stackalloc byte[16];
-        TransformBlock(tweakEncryptor, tweakInput, tweak);
-
-        var plaintext = new byte[ciphertext.Length];
-        Span<byte> block = stackalloc byte[16];
-        Span<byte> decrypted = stackalloc byte[16];
-        for (var offset = 0; offset < ciphertext.Length; offset += 16)
-        {
-            for (var i = 0; i < 16; i++)
-            {
-                block[i] = (byte)(ciphertext[offset + i] ^ tweak[i]);
-            }
-
-            TransformBlock(dataDecryptor, block, decrypted);
-            for (var i = 0; i < 16; i++)
-            {
-                plaintext[offset + i] = (byte)(decrypted[i] ^ tweak[i]);
-            }
-
-            MultiplyByX(tweak);
-        }
-
-        return plaintext;
-    }
-
     private static (byte[] DataKey, byte[] TweakKey) SplitXtsKey(uint encryptionMethod, byte[] fvek)
     {
         return encryptionMethod switch
@@ -149,52 +114,6 @@ public sealed class BitLockerDecryptingReader : IBlockReader, IDisposable
         };
     }
 
-    private static Aes CreateEcbAes(byte[] key)
-    {
-        var aes = Aes.Create();
-        aes.Mode = CipherMode.ECB;
-        aes.Padding = PaddingMode.None;
-        aes.Key = key;
-        return aes;
-    }
-
-    private static void TransformBlock(ICryptoTransform transform, ReadOnlySpan<byte> input, Span<byte> output)
-    {
-        var inputArray = input.ToArray();
-        var outputArray = new byte[inputArray.Length];
-        try
-        {
-            var bytes = transform.TransformBlock(inputArray, 0, inputArray.Length, outputArray, 0);
-            if (bytes != inputArray.Length)
-            {
-                throw new CryptographicException("AES block transform failed.");
-            }
-
-            outputArray.CopyTo(output);
-        }
-        finally
-        {
-            CryptographicOperations.ZeroMemory(inputArray);
-            CryptographicOperations.ZeroMemory(outputArray);
-        }
-    }
-
-    private static void MultiplyByX(Span<byte> tweak)
-    {
-        var carry = 0;
-        for (var i = 0; i < tweak.Length; i++)
-        {
-            var value = tweak[i];
-            var nextCarry = value >> 7;
-            tweak[i] = (byte)((value << 1) | carry);
-            carry = nextCarry;
-        }
-
-        if (carry != 0)
-        {
-            tweak[0] ^= 0x87;
-        }
-    }
 }
 
 public static class BitLockerUnlock

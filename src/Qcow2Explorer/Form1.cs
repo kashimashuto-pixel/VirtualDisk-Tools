@@ -2137,6 +2137,47 @@ public partial class Form1 : Form
                 }
             }
 
+            if (fs is null && TryReadLuks1UnlockMetadata(partition, out var luksMetadata))
+            {
+                Cursor = Cursors.Default;
+                while (TryPromptForLuks1Passphrase(luksMetadata, out var passphrase))
+                {
+                    try
+                    {
+                        Cursor = Cursors.WaitCursor;
+                        fs = FileSystemDetector.TryOpenWithLuksPassphrase(_reader, partition, passphrase, out error);
+                    }
+                    finally
+                    {
+                        Array.Clear(passphrase);
+                    }
+
+                    if (fs is not null)
+                    {
+                        break;
+                    }
+
+                    Cursor = Cursors.Default;
+                    var retry = MessageBox.Show(
+                        this,
+                        $"{error}{Environment.NewLine}{Environment.NewLine}パスフレーズを再入力しますか？",
+                        "LUKS1解除失敗",
+                        MessageBoxButtons.RetryCancel,
+                        MessageBoxIcon.Warning);
+                    if (retry != DialogResult.Retry)
+                    {
+                        _statusLabel.Text = "LUKS1解除をキャンセルしました";
+                        return null;
+                    }
+                }
+
+                if (fs is null)
+                {
+                    _statusLabel.Text = "LUKS1解除をキャンセルしました";
+                    return null;
+                }
+            }
+
             if (fs is null)
             {
                 MessageBox.Show(this, error, "ファイルシステム未対応", MessageBoxButtons.OK, MessageBoxIcon.Information);
@@ -2168,6 +2209,25 @@ public partial class Form1 : Form
             || (!parsed.HasRecoveryPasswordProtector
                 && !parsed.HasPasswordProtector
                 && !parsed.HasStartupKeyProtector))
+        {
+            return false;
+        }
+
+        metadata = parsed;
+        return true;
+    }
+
+    private bool TryReadLuks1UnlockMetadata(PartitionInfo partition, out Luks1Metadata metadata)
+    {
+        metadata = null!;
+        if (_reader is null
+            || !partition.FileSystem.Equals("LUKS1", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var slice = new PartitionSliceReader(_reader, partition);
+        if (!Luks1MetadataReader.TryRead(slice, out var parsed, out _) || parsed is null)
         {
             return false;
         }
@@ -2405,6 +2465,97 @@ public partial class Form1 : Form
         recoveryPasswordKey = decodedKey ?? Array.Empty<byte>();
         password = passwordCharacters ?? Array.Empty<char>();
         startupKey = selectedStartupKey;
+        return true;
+    }
+
+    private bool TryPromptForLuks1Passphrase(Luks1Metadata metadata, out char[] passphrase)
+    {
+        passphrase = Array.Empty<char>();
+        char[]? passphraseCharacters = null;
+        using var dialog = new Form
+        {
+            Text = "LUKS1解除",
+            ClientSize = new Size(620, 220),
+            FormBorderStyle = FormBorderStyle.FixedDialog,
+            MaximizeBox = false,
+            MinimizeBox = false,
+            ShowInTaskbar = false,
+            StartPosition = FormStartPosition.CenterParent
+        };
+        var explanation = new Label
+        {
+            AutoSize = false,
+            Location = new Point(16, 14),
+            Size = new Size(588, 62),
+            Text = $"LUKS1パスフレーズを入力してください。暗号方式: {metadata.CipherName}-{metadata.CipherMode}, " +
+                $"hash: {metadata.HashSpec}{Environment.NewLine}" +
+                $"有効key slot: {string.Join(", ", metadata.ActiveKeySlots.Select(slot => slot.Index))}。" +
+                "パスフレーズは保存・ログ出力されません。"
+        };
+        var passphraseBox = new TextBox
+        {
+            Location = new Point(16, 84),
+            Size = new Size(588, 27),
+            UseSystemPasswordChar = true,
+            MaxLength = 4096
+        };
+        var showPassphrase = new CheckBox
+        {
+            AutoSize = true,
+            Location = new Point(16, 122),
+            Text = "入力内容を表示"
+        };
+        var okButton = new Button
+        {
+            Location = new Point(420, 170),
+            Size = new Size(88, 32),
+            Text = "解除"
+        };
+        var cancelButton = new Button
+        {
+            DialogResult = DialogResult.Cancel,
+            Location = new Point(516, 170),
+            Size = new Size(88, 32),
+            Text = "キャンセル"
+        };
+
+        showPassphrase.CheckedChanged += (_, _) =>
+            passphraseBox.UseSystemPasswordChar = !showPassphrase.Checked;
+        okButton.Click += (_, _) =>
+        {
+            if (passphraseBox.TextLength == 0)
+            {
+                MessageBox.Show(
+                    dialog,
+                    "LUKS1パスフレーズを入力してください。",
+                    "パスフレーズの確認",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+                passphraseBox.Focus();
+                return;
+            }
+
+            passphraseCharacters = passphraseBox.Text.ToCharArray();
+            dialog.DialogResult = DialogResult.OK;
+            dialog.Close();
+        };
+        dialog.FormClosed += (_, _) => passphraseBox.Clear();
+        dialog.Controls.AddRange([explanation, passphraseBox, showPassphrase, okButton, cancelButton]);
+        dialog.AcceptButton = okButton;
+        dialog.CancelButton = cancelButton;
+        dialog.Shown += (_, _) => passphraseBox.Focus();
+
+        if (dialog.ShowDialog(this) != DialogResult.OK || passphraseCharacters is null)
+        {
+            if (passphraseCharacters is not null)
+            {
+                Array.Clear(passphraseCharacters);
+            }
+
+            return false;
+        }
+
+        passphrase = passphraseCharacters;
         return true;
     }
 
