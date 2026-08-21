@@ -418,6 +418,14 @@ static void TestBitLockerRecoveryPasswordUnlock()
         ValueType = 0x0005,
         Data = EncryptBitLockerAesCcm(stretchedKey, CreateBitLockerKeyData(0x2000, vmk), nonceSeed: 0x11)
     };
+    var decoyEncryptedVmkData = encryptedRecoveryVmk.Data.ToArray();
+    decoyEncryptedVmkData[^1] ^= 0xff;
+    var decoyEncryptedVmk = new BitLockerMetadataEntry
+    {
+        EntryType = 0x0012,
+        ValueType = 0x0005,
+        Data = decoyEncryptedVmkData
+    };
     var stretchData = new byte[4 + BitLockerRecoveryPassword.SaltSize];
     BinaryPrimitives.WriteUInt32LittleEndian(stretchData, 0x1000);
     salt.CopyTo(stretchData, 4);
@@ -433,8 +441,9 @@ static void TestBitLockerRecoveryPasswordUnlock()
                 EntryType = 0x0003,
                 ValueType = 0x0003,
                 Data = stretchData,
-                Children = [encryptedRecoveryVmk]
-            }
+                Children = [decoyEncryptedVmk]
+            },
+            encryptedRecoveryVmk
         ]
     };
     var recoveryMetadata = new BitLockerMetadata
@@ -457,9 +466,11 @@ static void TestBitLockerRecoveryPasswordUnlock()
         metadataError);
     Assert(
         parsedMetadata is { HasRecoveryPasswordProtector: true }
+        && parsedMetadata.EncryptionMethod == 0x8004
+        && parsedMetadata.KeyProtectors.Single().Properties.Any(entry => entry.ValueType == 0x0005)
         && parsedMetadata.KeyProtectors.Single().Properties.Single(entry => entry.ValueType == 0x0003)
             .Children.Single().ValueType == 0x0005,
-        "BitLocker recovery protector metadata parsing");
+        "BitLocker recovery protector metadata parsing and encryption method normalization");
 
     var encryptedReader = new MemorySectorReader(encryptedVolume, 512);
     Assert(
@@ -476,6 +487,43 @@ static void TestBitLockerRecoveryPasswordUnlock()
     Assert(recovered.SequenceEqual(plaintext), "BitLocker recovery password AES-CCM and XTS unlock");
 
     ((IDisposable)recoveryReader).Dispose();
+
+    var nestedRecoveryMetadata = new BitLockerMetadata
+    {
+        EncryptedVolumeSize = encryptedVolume.Length,
+        EncryptionMethod = 0x8004,
+        KeyProtectors =
+        [
+            new BitLockerKeyProtector
+            {
+                Identifier = recoveryProtector.Identifier,
+                ProtectionType = BitLockerProtectionType.RecoveryPassword,
+                RawProtectionType = 0x0800,
+                Properties =
+                [
+                    new BitLockerMetadataEntry
+                    {
+                        EntryType = 0x0003,
+                        ValueType = 0x0003,
+                        Data = stretchData,
+                        Children = [encryptedRecoveryVmk]
+                    }
+                ]
+            }
+        ],
+        Entries = [encryptedFvek]
+    };
+    Assert(
+        BitLockerUnlock.TryCreateReaderWithRecoveryKey(
+            encryptedReader,
+            nestedRecoveryMetadata,
+            intermediateKey,
+            out var nestedRecoveryReader,
+            out var nestedRecoveryError),
+        nestedRecoveryError);
+    Assert(nestedRecoveryReader is not null, "nested BitLocker recovery VMK fallback");
+    ((IDisposable)nestedRecoveryReader!).Dispose();
+
     try
     {
         recoveryReader.ReadAt(0, new byte[1], 0, 1);
@@ -544,6 +592,7 @@ static void TestBitLockerRecoveryPasswordUnlock()
     CryptographicOperations.ZeroMemory(intermediateKey);
     CryptographicOperations.ZeroMemory(wrongKey);
     CryptographicOperations.ZeroMemory(stretchedKey);
+    CryptographicOperations.ZeroMemory(decoyEncryptedVmkData);
     CryptographicOperations.ZeroMemory(clearKey);
     CryptographicOperations.ZeroMemory(vmk);
     CryptographicOperations.ZeroMemory(fvek);
@@ -567,14 +616,18 @@ static byte[] CreateBitLockerMetadataTestImage(
 {
     const int metadataBlockOffset = 4096;
     var encryptedVmkEntry = CreateBitLockerMetadataEntry(0x0003, 0x0005, encryptedVmkData);
-    var stretchPayload = new byte[stretchData.Length + encryptedVmkEntry.Length];
+    var decoyEncryptedVmkData = encryptedVmkData.ToArray();
+    decoyEncryptedVmkData[^1] ^= 0xff;
+    var decoyEncryptedVmkEntry = CreateBitLockerMetadataEntry(0x0012, 0x0005, decoyEncryptedVmkData);
+    var stretchPayload = new byte[stretchData.Length + decoyEncryptedVmkEntry.Length];
     stretchData.CopyTo(stretchPayload, 0);
-    encryptedVmkEntry.CopyTo(stretchPayload, stretchData.Length);
+    decoyEncryptedVmkEntry.CopyTo(stretchPayload, stretchData.Length);
     var stretchEntry = CreateBitLockerMetadataEntry(0x0003, 0x0003, stretchPayload);
-    var protectorPayload = new byte[28 + stretchEntry.Length];
+    var protectorPayload = new byte[28 + stretchEntry.Length + encryptedVmkEntry.Length];
     protectorIdentifier.ToByteArray().CopyTo(protectorPayload, 0);
     BinaryPrimitives.WriteUInt16LittleEndian(protectorPayload.AsSpan(26), 0x0800);
     stretchEntry.CopyTo(protectorPayload, 28);
+    encryptedVmkEntry.CopyTo(protectorPayload, 28 + stretchEntry.Length);
     var protectorEntry = CreateBitLockerMetadataEntry(0x0002, 0x0008, protectorPayload);
     var fvekEntry = CreateBitLockerMetadataEntry(0x0003, 0x0005, encryptedFvekData);
 
@@ -595,7 +648,7 @@ static byte[] CreateBitLockerMetadataTestImage(
     BinaryPrimitives.WriteUInt32LittleEndian(image.AsSpan(metadataOffset + 4), 2);
     BinaryPrimitives.WriteUInt32LittleEndian(image.AsSpan(metadataOffset + 8), metadataHeaderSize);
     Guid.Parse("511c4978-8ba7-4da5-a4f8-63d8f37460e2").ToByteArray().CopyTo(image, metadataOffset + 16);
-    BinaryPrimitives.WriteUInt32LittleEndian(image.AsSpan(metadataOffset + 36), 0x8004);
+    BinaryPrimitives.WriteUInt32LittleEndian(image.AsSpan(metadataOffset + 36), 0x80048004);
     protectorEntry.CopyTo(image, metadataOffset + metadataHeaderSize);
     fvekEntry.CopyTo(image, metadataOffset + metadataHeaderSize + protectorEntry.Length);
     return image;
