@@ -4,3 +4,4 @@ obj/
 *.user
 *.qcow2
 *.qcow
+tests/real-images*.local.json

@@ -44,6 +44,18 @@ if (args.Length > 1 && string.Equals(args[0], "--probe-physical", StringComparis
     return;
 }
 
+if (args.Length > 0 && string.Equals(args[0], "--real-image-regression", StringComparison.OrdinalIgnoreCase))
+{
+    if (args.Length != 2)
+    {
+        throw new ArgumentException("Usage: --real-image-regression <manifest.json>");
+    }
+
+    var summary = RealImageRegressionRunner.Run(args[1]);
+    Console.WriteLine($"Real-image regression passed: {summary.CaseCount} case(s), {summary.Elapsed.TotalSeconds:0.00} sec");
+    return;
+}
+
 if (args.Length > 0)
 {
     int? vmaDeviceId = null;
@@ -74,6 +86,7 @@ static void RunGeneratedImageTests()
     TestLvmMetadataDiagnostics();
     TestGeneratedLvm2Image();
     TestGeneratedLzopExt4Image();
+    TestRealImageRegressionRunner();
     TestGeneratedVmaLzopImage();
     TestGeneratedUefiVariableStore();
     TestGeneratedSwtpmStateStore();
@@ -297,6 +310,46 @@ static void RunGeneratedImageTests()
     }
 
     RunProjFsRemountSmoke(rawFs);
+}
+
+static void TestRealImageRegressionRunner()
+{
+    var imagePath = Path.Combine(AppContext.BaseDirectory, "sample-regression-fat16.qcow2");
+    TestImageFactory.CreateFat16Qcow2(imagePath);
+    var helloSha256 = Convert.ToHexString(SHA256.HashData(Encoding.ASCII.GetBytes(TestImageFactory.HelloText)));
+    var manifestPath = Path.Combine(AppContext.BaseDirectory, "real-image-regression.generated.json");
+    var manifest = $$"""
+        {
+          "version": 1,
+          "cases": [
+            {
+              "name": "generated FAT16 runner smoke",
+              "path": "{{Path.GetFileName(imagePath)}}",
+              "sha256": "{{Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(imagePath)))}}",
+              "expectedFormatContains": "qcow2",
+              "expectedDiskLength": {{TestImageFactory.VirtualSize}},
+              "expectedPartitionCount": 1,
+              "partitions": [
+                {
+                  "number": 1,
+                  "expectedFileSystem": "FAT16",
+                  "files": [
+                    {
+                      "path": "/HELLO.TXT",
+                      "expectedDirectory": false,
+                      "expectedLength": {{Encoding.ASCII.GetByteCount(TestImageFactory.HelloText)}},
+                      "sha256": "{{helloSha256}}"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+        """;
+    File.WriteAllText(manifestPath, manifest, new UTF8Encoding(false));
+    var summary = RealImageRegressionRunner.Run(manifestPath);
+    Assert(summary.CaseCount == 1, "real-image regression runner case count");
 }
 
 static void TestBitLockerRecoveryPasswordUnlock()
@@ -965,7 +1018,32 @@ static void TestGeneratedLzopExt4Image()
     }
 
     var metadataPath = Path.Combine(Path.GetDirectoryName(cachedRawPath)!, "cache.json");
+    File.WriteAllText(metadataPath, "{ invalid json", new UTF8Encoding(false));
+    using (var invalidMetadataReader = DiskImageReaderFactory.Open(
+        cacheSourcePath,
+        lzopOpenMode: LzopOpenMode.CachedRaw,
+        lzopTemporaryDirectory: cacheRoot))
+    {
+        Assert(
+            invalidMetadataReader is TemporaryLzopDiskImageReader { CacheReused: false },
+            "dd.lzo invalid cache metadata rejection");
+    }
+
     var metadataJson = File.ReadAllText(metadataPath);
+    var unsupportedVersionJson = metadataJson.Replace("\"Version\": 1", "\"Version\": 99", StringComparison.Ordinal);
+    Assert(unsupportedVersionJson != metadataJson, "dd.lzo cache metadata version fixture");
+    File.WriteAllText(metadataPath, unsupportedVersionJson, new UTF8Encoding(false));
+    using (var unsupportedMetadataReader = DiskImageReaderFactory.Open(
+        cacheSourcePath,
+        lzopOpenMode: LzopOpenMode.CachedRaw,
+        lzopTemporaryDirectory: cacheRoot))
+    {
+        Assert(
+            unsupportedMetadataReader is TemporaryLzopDiskImageReader { CacheReused: false },
+            "dd.lzo unsupported cache metadata version rejection");
+    }
+
+    metadataJson = File.ReadAllText(metadataPath);
     var incompleteJson = metadataJson.Replace("\"Completed\": true", "\"Completed\": false", StringComparison.Ordinal);
     Assert(incompleteJson != metadataJson, "dd.lzo cache completion fixture");
     File.WriteAllText(metadataPath, incompleteJson, new UTF8Encoding(false));
@@ -995,6 +1073,25 @@ static void TestGeneratedLzopExt4Image()
         Assert(repairedReader.Length == reader.Length, "dd.lzo truncated cache rebuild");
     }
 
+    var sourceWriteTime = File.GetLastWriteTimeUtc(cacheSourcePath);
+    var sameLengthReplacementPath = Path.Combine(AppContext.BaseDirectory, "sample-ext4-cache-replacement.dd.lzo");
+    TestImageFactory.CreateExt4LzopDisk(sameLengthReplacementPath, originalName: "sample-alt0.dd");
+    Assert(
+        new FileInfo(sameLengthReplacementPath).Length == new FileInfo(cacheSourcePath).Length,
+        "dd.lzo same-length source replacement fixture");
+    File.Copy(sameLengthReplacementPath, cacheSourcePath, overwrite: true);
+    File.SetLastWriteTimeUtc(cacheSourcePath, sourceWriteTime);
+    using (var contentChangedReader = DiskImageReaderFactory.Open(
+        cacheSourcePath,
+        lzopOpenMode: LzopOpenMode.CachedRaw,
+        lzopTemporaryDirectory: cacheRoot))
+    {
+        Assert(
+            contentChangedReader is TemporaryLzopDiskImageReader { CacheReused: false },
+            "dd.lzo SHA-256 detects same-length same-time source replacement");
+    }
+
+    File.Delete(sameLengthReplacementPath);
     File.SetLastWriteTimeUtc(cacheSourcePath, File.GetLastWriteTimeUtc(cacheSourcePath).AddSeconds(2));
     using (var changedSourceReader = DiskImageReaderFactory.Open(
         cacheSourcePath,
@@ -1149,6 +1246,60 @@ static void TestGeneratedLzopExt4Image()
     catch (InvalidDataException ex)
     {
         Assert(ex.Message.Contains("チェックサム", StringComparison.Ordinal), "damaged dd.lzo diagnostic");
+    }
+
+    var sourceBytes = File.ReadAllBytes(imagePath);
+    foreach (var truncatedLength in new[] { 0, 8, 32, sourceBytes.Length / 2, sourceBytes.Length - 1 })
+    {
+        var truncatedPath = Path.Combine(AppContext.BaseDirectory, $"sample-ext4-truncated-{truncatedLength}.dd.lzo");
+        File.WriteAllBytes(truncatedPath, sourceBytes.AsSpan(0, truncatedLength).ToArray());
+        try
+        {
+            using var _ = DiskImageReaderFactory.Open(truncatedPath);
+            Assert(false, $"truncated dd.lzo rejection at {truncatedLength} bytes");
+        }
+        catch (Exception ex) when (ex is EndOfStreamException or InvalidDataException)
+        {
+        }
+        finally
+        {
+            File.Delete(truncatedPath);
+        }
+    }
+
+    var corruptedBlockPath = Path.Combine(AppContext.BaseDirectory, "sample-ext4-corrupted-block.dd.lzo");
+    var corruptedBlockBytes = sourceBytes.ToArray();
+    var firstBlockOffset = 9 + 24;
+    var originalNameLength = corruptedBlockBytes[firstBlockOffset];
+    firstBlockOffset += 1 + originalNameLength + sizeof(uint);
+    var uncompressedSize = BinaryPrimitives.ReadUInt32BigEndian(corruptedBlockBytes.AsSpan(firstBlockOffset, sizeof(uint)));
+    var compressedSize = BinaryPrimitives.ReadUInt32BigEndian(corruptedBlockBytes.AsSpan(firstBlockOffset + sizeof(uint), sizeof(uint)));
+    firstBlockOffset += 2 * sizeof(uint);
+    firstBlockOffset += 2 * sizeof(uint);
+    if (compressedSize < uncompressedSize)
+    {
+        firstBlockOffset += 2 * sizeof(uint);
+    }
+
+    corruptedBlockBytes[firstBlockOffset] ^= 0x01;
+    File.WriteAllBytes(corruptedBlockPath, corruptedBlockBytes);
+    try
+    {
+        using var corruptedReader = DiskImageReaderFactory.Open(corruptedBlockPath);
+        var firstByte = new byte[1];
+        corruptedReader.ReadAt(0, firstByte, 0, firstByte.Length);
+        Assert(false, "dd.lzo data checksum corruption rejection");
+    }
+    catch (InvalidDataException ex)
+    {
+        Assert(
+            ex.Message.Contains("lzopブロック", StringComparison.Ordinal)
+            && ex.Message.Contains("一致しません", StringComparison.Ordinal),
+            "dd.lzo data checksum corruption diagnostic");
+    }
+    finally
+    {
+        File.Delete(corruptedBlockPath);
     }
 }
 
@@ -1885,9 +2036,12 @@ internal static class TestImageFactory
         File.WriteAllBytes(path, CreateVirtualDisk());
     }
 
-    public static void CreateExt4LzopDisk(string path, bool corruptHeaderChecksum = false)
+    public static void CreateExt4LzopDisk(
+        string path,
+        bool corruptHeaderChecksum = false,
+        string originalName = "sample-ext4.dd")
     {
-        WriteLzop(path, CreateMinimalExt4Disk(), "sample-ext4.dd", corruptHeaderChecksum);
+        WriteLzop(path, CreateMinimalExt4Disk(), originalName, corruptHeaderChecksum);
     }
 
     public static void CreateFat16VmaLzop(string path)

@@ -1,7 +1,7 @@
 # 次回対応予定
 
 - 最終更新: 2026-08-21
-- 基準コミット: `dfcc670`
+- 基準ブランチ: `main`
 
 この文書は、次回の開発作業へ引き継ぐための優先順位付きロードマップです。
 本ソフトは引き続き、ディスクイメージと内部ファイルシステムを変更しない読み取り専用ツールとして実装します。
@@ -57,11 +57,14 @@
 - DiscUtils系パッケージを`1.0.84`からNuGet上の最新`1.0.88`へ更新し、全テストを確認
 - GitHub ActionsでWindows、.NET 10、フォーマット検査、Debugビルド、自動テストを実行
 - LZOキャッシュの破損・途中切れ・異常状態に対する回帰テストを追加
+- 実イメージをGitへ追加せず、SHA-256、形式、パーティション、ファイルシステム、ファイル内容・更新日時をmanifestで検証する任意実行ランナーを追加
+- BitLocker回復パスワードはmanifestへ保存せず環境変数から読み込み、LZO実イメージは初回展開・再利用時間とキャンセル後の清掃を検証可能
 
 ## 次回の推奨作業
 
 ### 1. 実イメージ回帰テストの拡充
 
+- `tests/REAL_IMAGE_REGRESSION.md`の手順でローカルmanifestを作成する
 - XFS bigtime、BitLocker回復パスワード、LZOキャッシュを実環境由来イメージでも確認する
 - 再配布条件と機密情報を確認し、公開できないイメージは生成手順またはハッシュだけを管理する
 - 大容量イメージでキャッシュ検証のSHA-256計算時間、再利用時間、キャンセル応答を計測する
@@ -106,4 +109,4 @@
 2. 作業ツリーにユーザーの未コミット変更がないか確認する
 3. `dotnet build Qcow2Explorer.sln --configuration Debug`を実行する
 4. `dotnet run --project tests\Qcow2Explorer.Tests\Qcow2Explorer.Tests.csproj --configuration Debug --no-build`を実行する
-5. 上記の「1. 実イメージ回帰テストの拡充」から着手する
+5. `tests/REAL_IMAGE_REGRESSION.md`に従い、利用可能な実イメージfixtureをローカルmanifestへ登録する

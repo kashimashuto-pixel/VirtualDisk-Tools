@@ -131,6 +131,10 @@ dotnet run --project tests\Qcow2Explorer.Tests\Qcow2Explorer.Tests.csproj -- "<a
 dotnet run --project tests\Qcow2Explorer.Tests\Qcow2Explorer.Tests.csproj -- "<image-path>" --copy-smoke
 ```
 
+XFS bigtime、BitLocker回復パスワード、LZOキャッシュなどを実環境由来イメージで回帰確認する場合は、
+[実イメージ回帰テスト手順](tests/REAL_IMAGE_REGRESSION.md)を参照してください。
+イメージとローカルmanifestはGitへ追加せず、SHA-256と期待値を照合して任意実行します。
+
 ## ProjFS マウント
 
 ProjFS マウントは Windows の Client-ProjFS 機能を使い、選択したパーティションを既存フォルダ配下へ読み取り専用で投影します。
