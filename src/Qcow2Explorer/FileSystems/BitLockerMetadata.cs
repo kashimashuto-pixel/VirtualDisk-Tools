@@ -86,17 +86,28 @@ public static class BitLockerMetadataReader
             }
 
             var candidates = GetMetadataOffsetCandidates(boot, reader.Length);
+            var candidateErrors = new List<string>();
             foreach (var offset in candidates)
             {
-                if (TryReadMetadataBlock(reader, offset, out metadata, out error))
+                try
                 {
-                    return true;
+                    if (TryReadMetadataBlock(reader, offset, out metadata, out var candidateError))
+                    {
+                        return true;
+                    }
+
+                    candidateErrors.Add($"0x{offset:X}: {candidateError}");
+                }
+                catch (Exception ex) when (ex is IOException or InvalidDataException or ArgumentOutOfRangeException or OverflowException)
+                {
+                    metadata = null;
+                    candidateErrors.Add($"0x{offset:X}: {ex.Message}");
                 }
             }
 
-            error = string.IsNullOrWhiteSpace(error)
+            error = candidateErrors.Count == 0
                 ? "有効な BitLocker/FVE メタデータブロックを検出できませんでした。"
-                : error;
+                : $"有効な BitLocker/FVE メタデータブロックを検出できませんでした: {string.Join("; ", candidateErrors)}";
             return false;
         }
         catch (Exception ex) when (ex is IOException or InvalidDataException or ArgumentOutOfRangeException or OverflowException)
@@ -249,8 +260,20 @@ public static class BitLockerMetadataReader
             return false;
         }
 
-        var metadataBytes = EndianUtilities.ReadBytes(reader, blockOffset + 64, metadataSize);
-        var entries = ParseEntries(metadataBytes, metadataHeaderSize, metadataSize).ToList();
+        var metadataOffset = checked(blockOffset + 64);
+        if (metadataSize > reader.Length - metadataOffset)
+        {
+            error = $"BitLocker メタデータが入力範囲を超えています: offset=0x{metadataOffset:X}, size={metadataSize}";
+            return false;
+        }
+
+        var metadataBytes = EndianUtilities.ReadBytes(reader, metadataOffset, metadataSize);
+        if (!TryParseEntries(metadataBytes, metadataHeaderSize, metadataSize, 0, out var entries, out var entryError))
+        {
+            error = $"BitLocker メタデータエントリが不正です: {entryError}";
+            return false;
+        }
+
         // Windows can repeat the 16-bit algorithm identifier in the upper word.
         var encryptionMethod = EndianUtilities.ReadUInt32Little(metadataBytes, 36) & ushort.MaxValue;
         metadata = new BitLockerMetadata
@@ -286,9 +309,23 @@ public static class BitLockerMetadataReader
         };
     }
 
-    private static IReadOnlyList<BitLockerMetadataEntry> ParseEntries(byte[] buffer, int startOffset, int endOffset)
+    private static bool TryParseEntries(
+        byte[] buffer,
+        int startOffset,
+        int endOffset,
+        int depth,
+        out IReadOnlyList<BitLockerMetadataEntry> entries,
+        out string error)
     {
         var result = new List<BitLockerMetadataEntry>();
+        entries = result;
+        error = "";
+        if (depth > 32)
+        {
+            error = "メタデータエントリの入れ子が深すぎます。";
+            return false;
+        }
+
         var offset = startOffset;
         while (offset + 8 <= endOffset)
         {
@@ -298,17 +335,29 @@ public static class BitLockerMetadataReader
             var version = EndianUtilities.ReadUInt16Little(buffer, offset + 6);
             if (size == 0 || entryType == 0 && valueType == 0 && version == 0)
             {
-                break;
+                if (!IsZeroFilled(buffer, offset, endOffset))
+                {
+                    error = $"オフセット0x{offset:X}以降に不正な終端データがあります。";
+                    return false;
+                }
+
+                return true;
             }
 
             if (size < 8 || offset + size > endOffset)
             {
-                break;
+                error = $"エントリ範囲が不正です: offset=0x{offset:X}, size={size}, end=0x{endOffset:X}";
+                return false;
             }
 
             var data = new byte[size - 8];
             Array.Copy(buffer, offset + 8, data, 0, data.Length);
-            var children = ParseChildEntries(entryType, valueType, data);
+            if (!TryParseChildEntries(entryType, valueType, data, depth, out var children, out var childError))
+            {
+                error = $"オフセット0x{offset:X}の子エントリが不正です: {childError}";
+                return false;
+            }
+
             result.Add(new BitLockerMetadataEntry
             {
                 Offset = offset,
@@ -323,27 +372,54 @@ public static class BitLockerMetadataReader
             offset += size;
         }
 
-        return result;
+        if (!IsZeroFilled(buffer, offset, endOffset))
+        {
+            error = $"オフセット0x{offset:X}に切り詰められたエントリがあります。";
+            return false;
+        }
+
+        return true;
     }
 
-    private static IReadOnlyList<BitLockerMetadataEntry> ParseChildEntries(ushort entryType, ushort valueType, byte[] data)
+    private static bool TryParseChildEntries(
+        ushort entryType,
+        ushort valueType,
+        byte[] data,
+        int depth,
+        out IReadOnlyList<BitLockerMetadataEntry> children,
+        out string error)
     {
         if (entryType == 0x0002 && valueType == 0x0008 && data.Length >= 28)
         {
-            return ParseEntries(data, 28, data.Length);
+            return TryParseEntries(data, 28, data.Length, depth + 1, out children, out error);
         }
 
         if (valueType == 0x0003 && data.Length >= 20)
         {
-            return ParseEntries(data, 20, data.Length);
+            return TryParseEntries(data, 20, data.Length, depth + 1, out children, out error);
         }
 
         if (valueType == 0x0009 && data.Length >= 24)
         {
-            return ParseEntries(data, 24, data.Length);
+            return TryParseEntries(data, 24, data.Length, depth + 1, out children, out error);
         }
 
-        return Array.Empty<BitLockerMetadataEntry>();
+        children = Array.Empty<BitLockerMetadataEntry>();
+        error = "";
+        return true;
+    }
+
+    private static bool IsZeroFilled(byte[] buffer, int startOffset, int endOffset)
+    {
+        for (var offset = startOffset; offset < endOffset; offset++)
+        {
+            if (buffer[offset] != 0)
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private static IReadOnlyList<BitLockerKeyProtector> ReadKeyProtectors(IReadOnlyList<BitLockerMetadataEntry> entries)
