@@ -8,6 +8,9 @@ param(
 
     [string]$Distribution = 'Ubuntu-24.04',
 
+    [ValidateSet('Pbkdf2', 'Argon2id')]
+    [string]$Kdf = 'Pbkdf2',
+
     [ValidateRange(128, 4096)]
     [int]$SizeMiB = 256
 )
@@ -50,10 +53,11 @@ try {
     $linuxGenerator = ConvertTo-WslPath $generator
     $linuxOutput = ConvertTo-WslPath $resolvedOutput
     $linuxKeyFile = ConvertTo-WslPath $temporaryKeyPath
+    $linuxKdf = $Kdf.ToLowerInvariant()
     & wsl.exe `
         --distribution $Distribution `
         --user root `
-        --exec bash $linuxGenerator $linuxOutput $linuxKeyFile $SizeMiB
+        --exec bash $linuxGenerator $linuxOutput $linuxKeyFile $SizeMiB $linuxKdf
     if ($LASTEXITCODE -ne 0) {
         throw "LUKS2 fixture generation failed with exit code $LASTEXITCODE."
     }
@@ -63,6 +67,7 @@ try {
         $passphrase,
         [EnvironmentVariableTarget]::User)
     Write-Output "passphrase_environment_variable=$PassphraseEnvironmentVariable"
+    Write-Output "kdf=$Kdf"
     Write-Output 'cryptsetup_unlock_verified=true'
 }
 finally {
