@@ -79,6 +79,9 @@ C# / Windows Forms で作成した、読み取り専用の仮想ディスク解�
   - VMAヘッダーとエクステントのMD5を検証
   - 最大容量の仮想ディスクを初期選択し、ツールバーの「VMAディスク」から格納ディスクを切り替え
   - 疎な4 KiBブロックを元の仮想ディスク位置へ読み取り専用で復元
+- Expert Witness Format / EnCase E01 (`.E01`、連番の`.E02`以降を自動検出)
+  - EWF1/EVFのEnCase 6 `volume` / `sectors` / `table`構成を読み取り
+  - deflate圧縮chunkと非圧縮chunkのAdler-32、section・tableのAdler-32を検証
 - raw / dd / img
 - lzop/LZO1X圧縮された `.dd.lzo` / `.img.lzo` / `.raw.lzo` / `.lzo`
   - 開く際に、全体を一時RAWへ展開する「高速モード」と必要なブロックだけを展開する「省容量モード」を選択
@@ -150,7 +153,7 @@ dotnet run --project tests\Qcow2Explorer.Tests\Qcow2Explorer.Tests.csproj -- "<a
 dotnet run --project tests\Qcow2Explorer.Tests\Qcow2Explorer.Tests.csproj -- "<image-path>" --copy-smoke
 ```
 
-XFS bigtime、BitLocker、LUKS1/LUKS2、LZOキャッシュなどを実環境由来イメージで回帰確認する場合は、
+XFS bigtime、BitLocker、LUKS1/LUKS2、E01、LZOキャッシュなどを実環境由来イメージで回帰確認する場合は、
 [実イメージ回帰テスト手順](tests/REAL_IMAGE_REGRESSION.md)を参照してください。
 イメージとローカルmanifestはGitへ追加せず、SHA-256と期待値を照合して任意実行します。
 
@@ -189,6 +192,7 @@ ProjFS マウントは Windows の Client-ProjFS 機能を使い、選択した�
 - LUKS1はAES-XTS/plain64の256/512-bit合成キーに対応します。detached header、AES-CBC、ESSIV、plain/plain64以外のIV方式は未対応です。
 - LUKS2は有効なprimary/secondary headerのうちsequence IDが新しいものを使用し、PBKDF2/Argon2id keyslot、標準4000 AF stripes、単一dynamic crypt segment、AES-XTS/plain64に対応します。Argon2idはmemory 1 GiB、time cost 10、parallelism 16を上限とし、実行時のメモリ余力も確認します。Argon2i/d、reencryption、複数・固定長segment、detached headerは未対応です。
 - LUKS1/LUKS2パスフレーズとvolume keyは設定・ログ・解析レポートへ保存せず、一時配列と復号リーダーのキーを使用後に消去します。
+- E01はEWF1/EVFのEnCase 6形式、deflateまたは非圧縮chunk、連続したsegmentに対応します。安全なメモリ使用のためchunk数上限は4,194,304です。EWF2/Ex01、bzip2、論理証拠ファイル（L01）、暗号化EWF、旧形式など異なるtable配置は未対応です。
 - NTFSの主 `$MFT` 先頭レコードが破損している場合は `$MFTMirr` から復旧を試みます。ルートレコードなど主MFTの必須データ自体が欠落しているイメージは、元ディスクまたはバックアップからの再取得が必要です。
 - NTFS削除済みファイルはMFTに残っている情報を表示します。削除後に再利用されたクラスタの内容は復旧できません。
 - LVM2 は、現在の入力内に必要なPVがすべてあり、LVが単一stripeのlinear相当である構成を読み取ります。
@@ -384,5 +388,6 @@ SOFTWARE.
 - BitLocker/FVEメタデータ・鍵導出形式: https://github.com/libyal/libbde/blob/main/documentation/BitLocker%20Drive%20Encryption%20%28BDE%29%20format.asciidoc
 - LUKS1 on-disk format: https://cdn.kernel.org/pub/linux/utils/cryptsetup/LUKS_docs/on-disk-format.pdf
 - LUKS2 on-disk format: https://gitlab.com/cryptsetup/cryptsetup/-/blob/master/docs/on-disk-format-luks2.pdf
+- Expert Witness Compression Format (EWF): https://github.com/libyal/libewf/blob/main/documentation/Expert%20Witness%20Compression%20Format%20%28EWF%29.asciidoc
 - Argon2 reference implementation: https://github.com/P-H-C/phc-winner-argon2
 - Konscious Argon2 for .NET: https://github.com/kmaragon/Konscious.Security.Cryptography

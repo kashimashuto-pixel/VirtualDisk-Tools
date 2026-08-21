@@ -95,13 +95,19 @@
 - 実イメージをGitへ追加せず、SHA-256、形式、パーティション、ファイルシステム、ファイル内容・更新日時をmanifestで検証する任意実行ランナーを追加
 - BitLocker回復パスワードはmanifestへ保存せず環境変数から読み込み、LZO実イメージは初回展開・再利用時間とキャンセル後の清掃を検証可能
 
+### E01/EWF読み取り対応
+
+- libyalの一次仕様を基に、外部native依存を追加しないmanaged readerを実装
+- EWF1/EVF EnCase 6の分割segment、deflate/非圧縮chunk、section・table・chunkのAdler-32を検証
+- 生成multipartテストと、`ewfacquire` / `ewfverify`由来fixtureのlogical SHA-256回帰を追加
+- EWF2/Ex01、bzip2、L01、暗号化EWF、旧table配置は明示的に未対応
+
 ## 次回の推奨作業
 
-### 1. E01/EWF対応の仕様・ライセンス調査
+### 1. Btrfs対応の仕様・実装範囲調査
 
-- EWF/E01の一次仕様、圧縮、segment分割、chunk checksum、metadata構造を調査する
-- libewf等の実装候補について、ライセンス、Windows self-contained配布、native依存を比較する
-- 読み取り専用の最小対応範囲と、再配布可能なfixtureの生成方法を決定する
+- superblock、chunk tree、root tree、checksum tree、圧縮extentの段階的な対応範囲を決める
+- 単一デバイス・非RAID・読み取り専用の最小実装と、再配布可能なfixture生成方法を検討する
 
 ## 保守・品質改善
 
@@ -115,14 +121,11 @@
 
 利用目的に応じ、次の順で検討します。
 
-1. E01/EWF
-   - フォレンジック用途向け
-   - 分割セグメント、圧縮、整合性情報、ライセンスと配布方法を事前調査する
-2. Btrfs
+1. Btrfs
    - サブボリューム、圧縮、チェックサム、複数デバイスを段階的に扱う
-3. Linux md RAIDの実読み取り
+2. Linux md RAIDの実読み取り
    - まずRAID1から開始し、その後RAID0/5/6を検討する
-4. LVM2の拡張
+3. LVM2の拡張
    - 複数PV、thin、snapshot、cache、mirror、RAID segmentを段階的に対応する
 
 ## 維持する既存仕様

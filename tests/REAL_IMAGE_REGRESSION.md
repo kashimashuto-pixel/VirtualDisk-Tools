@@ -2,6 +2,7 @@
 
 実環境由来のディスクイメージはGitへ追加せず、ローカルmanifestから明示的に実行します。
 manifestにはイメージのSHA-256、期待する形式・ファイルシステム・ファイル情報だけを記録します。
+コンテナー展開後の仮想ディスク全体も照合する場合は`expectedLogicalSha256`を指定します。
 
 ```powershell
 dotnet run --project tests\Qcow2Explorer.Tests\Qcow2Explorer.Tests.csproj `
@@ -110,6 +111,24 @@ PBKDF2の短いiteration targetはローカルfixtureを高速に再生成する
 
 環境に応じて最大1 GiB程度のメモリを使用し、生成時と回帰実行時の解除に数秒以上かかります。
 ローカルmanifestでは`"luksPassphraseEnvironmentVariable": "VDT_LUKS2_ARGON2ID_PASSPHRASE"`を指定します。
+
+### EnCase 6 E01
+
+WSL 2のUbuntu 24.04へ`ewf-tools`をインストールし、既存のRAW fixtureをE01へ変換します。
+
+```powershell
+wsl --distribution Ubuntu-24.04 --user root -- sh -lc `
+  "apt-get update && apt-get install -y ewf-tools"
+
+.\tools\New-EwfRegressionFixture.ps1 `
+  -SourcePath .\.tmp\real-images\sample-fat16.img `
+  -OutputPath .\.tmp\real-images\ewf-fat16.E01 `
+  -SegmentSizeMiB 2048
+```
+
+スクリプトはEnCase 6形式を生成し、`ewfverify`で検証して、元RAWと各segmentのSHA-256を表示します。
+分割読取を実イメージでも確認する場合は、小さい`SegmentSizeMiB`を指定します。manifestの`sha256`にはE01第1 segment、`expectedLogicalSha256`には元RAWのSHA-256を記録します。
+fixture本体とローカルmanifestはコミットしないでください。
 
 ## Manifest例
 

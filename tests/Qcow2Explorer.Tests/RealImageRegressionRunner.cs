@@ -207,6 +207,20 @@ internal static class RealImageRegressionRunner
                 $"disk length mismatch: expected={expectedLength}, actual={reader.Length}");
         }
 
+        if (!string.IsNullOrWhiteSpace(regressionCase.ExpectedLogicalSha256))
+        {
+            var expectedLogicalHash = NormalizeSha256(
+                regressionCase.ExpectedLogicalSha256,
+                regressionCase.Name,
+                "logical disk");
+            Console.WriteLine($"[{regressionCase.Name}] logical SHA-256を検証中 ({reader.Length:N0} bytes)...");
+            var actualLogicalHash = ComputeReaderSha256(reader);
+            Require(
+                string.Equals(actualLogicalHash, expectedLogicalHash, StringComparison.OrdinalIgnoreCase),
+                regressionCase.Name,
+                $"logical disk SHA-256 mismatch: expected={expectedLogicalHash}, actual={actualLogicalHash}");
+        }
+
         var partitions = PartitionTableReader.ReadPartitions(reader).ToList();
         if (regressionCase.ExpectedPartitionCount is int expectedPartitionCount)
         {
@@ -428,6 +442,21 @@ internal static class RealImageRegressionRunner
         return Convert.ToHexString(SHA256.HashData(stream));
     }
 
+    private static string ComputeReaderSha256(IBlockReader reader)
+    {
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        var buffer = new byte[HashBufferSize];
+        long offset = 0;
+        while (offset < reader.Length)
+        {
+            var count = checked((int)Math.Min(buffer.Length, reader.Length - offset));
+            reader.ReadAt(offset, buffer, 0, count);
+            hash.AppendData(buffer, 0, count);
+            offset += count;
+        }
+        return Convert.ToHexString(hash.GetHashAndReset());
+    }
+
     private static string ComputeFileSystemFileSha256(IReadOnlyFileSystem fileSystem, VfsNode file)
     {
         using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
@@ -483,6 +512,7 @@ internal sealed class RealImageRegressionCase
     public string Sha256 { get; set; } = "";
     public string ExpectedFormatContains { get; set; } = "";
     public long? ExpectedDiskLength { get; set; }
+    public string ExpectedLogicalSha256 { get; set; } = "";
     public int? ExpectedPartitionCount { get; set; }
     public bool VerifyLzopCacheReuse { get; set; }
     public bool VerifyLzopCacheCancellation { get; set; }
