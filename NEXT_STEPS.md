@@ -113,15 +113,19 @@
 - LZO圧縮extentの全体／segment長、4 KiB境界padding、128 KiB展開上限を検証し、通常・inline extentと破損payloadを回帰テスト
 - zstd圧縮extentのframe header、window、content size、block境界、割当末尾paddingを検証し、通常・inline extentと破損payloadを回帰テスト
 - `btrfs-progs 6.6.3`由来のzstd通常・inline extentを実イメージ回帰で確認
+- tree IDとinode番号の複合参照へ移行し、subvolume間で重複するinode番号を分離
+- ROOT_REF/ROOT_BACKREF、親DIR_INDEX、ROOT_ITEM世代を相互検証し、subvolume・入れ子subvolume・snapshotを読み取り
+- root treeの`default` DIR_ITEMからdefault subvolumeを解決し、snapshot内の入れ子subvolume境界は空ディレクトリとして扱う
+- `btrfs-progs 6.6.3`由来のdefault・入れ子subvolume・snapshotを実イメージ回帰で確認
 
 ## 次回の推奨作業
 
 ### 1. Btrfs対応の第2段階
 
-- root ref/backrefを解析し、トップレベルから到達可能なsubvolumeを読み取り専用で列挙する
-- default subvolumeを安全に解決し、欠損・循環・世代不整合時はトップレベルへ明示的にフォールバックする
-- subvolume間の名前衝突、snapshot、入れ子構造を合成・実イメージ回帰で検証する
-- backup superblock利用は、世代整合性と誤復旧防止の設計後に追加する
+- primaryとbackup superblock候補のFSID、物理位置、世代、geometry、tree rootを個別に検証する
+- primary破損時だけ、整合する最新世代のbackup superblockへ読み取り専用で復旧する
+- primaryが有効な場合は世代の新しいbackupへ不用意に切り替えず、選択理由を診断可能にする
+- primary checksum、backup checksum、世代不整合、別FS混入、途中切れを合成テストで検証する
 
 ## 保守・品質改善
 
