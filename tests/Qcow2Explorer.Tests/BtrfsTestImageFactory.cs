@@ -21,13 +21,18 @@ internal static class BtrfsTestImageFactory
     private const int ChecksumTreeLogicalOffset = ChunkTreeLogicalOffset + 3 * NodeSize;
     private const int SparseDataLogicalOffset = RegularDataLogicalOffset + 2 * SectorSize;
     private const int ZlibDataLogicalOffset = RegularDataLogicalOffset + 3 * SectorSize;
+    private const int LzoDataLogicalOffset = RegularDataLogicalOffset + 4 * SectorSize;
     private const ulong Generation = 1;
 
     public static byte[] RegularData { get; } = Enumerable.Range(0, 6000)
         .Select(index => checked((byte)((index * 73 + 19) & 0xff)))
         .ToArray();
 
-    public static BtrfsTestFixture Create(string path, bool corruptZlibPayload = false)
+    public static BtrfsTestFixture Create(
+        string path,
+        bool corruptZlibPayload = false,
+        bool corruptLzoPayload = false,
+        bool corruptLzoHeader = false)
     {
         var disk = new byte[DiskSize];
         var partitionLength = DiskSize - PartitionStart;
@@ -61,6 +66,7 @@ internal static class BtrfsTestImageFactory
 
         var helloBytes = Encoding.UTF8.GetBytes(HelloText);
         var sparseTailBytes = Encoding.UTF8.GetBytes(SparseTail);
+        var inlineLzoData = CompressBtrfsLzoZeros(1024, padToSector: false);
         var fileSystemTree = CreateLeaf(
             FileSystemTreeLogicalOffset,
             owner: 5,
@@ -73,7 +79,9 @@ internal static class BtrfsTestImageFactory
                     (258, 1, 1, "regular.bin"),
                     (259, 1, 2, "nested"),
                     (261, 1, 1, "sparse.bin"),
-                    (262, 1, 1, "zlib.bin"))),
+                    (262, 1, 1, "zlib.bin"),
+                    (263, 1, 1, "lzo.bin"),
+                    (264, 1, 1, "inline-lzo.bin"))),
                 (new BtrfsKey(257, 1, 0), CreateInode(helloBytes.Length, 0x81a4)),
                 (new BtrfsKey(257, 108, 0), CreateInlineExtent(helloBytes)),
                 (new BtrfsKey(258, 1, 0), CreateInode(RegularData.Length, 0x81a4)),
@@ -90,7 +98,16 @@ internal static class BtrfsTestImageFactory
                     SectorSize,
                     128 * 1024,
                     compression: 1,
-                    ramBytes: 128 * 1024))
+                    ramBytes: 128 * 1024)),
+                (new BtrfsKey(263, 1, 0), CreateInode(128 * 1024, 0x81a4)),
+                (new BtrfsKey(263, 108, 0), CreateRegularExtent(
+                    LzoDataLogicalOffset,
+                    SectorSize,
+                    128 * 1024,
+                    compression: 2,
+                    ramBytes: 128 * 1024)),
+                (new BtrfsKey(264, 1, 0), CreateInode(1024, 0x81a4)),
+                (new BtrfsKey(264, 108, 0), CreateCompressedInlineExtent(inlineLzoData, 1024, compression: 2))
             ]);
         fileSystemTree.CopyTo(disk, PartitionStart + FileSystemTreeLogicalOffset);
 
@@ -103,8 +120,20 @@ internal static class BtrfsTestImageFactory
         }
 
         zlibData.CopyTo(disk, PartitionStart + ZlibDataLogicalOffset);
-        var checksumBytes = new byte[4 * sizeof(uint)];
-        for (var sector = 0; sector < 4; sector++)
+        var lzoData = CompressBtrfsLzoZeros(128 * 1024);
+        if (corruptLzoPayload)
+        {
+            var firstSegmentLength = checked((int)BinaryPrimitives.ReadUInt32LittleEndian(lzoData.AsSpan(4, 4)));
+            lzoData[8 + firstSegmentLength - 1] ^= 1;
+        }
+        else if (corruptLzoHeader)
+        {
+            lzoData.AsSpan(0, sizeof(uint)).Clear();
+        }
+
+        lzoData.CopyTo(disk, PartitionStart + LzoDataLogicalOffset);
+        var checksumBytes = new byte[5 * sizeof(uint)];
+        for (var sector = 0; sector < 5; sector++)
         {
             var source = disk.AsSpan(PartitionStart + RegularDataLogicalOffset + sector * SectorSize, SectorSize);
             WriteU32(checksumBytes, sector * sizeof(uint), ComputeCrc32C(source));
@@ -219,6 +248,16 @@ internal static class BtrfsTestImageFactory
         return extent;
     }
 
+    private static byte[] CreateCompressedInlineExtent(byte[] data, int decodedLength, byte compression)
+    {
+        var extent = new byte[21 + data.Length];
+        WriteU64(extent, 0, Generation);
+        WriteU64(extent, 8, decodedLength);
+        extent[16] = compression;
+        data.CopyTo(extent, 21);
+        return extent;
+    }
+
     private static byte[] CreateRegularExtent(
         ulong diskBytenr,
         int diskBytes,
@@ -246,6 +285,72 @@ internal static class BtrfsTestImageFactory
         }
 
         return output.ToArray();
+    }
+
+    private static byte[] CompressBtrfsLzoZeros(int decodedLength, bool padToSector = true)
+    {
+        if (decodedLength <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(decodedLength));
+        }
+
+        var output = new List<byte>(SectorSize) { 0, 0, 0, 0 };
+        for (var offset = 0; offset < decodedLength; offset += SectorSize)
+        {
+            var segmentDecodedLength = Math.Min(SectorSize, decodedLength - offset);
+            var compressed = EncodeLzoZeroBlock(segmentDecodedLength);
+            AppendU32Little(output, checked((uint)compressed.Length));
+            output.AddRange(compressed);
+            var bytesLeftInSector = SectorSize - output.Count % SectorSize;
+            if (bytesLeftInSector is > 0 and < sizeof(uint))
+            {
+                output.AddRange(new byte[bytesLeftInSector]);
+            }
+        }
+
+        var totalLength = output.Count;
+        while (padToSector && output.Count % SectorSize != 0)
+        {
+            output.Add(0);
+        }
+
+        var result = output.ToArray();
+        BinaryPrimitives.WriteUInt32LittleEndian(
+            result.AsSpan(0, sizeof(uint)),
+            checked((uint)totalLength));
+        return result;
+    }
+
+    private static byte[] EncodeLzoZeroBlock(int length)
+    {
+        if (length < 37)
+        {
+            throw new ArgumentOutOfRangeException(nameof(length));
+        }
+
+        var compressed = new List<byte> { 21, 0, 0, 0, 0, 32 };
+        var extended = length - 4 - 33;
+        while (extended > 255)
+        {
+            compressed.Add(0);
+            extended -= 255;
+        }
+
+        compressed.Add(extended == 0 ? (byte)255 : checked((byte)extended));
+        compressed.Add(0);
+        compressed.Add(0);
+        compressed.Add(17);
+        compressed.Add(0);
+        compressed.Add(0);
+        return compressed.ToArray();
+    }
+
+    private static void AppendU32Little(List<byte> data, uint value)
+    {
+        data.Add((byte)value);
+        data.Add((byte)(value >> 8));
+        data.Add((byte)(value >> 16));
+        data.Add((byte)(value >> 24));
     }
 
     private static byte[] CreateLeaf(
