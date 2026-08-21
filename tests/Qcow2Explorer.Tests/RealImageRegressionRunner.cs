@@ -232,14 +232,21 @@ internal static class RealImageRegressionRunner
     {
         partition.FileSystem = FileSystemDetector.Detect(reader, partition);
         byte[] recoveryKey = [];
+        char[] passwordCharacters = [];
         IReadOnlyFileSystem? fileSystem = null;
         try
         {
             var shouldOpen = expectation.Files.Count > 0
                 || !string.IsNullOrWhiteSpace(expectation.RecoveryPasswordEnvironmentVariable)
+                || !string.IsNullOrWhiteSpace(expectation.PasswordEnvironmentVariable)
                 || expectation.ExpectedFileSystem.Contains("->", StringComparison.Ordinal);
             if (shouldOpen)
             {
+                Require(
+                    string.IsNullOrWhiteSpace(expectation.RecoveryPasswordEnvironmentVariable)
+                    || string.IsNullOrWhiteSpace(expectation.PasswordEnvironmentVariable),
+                    caseName,
+                    "recoveryPasswordEnvironmentVariable and passwordEnvironmentVariable cannot both be set");
                 if (!string.IsNullOrWhiteSpace(expectation.RecoveryPasswordEnvironmentVariable))
                 {
                     var password = Environment.GetEnvironmentVariable(expectation.RecoveryPasswordEnvironmentVariable);
@@ -252,10 +259,21 @@ internal static class RealImageRegressionRunner
                         caseName,
                         $"BitLocker recovery password validation failed: {decodeError}");
                 }
+                else if (!string.IsNullOrWhiteSpace(expectation.PasswordEnvironmentVariable))
+                {
+                    var password = Environment.GetEnvironmentVariable(expectation.PasswordEnvironmentVariable);
+                    Require(
+                        !string.IsNullOrEmpty(password),
+                        caseName,
+                        $"environment variable '{expectation.PasswordEnvironmentVariable}' is not set");
+                    passwordCharacters = password!.ToCharArray();
+                }
 
-                fileSystem = recoveryKey.Length == 0
-                    ? FileSystemDetector.TryOpen(reader, partition, out var openError)
-                    : FileSystemDetector.TryOpen(reader, partition, recoveryKey, out openError);
+                fileSystem = recoveryKey.Length > 0
+                    ? FileSystemDetector.TryOpen(reader, partition, recoveryKey, out var openError)
+                    : passwordCharacters.Length > 0
+                        ? FileSystemDetector.TryOpenWithBitLockerPassword(reader, partition, passwordCharacters, out openError)
+                        : FileSystemDetector.TryOpen(reader, partition, out openError);
                 Require(fileSystem is not null, caseName, $"partition #{partition.Number} open failed: {openError}");
             }
 
@@ -279,6 +297,11 @@ internal static class RealImageRegressionRunner
             if (recoveryKey.Length > 0)
             {
                 CryptographicOperations.ZeroMemory(recoveryKey);
+            }
+
+            if (passwordCharacters.Length > 0)
+            {
+                Array.Clear(passwordCharacters);
             }
         }
     }
@@ -430,6 +453,7 @@ internal sealed class RealImagePartitionExpectation
     public int Number { get; set; }
     public string ExpectedFileSystem { get; set; } = "";
     public string RecoveryPasswordEnvironmentVariable { get; set; } = "";
+    public string PasswordEnvironmentVariable { get; set; } = "";
     public List<RealImageFileExpectation> Files { get; set; } = [];
 }
 

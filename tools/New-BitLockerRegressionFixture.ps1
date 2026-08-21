@@ -9,6 +9,9 @@ param(
     [ValidatePattern('^[A-Za-z_][A-Za-z0-9_]*$')]
     [string]$RecoveryPasswordEnvironmentVariable,
 
+    [ValidateScript({ [string]::IsNullOrEmpty($_) -or $_ -match '^[A-Za-z_][A-Za-z0-9_]*$' })]
+    [string]$PasswordEnvironmentVariable = '',
+
     [string]$FixtureText = "BitLocker recovery fixture`n",
 
     [ValidateRange(256, 4096)]
@@ -37,6 +40,8 @@ if (Test-Path -LiteralPath $resolvedOutput) {
 $mounted = $false
 $completed = $false
 $recoveryPassword = $null
+$password = $null
+$securePassword = $null
 try {
     New-VHD -Path $resolvedOutput -Dynamic -SizeBytes ($SizeMiB * 1MB) | Out-Null
     $vhd = Mount-VHD -Path $resolvedOutput -Passthru
@@ -83,11 +88,41 @@ try {
         throw 'BitLocker recovery password protector was not created.'
     }
 
+    if (-not [string]::IsNullOrWhiteSpace($PasswordEnvironmentVariable)) {
+        $randomPasswordBytes = [byte[]]::new(24)
+        try {
+            [Security.Cryptography.RandomNumberGenerator]::Fill($randomPasswordBytes)
+            $password = [Convert]::ToBase64String($randomPasswordBytes) + 'aA1!'
+        }
+        finally {
+            [Security.Cryptography.CryptographicOperations]::ZeroMemory($randomPasswordBytes)
+        }
+        $securePassword = ConvertTo-SecureString -String $password -AsPlainText -Force
+        Add-BitLockerKeyProtector `
+            -MountPoint $mountPoint `
+            -PasswordProtector `
+            -Password $securePassword `
+            -WarningAction SilentlyContinue | Out-Null
+    }
+
     Lock-BitLocker -MountPoint $mountPoint -ForceDismount | Out-Null
     Unlock-BitLocker -MountPoint $mountPoint -RecoveryPassword $recoveryPassword | Out-Null
     $verified = Get-BitLockerVolume -MountPoint $mountPoint
     if ($verified.LockStatus -ne 'Unlocked') {
         throw 'The generated recovery password could not unlock the BitLocker fixture.'
+    }
+
+    if ($securePassword -is [IDisposable]) {
+        Lock-BitLocker -MountPoint $mountPoint -ForceDismount | Out-Null
+        Unlock-BitLocker -MountPoint $mountPoint -Password $securePassword | Out-Null
+        $verified = Get-BitLockerVolume -MountPoint $mountPoint
+        if ($verified.LockStatus -ne 'Unlocked') {
+            throw 'The generated password could not unlock the BitLocker fixture.'
+        }
+        [Environment]::SetEnvironmentVariable(
+            $PasswordEnvironmentVariable,
+            $password,
+            [EnvironmentVariableTarget]::User)
     }
 
     [Environment]::SetEnvironmentVariable(
@@ -100,10 +135,18 @@ try {
     Write-Output "fixture_sha256=$fixtureHash"
     Write-Output "recovery_password_environment_variable=$RecoveryPasswordEnvironmentVariable"
     Write-Output 'recovery_password_unlock_verified=true'
+    if (-not [string]::IsNullOrWhiteSpace($PasswordEnvironmentVariable)) {
+        Write-Output "password_environment_variable=$PasswordEnvironmentVariable"
+        Write-Output 'password_unlock_verified=true'
+    }
     $completed = $true
 }
 finally {
     $recoveryPassword = $null
+    $password = $null
+    if ($securePassword -is [IDisposable]) {
+        $securePassword.Dispose()
+    }
     if ($mounted) {
         Dismount-VHD -Path $resolvedOutput
     }
