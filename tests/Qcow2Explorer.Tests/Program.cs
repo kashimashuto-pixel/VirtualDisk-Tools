@@ -401,16 +401,53 @@ static void TestBitLockerRecoveryPasswordUnlock()
     {
     }
 
+    const string wrongRecoveryPassword = "000000-000000-000000-000000-000000-000000-000000-000000";
+    Assert(BitLockerRecoveryPassword.TryDecode(wrongRecoveryPassword, out var wrongKey, out _), "valid alternate recovery password");
+
+    TestBitLockerXtsUnlockVariant(
+        encryptionMethod: 0x8004,
+        fvekLength: 32,
+        variantName: "XTS-AES 128",
+        intermediateKey,
+        stretchedKey,
+        salt,
+        wrongKey,
+        runRecoveryFailureChecks: true);
+    TestBitLockerXtsUnlockVariant(
+        encryptionMethod: 0x8005,
+        fvekLength: 64,
+        variantName: "XTS-AES 256",
+        intermediateKey,
+        stretchedKey,
+        salt,
+        wrongKey,
+        runRecoveryFailureChecks: false);
+
+    CryptographicOperations.ZeroMemory(intermediateKey);
+    CryptographicOperations.ZeroMemory(wrongKey);
+    CryptographicOperations.ZeroMemory(stretchedKey);
+}
+
+static void TestBitLockerXtsUnlockVariant(
+    uint encryptionMethod,
+    int fvekLength,
+    string variantName,
+    byte[] intermediateKey,
+    byte[] stretchedKey,
+    byte[] salt,
+    byte[] wrongKey,
+    bool runRecoveryFailureChecks)
+{
     var clearKey = Enumerable.Range(0x20, 32).Select(value => (byte)value).ToArray();
     var vmk = Enumerable.Range(0x60, 32).Select(value => (byte)value).ToArray();
-    var fvek = Enumerable.Range(0xa0, 32).Select(value => (byte)value).ToArray();
-    var plaintext = Enumerable.Range(0, 1024).Select(value => (byte)(value * 37 + 11)).ToArray();
+    var fvek = Enumerable.Range(0, fvekLength).Select(value => (byte)(0xa0 + value)).ToArray();
+    var plaintext = Enumerable.Range(0, 1536).Select(value => (byte)(value * 37 + 11)).ToArray();
     var encryptedVolume = EncryptBitLockerXts(plaintext, fvek);
     var encryptedFvek = new BitLockerMetadataEntry
     {
         EntryType = 0x0003,
         ValueType = 0x0005,
-        Data = EncryptBitLockerAesCcm(vmk, CreateBitLockerKeyData(0x8004, fvek), nonceSeed: 0x31)
+        Data = EncryptBitLockerAesCcm(vmk, CreateBitLockerKeyData(encryptionMethod, fvek), nonceSeed: 0x31)
     };
     var encryptedRecoveryVmk = new BitLockerMetadataEntry
     {
@@ -449,7 +486,7 @@ static void TestBitLockerRecoveryPasswordUnlock()
     var recoveryMetadata = new BitLockerMetadata
     {
         EncryptedVolumeSize = encryptedVolume.Length,
-        EncryptionMethod = 0x8004,
+        EncryptionMethod = encryptionMethod,
         KeyProtectors = [recoveryProtector],
         Entries = [encryptedFvek]
     };
@@ -457,7 +494,8 @@ static void TestBitLockerRecoveryPasswordUnlock()
         recoveryProtector.Identifier,
         stretchData,
         encryptedRecoveryVmk.Data,
-        encryptedFvek.Data);
+        encryptedFvek.Data,
+        encryptionMethod);
     Assert(
         BitLockerMetadataReader.TryRead(
             new MemorySectorReader(metadataImage, 512),
@@ -466,11 +504,11 @@ static void TestBitLockerRecoveryPasswordUnlock()
         metadataError);
     Assert(
         parsedMetadata is { HasRecoveryPasswordProtector: true }
-        && parsedMetadata.EncryptionMethod == 0x8004
+        && parsedMetadata.EncryptionMethod == encryptionMethod
         && parsedMetadata.KeyProtectors.Single().Properties.Any(entry => entry.ValueType == 0x0005)
         && parsedMetadata.KeyProtectors.Single().Properties.Single(entry => entry.ValueType == 0x0003)
             .Children.Single().ValueType == 0x0005,
-        "BitLocker recovery protector metadata parsing and encryption method normalization");
+        $"{variantName} recovery protector metadata parsing and encryption method normalization");
 
     var encryptedReader = new MemorySectorReader(encryptedVolume, 512);
     Assert(
@@ -481,73 +519,73 @@ static void TestBitLockerRecoveryPasswordUnlock()
             out var recoveryReader,
             out var recoveryError),
         recoveryError);
-    Assert(recoveryReader is not null, "BitLocker recovery reader created");
-    var recovered = new byte[plaintext.Length];
-    recoveryReader!.ReadAt(0, recovered, 0, recovered.Length);
-    Assert(recovered.SequenceEqual(plaintext), "BitLocker recovery password AES-CCM and XTS unlock");
+    Assert(recoveryReader is not null, $"{variantName} recovery reader created");
+    ValidateBitLockerReaderReads(recoveryReader!, plaintext, $"{variantName} recovery unlock");
 
-    ((IDisposable)recoveryReader).Dispose();
+    ((IDisposable)recoveryReader!).Dispose();
 
-    var nestedRecoveryMetadata = new BitLockerMetadata
+    if (runRecoveryFailureChecks)
     {
-        EncryptedVolumeSize = encryptedVolume.Length,
-        EncryptionMethod = 0x8004,
-        KeyProtectors =
-        [
-            new BitLockerKeyProtector
-            {
-                Identifier = recoveryProtector.Identifier,
-                ProtectionType = BitLockerProtectionType.RecoveryPassword,
-                RawProtectionType = 0x0800,
-                Properties =
-                [
-                    new BitLockerMetadataEntry
-                    {
-                        EntryType = 0x0003,
-                        ValueType = 0x0003,
-                        Data = stretchData,
-                        Children = [encryptedRecoveryVmk]
-                    }
-                ]
-            }
-        ],
-        Entries = [encryptedFvek]
-    };
-    Assert(
-        BitLockerUnlock.TryCreateReaderWithRecoveryKey(
-            encryptedReader,
-            nestedRecoveryMetadata,
-            intermediateKey,
-            out var nestedRecoveryReader,
-            out var nestedRecoveryError),
-        nestedRecoveryError);
-    Assert(nestedRecoveryReader is not null, "nested BitLocker recovery VMK fallback");
-    ((IDisposable)nestedRecoveryReader!).Dispose();
+        var nestedRecoveryMetadata = new BitLockerMetadata
+        {
+            EncryptedVolumeSize = encryptedVolume.Length,
+            EncryptionMethod = encryptionMethod,
+            KeyProtectors =
+            [
+                new BitLockerKeyProtector
+                {
+                    Identifier = recoveryProtector.Identifier,
+                    ProtectionType = BitLockerProtectionType.RecoveryPassword,
+                    RawProtectionType = 0x0800,
+                    Properties =
+                    [
+                        new BitLockerMetadataEntry
+                        {
+                            EntryType = 0x0003,
+                            ValueType = 0x0003,
+                            Data = stretchData,
+                            Children = [encryptedRecoveryVmk]
+                        }
+                    ]
+                }
+            ],
+            Entries = [encryptedFvek]
+        };
+        Assert(
+            BitLockerUnlock.TryCreateReaderWithRecoveryKey(
+                encryptedReader,
+                nestedRecoveryMetadata,
+                intermediateKey,
+                out var nestedRecoveryReader,
+                out var nestedRecoveryError),
+            nestedRecoveryError);
+        Assert(nestedRecoveryReader is not null, "nested BitLocker recovery VMK fallback");
+        ((IDisposable)nestedRecoveryReader!).Dispose();
+
+        const string wrongRecoveryPassword = "000000-000000-000000-000000-000000-000000-000000-000000";
+        Assert(
+            !BitLockerUnlock.TryCreateReaderWithRecoveryKey(
+                encryptedReader,
+                recoveryMetadata,
+                wrongKey,
+                out _,
+                out var wrongPasswordError),
+            "wrong BitLocker recovery password rejection");
+        Assert(
+            !wrongPasswordError.Contains(wrongRecoveryPassword, StringComparison.Ordinal)
+            && !wrongPasswordError.Contains(Convert.ToHexString(intermediateKey), StringComparison.OrdinalIgnoreCase)
+            && !wrongPasswordError.Contains(Convert.ToHexString(fvek), StringComparison.OrdinalIgnoreCase),
+            "BitLocker errors do not expose passwords or keys");
+    }
 
     try
     {
         recoveryReader.ReadAt(0, new byte[1], 0, 1);
-        Assert(false, "disposed BitLocker reader rejects reads");
+        Assert(false, $"disposed {variantName} reader rejects reads");
     }
     catch (ObjectDisposedException)
     {
     }
-
-    const string wrongRecoveryPassword = "000000-000000-000000-000000-000000-000000-000000-000000";
-    Assert(BitLockerRecoveryPassword.TryDecode(wrongRecoveryPassword, out var wrongKey, out _), "valid alternate recovery password");
-    Assert(
-        !BitLockerUnlock.TryCreateReaderWithRecoveryKey(
-            encryptedReader,
-            recoveryMetadata,
-            wrongKey,
-            out _,
-            out var wrongPasswordError),
-        "wrong BitLocker recovery password rejection");
-    Assert(
-        !wrongPasswordError.Contains(wrongRecoveryPassword, StringComparison.Ordinal)
-        && !wrongPasswordError.Contains(Convert.ToHexString(intermediateKey), StringComparison.OrdinalIgnoreCase)
-        && !wrongPasswordError.Contains(Convert.ToHexString(fvek), StringComparison.OrdinalIgnoreCase),
-        "BitLocker errors do not expose passwords or keys");
 
     var clearProtector = new BitLockerKeyProtector
     {
@@ -573,7 +611,7 @@ static void TestBitLockerRecoveryPasswordUnlock()
     var clearMetadata = new BitLockerMetadata
     {
         EncryptedVolumeSize = encryptedVolume.Length,
-        EncryptionMethod = 0x8004,
+        EncryptionMethod = encryptionMethod,
         KeyProtectors = [clearProtector],
         Entries = [encryptedFvek]
     };
@@ -584,20 +622,59 @@ static void TestBitLockerRecoveryPasswordUnlock()
             out var clearReader,
             out var clearError),
         clearError);
-    var clearRecovered = new byte[plaintext.Length];
-    clearReader!.ReadAt(0, clearRecovered, 0, clearRecovered.Length);
-    Assert(clearRecovered.SequenceEqual(plaintext), "BitLocker clear-key regression");
-    ((IDisposable)clearReader).Dispose();
+    Assert(clearReader is not null, $"{variantName} clear-key reader created");
+    ValidateBitLockerReaderReads(clearReader!, plaintext, $"{variantName} clear-key unlock");
+    ((IDisposable)clearReader!).Dispose();
 
-    CryptographicOperations.ZeroMemory(intermediateKey);
-    CryptographicOperations.ZeroMemory(wrongKey);
-    CryptographicOperations.ZeroMemory(stretchedKey);
+    var invalidFvek = new byte[fvekLength - 1];
+    Assert(
+        !BitLockerUnlock.TryCreateReaderWithRawFvek(
+            encryptedReader,
+            recoveryMetadata,
+            invalidFvek,
+            out _,
+            out var invalidFvekError)
+        && invalidFvekError.Contains($"{fvekLength} byte", StringComparison.Ordinal),
+        $"{variantName} invalid FVEK length rejection");
+
     CryptographicOperations.ZeroMemory(decoyEncryptedVmkData);
     CryptographicOperations.ZeroMemory(clearKey);
     CryptographicOperations.ZeroMemory(vmk);
     CryptographicOperations.ZeroMemory(fvek);
+    CryptographicOperations.ZeroMemory(plaintext);
+    CryptographicOperations.ZeroMemory(invalidFvek);
+}
+
+static void ValidateBitLockerReaderReads(IBlockReader reader, byte[] plaintext, string testName)
+{
+    var recovered = new byte[plaintext.Length];
+    reader.ReadAt(0, recovered, 0, recovered.Length);
+    Assert(recovered.SequenceEqual(plaintext), $"{testName} full-volume read");
+
+    const int sourceOffset = 509;
+    const int bufferOffset = 7;
+    const int count = 700;
+    var boundaryRead = Enumerable.Repeat((byte)0xa5, bufferOffset + count + 9).ToArray();
+    reader.ReadAt(sourceOffset, boundaryRead, bufferOffset, count);
+    Assert(
+        boundaryRead.AsSpan(bufferOffset, count).SequenceEqual(plaintext.AsSpan(sourceOffset, count)),
+        $"{testName} sector-boundary read");
+    Assert(
+        boundaryRead.AsSpan(0, bufferOffset).ToArray().All(value => value == 0xa5)
+        && boundaryRead.AsSpan(bufferOffset + count).ToArray().All(value => value == 0xa5),
+        $"{testName} preserves bytes outside the destination range");
+
+    const int tailLength = 13;
+    var tailRead = Enumerable.Repeat((byte)0xa5, 32).ToArray();
+    reader.ReadAt(plaintext.Length - tailLength, tailRead, 3, 20);
+    Assert(
+        tailRead.AsSpan(3, tailLength).SequenceEqual(plaintext.AsSpan(plaintext.Length - tailLength))
+        && tailRead.AsSpan(3 + tailLength, 20 - tailLength).ToArray().All(value => value == 0),
+        $"{testName} zero-fills past end of volume");
+
     CryptographicOperations.ZeroMemory(recovered);
-    CryptographicOperations.ZeroMemory(clearRecovered);
+    CryptographicOperations.ZeroMemory(boundaryRead);
+    CryptographicOperations.ZeroMemory(tailRead);
 }
 
 static byte[] CreateBitLockerKeyData(uint method, byte[] key)
@@ -612,7 +689,8 @@ static byte[] CreateBitLockerMetadataTestImage(
     Guid protectorIdentifier,
     byte[] stretchData,
     byte[] encryptedVmkData,
-    byte[] encryptedFvekData)
+    byte[] encryptedFvekData,
+    uint encryptionMethod)
 {
     const int metadataBlockOffset = 4096;
     var encryptedVmkEntry = CreateBitLockerMetadataEntry(0x0003, 0x0005, encryptedVmkData);
@@ -648,7 +726,9 @@ static byte[] CreateBitLockerMetadataTestImage(
     BinaryPrimitives.WriteUInt32LittleEndian(image.AsSpan(metadataOffset + 4), 2);
     BinaryPrimitives.WriteUInt32LittleEndian(image.AsSpan(metadataOffset + 8), metadataHeaderSize);
     Guid.Parse("511c4978-8ba7-4da5-a4f8-63d8f37460e2").ToByteArray().CopyTo(image, metadataOffset + 16);
-    BinaryPrimitives.WriteUInt32LittleEndian(image.AsSpan(metadataOffset + 36), 0x80048004);
+    BinaryPrimitives.WriteUInt32LittleEndian(
+        image.AsSpan(metadataOffset + 36),
+        encryptionMethod | (encryptionMethod << 16));
     protectorEntry.CopyTo(image, metadataOffset + metadataHeaderSize);
     fvekEntry.CopyTo(image, metadataOffset + metadataHeaderSize + protectorEntry.Length);
     return image;
@@ -683,13 +763,14 @@ static byte[] EncryptBitLockerAesCcm(byte[] key, byte[] plaintext, byte nonceSee
 static byte[] EncryptBitLockerXts(byte[] plaintext, byte[] fvek)
 {
     Assert(plaintext.Length % 512 == 0, "BitLocker XTS test data sector alignment");
-    Assert(fvek.Length == 32, "BitLocker XTS-128 test FVEK length");
+    Assert(fvek.Length is 32 or 64, "BitLocker XTS test FVEK length");
+    var keyLength = fvek.Length / 2;
     using var dataAes = Aes.Create();
     using var tweakAes = Aes.Create();
     dataAes.Mode = tweakAes.Mode = CipherMode.ECB;
     dataAes.Padding = tweakAes.Padding = PaddingMode.None;
-    dataAes.Key = fvek[..16];
-    tweakAes.Key = fvek[16..32];
+    dataAes.Key = fvek[..keyLength];
+    tweakAes.Key = fvek[keyLength..];
     using var dataEncryptor = dataAes.CreateEncryptor();
     using var tweakEncryptor = tweakAes.CreateEncryptor();
 
