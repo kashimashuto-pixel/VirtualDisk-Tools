@@ -91,6 +91,7 @@ static void RunGeneratedImageTests()
     TestLvmMetadataDiagnostics();
     TestGeneratedLvm2Image();
     TestGeneratedLzopExt4Image();
+    TestGeneratedBtrfsImage();
     TestGeneratedEwfE01Image();
     TestRealImageRegressionRunner();
     TestGeneratedVmaLzopImage();
@@ -316,6 +317,106 @@ static void RunGeneratedImageTests()
     }
 
     RunProjFsRemountSmoke(rawFs);
+}
+
+static void TestGeneratedBtrfsImage()
+{
+    var imagePath = Path.Combine(AppContext.BaseDirectory, "synthetic-btrfs.raw");
+    var fixture = BtrfsTestImageFactory.Create(imagePath);
+    using (var reader = DiskImageReaderFactory.Open(imagePath))
+    {
+        var partition = PartitionTableReader.ReadPartitions(reader).Single();
+        partition.FileSystem = FileSystemDetector.Detect(reader, partition);
+        Assert(partition.FileSystem == "Btrfs", "generated Btrfs detection");
+        var fs = FileSystemDetector.TryOpen(reader, partition, out var error);
+        Assert(fs is not null, error);
+
+        var root = fs!.ListDirectory(fs.Root);
+        var hello = root.Single(node => node.Name == "hello.txt");
+        var regular = root.Single(node => node.Name == "regular.bin");
+        var nested = root.Single(node => node.Name == "nested");
+        var sparse = root.Single(node => node.Name == "sparse.bin");
+        var zlib = root.Single(node => node.Name == "zlib.bin");
+        Assert(Encoding.UTF8.GetString(fs.ReadFile(hello, 0, checked((int)hello.Size))) == BtrfsTestImageFactory.HelloText, "generated Btrfs inline extent");
+        Assert(fs.ReadFile(regular, 0, checked((int)regular.Size)).SequenceEqual(BtrfsTestImageFactory.RegularData), "generated Btrfs regular extent");
+        Assert(fs.ReadFile(regular, 4090, 32).SequenceEqual(BtrfsTestImageFactory.RegularData.AsSpan(4090, 32).ToArray()), "generated Btrfs cross-sector read");
+        Assert(nested.IsDirectory, "generated Btrfs nested directory");
+        Assert(fs.ListDirectory(nested).Single().Name == "inside.txt", "generated Btrfs nested entry");
+
+        var sparseData = fs.ReadFile(sparse, 0, checked((int)sparse.Size));
+        Assert(sparseData.AsSpan(0, BtrfsTestImageFactory.SparseTailOffset).IndexOfAnyExcept((byte)0) < 0, "generated Btrfs sparse hole");
+        Assert(Encoding.UTF8.GetString(sparseData.AsSpan(BtrfsTestImageFactory.SparseTailOffset)) == BtrfsTestImageFactory.SparseTail, "generated Btrfs sparse tail");
+        Assert(hello.ModifiedUtc == DateTimeOffset.FromUnixTimeSeconds(2_400_000_000).AddTicks(1_234_567).UtcDateTime, "generated Btrfs timestamp");
+        Assert(fs.ReadFile(zlib, 0, checked((int)zlib.Size)).All(value => value == 0), "generated Btrfs zlib extent");
+        Assert(fs.ReadFile(zlib, 65530, 32).All(value => value == 0), "generated Btrfs zlib partial read");
+    }
+
+    var superblockCorruptPath = Path.Combine(AppContext.BaseDirectory, "synthetic-btrfs-super-corrupt.raw");
+    var corrupt = File.ReadAllBytes(imagePath);
+    corrupt[fixture.SuperblockPhysicalOffset + 0x100] ^= 1;
+    File.WriteAllBytes(superblockCorruptPath, corrupt);
+    using (var reader = DiskImageReaderFactory.Open(superblockCorruptPath))
+    {
+        var partition = PartitionTableReader.ReadPartitions(reader).Single();
+        partition.FileSystem = FileSystemDetector.Detect(reader, partition);
+        Assert(partition.FileSystem == "Btrfs", "corrupt Btrfs superblock detection");
+        Assert(FileSystemDetector.TryOpen(reader, partition, out var error) is null, "corrupt Btrfs superblock rejection");
+        Assert(error.Contains("CRC32C", StringComparison.Ordinal), "corrupt Btrfs superblock diagnostic");
+    }
+
+    var treeCorruptPath = Path.Combine(AppContext.BaseDirectory, "synthetic-btrfs-tree-corrupt.raw");
+    corrupt = File.ReadAllBytes(imagePath);
+    corrupt[fixture.FileSystemTreePhysicalOffset + 0x200] ^= 1;
+    File.WriteAllBytes(treeCorruptPath, corrupt);
+    using (var reader = DiskImageReaderFactory.Open(treeCorruptPath))
+    {
+        var partition = PartitionTableReader.ReadPartitions(reader).Single();
+        partition.FileSystem = FileSystemDetector.Detect(reader, partition);
+        Assert(FileSystemDetector.TryOpen(reader, partition, out var error) is null, "corrupt Btrfs tree rejection");
+        Assert(error.Contains("tree block", StringComparison.Ordinal) && error.Contains("CRC32C", StringComparison.Ordinal), "corrupt Btrfs tree diagnostic");
+    }
+
+    var dataCorruptPath = Path.Combine(AppContext.BaseDirectory, "synthetic-btrfs-data-corrupt.raw");
+    corrupt = File.ReadAllBytes(imagePath);
+    corrupt[fixture.RegularDataPhysicalOffset + 17] ^= 1;
+    File.WriteAllBytes(dataCorruptPath, corrupt);
+    using (var reader = DiskImageReaderFactory.Open(dataCorruptPath))
+    {
+        var partition = PartitionTableReader.ReadPartitions(reader).Single();
+        partition.FileSystem = FileSystemDetector.Detect(reader, partition);
+        var fs = FileSystemDetector.TryOpen(reader, partition, out var error);
+        Assert(fs is not null, error);
+        var regular = fs!.ListDirectory(fs.Root).Single(node => node.Name == "regular.bin");
+        try
+        {
+            _ = fs.ReadFile(regular, 0, checked((int)regular.Size));
+            Assert(false, "corrupt Btrfs data throws");
+        }
+        catch (InvalidDataException ex)
+        {
+            Assert(ex.Message.Contains("data checksum", StringComparison.Ordinal), "corrupt Btrfs data diagnostic");
+        }
+    }
+
+    var zlibCorruptPath = Path.Combine(AppContext.BaseDirectory, "synthetic-btrfs-zlib-corrupt.raw");
+    BtrfsTestImageFactory.Create(zlibCorruptPath, corruptZlibPayload: true);
+    using (var reader = DiskImageReaderFactory.Open(zlibCorruptPath))
+    {
+        var partition = PartitionTableReader.ReadPartitions(reader).Single();
+        partition.FileSystem = FileSystemDetector.Detect(reader, partition);
+        var fs = FileSystemDetector.TryOpen(reader, partition, out var error);
+        Assert(fs is not null, error);
+        var zlib = fs!.ListDirectory(fs.Root).Single(node => node.Name == "zlib.bin");
+        try
+        {
+            _ = fs.ReadFile(zlib, 0, checked((int)zlib.Size));
+            Assert(false, "corrupt Btrfs zlib throws");
+        }
+        catch (InvalidDataException ex)
+        {
+            Assert(ex.Message.Contains("zlib extent", StringComparison.Ordinal), "corrupt Btrfs zlib diagnostic");
+        }
+    }
 }
 
 static void TestGeneratedEwfE01Image()

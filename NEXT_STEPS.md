@@ -102,12 +102,22 @@
 - 生成multipartテストと、`ewfacquire` / `ewfverify`由来fixtureのlogical SHA-256回帰を追加
 - EWF2/Ex01、bzip2、L01、暗号化EWF、旧table配置は明示的に未対応
 
+### Btrfs読み取り対応（第1段階）
+
+- 公式on-disk formatとLinux UAPIを基に、primary superblock、system chunk array、chunk/root/FS/checksum treeを境界検証付きで解析
+- 単一デバイス・single profileのインライン、通常、preallocated、スパースextentを読み取り専用で扱う
+- superblockとmetadata tree block、およびchecksum treeに記録されたdata sectorのCRC32Cを検証
+- 合成fixtureで階層・sector境界・スパース領域・時刻と、superblock/tree/data破損の拒否を自動テスト
+- `mkfs.btrfs -m single -d single`由来fixtureを生成し、`btrfs check --readonly`と実イメージ回帰で確認
+- zlib圧縮extentを128 KiBの展開上限、CRC32C先行検証、部分読出しキャッシュ付きで追加し、圧縮stream破損も拒否
+
 ## 次回の推奨作業
 
-### 1. Btrfs対応の仕様・実装範囲調査
+### 1. Btrfs対応の第2段階
 
-- superblock、chunk tree、root tree、checksum tree、圧縮extentの段階的な対応範囲を決める
-- 単一デバイス・非RAID・読み取り専用の最小実装と、再配布可能なfixture生成方法を検討する
+- LZO、zstd圧縮extentを方式ごとに追加し、展開上限と破損入力を検証する
+- subvolume/root refとdefault subvolumeを安全に辿る
+- backup superblock利用は、世代整合性と誤復旧防止の設計後に追加する
 
 ## 保守・品質改善
 
@@ -122,7 +132,7 @@
 利用目的に応じ、次の順で検討します。
 
 1. Btrfs
-   - サブボリューム、圧縮、チェックサム、複数デバイスを段階的に扱う
+   - 圧縮、サブボリューム、backup superblock、複数デバイスを段階的に扱う
 2. Linux md RAIDの実読み取り
    - まずRAID1から開始し、その後RAID0/5/6を検討する
 3. LVM2の拡張

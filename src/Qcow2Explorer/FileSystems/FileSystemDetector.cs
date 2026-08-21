@@ -53,6 +53,17 @@ public static class FileSystemDetector
             return "XFS";
         }
 
+        const long btrfsMagicOffset = 64 * 1024 + 0x40;
+        if (partition.LengthBytes >= btrfsMagicOffset + 8)
+        {
+            var btrfsMagic = EndianUtilities.ReadBytes(slice, btrfsMagicOffset, 8);
+            cancellationToken.ThrowIfCancellationRequested();
+            if (EndianUtilities.ReadAscii(btrfsMagic, 0, 8) == "_BHRfS_M")
+            {
+                return "Btrfs";
+            }
+        }
+
         var squashFs = DetectSquashFs(boot);
         if (!string.IsNullOrEmpty(squashFs))
         {
@@ -591,7 +602,8 @@ public static class FileSystemDetector
                 : $"{detected} は検出のみで、ファイル一覧表示は未対応です。";
             return null;
         }
-        catch (Exception ex) when (ex is IOException or InvalidDataException or NotSupportedException or ArgumentOutOfRangeException or CryptographicException)
+        catch (Exception ex) when (ex is IOException or InvalidDataException or NotSupportedException
+            or ArgumentOutOfRangeException or OverflowException or CryptographicException)
         {
             error = ex.Message;
             return null;
@@ -644,6 +656,11 @@ public static class FileSystemDetector
         if (detected == "XFS")
         {
             return new XfsFileSystem(slice, partition);
+        }
+
+        if (detected == "Btrfs")
+        {
+            return new BtrfsFileSystem(slice, partition);
         }
 
         return null;
