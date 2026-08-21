@@ -12,6 +12,46 @@ dotnet run --project tests\Qcow2Explorer.Tests\Qcow2Explorer.Tests.csproj `
 `tests/real-images*.local.json`は`.gitignore`対象です。絶対パスや機密情報をGitへ追加しないでください。
 イメージの`path`はmanifestからの相対パス、または`%VDT_FIXTURE_ROOT%`などの環境変数を使用できます。
 
+## ローカルfixtureの生成
+
+生成物は既定で`.tmp/real-images`へ保存され、Gitには追加されません。
+生成ツールは既存のfixtureを上書きしないため、作り直す場合は保存済みの回復パスワードと対象を確認してから古いfixtureを削除してください。
+
+### XFS bigtimeとLZO
+
+WSL 2のUbuntu 24.04を用意し、必要なLinuxツールをインストールします。
+
+```powershell
+wsl --install --distribution Ubuntu-24.04 --no-launch
+wsl --distribution Ubuntu-24.04 --user root -- sh -lc `
+  "apt-get update && apt-get install -y xfsprogs lzop util-linux"
+
+.\tools\New-LinuxRegressionFixtures.ps1
+```
+
+スクリプトは、2045年の更新日時を持つXFS bigtime RAWと、そのRAWを圧縮したLZOを生成します。
+
+### BitLocker XTS-AES
+
+BitLocker fixtureの生成は管理者PowerShellで実行します。
+回復パスワードは出力せず、指定したユーザー環境変数へ保存します。
+
+```powershell
+.\tools\New-BitLockerRegressionFixture.ps1 `
+  -OutputPath .\.tmp\real-images\bitlocker-xts128.vhdx `
+  -EncryptionMethod XtsAes128 `
+  -RecoveryPasswordEnvironmentVariable VDT_BITLOCKER_XTS128_RECOVERY
+
+.\tools\New-BitLockerRegressionFixture.ps1 `
+  -OutputPath .\.tmp\real-images\bitlocker-xts256.vhdx `
+  -EncryptionMethod XtsAes256 `
+  -RecoveryPasswordEnvironmentVariable VDT_BITLOCKER_XTS256_RECOVERY `
+  -FixtureText "BitLocker XTS-AES 256 fixture`n"
+```
+
+生成後は`Get-FileHash -Algorithm SHA256`でイメージのハッシュを取得し、ローカルmanifestへ登録します。
+fixture本体、manifest、回復パスワードをコミットしないでください。
+
 ## Manifest例
 
 ```json
@@ -46,9 +86,10 @@ dotnet run --project tests\Qcow2Explorer.Tests\Qcow2Explorer.Tests.csproj `
       "path": "%VDT_FIXTURE_ROOT%\\bitlocker.vhdx",
       "sha256": "REPLACE_WITH_64_HEX_CHARACTERS",
       "expectedFormatContains": "VHDX",
+      "expectedPartitionCount": 2,
       "partitions": [
         {
-          "number": 1,
+          "number": 2,
           "expectedFileSystem": "BitLocker/FVE -> NTFS",
           "recoveryPasswordEnvironmentVariable": "VDT_BITLOCKER_RECOVERY",
           "files": [
