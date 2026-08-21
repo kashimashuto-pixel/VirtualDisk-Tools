@@ -11,6 +11,7 @@ namespace Qcow2Explorer.FileSystems;
 public sealed class BtrfsFileSystem : IReadOnlyFileSystem
 {
     private const long SuperblockOffset = 64 * 1024;
+    private static readonly long[] BackupSuperblockOffsets = [64L * 1024 * 1024, 256L * 1024 * 1024 * 1024];
     private const int SuperblockSize = 4096;
     private const int TreeHeaderSize = 101;
     private const int KeySize = 17;
@@ -80,13 +81,7 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
     {
         _reader = reader;
         Partition = partition;
-        if (reader.Length < SuperblockOffset + SuperblockSize)
-        {
-            throw new InvalidDataException("Btrfs superblockが収まらないボリュームです。");
-        }
-
-        var superblock = EndianUtilities.ReadBytes(reader, SuperblockOffset, SuperblockSize);
-        ValidateSuperblock(superblock, reader.Length);
+        var superblock = SelectSuperblock(reader);
         _fileSystemId = superblock.AsSpan(0x20, 16).ToArray();
         _sectorSize = checked((int)EndianUtilities.ReadUInt32Little(superblock, 0x90));
         _nodeSize = checked((int)EndianUtilities.ReadUInt32Little(superblock, 0x94));
@@ -337,7 +332,95 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
         return output;
     }
 
-    private void ValidateSuperblock(byte[] superblock, long readerLength)
+    private static byte[] SelectSuperblock(IBlockReader reader)
+    {
+        InvalidDataException? primaryError = null;
+        if (reader.Length >= SuperblockOffset + SuperblockSize)
+        {
+            var primary = EndianUtilities.ReadBytes(reader, SuperblockOffset, SuperblockSize);
+            try
+            {
+                ValidateSuperblock(primary, reader.Length, SuperblockOffset);
+                return primary;
+            }
+            catch (InvalidDataException ex)
+            {
+                primaryError = ex;
+            }
+        }
+        else
+        {
+            primaryError = new InvalidDataException("Btrfs primary superblockが収まらないボリュームです。");
+        }
+
+        var backups = new List<(long Offset, byte[] Data)>();
+        foreach (var offset in BackupSuperblockOffsets)
+        {
+            if (offset > reader.Length - SuperblockSize)
+            {
+                continue;
+            }
+
+            var backup = EndianUtilities.ReadBytes(reader, offset, SuperblockSize);
+            try
+            {
+                ValidateSuperblock(backup, reader.Length, offset);
+                backups.Add((offset, backup));
+            }
+            catch (InvalidDataException)
+            {
+                // Try the next official mirror location.
+            }
+        }
+
+        if (backups.Count == 0)
+        {
+            throw new InvalidDataException(
+                $"Btrfs primary/backup superblockを検証できませんでした: {primaryError!.Message}",
+                primaryError);
+        }
+
+        var firstFileSystemId = backups[0].Data.AsSpan(0x20, 16).ToArray();
+        if (backups.Any(candidate => !candidate.Data.AsSpan(0x20, 16).SequenceEqual(firstFileSystemId)))
+        {
+            throw new InvalidDataException("Btrfs backup superblockのFSIDが相互に一致しません。");
+        }
+
+        var maximumGeneration = backups.Max(candidate => EndianUtilities.ReadUInt64Little(candidate.Data, 0x48));
+        var newest = backups
+            .Where(candidate => EndianUtilities.ReadUInt64Little(candidate.Data, 0x48) == maximumGeneration)
+            .OrderBy(candidate => candidate.Offset)
+            .ToArray();
+        if (newest.Skip(1).Any(candidate => !HaveMatchingSuperblockState(newest[0].Data, candidate.Data)))
+        {
+            throw new InvalidDataException(
+                $"Btrfs backup superblockの同一世代でtree stateが一致しません: generation={maximumGeneration}");
+        }
+
+        return newest[0].Data;
+    }
+
+    private static bool HaveMatchingSuperblockState(byte[] left, byte[] right)
+    {
+        return EndianUtilities.ReadUInt64Little(left, 0x48) == EndianUtilities.ReadUInt64Little(right, 0x48)
+            && EndianUtilities.ReadUInt64Little(left, 0x50) == EndianUtilities.ReadUInt64Little(right, 0x50)
+            && EndianUtilities.ReadUInt64Little(left, 0x58) == EndianUtilities.ReadUInt64Little(right, 0x58)
+            && EndianUtilities.ReadUInt64Little(left, 0x70) == EndianUtilities.ReadUInt64Little(right, 0x70)
+            && EndianUtilities.ReadUInt64Little(left, 0x88) == EndianUtilities.ReadUInt64Little(right, 0x88)
+            && EndianUtilities.ReadUInt32Little(left, 0x90) == EndianUtilities.ReadUInt32Little(right, 0x90)
+            && EndianUtilities.ReadUInt32Little(left, 0x94) == EndianUtilities.ReadUInt32Little(right, 0x94)
+            && EndianUtilities.ReadUInt32Little(left, 0xa0) == EndianUtilities.ReadUInt32Little(right, 0xa0)
+            && EndianUtilities.ReadUInt64Little(left, 0xa4) == EndianUtilities.ReadUInt64Little(right, 0xa4)
+            && EndianUtilities.ReadUInt64Little(left, 0xac) == EndianUtilities.ReadUInt64Little(right, 0xac)
+            && EndianUtilities.ReadUInt64Little(left, 0xb4) == EndianUtilities.ReadUInt64Little(right, 0xb4)
+            && EndianUtilities.ReadUInt64Little(left, 0xbc) == EndianUtilities.ReadUInt64Little(right, 0xbc)
+            && left[0xc6] == right[0xc6]
+            && left[0xc7] == right[0xc7]
+            && left.AsSpan(0x32b, checked((int)EndianUtilities.ReadUInt32Little(left, 0xa0)))
+                .SequenceEqual(right.AsSpan(0x32b, checked((int)EndianUtilities.ReadUInt32Little(right, 0xa0))));
+    }
+
+    private static void ValidateSuperblock(byte[] superblock, long readerLength, long expectedOffset)
     {
         if (EndianUtilities.ReadAscii(superblock, 0x40, 8) != "_BHRfS_M")
         {
@@ -351,13 +434,16 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
         }
 
         VerifyChecksum(superblock, "Btrfs superblock");
-        if (EndianUtilities.ReadUInt64Little(superblock, 0x30) != (ulong)SuperblockOffset)
+        if (EndianUtilities.ReadUInt64Little(superblock, 0x30) != (ulong)expectedOffset)
         {
-            throw new InvalidDataException("Btrfs primary superblockの物理位置が一致しません。");
+            throw new InvalidDataException(
+                $"Btrfs superblockの物理位置が一致しません: expected={expectedOffset:N0}");
         }
 
         var totalBytes = EndianUtilities.ReadUInt64Little(superblock, 0x70);
-        if (totalBytes == 0 || totalBytes > (ulong)readerLength)
+        if (totalBytes < SuperblockSize
+            || totalBytes > (ulong)readerLength
+            || (ulong)expectedOffset > totalBytes - SuperblockSize)
         {
             throw new InvalidDataException($"Btrfs total_bytesがボリューム範囲外です: {totalBytes:N0}");
         }

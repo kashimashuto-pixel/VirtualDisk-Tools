@@ -16,6 +16,7 @@ internal static class BtrfsTestImageFactory
 
     private const int SectorSize = 4096;
     private const int NodeSize = 4096;
+    private const int BackupSuperblockLogicalOffset = 64 * 1024 * 1024;
     private const int TreeHeaderSize = 101;
     private const int ChunkTreeLogicalOffset = 1024 * 1024;
     private const int RootTreeLogicalOffset = ChunkTreeLogicalOffset + NodeSize;
@@ -43,15 +44,29 @@ internal static class BtrfsTestImageFactory
         bool includeSubvolumes = false,
         bool defaultSubvolume = false,
         bool corruptRootBackReference = false,
-        bool corruptSubvolumeGeneration = false)
+        bool corruptSubvolumeGeneration = false,
+        bool includeBackupSuperblock = false,
+        bool corruptPrimarySuperblock = false,
+        bool corruptPrimaryMagic = false,
+        bool corruptBackupSuperblock = false,
+        bool newerBackupGeneration = false)
     {
         if (defaultSubvolume && !includeSubvolumes)
         {
             throw new ArgumentException("A default subvolume requires subvolume fixtures.", nameof(defaultSubvolume));
         }
 
-        var disk = new byte[DiskSize];
-        var partitionLength = DiskSize - PartitionStart;
+        if ((corruptPrimarySuperblock || corruptPrimaryMagic || corruptBackupSuperblock || newerBackupGeneration)
+            && !includeBackupSuperblock)
+        {
+            throw new ArgumentException("Backup corruption options require a backup superblock fixture.");
+        }
+
+        var diskSize = includeBackupSuperblock
+            ? PartitionStart + BackupSuperblockLogicalOffset + 2 * 1024 * 1024
+            : DiskSize;
+        var disk = new byte[diskSize];
+        var partitionLength = diskSize - PartitionStart;
         WriteMbr(disk, partitionLength);
 
         var fsid = Guid.Parse("8e0a61a3-fbcb-4a76-b16e-777579eecdc6").ToByteArray();
@@ -251,6 +266,34 @@ internal static class BtrfsTestImageFactory
             chunkUuid,
             [(new BtrfsKey(unchecked((ulong)-10L), 128, RegularDataLogicalOffset), checksumBytes)]);
         checksumTree.CopyTo(disk, PartitionStart + ChecksumTreeLogicalOffset);
+
+        if (includeBackupSuperblock)
+        {
+            var backup = disk.AsSpan(
+                PartitionStart + SuperblockLogicalOffset,
+                NodeSize).ToArray();
+            WriteU64(backup, 0x30, BackupSuperblockLogicalOffset);
+            if (newerBackupGeneration)
+            {
+                WriteU64(backup, 0x48, Generation + 1);
+            }
+
+            WriteU32(backup, 0, ComputeCrc32C(backup.AsSpan(32)));
+            backup.CopyTo(disk, PartitionStart + BackupSuperblockLogicalOffset);
+            if (corruptBackupSuperblock)
+            {
+                disk[PartitionStart + BackupSuperblockLogicalOffset] ^= 1;
+            }
+
+            if (corruptPrimaryMagic)
+            {
+                disk[PartitionStart + SuperblockLogicalOffset + 0x40] ^= 1;
+            }
+            else if (corruptPrimarySuperblock)
+            {
+                disk[PartitionStart + SuperblockLogicalOffset] ^= 1;
+            }
+        }
 
         File.WriteAllBytes(path, disk);
         return new BtrfsTestFixture(
