@@ -91,6 +91,7 @@ static void RunGeneratedImageTests()
     TestLvmMetadataDiagnostics();
     TestGeneratedLvm2Image();
     TestGeneratedLzopExt4Image();
+    TestGeneratedEwfE01Image();
     TestRealImageRegressionRunner();
     TestGeneratedVmaLzopImage();
     TestGeneratedUefiVariableStore();
@@ -315,6 +316,77 @@ static void RunGeneratedImageTests()
     }
 
     RunProjFsRemountSmoke(rawFs);
+}
+
+static void TestGeneratedEwfE01Image()
+{
+    var directory = Path.Combine(AppContext.BaseDirectory, "ewf-generated");
+    Directory.CreateDirectory(directory);
+    var firstSegmentPath = Path.Combine(directory, "synthetic.E01");
+    var raw = new byte[3 * 1024];
+    Array.Fill(raw, (byte)0x41, 0, 1024);
+    for (var index = 1024; index < 2048; index++)
+    {
+        raw[index] = checked((byte)((index * 73 + 19) & 0xff));
+    }
+    Array.Fill(raw, (byte)0x5a, 2048, 1024);
+
+    var fixture = EwfTestImageFactory.Create(
+        firstSegmentPath,
+        raw,
+        chunkSize: 1024,
+        chunksPerSegment: [2, 1],
+        compressedChunks: new HashSet<int> { 0, 2 });
+
+    using (var reader = DiskImageReaderFactory.Open(fixture.SegmentPaths[1]))
+    {
+        Assert(reader is EwfDiskImageReader, "E01 reader factory");
+        var ewf = (EwfDiskImageReader)reader;
+        Assert(ewf.FormatName == "EWF/E01 (2 segments)", "E01 multipart format name");
+        Assert(ewf.Length == raw.Length, "E01 logical size");
+        Assert(ewf.ChunkCount == 3 && ewf.SegmentCount == 2, "E01 chunk and segment counts");
+
+        var actual = new byte[raw.Length];
+        reader.ReadAt(0, actual, 0, actual.Length);
+        Assert(actual.SequenceEqual(raw), "E01 full logical contents");
+
+        var crossing = Enumerable.Repeat((byte)0xcc, 1200).ToArray();
+        reader.ReadAt(900, crossing, 37, 1100);
+        Assert(crossing.AsSpan(37, 1100).SequenceEqual(raw.AsSpan(900, 1100)), "E01 cross-chunk read");
+        Assert(crossing.AsSpan(0, 37).ToArray().All(value => value == 0xcc), "E01 buffer offset prefix");
+    }
+
+    var corruptChunkPath = Path.Combine(directory, "corrupt-chunk.E01");
+    File.Copy(fixture.SegmentPaths[0], corruptChunkPath, overwrite: true);
+    File.Copy(fixture.SegmentPaths[1], Path.Combine(directory, "corrupt-chunk.E02"), overwrite: true);
+    var corruptChunk = File.ReadAllBytes(corruptChunkPath);
+    corruptChunk[fixture.UncompressedChecksumOffset] ^= 1;
+    File.WriteAllBytes(corruptChunkPath, corruptChunk);
+    try
+    {
+        using var reader = EwfDiskImageReader.Open(corruptChunkPath);
+        reader.ReadAt(1024, new byte[1024], 0, 1024);
+        Assert(false, "E01 corrupt uncompressed checksum throws");
+    }
+    catch (InvalidDataException ex)
+    {
+        Assert(ex.Message.Contains("Adler-32", StringComparison.Ordinal), "E01 chunk checksum diagnostic");
+    }
+
+    var corruptDescriptorPath = Path.Combine(directory, "corrupt-descriptor.E01");
+    File.Copy(fixture.SegmentPaths[0], corruptDescriptorPath, overwrite: true);
+    var corruptDescriptor = File.ReadAllBytes(corruptDescriptorPath);
+    corruptDescriptor[13 + 72] ^= 1;
+    File.WriteAllBytes(corruptDescriptorPath, corruptDescriptor);
+    try
+    {
+        using var _ = EwfDiskImageReader.Open(corruptDescriptorPath);
+        Assert(false, "E01 corrupt descriptor checksum throws");
+    }
+    catch (InvalidDataException ex)
+    {
+        Assert(ex.Message.Contains("Adler-32", StringComparison.Ordinal), "E01 descriptor checksum diagnostic");
+    }
 }
 
 static void TestRealImageRegressionRunner()
