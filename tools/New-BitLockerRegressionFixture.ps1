@@ -12,6 +12,11 @@ param(
     [ValidateScript({ [string]::IsNullOrEmpty($_) -or $_ -match '^[A-Za-z_][A-Za-z0-9_]*$' })]
     [string]$PasswordEnvironmentVariable = '',
 
+    [ValidateScript({ [string]::IsNullOrEmpty($_) -or $_ -match '^[A-Za-z_][A-Za-z0-9_]*$' })]
+    [string]$StartupKeyPathEnvironmentVariable = '',
+
+    [string]$StartupKeyDirectory = '',
+
     [string]$FixtureText = "BitLocker recovery fixture`n",
 
     [ValidateRange(256, 4096)]
@@ -29,6 +34,9 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 if ([string]::IsNullOrEmpty($FixtureText)) {
     throw 'FixtureText must not be empty.'
 }
+if ([string]::IsNullOrWhiteSpace($StartupKeyPathEnvironmentVariable) -ne [string]::IsNullOrWhiteSpace($StartupKeyDirectory)) {
+    throw 'StartupKeyPathEnvironmentVariable and StartupKeyDirectory must be specified together.'
+}
 
 $resolvedOutput = [IO.Path]::GetFullPath($OutputPath)
 $outputDirectory = Split-Path -Parent $resolvedOutput
@@ -42,6 +50,8 @@ $completed = $false
 $recoveryPassword = $null
 $password = $null
 $securePassword = $null
+$resolvedStartupKeyDirectory = $null
+$generatedStartupKeyPath = $null
 try {
     New-VHD -Path $resolvedOutput -Dynamic -SizeBytes ($SizeMiB * 1MB) | Out-Null
     $vhd = Mount-VHD -Path $resolvedOutput -Passthru
@@ -105,6 +115,28 @@ try {
             -WarningAction SilentlyContinue | Out-Null
     }
 
+    if (-not [string]::IsNullOrWhiteSpace($StartupKeyPathEnvironmentVariable)) {
+        $resolvedStartupKeyDirectory = [IO.Path]::GetFullPath($StartupKeyDirectory)
+        New-Item -ItemType Directory -Path $resolvedStartupKeyDirectory -Force | Out-Null
+        $existingStartupKeys = @(
+            Get-ChildItem -LiteralPath $resolvedStartupKeyDirectory -Filter '*.bek' -File -Force |
+                ForEach-Object FullName
+        )
+        Add-BitLockerKeyProtector `
+            -MountPoint $mountPoint `
+            -StartupKeyProtector `
+            -StartupKeyPath $resolvedStartupKeyDirectory `
+            -WarningAction SilentlyContinue | Out-Null
+        $newStartupKeys = @(
+            Get-ChildItem -LiteralPath $resolvedStartupKeyDirectory -Filter '*.bek' -File -Force |
+                Where-Object { $_.FullName -notin $existingStartupKeys }
+        )
+        if ($newStartupKeys.Count -ne 1) {
+            throw "Expected one new BitLocker startup key, but found $($newStartupKeys.Count)."
+        }
+        $generatedStartupKeyPath = $newStartupKeys[0].FullName
+    }
+
     Lock-BitLocker -MountPoint $mountPoint -ForceDismount | Out-Null
     Unlock-BitLocker -MountPoint $mountPoint -RecoveryPassword $recoveryPassword | Out-Null
     $verified = Get-BitLockerVolume -MountPoint $mountPoint
@@ -125,6 +157,19 @@ try {
             [EnvironmentVariableTarget]::User)
     }
 
+    if (-not [string]::IsNullOrWhiteSpace($generatedStartupKeyPath)) {
+        Lock-BitLocker -MountPoint $mountPoint -ForceDismount | Out-Null
+        Unlock-BitLocker -MountPoint $mountPoint -RecoveryKeyPath $generatedStartupKeyPath | Out-Null
+        $verified = Get-BitLockerVolume -MountPoint $mountPoint
+        if ($verified.LockStatus -ne 'Unlocked') {
+            throw 'The generated startup key could not unlock the BitLocker fixture.'
+        }
+        [Environment]::SetEnvironmentVariable(
+            $StartupKeyPathEnvironmentVariable,
+            $generatedStartupKeyPath,
+            [EnvironmentVariableTarget]::User)
+    }
+
     [Environment]::SetEnvironmentVariable(
         $RecoveryPasswordEnvironmentVariable,
         $recoveryPassword,
@@ -139,6 +184,10 @@ try {
         Write-Output "password_environment_variable=$PasswordEnvironmentVariable"
         Write-Output 'password_unlock_verified=true'
     }
+    if (-not [string]::IsNullOrWhiteSpace($StartupKeyPathEnvironmentVariable)) {
+        Write-Output "startup_key_path_environment_variable=$StartupKeyPathEnvironmentVariable"
+        Write-Output 'startup_key_unlock_verified=true'
+    }
     $completed = $true
 }
 finally {
@@ -152,6 +201,13 @@ finally {
     }
     if (-not $completed -and (Test-Path -LiteralPath $resolvedOutput)) {
         Remove-Item -LiteralPath $resolvedOutput -Force
+    }
+    if (-not $completed -and -not [string]::IsNullOrWhiteSpace($generatedStartupKeyPath) -and (Test-Path -LiteralPath $generatedStartupKeyPath)) {
+        $resolvedGeneratedKey = [IO.Path]::GetFullPath($generatedStartupKeyPath)
+        if (-not [string]::IsNullOrWhiteSpace($resolvedStartupKeyDirectory) -and
+            [IO.Path]::GetDirectoryName($resolvedGeneratedKey) -eq $resolvedStartupKeyDirectory) {
+            Remove-Item -LiteralPath $resolvedGeneratedKey -Force
+        }
     }
 }
 

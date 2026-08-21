@@ -233,20 +233,26 @@ internal static class RealImageRegressionRunner
         partition.FileSystem = FileSystemDetector.Detect(reader, partition);
         byte[] recoveryKey = [];
         char[] passwordCharacters = [];
+        BitLockerStartupKey? startupKey = null;
         IReadOnlyFileSystem? fileSystem = null;
         try
         {
             var shouldOpen = expectation.Files.Count > 0
                 || !string.IsNullOrWhiteSpace(expectation.RecoveryPasswordEnvironmentVariable)
                 || !string.IsNullOrWhiteSpace(expectation.PasswordEnvironmentVariable)
+                || !string.IsNullOrWhiteSpace(expectation.StartupKeyPathEnvironmentVariable)
                 || expectation.ExpectedFileSystem.Contains("->", StringComparison.Ordinal);
             if (shouldOpen)
             {
                 Require(
-                    string.IsNullOrWhiteSpace(expectation.RecoveryPasswordEnvironmentVariable)
-                    || string.IsNullOrWhiteSpace(expectation.PasswordEnvironmentVariable),
+                    new[]
+                    {
+                        expectation.RecoveryPasswordEnvironmentVariable,
+                        expectation.PasswordEnvironmentVariable,
+                        expectation.StartupKeyPathEnvironmentVariable
+                    }.Count(value => !string.IsNullOrWhiteSpace(value)) <= 1,
                     caseName,
-                    "recoveryPasswordEnvironmentVariable and passwordEnvironmentVariable cannot both be set");
+                    "only one BitLocker credential environment variable can be set");
                 if (!string.IsNullOrWhiteSpace(expectation.RecoveryPasswordEnvironmentVariable))
                 {
                     var password = Environment.GetEnvironmentVariable(expectation.RecoveryPasswordEnvironmentVariable);
@@ -268,11 +274,25 @@ internal static class RealImageRegressionRunner
                         $"environment variable '{expectation.PasswordEnvironmentVariable}' is not set");
                     passwordCharacters = password!.ToCharArray();
                 }
+                else if (!string.IsNullOrWhiteSpace(expectation.StartupKeyPathEnvironmentVariable))
+                {
+                    var startupKeyPath = Environment.GetEnvironmentVariable(expectation.StartupKeyPathEnvironmentVariable);
+                    Require(
+                        !string.IsNullOrWhiteSpace(startupKeyPath),
+                        caseName,
+                        $"environment variable '{expectation.StartupKeyPathEnvironmentVariable}' is not set");
+                    Require(
+                        BitLockerStartupKey.TryRead(startupKeyPath!, out startupKey, out var startupKeyError),
+                        caseName,
+                        $"BitLocker startup key validation failed: {startupKeyError}");
+                }
 
                 fileSystem = recoveryKey.Length > 0
                     ? FileSystemDetector.TryOpen(reader, partition, recoveryKey, out var openError)
                     : passwordCharacters.Length > 0
                         ? FileSystemDetector.TryOpenWithBitLockerPassword(reader, partition, passwordCharacters, out openError)
+                        : startupKey is not null
+                            ? FileSystemDetector.TryOpenWithBitLockerStartupKey(reader, partition, startupKey, out openError)
                         : FileSystemDetector.TryOpen(reader, partition, out openError);
                 Require(fileSystem is not null, caseName, $"partition #{partition.Number} open failed: {openError}");
             }
@@ -303,6 +323,8 @@ internal static class RealImageRegressionRunner
             {
                 Array.Clear(passwordCharacters);
             }
+
+            startupKey?.Dispose();
         }
     }
 
@@ -454,6 +476,7 @@ internal sealed class RealImagePartitionExpectation
     public string ExpectedFileSystem { get; set; } = "";
     public string RecoveryPasswordEnvironmentVariable { get; set; } = "";
     public string PasswordEnvironmentVariable { get; set; } = "";
+    public string StartupKeyPathEnvironmentVariable { get; set; } = "";
     public List<RealImageFileExpectation> Files { get; set; } = [];
 }
 

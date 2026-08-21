@@ -318,6 +318,72 @@ public static class BitLockerUnlock
         }
     }
 
+    public static bool TryCreateReaderWithStartupKey(
+        IBlockReader encryptedReader,
+        BitLockerMetadata metadata,
+        BitLockerStartupKey startupKey,
+        out IBlockReader? decryptedReader,
+        out string error)
+    {
+        decryptedReader = null;
+        error = "";
+        if (startupKey.IsDisposed)
+        {
+            error = "BitLockerスタートアップキーは既に破棄されています。";
+            return false;
+        }
+
+        var protector = metadata.KeyProtectors.FirstOrDefault(candidate =>
+            candidate.ProtectionType == BitLockerProtectionType.StartupKey
+            && candidate.Identifier == startupKey.Identifier);
+        if (protector is null)
+        {
+            error = "BitLockerスタートアップキーの識別子が、このボリュームの保護子と一致しません。";
+            return false;
+        }
+
+        var encryptedVmkEntry = protector.Properties.FirstOrDefault(entry => entry.ValueType == 0x0005)
+            ?? protector.Properties.SelectMany(entry => entry.Children).FirstOrDefault(entry => entry.ValueType == 0x0005);
+        var encryptedFvekEntry = metadata.Entries.FirstOrDefault(
+            entry => entry.EntryType == 0x0003 && entry.ValueType == 0x0005);
+        if (encryptedVmkEntry is null || encryptedFvekEntry is null)
+        {
+            error = "スタートアップキー保護子の暗号化VMK、または暗号化FVEKのエントリが不足しています。";
+            return false;
+        }
+
+        byte[]? externalKey = null;
+        byte[]? vmkEntryBytes = null;
+        byte[]? vmk = null;
+        byte[]? fvekEntryBytes = null;
+        byte[]? fvek = null;
+        try
+        {
+            externalKey = startupKey.Key.ToArray();
+            vmkEntryBytes = DecryptAesCcmEntry(externalKey, encryptedVmkEntry.Data);
+            vmk = ExtractKeyFromDecryptedEntry(vmkEntryBytes, "VMK");
+            fvekEntryBytes = DecryptAesCcmEntry(vmk, encryptedFvekEntry.Data);
+            fvek = ExtractKeyFromDecryptedEntry(fvekEntryBytes, "FVEK");
+            decryptedReader = new BitLockerDecryptingReader(encryptedReader, metadata, fvek);
+            return true;
+        }
+        catch (Exception ex) when (ex is InvalidDataException or NotSupportedException or CryptographicException)
+        {
+            error = ex is CryptographicException
+                ? "BitLockerスタートアップキーがこの保護子と一致しません。"
+                : ex.Message;
+            return false;
+        }
+        finally
+        {
+            ZeroKey(externalKey);
+            ZeroKey(vmkEntryBytes);
+            ZeroKey(vmk);
+            ZeroKey(fvekEntryBytes);
+            ZeroKey(fvek);
+        }
+    }
+
     private static bool TryCreateReaderWithStretchProtector(
         IBlockReader encryptedReader,
         BitLockerMetadata metadata,
@@ -477,6 +543,11 @@ public static class BitLockerUnlock
         if (metadata.HasPasswordProtector)
         {
             return "パスワード保護子があります。BitLockerパスワードを入力して解除できます。";
+        }
+
+        if (metadata.HasStartupKeyProtector)
+        {
+            return "スタートアップキー保護子があります。.BEKファイルを選択して解除できます。";
         }
 
         return "対応する解除キーが必要です。TPM のみの保護子はオフライン復号できません。";
