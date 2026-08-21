@@ -111,13 +111,16 @@
 - `mkfs.btrfs -m single -d single`由来fixtureを生成し、`btrfs check --readonly`と実イメージ回帰で確認
 - zlib圧縮extentを128 KiBの展開上限、CRC32C先行検証、部分読出しキャッシュ付きで追加し、圧縮stream破損も拒否
 - LZO圧縮extentの全体／segment長、4 KiB境界padding、128 KiB展開上限を検証し、通常・inline extentと破損payloadを回帰テスト
+- zstd圧縮extentのframe header、window、content size、block境界、割当末尾paddingを検証し、通常・inline extentと破損payloadを回帰テスト
+- `btrfs-progs 6.6.3`由来のzstd通常・inline extentを実イメージ回帰で確認
 
 ## 次回の推奨作業
 
 ### 1. Btrfs対応の第2段階
 
-- zstd圧縮extentを追加し、展開上限と破損入力を検証する
-- subvolume/root refとdefault subvolumeを安全に辿る
+- root ref/backrefを解析し、トップレベルから到達可能なsubvolumeを読み取り専用で列挙する
+- default subvolumeを安全に解決し、欠損・循環・世代不整合時はトップレベルへ明示的にフォールバックする
+- subvolume間の名前衝突、snapshot、入れ子構造を合成・実イメージ回帰で検証する
 - backup superblock利用は、世代整合性と誤復旧防止の設計後に追加する
 
 ## 保守・品質改善

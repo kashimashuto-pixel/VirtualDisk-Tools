@@ -67,6 +67,12 @@ dd if=/dev/zero of="$mount_dir/compressed-lzo.bin" bs=131072 count=2 status=none
 touch "$mount_dir/compressed-inline-lzo.bin"
 btrfs property set "$mount_dir/compressed-inline-lzo.bin" compression lzo
 dd if=/dev/zero of="$mount_dir/compressed-inline-lzo.bin" bs=1024 count=1 status=none
+touch "$mount_dir/compressed-zstd.bin"
+btrfs property set "$mount_dir/compressed-zstd.bin" compression zstd
+dd if=/dev/zero of="$mount_dir/compressed-zstd.bin" bs=131072 count=2 status=none
+touch "$mount_dir/compressed-inline-zstd.bin"
+btrfs property set "$mount_dir/compressed-inline-zstd.bin" compression zstd
+dd if=/dev/zero of="$mount_dir/compressed-inline-zstd.bin" bs=1024 count=1 status=none
 truncate -s 1048576 "$mount_dir/sparse.bin"
 printf 'sparse-tail\n' >> "$mount_dir/sparse.bin"
 touch -d '2046-02-03 04:05:06 UTC' "$mount_dir/hello.txt"
@@ -77,7 +83,9 @@ stat --format='%n size=%s' "$mount_dir/nested/regular.bin" "$mount_dir/sparse.bi
 stat --format='%n size=%s' "$mount_dir/compressed-zlib.bin"
 stat --format='%n size=%s' "$mount_dir/compressed-lzo.bin"
 stat --format='%n size=%s' "$mount_dir/compressed-inline-lzo.bin"
-sha256sum "$mount_dir/hello.txt" "$mount_dir/nested/regular.bin" "$mount_dir/compressed-zlib.bin" "$mount_dir/compressed-lzo.bin" "$mount_dir/compressed-inline-lzo.bin" "$mount_dir/sparse.bin"
+stat --format='%n size=%s' "$mount_dir/compressed-zstd.bin"
+stat --format='%n size=%s' "$mount_dir/compressed-inline-zstd.bin"
+sha256sum "$mount_dir/hello.txt" "$mount_dir/nested/regular.bin" "$mount_dir/compressed-zlib.bin" "$mount_dir/compressed-lzo.bin" "$mount_dir/compressed-inline-lzo.bin" "$mount_dir/compressed-zstd.bin" "$mount_dir/compressed-inline-zstd.bin" "$mount_dir/sparse.bin"
 
 umount "$mount_dir"
 btrfs check --readonly "$partition"
