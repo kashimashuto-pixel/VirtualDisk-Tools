@@ -306,8 +306,8 @@ public static class BitLockerUnlock
                 continue;
             }
 
-            var encryptedVmkEntry = stretchEntry.Children.FirstOrDefault(entry => entry.ValueType == 0x0005)
-                ?? protector.Properties.FirstOrDefault(entry => entry.ValueType == 0x0005);
+            var encryptedVmkEntry = protector.Properties.FirstOrDefault(entry => entry.ValueType == 0x0005)
+                ?? stretchEntry.Children.FirstOrDefault(entry => entry.ValueType == 0x0005);
             if (encryptedVmkEntry is null)
             {
                 continue;

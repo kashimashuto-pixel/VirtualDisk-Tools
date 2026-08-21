@@ -251,6 +251,8 @@ public static class BitLockerMetadataReader
 
         var metadataBytes = EndianUtilities.ReadBytes(reader, blockOffset + 64, metadataSize);
         var entries = ParseEntries(metadataBytes, metadataHeaderSize, metadataSize).ToList();
+        // Windows can repeat the 16-bit algorithm identifier in the upper word.
+        var encryptionMethod = EndianUtilities.ReadUInt32Little(metadataBytes, 36) & ushort.MaxValue;
         metadata = new BitLockerMetadata
         {
             VolumeIdentifier = new Guid(metadataBytes.AsSpan(16, 16)),
@@ -263,7 +265,7 @@ public static class BitLockerMetadataReader
             VolumeHeaderOffset = blockHeaderVersion == 2 ? checked((long)EndianUtilities.ReadUInt64Little(blockHeader, 56)) : 0,
             VolumeHeaderSectors = blockHeaderVersion == 2 ? checked((int)EndianUtilities.ReadUInt32Little(blockHeader, 28)) : 0,
             EncryptedVolumeSize = blockHeaderVersion == 2 ? checked((long)EndianUtilities.ReadUInt64Little(blockHeader, 16)) : 0,
-            EncryptionMethod = EndianUtilities.ReadUInt32Little(metadataBytes, 36),
+            EncryptionMethod = encryptionMethod,
             CreatedUtc = ReadFileTime(metadataBytes, 40),
             Description = ReadDescription(entries),
             KeyProtectors = ReadKeyProtectors(entries),
