@@ -105,6 +105,22 @@ dotnet run --project src\Qcow2Explorer\Qcow2Explorer.csproj
 
 Visual Studio で開く場合は `Qcow2Explorer.sln` を使ってください。
 
+## Windows配布パッケージ
+
+`v`で始まるタグ（例: `v1.0.0`）をpushすると、GitHub ActionsがWindows x64向けの自己完結ZIPとSHA-256ファイルを作成し、GitHub Releaseへ追加します。
+自己完結パッケージの実行に.NET SDKや.NETランタイムは不要です。
+
+ローカルで同じ形式のパッケージを作成する場合:
+
+```powershell
+dotnet restore Qcow2Explorer.sln --runtime win-x64
+.\tools\New-WindowsReleasePackage.ps1 -Version 1.0.0
+```
+
+既定の出力先は`.tmp/release`です。生成ツールは既存の出力先を上書きしません。
+配布前に`.zip.sha256`の値とダウンロードしたZIPの`Get-FileHash -Algorithm SHA256`を照合してください。
+現在の配布物はコード署名されていないため、Windowsが発行元の警告を表示する場合があります。
+
 ## テスト
 
 テストは qemu-img などを使わず、最小 qcow2/raw イメージを C# で生成して確認します。
