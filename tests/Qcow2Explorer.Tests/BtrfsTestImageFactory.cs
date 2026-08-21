@@ -1,6 +1,7 @@
 using System.Buffers.Binary;
 using System.IO.Compression;
 using System.Text;
+using ZstdSharp;
 
 internal static class BtrfsTestImageFactory
 {
@@ -22,6 +23,7 @@ internal static class BtrfsTestImageFactory
     private const int SparseDataLogicalOffset = RegularDataLogicalOffset + 2 * SectorSize;
     private const int ZlibDataLogicalOffset = RegularDataLogicalOffset + 3 * SectorSize;
     private const int LzoDataLogicalOffset = RegularDataLogicalOffset + 4 * SectorSize;
+    private const int ZstdDataLogicalOffset = RegularDataLogicalOffset + 5 * SectorSize;
     private const ulong Generation = 1;
 
     public static byte[] RegularData { get; } = Enumerable.Range(0, 6000)
@@ -32,7 +34,9 @@ internal static class BtrfsTestImageFactory
         string path,
         bool corruptZlibPayload = false,
         bool corruptLzoPayload = false,
-        bool corruptLzoHeader = false)
+        bool corruptLzoHeader = false,
+        bool corruptZstdPayload = false,
+        bool corruptZstdPadding = false)
     {
         var disk = new byte[DiskSize];
         var partitionLength = DiskSize - PartitionStart;
@@ -67,6 +71,7 @@ internal static class BtrfsTestImageFactory
         var helloBytes = Encoding.UTF8.GetBytes(HelloText);
         var sparseTailBytes = Encoding.UTF8.GetBytes(SparseTail);
         var inlineLzoData = CompressBtrfsLzoZeros(1024, padToSector: false);
+        var inlineZstdData = CompressZstdZeros(1024, padToSector: false);
         var fileSystemTree = CreateLeaf(
             FileSystemTreeLogicalOffset,
             owner: 5,
@@ -81,7 +86,9 @@ internal static class BtrfsTestImageFactory
                     (261, 1, 1, "sparse.bin"),
                     (262, 1, 1, "zlib.bin"),
                     (263, 1, 1, "lzo.bin"),
-                    (264, 1, 1, "inline-lzo.bin"))),
+                    (264, 1, 1, "inline-lzo.bin"),
+                    (265, 1, 1, "zstd.bin"),
+                    (266, 1, 1, "inline-zstd.bin"))),
                 (new BtrfsKey(257, 1, 0), CreateInode(helloBytes.Length, 0x81a4)),
                 (new BtrfsKey(257, 108, 0), CreateInlineExtent(helloBytes)),
                 (new BtrfsKey(258, 1, 0), CreateInode(RegularData.Length, 0x81a4)),
@@ -107,7 +114,16 @@ internal static class BtrfsTestImageFactory
                     compression: 2,
                     ramBytes: 128 * 1024)),
                 (new BtrfsKey(264, 1, 0), CreateInode(1024, 0x81a4)),
-                (new BtrfsKey(264, 108, 0), CreateCompressedInlineExtent(inlineLzoData, 1024, compression: 2))
+                (new BtrfsKey(264, 108, 0), CreateCompressedInlineExtent(inlineLzoData, 1024, compression: 2)),
+                (new BtrfsKey(265, 1, 0), CreateInode(128 * 1024, 0x81a4)),
+                (new BtrfsKey(265, 108, 0), CreateRegularExtent(
+                    ZstdDataLogicalOffset,
+                    SectorSize,
+                    128 * 1024,
+                    compression: 3,
+                    ramBytes: 128 * 1024)),
+                (new BtrfsKey(266, 1, 0), CreateInode(1024, 0x81a4)),
+                (new BtrfsKey(266, 108, 0), CreateCompressedInlineExtent(inlineZstdData, 1024, compression: 3))
             ]);
         fileSystemTree.CopyTo(disk, PartitionStart + FileSystemTreeLogicalOffset);
 
@@ -132,8 +148,20 @@ internal static class BtrfsTestImageFactory
         }
 
         lzoData.CopyTo(disk, PartitionStart + LzoDataLogicalOffset);
-        var checksumBytes = new byte[5 * sizeof(uint)];
-        for (var sector = 0; sector < 5; sector++)
+        var zstdData = CompressZstdZeros(128 * 1024, padToSector: true);
+        if (corruptZstdPayload)
+        {
+            zstdData[0] ^= 1;
+        }
+
+        if (corruptZstdPadding)
+        {
+            zstdData[^1] = 1;
+        }
+
+        zstdData.CopyTo(disk, PartitionStart + ZstdDataLogicalOffset);
+        var checksumBytes = new byte[6 * sizeof(uint)];
+        for (var sector = 0; sector < 6; sector++)
         {
             var source = disk.AsSpan(PartitionStart + RegularDataLogicalOffset + sector * SectorSize, SectorSize);
             WriteU32(checksumBytes, sector * sizeof(uint), ComputeCrc32C(source));
@@ -319,6 +347,20 @@ internal static class BtrfsTestImageFactory
             result.AsSpan(0, sizeof(uint)),
             checked((uint)totalLength));
         return result;
+    }
+
+    private static byte[] CompressZstdZeros(int decodedLength, bool padToSector)
+    {
+        using var compressor = new Compressor(3);
+        var compressed = compressor.Wrap(new byte[decodedLength]).ToArray();
+        if (!padToSector)
+        {
+            return compressed;
+        }
+
+        var allocatedLength = (compressed.Length + SectorSize - 1) / SectorSize * SectorSize;
+        Array.Resize(ref compressed, allocatedLength);
+        return compressed;
     }
 
     private static byte[] EncodeLzoZeroBlock(int length)

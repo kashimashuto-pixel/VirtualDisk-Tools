@@ -339,6 +339,8 @@ static void TestGeneratedBtrfsImage()
         var zlib = root.Single(node => node.Name == "zlib.bin");
         var lzo = root.Single(node => node.Name == "lzo.bin");
         var inlineLzo = root.Single(node => node.Name == "inline-lzo.bin");
+        var zstd = root.Single(node => node.Name == "zstd.bin");
+        var inlineZstd = root.Single(node => node.Name == "inline-zstd.bin");
         Assert(Encoding.UTF8.GetString(fs.ReadFile(hello, 0, checked((int)hello.Size))) == BtrfsTestImageFactory.HelloText, "generated Btrfs inline extent");
         Assert(fs.ReadFile(regular, 0, checked((int)regular.Size)).SequenceEqual(BtrfsTestImageFactory.RegularData), "generated Btrfs regular extent");
         Assert(fs.ReadFile(regular, 4090, 32).SequenceEqual(BtrfsTestImageFactory.RegularData.AsSpan(4090, 32).ToArray()), "generated Btrfs cross-sector read");
@@ -354,6 +356,9 @@ static void TestGeneratedBtrfsImage()
         Assert(fs.ReadFile(lzo, 0, checked((int)lzo.Size)).All(value => value == 0), "generated Btrfs LZO extent");
         Assert(fs.ReadFile(lzo, 4090, 32).All(value => value == 0), "generated Btrfs LZO segment boundary read");
         Assert(fs.ReadFile(inlineLzo, 0, checked((int)inlineLzo.Size)).All(value => value == 0), "generated Btrfs inline LZO extent");
+        Assert(fs.ReadFile(zstd, 0, checked((int)zstd.Size)).All(value => value == 0), "generated Btrfs zstd extent");
+        Assert(fs.ReadFile(zstd, 65530, 32).All(value => value == 0), "generated Btrfs zstd partial read");
+        Assert(fs.ReadFile(inlineZstd, 0, checked((int)inlineZstd.Size)).All(value => value == 0), "generated Btrfs inline zstd extent");
     }
 
     var superblockCorruptPath = Path.Combine(AppContext.BaseDirectory, "synthetic-btrfs-super-corrupt.raw");
@@ -460,6 +465,46 @@ static void TestGeneratedBtrfsImage()
         catch (InvalidDataException ex)
         {
             Assert(ex.Message.Contains("total length", StringComparison.Ordinal), "corrupt Btrfs LZO header diagnostic");
+        }
+    }
+
+    var zstdCorruptPath = Path.Combine(AppContext.BaseDirectory, "synthetic-btrfs-zstd-corrupt.raw");
+    BtrfsTestImageFactory.Create(zstdCorruptPath, corruptZstdPayload: true);
+    using (var reader = DiskImageReaderFactory.Open(zstdCorruptPath))
+    {
+        var partition = PartitionTableReader.ReadPartitions(reader).Single();
+        partition.FileSystem = FileSystemDetector.Detect(reader, partition);
+        var fs = FileSystemDetector.TryOpen(reader, partition, out var error);
+        Assert(fs is not null, error);
+        var zstd = fs!.ListDirectory(fs.Root).Single(node => node.Name == "zstd.bin");
+        try
+        {
+            _ = fs.ReadFile(zstd, 0, checked((int)zstd.Size));
+            Assert(false, "corrupt Btrfs zstd throws");
+        }
+        catch (InvalidDataException ex)
+        {
+            Assert(ex.Message.Contains("zstd extent", StringComparison.Ordinal), "corrupt Btrfs zstd diagnostic");
+        }
+    }
+
+    var zstdPaddingCorruptPath = Path.Combine(AppContext.BaseDirectory, "synthetic-btrfs-zstd-padding-corrupt.raw");
+    BtrfsTestImageFactory.Create(zstdPaddingCorruptPath, corruptZstdPadding: true);
+    using (var reader = DiskImageReaderFactory.Open(zstdPaddingCorruptPath))
+    {
+        var partition = PartitionTableReader.ReadPartitions(reader).Single();
+        partition.FileSystem = FileSystemDetector.Detect(reader, partition);
+        var fs = FileSystemDetector.TryOpen(reader, partition, out var error);
+        Assert(fs is not null, error);
+        var zstd = fs!.ListDirectory(fs.Root).Single(node => node.Name == "zstd.bin");
+        try
+        {
+            _ = fs.ReadFile(zstd, 0, checked((int)zstd.Size));
+            Assert(false, "corrupt Btrfs zstd padding throws");
+        }
+        catch (InvalidDataException ex)
+        {
+            Assert(ex.Message.Contains("padding", StringComparison.Ordinal), "corrupt Btrfs zstd padding diagnostic");
         }
     }
 }

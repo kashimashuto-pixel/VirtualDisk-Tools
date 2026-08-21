@@ -1,7 +1,10 @@
+using System.Buffers;
+using System.Buffers.Binary;
 using System.IO.Compression;
 using System.Text;
 using Qcow2Explorer.Core;
 using Qcow2Explorer.Partitions;
+using ZstdSharp;
 
 namespace Qcow2Explorer.FileSystems;
 
@@ -222,7 +225,7 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
             var length = checked((int)(overlapEnd - overlapStart));
             if (extent.Type == BtrfsFileExtentType.Inline)
             {
-                if (extent.Compression is not 0 and not 1 and not 2)
+                if (extent.Compression is not 0 and not 1 and not 2 and not 3)
                 {
                     throw new NotSupportedException($"未対応のBtrfs inline圧縮方式です: {extent.Compression}");
                 }
@@ -237,7 +240,7 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
                     var logical = checked(extent.DiskBytenr + extent.ExtentOffset + sourceOffset);
                     ReadVerifiedData(logical, output, destinationOffset, length);
                 }
-                else if (extent.Compression is 1 or 2)
+                else if (extent.Compression is 1 or 2 or 3)
                 {
                     var decoded = ReadCompressedExtent(extent);
                     var decodedOffset = checked((int)(extent.ExtentOffset + sourceOffset));
@@ -717,6 +720,10 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
             {
                 inlineData = DecodeLzo(inlineData, ramBytes, "Btrfs inline LZO extent", allowSectorPadding: false);
             }
+            else if (compression == 3)
+            {
+                inlineData = DecodeZstd(inlineData, ramBytes, "Btrfs inline zstd extent", allowSectorPadding: false);
+            }
 
             return new BtrfsFileExtent(
                 item.Key.Offset,
@@ -842,6 +849,7 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
         {
             1 => DecodeZlib(compressed, extent.RamBytes, "Btrfs zlib extent"),
             2 => DecodeLzo(compressed, extent.RamBytes, "Btrfs LZO extent", allowSectorPadding: true),
+            3 => DecodeZstd(compressed, extent.RamBytes, "Btrfs zstd extent", allowSectorPadding: true),
             _ => throw new NotSupportedException($"未対応のBtrfs圧縮方式です: {extent.Compression}")
         };
         lock (_decodedExtentCacheLock)
@@ -1019,6 +1027,230 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
         }
 
         return output;
+    }
+
+    private static byte[] DecodeZstd(
+        byte[] compressed,
+        ulong decodedLength,
+        string label,
+        bool allowSectorPadding)
+    {
+        if (decodedLength == 0 || decodedLength > MaximumDecodedExtentSize)
+        {
+            throw new InvalidDataException($"{label}の展開後サイズが不正です: {decodedLength:N0}");
+        }
+
+        var frameLength = GetZstdFrameLength(compressed, decodedLength, label);
+        var trailing = compressed.AsSpan(frameLength);
+        if (!allowSectorPadding && trailing.Length != 0)
+        {
+            throw new InvalidDataException($"{label}のinline入力末尾に余分なデータがあります。");
+        }
+
+        if (trailing.IndexOfAnyExcept((byte)0) >= 0)
+        {
+            throw new InvalidDataException($"{label}の割当末尾paddingがゼロではありません。");
+        }
+
+        var decodeBuffer = new byte[checked((int)decodedLength + 1)];
+        int consumed;
+        int written;
+        OperationStatus status;
+        try
+        {
+            using var decompressor = new Decompressor();
+            status = decompressor.UnwrapStream(
+                compressed.AsSpan(0, frameLength),
+                decodeBuffer,
+                out consumed,
+                out written);
+        }
+        catch (ZstdException ex)
+        {
+            throw new InvalidDataException($"{label}を展開できませんでした: {ex.Message}", ex);
+        }
+
+        if (status != OperationStatus.Done || written != (int)decodedLength)
+        {
+            throw new InvalidDataException(
+                $"{label}の展開結果が不正です: status={status}, "
+                + $"expected={decodedLength:N0}, actual={written:N0}");
+        }
+
+        if (consumed != frameLength)
+        {
+            throw new InvalidDataException(
+                $"{label}の入力消費量が不正です: consumed={consumed:N0}, frame={frameLength:N0}");
+        }
+
+        return decodeBuffer.AsSpan(0, written).ToArray();
+    }
+
+    private static int GetZstdFrameLength(ReadOnlySpan<byte> input, ulong decodedLength, string label)
+    {
+        const uint zstdMagic = 0xFD2FB528;
+
+        var offset = 0;
+        EnsureZstdAvailable(input.Length, offset, sizeof(uint), label, "magic");
+        if (BinaryPrimitives.ReadUInt32LittleEndian(input) != zstdMagic)
+        {
+            throw new InvalidDataException($"{label}のmagicが不正です。");
+        }
+
+        offset += sizeof(uint);
+        EnsureZstdAvailable(input.Length, offset, sizeof(byte), label, "frame header descriptor");
+        var descriptor = input[offset++];
+        if ((descriptor & 0x08) != 0)
+        {
+            throw new InvalidDataException($"{label}のreserved bitが設定されています。");
+        }
+
+        var contentSizeFlag = descriptor >> 6;
+        var singleSegment = (descriptor & 0x20) != 0;
+        var hasChecksum = (descriptor & 0x04) != 0;
+        var dictionaryIdSize = (descriptor & 0x03) switch
+        {
+            0 => 0,
+            1 => 1,
+            2 => 2,
+            _ => 4,
+        };
+        var contentSizeFieldSize = contentSizeFlag switch
+        {
+            0 when singleSegment => 1,
+            0 => 0,
+            1 => 2,
+            2 => 4,
+            _ => 8,
+        };
+
+        ulong windowSize;
+        if (singleSegment)
+        {
+            windowSize = 0;
+        }
+        else
+        {
+            EnsureZstdAvailable(input.Length, offset, sizeof(byte), label, "window descriptor");
+            var windowDescriptor = input[offset++];
+            var windowLog = 10 + (windowDescriptor >> 3);
+            var windowBase = 1UL << windowLog;
+            windowSize = checked(windowBase + windowBase / 8 * (ulong)(windowDescriptor & 0x07));
+            if (windowSize > MaximumDecodedExtentSize)
+            {
+                throw new InvalidDataException($"{label}のwindowが128 KiBを超えています: {windowSize:N0}");
+            }
+        }
+
+        EnsureZstdAvailable(input.Length, offset, dictionaryIdSize, label, "dictionary ID");
+        var dictionaryId = ReadUnsignedLittleEndian(input.Slice(offset, dictionaryIdSize));
+        offset += dictionaryIdSize;
+        if (dictionaryId != 0)
+        {
+            throw new InvalidDataException($"{label}は外部dictionaryを要求しています: {dictionaryId}");
+        }
+
+        if (contentSizeFieldSize == 0)
+        {
+            throw new InvalidDataException($"{label}に展開後サイズが記録されていません。");
+        }
+
+        EnsureZstdAvailable(input.Length, offset, contentSizeFieldSize, label, "frame content size");
+        var frameContentSize = ReadUnsignedLittleEndian(input.Slice(offset, contentSizeFieldSize));
+        offset += contentSizeFieldSize;
+        if (contentSizeFieldSize == 2)
+        {
+            frameContentSize = checked(frameContentSize + 256);
+        }
+
+        if (frameContentSize != decodedLength)
+        {
+            throw new InvalidDataException(
+                $"{label}の展開後サイズがextent情報と一致しません: "
+                + $"frame={frameContentSize:N0}, extent={decodedLength:N0}");
+        }
+
+        if (singleSegment)
+        {
+            windowSize = frameContentSize;
+            if (windowSize > MaximumDecodedExtentSize)
+            {
+                throw new InvalidDataException($"{label}のwindowが128 KiBを超えています: {windowSize:N0}");
+            }
+        }
+
+        var blockMaximumSize = Math.Min(windowSize, (ulong)MaximumDecodedExtentSize);
+        var blockCount = 0;
+        while (true)
+        {
+            EnsureZstdAvailable(input.Length, offset, 3, label, "block header");
+            var blockHeader = input[offset]
+                | input[offset + 1] << 8
+                | input[offset + 2] << 16;
+            offset += 3;
+
+            var lastBlock = (blockHeader & 1) != 0;
+            var blockType = (blockHeader >> 1) & 0x03;
+            var blockSize = (ulong)(blockHeader >> 3);
+            if (blockType == 3)
+            {
+                throw new InvalidDataException($"{label}にreserved block typeが含まれています。");
+            }
+
+            if (blockSize > blockMaximumSize)
+            {
+                throw new InvalidDataException(
+                    $"{label}のblockがwindowを超えています: block={blockSize:N0}, max={blockMaximumSize:N0}");
+            }
+
+            var storedSize = blockType == 1 ? 1 : checked((int)blockSize);
+            EnsureZstdAvailable(input.Length, offset, storedSize, label, "block content");
+            offset += storedSize;
+            blockCount++;
+            if (lastBlock)
+            {
+                break;
+            }
+        }
+
+        if (blockCount == 0)
+        {
+            throw new InvalidDataException($"{label}にblockがありません。");
+        }
+
+        if (hasChecksum)
+        {
+            EnsureZstdAvailable(input.Length, offset, sizeof(uint), label, "content checksum");
+            offset += sizeof(uint);
+        }
+
+        return offset;
+    }
+
+    private static void EnsureZstdAvailable(
+        int inputLength,
+        int offset,
+        int length,
+        string label,
+        string field)
+    {
+        if (length < 0 || offset < 0 || offset > inputLength - length)
+        {
+            throw new InvalidDataException($"{label}の{field}が入力範囲外です。");
+        }
+    }
+
+    private static ulong ReadUnsignedLittleEndian(ReadOnlySpan<byte> value)
+    {
+        return value.Length switch
+        {
+            0 => 0,
+            1 => value[0],
+            2 => BinaryPrimitives.ReadUInt16LittleEndian(value),
+            4 => BinaryPrimitives.ReadUInt32LittleEndian(value),
+            8 => BinaryPrimitives.ReadUInt64LittleEndian(value),
+            _ => throw new ArgumentOutOfRangeException(nameof(value)),
+        };
     }
 
     private void ReadLogical(ulong logical, byte[] destination, int destinationOffset, int count)

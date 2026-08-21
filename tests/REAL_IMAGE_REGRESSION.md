@@ -44,7 +44,7 @@ wsl --distribution Ubuntu-24.04 --user root -- sh -lc `
   -OutputPath .\.tmp\real-images\btrfs-single.raw
 ```
 
-スクリプトはインラインファイル、通常extent、スパースファイル、zlib圧縮ファイル、通常・inline LZO圧縮ファイルを作成し、`btrfs check --readonly`と各ファイルのSHA-256を表示します。
+スクリプトはインラインファイル、通常extent、スパースファイル、zlib圧縮ファイル、通常・inline LZO／zstd圧縮ファイルを作成し、`btrfs check --readonly`と各ファイルのSHA-256を表示します。
 既存fixtureは上書きせず、生成物とローカルmanifestはGitへ追加しません。
 
 ### BitLocker XTS-AES
@@ -234,6 +234,18 @@ fixture本体とローカルmanifestはコミットしないでください。
             },
             {
               "path": "/compressed-inline-lzo.bin",
+              "expectedDirectory": false,
+              "expectedLength": 1024,
+              "sha256": "5F70BF18A086007016E948B04AED3B82103A36BEA41755B6CDDFAF10ACE3C6EF"
+            },
+            {
+              "path": "/compressed-zstd.bin",
+              "expectedDirectory": false,
+              "expectedLength": 262144,
+              "sha256": "8A39D2ABD3999AB73C34DB2476849CDDF303CE389B35826850F9A700589B4A90"
+            },
+            {
+              "path": "/compressed-inline-zstd.bin",
               "expectedDirectory": false,
               "expectedLength": 1024,
               "sha256": "5F70BF18A086007016E948B04AED3B82103A36BEA41755B6CDDFAF10ACE3C6EF"
