@@ -45,6 +45,7 @@ wsl --distribution Ubuntu-24.04 --user root -- sh -lc `
 ```
 
 スクリプトはインラインファイル、通常extent、スパースファイル、zlib圧縮ファイル、通常・inline LZO／zstd圧縮ファイル、subvolume、入れ子subvolume、snapshotを作成し、作成したsubvolumeをdefaultに設定します。最後に`btrfs check --readonly`と各ファイルのSHA-256を表示します。
+64 MiB mirrorが収まるfixtureでは、primaryを変更せず`btrfs inspect-internal dump-super -s 1`でbackup superblockも確認できます。破損回帰用コピーを作る場合も、元fixtureは保持してください。
 既存fixtureは上書きせず、生成物とローカルmanifestはGitへ追加しません。
 
 ### BitLocker XTS-AES

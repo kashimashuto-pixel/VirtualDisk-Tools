@@ -585,6 +585,68 @@ static void TestGeneratedBtrfsImage()
         Assert(fs is null, "corrupt Btrfs subvolume generation is rejected");
         Assert(error.Contains("generation", StringComparison.Ordinal), "corrupt Btrfs subvolume generation diagnostic");
     }
+
+    var backupRecoveryPath = Path.Combine(AppContext.BaseDirectory, "synthetic-btrfs-backup-recovery.raw");
+    BtrfsTestImageFactory.Create(
+        backupRecoveryPath,
+        includeBackupSuperblock: true,
+        corruptPrimarySuperblock: true);
+    using (var reader = DiskImageReaderFactory.Open(backupRecoveryPath))
+    {
+        var partition = PartitionTableReader.ReadPartitions(reader).Single();
+        partition.FileSystem = FileSystemDetector.Detect(reader, partition);
+        Assert(partition.FileSystem == "Btrfs", "Btrfs backup with primary checksum corruption detection");
+        var fs = FileSystemDetector.TryOpen(reader, partition, out var error);
+        Assert(fs is not null, error);
+        var hello = fs!.ListDirectory(fs.Root).Single(node => node.Name == "hello.txt");
+        Assert(
+            Encoding.UTF8.GetString(fs.ReadFile(hello, 0, checked((int)hello.Size))) == BtrfsTestImageFactory.HelloText,
+            "Btrfs backup with primary checksum corruption recovery");
+    }
+
+    var backupMagicRecoveryPath = Path.Combine(AppContext.BaseDirectory, "synthetic-btrfs-backup-magic-recovery.raw");
+    BtrfsTestImageFactory.Create(
+        backupMagicRecoveryPath,
+        includeBackupSuperblock: true,
+        corruptPrimaryMagic: true);
+    using (var reader = DiskImageReaderFactory.Open(backupMagicRecoveryPath))
+    {
+        var partition = PartitionTableReader.ReadPartitions(reader).Single();
+        partition.FileSystem = FileSystemDetector.Detect(reader, partition);
+        Assert(partition.FileSystem == "Btrfs", "Btrfs backup mirror detection");
+        var fs = FileSystemDetector.TryOpen(reader, partition, out var error);
+        Assert(fs is not null, error);
+        Assert(fs!.ListDirectory(fs.Root).Any(node => node.Name == "hello.txt"), "Btrfs backup magic recovery");
+    }
+
+    var primaryPreferredPath = Path.Combine(AppContext.BaseDirectory, "synthetic-btrfs-primary-preferred.raw");
+    BtrfsTestImageFactory.Create(
+        primaryPreferredPath,
+        includeBackupSuperblock: true,
+        newerBackupGeneration: true);
+    using (var reader = DiskImageReaderFactory.Open(primaryPreferredPath))
+    {
+        var partition = PartitionTableReader.ReadPartitions(reader).Single();
+        partition.FileSystem = FileSystemDetector.Detect(reader, partition);
+        var fs = FileSystemDetector.TryOpen(reader, partition, out var error);
+        Assert(fs is not null, error);
+        Assert(fs!.ListDirectory(fs.Root).Any(node => node.Name == "hello.txt"), "Btrfs valid primary is preferred");
+    }
+
+    var allSuperblocksCorruptPath = Path.Combine(AppContext.BaseDirectory, "synthetic-btrfs-all-super-corrupt.raw");
+    BtrfsTestImageFactory.Create(
+        allSuperblocksCorruptPath,
+        includeBackupSuperblock: true,
+        corruptPrimarySuperblock: true,
+        corruptBackupSuperblock: true);
+    using (var reader = DiskImageReaderFactory.Open(allSuperblocksCorruptPath))
+    {
+        var partition = PartitionTableReader.ReadPartitions(reader).Single();
+        partition.FileSystem = FileSystemDetector.Detect(reader, partition);
+        var fs = FileSystemDetector.TryOpen(reader, partition, out var error);
+        Assert(fs is null, "corrupt Btrfs primary and backup are rejected");
+        Assert(error.Contains("primary/backup", StringComparison.Ordinal), "corrupt Btrfs superblock diagnostic");
+    }
 }
 
 static void TestGeneratedEwfE01Image()

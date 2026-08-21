@@ -117,15 +117,18 @@
 - ROOT_REF/ROOT_BACKREF、親DIR_INDEX、ROOT_ITEM世代を相互検証し、subvolume・入れ子subvolume・snapshotを読み取り
 - root treeの`default` DIR_ITEMからdefault subvolumeを解決し、snapshot内の入れ子subvolume境界は空ディレクトリとして扱う
 - `btrfs-progs 6.6.3`由来のdefault・入れ子subvolume・snapshotを実イメージ回帰で確認
+- primaryが無効な場合だけ64 MiB／256 GiBのbackup superblockを検証し、同一FSIDの最新世代へ読み取り専用で復旧
+- primary有効時はbackupの世代にかかわらずprimaryを優先し、backup間のFSID・同一世代tree state不一致は拒否
+- primary checksum／magic、backup checksum、全superblock破損、primary優先を合成回帰テストで確認
 
 ## 次回の推奨作業
 
 ### 1. Btrfs対応の第2段階
 
-- primaryとbackup superblock候補のFSID、物理位置、世代、geometry、tree rootを個別に検証する
-- primary破損時だけ、整合する最新世代のbackup superblockへ読み取り専用で復旧する
-- primaryが有効な場合は世代の新しいbackupへ不用意に切り替えず、選択理由を診断可能にする
-- primary checksum、backup checksum、世代不整合、別FS混入、途中切れを合成テストで検証する
+- 複数デバイスのDEVICE_ITEM、stripe、devidとFSIDを検証し、まずsingle profileの複数デバイス構成を扱う
+- 不足デバイスを具体的に表示し、別FSのデバイスや重複devidを安全に拒否する
+- RAID1は検証済みmirrorから読み取り、checksum不一致時の代替mirror選択を追加する
+- 複数RAWイメージを一組として指定するUIとmanifest形式を設計してから実装する
 
 ## 保守・品質改善
 

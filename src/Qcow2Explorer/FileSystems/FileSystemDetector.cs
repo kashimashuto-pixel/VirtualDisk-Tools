@@ -64,6 +64,21 @@ public static class FileSystemDetector
             }
         }
 
+        foreach (var backupOffset in new[] { 64L * 1024 * 1024, 256L * 1024 * 1024 * 1024 })
+        {
+            if (backupOffset > partition.LengthBytes - 0x48)
+            {
+                continue;
+            }
+
+            var btrfsBackupMagic = EndianUtilities.ReadBytes(slice, backupOffset + 0x40, 8);
+            cancellationToken.ThrowIfCancellationRequested();
+            if (EndianUtilities.ReadAscii(btrfsBackupMagic, 0, 8) == "_BHRfS_M")
+            {
+                return "Btrfs";
+            }
+        }
+
         var squashFs = DetectSquashFs(boot);
         if (!string.IsNullOrEmpty(squashFs))
         {
