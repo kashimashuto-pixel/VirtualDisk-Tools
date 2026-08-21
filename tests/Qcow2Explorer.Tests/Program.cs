@@ -84,6 +84,7 @@ static void RunGeneratedImageTests()
     TestBitLockerPasswordUnlock();
     TestBitLockerStartupKeyUnlock();
     TestLuks1Unlock();
+    TestLuks2Unlock();
     TestXfsTimestampDecoding();
     Test4KnGptParsing();
     TestLvmMetadataDiagnostics();
@@ -716,6 +717,136 @@ static void TestLuks1Unlock()
     CryptographicOperations.ZeroMemory(excessiveIterations);
 }
 
+static void TestLuks2Unlock()
+{
+    const string passphrase = "LUKS2 synthetic passphrase";
+    var volumeKey = Enumerable.Range(0, 64).Select(value => (byte)(0x20 + value)).ToArray();
+    var passwordSalt = Enumerable.Range(0, 32).Select(value => (byte)(0x50 + value)).ToArray();
+    var digestSalt = Enumerable.Range(0, 32).Select(value => (byte)(0xa0 + value)).ToArray();
+    var plaintext = Enumerable.Range(0, 1536).Select(value => (byte)(value * 7 + 3)).ToArray();
+    var image = CreateLuks2TestImage(passphrase, volumeKey, passwordSalt, digestSalt, plaintext);
+    var encryptedReader = new MemorySectorReader(image, 512);
+    Assert(
+        Luks2MetadataReader.TryRead(encryptedReader, out var metadata, out var metadataError),
+        metadataError);
+    Assert(
+        metadata is
+        {
+            HeaderSize: 16384,
+            UsedSecondaryHeader: false,
+            Segment.Encryption: "aes-xts-plain64",
+            Segment.SectorSize: 512
+        }
+        && metadata.SupportedKeySlots.Select(slot => slot.Index).SequenceEqual([0]),
+        "LUKS2 binary header, JSON metadata, and PBKDF2 keyslot parsing");
+    Assert(
+        Luks2Unlock.TryCreateReader(
+            encryptedReader,
+            metadata!,
+            passphrase,
+            out var decryptedReader,
+            out var unlockError),
+        unlockError);
+    Assert(decryptedReader is not null, "LUKS2 decrypting reader created");
+    ValidateBitLockerReaderReads(decryptedReader!, plaintext, "LUKS2 PBKDF2 AES-XTS/plain64 unlock");
+    ((IDisposable)decryptedReader!).Dispose();
+    try
+    {
+        decryptedReader.ReadAt(0, new byte[1], 0, 1);
+        Assert(false, "disposed LUKS2 reader rejects reads");
+    }
+    catch (ObjectDisposedException)
+    {
+    }
+
+    const string wrongPassphrase = "wrong LUKS2 passphrase";
+    Assert(
+        !Luks2Unlock.TryCreateReader(
+            encryptedReader,
+            metadata!,
+            wrongPassphrase,
+            out _,
+            out var wrongPassphraseError)
+        && !wrongPassphraseError.Contains(passphrase, StringComparison.Ordinal)
+        && !wrongPassphraseError.Contains(wrongPassphrase, StringComparison.Ordinal)
+        && !wrongPassphraseError.Contains(Convert.ToHexString(volumeKey), StringComparison.OrdinalIgnoreCase),
+        "wrong LUKS2 passphrase fails without exposing secrets");
+
+    var corruptPrimary = image.ToArray();
+    corruptPrimary[448] ^= 0x80;
+    Assert(
+        Luks2MetadataReader.TryRead(
+            new MemorySectorReader(corruptPrimary, 512),
+            out var secondaryMetadata,
+            out var secondaryError),
+        secondaryError);
+    Assert(secondaryMetadata is { UsedSecondaryHeader: true }, "LUKS2 corrupt primary falls back to secondary header");
+    Assert(
+        Luks2Unlock.TryCreateReader(
+            new MemorySectorReader(corruptPrimary, 512),
+            secondaryMetadata!,
+            passphrase,
+            out var secondaryReader,
+            out var secondaryUnlockError),
+        secondaryUnlockError);
+    ValidateBitLockerReaderReads(secondaryReader!, plaintext, "LUKS2 secondary-header recovery unlock");
+    ((IDisposable)secondaryReader!).Dispose();
+
+    var corruptBoth = corruptPrimary.ToArray();
+    corruptBoth[16384 + 448] ^= 0x40;
+    Assert(
+        !Luks2MetadataReader.TryRead(new MemorySectorReader(corruptBoth, 512), out _, out var checksumError)
+        && checksumError.Contains("checksum", StringComparison.OrdinalIgnoreCase),
+        "LUKS2 rejects both invalid header checksums");
+
+    var argon2Slot = image.ToArray();
+    ReplaceLuks2HeaderText(argon2Slot, "\"kdf\":{\"type\":\"pbkdf2\"", "\"kdf\":{\"type\":\"argon2\"");
+    Assert(
+        Luks2MetadataReader.TryRead(new MemorySectorReader(argon2Slot, 512), out var argon2Metadata, out var argon2Error),
+        argon2Error);
+    Assert(
+        argon2Metadata is not null
+        && argon2Metadata.SupportedKeySlots.Count == 0
+        && argon2Metadata.UnsupportedKeySlots.Single().UnsupportedReason.Contains("argon2", StringComparison.OrdinalIgnoreCase),
+        "LUKS2 Argon2 keyslot is reported as unsupported without crashing");
+
+    var invalidJsonPadding = image.ToArray();
+    for (var headerOffset = 0; headerOffset <= 16384; headerOffset += 16384)
+    {
+        var jsonStart = headerOffset + Luks2MetadataReader.BinaryHeaderSize;
+        var terminator = Array.IndexOf(invalidJsonPadding, (byte)0, jsonStart, 16384 - Luks2MetadataReader.BinaryHeaderSize);
+        invalidJsonPadding[terminator + 1] = 1;
+    }
+    RecalculateLuks2HeaderChecksums(invalidJsonPadding);
+    Assert(
+        !Luks2MetadataReader.TryRead(new MemorySectorReader(invalidJsonPadding, 512), out _, out var paddingError)
+        && paddingError.Contains("padding", StringComparison.OrdinalIgnoreCase),
+        "LUKS2 rejects nonzero JSON padding after checksum validation");
+
+    var invalidIterations = CreateLuks2TestImage(
+        passphrase,
+        volumeKey,
+        passwordSalt,
+        digestSalt,
+        plaintext,
+        jsonKdfIterations: 0);
+    Assert(
+        !Luks2MetadataReader.TryRead(new MemorySectorReader(invalidIterations, 512), out _, out var iterationsError)
+        && iterationsError.Contains("反復回数", StringComparison.Ordinal),
+        "LUKS2 rejects invalid PBKDF2 iteration count");
+
+    CryptographicOperations.ZeroMemory(volumeKey);
+    CryptographicOperations.ZeroMemory(passwordSalt);
+    CryptographicOperations.ZeroMemory(digestSalt);
+    CryptographicOperations.ZeroMemory(plaintext);
+    CryptographicOperations.ZeroMemory(image);
+    CryptographicOperations.ZeroMemory(corruptPrimary);
+    CryptographicOperations.ZeroMemory(corruptBoth);
+    CryptographicOperations.ZeroMemory(argon2Slot);
+    CryptographicOperations.ZeroMemory(invalidJsonPadding);
+    CryptographicOperations.ZeroMemory(invalidIterations);
+}
+
 static void TestBitLockerXtsUnlockVariant(
     uint encryptionMethod,
     int fvekLength,
@@ -1268,6 +1399,138 @@ static byte[] CreateLuks1TestImage(
         CryptographicOperations.ZeroMemory(derivedKey);
         CryptographicOperations.ZeroMemory(masterDigest);
         CryptographicOperations.ZeroMemory(splitKey);
+    }
+}
+
+static byte[] CreateLuks2TestImage(
+    string passphrase,
+    byte[] volumeKey,
+    byte[] passwordSalt,
+    byte[] digestSalt,
+    byte[] plaintext,
+    int jsonKdfIterations = 1000)
+{
+    const int headerSize = 16384;
+    const int keyslotAreaOffset = headerSize * 2;
+    const int payloadOffset = 2 * 1024 * 1024;
+    const int keyslotAreaSize = 256000;
+    const int cryptoIterations = 1000;
+    const int stripes = 4000;
+    Assert(volumeKey.Length == 64, "LUKS2 synthetic volume key length");
+    Assert(plaintext.Length % 512 == 0, "LUKS2 synthetic payload alignment");
+
+    var passphraseBytes = Encoding.UTF8.GetBytes(passphrase);
+    var derivedKey = new byte[volumeKey.Length];
+    var digest = new byte[32];
+    var splitKey = CreateLuks1AntiForensicSplit(volumeKey, stripes);
+    try
+    {
+        Rfc2898DeriveBytes.Pbkdf2(
+            passphraseBytes,
+            passwordSalt,
+            derivedKey,
+            cryptoIterations,
+            HashAlgorithmName.SHA256);
+        Rfc2898DeriveBytes.Pbkdf2(
+            volumeKey,
+            digestSalt,
+            digest,
+            cryptoIterations,
+            HashAlgorithmName.SHA256);
+        var encryptedKeyMaterial = EncryptBitLockerXts(splitKey, derivedKey);
+        var encryptedPayload = EncryptBitLockerXts(plaintext, volumeKey);
+        try
+        {
+            var json = "{" +
+                "\"keyslots\":{\"0\":{" +
+                    "\"type\":\"luks2\",\"key_size\":64," +
+                    "\"af\":{\"type\":\"luks1\",\"stripes\":4000,\"hash\":\"sha256\"}," +
+                    $"\"area\":{{\"type\":\"raw\",\"encryption\":\"aes-xts-plain64\",\"key_size\":64,\"offset\":\"{keyslotAreaOffset}\",\"size\":\"{keyslotAreaSize}\"}}," +
+                    $"\"kdf\":{{\"type\":\"pbkdf2\",\"hash\":\"sha256\",\"iterations\":{jsonKdfIterations},\"salt\":\"{Convert.ToBase64String(passwordSalt)}\"}}" +
+                "}}," +
+                "\"tokens\":{}," +
+                $"\"segments\":{{\"0\":{{\"type\":\"crypt\",\"offset\":\"{payloadOffset}\",\"size\":\"dynamic\",\"iv_tweak\":\"0\",\"encryption\":\"aes-xts-plain64\",\"sector_size\":512}}}}," +
+                $"\"digests\":{{\"0\":{{\"type\":\"pbkdf2\",\"keyslots\":[\"0\"],\"segments\":[\"0\"],\"hash\":\"sha256\",\"iterations\":{cryptoIterations},\"salt\":\"{Convert.ToBase64String(digestSalt)}\",\"digest\":\"{Convert.ToBase64String(digest)}\"}}}}," +
+                $"\"config\":{{\"json_size\":\"{headerSize - Luks2MetadataReader.BinaryHeaderSize}\",\"keyslots_size\":\"{payloadOffset - keyslotAreaOffset}\"}}" +
+                "}";
+            var jsonBytes = Encoding.UTF8.GetBytes(json);
+            Assert(jsonBytes.Length < headerSize - Luks2MetadataReader.BinaryHeaderSize, "LUKS2 synthetic JSON size");
+            var image = new byte[payloadOffset + encryptedPayload.Length];
+            WriteLuks2Header(image, 0, headerSize, false, jsonBytes);
+            WriteLuks2Header(image, headerSize, headerSize, true, jsonBytes);
+            encryptedKeyMaterial.CopyTo(image, keyslotAreaOffset);
+            encryptedPayload.CopyTo(image, payloadOffset);
+            return image;
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(encryptedKeyMaterial);
+            CryptographicOperations.ZeroMemory(encryptedPayload);
+        }
+    }
+    finally
+    {
+        CryptographicOperations.ZeroMemory(passphraseBytes);
+        CryptographicOperations.ZeroMemory(derivedKey);
+        CryptographicOperations.ZeroMemory(digest);
+        CryptographicOperations.ZeroMemory(splitKey);
+    }
+}
+
+static void WriteLuks2Header(byte[] image, int offset, int headerSize, bool secondary, byte[] json)
+{
+    var header = image.AsSpan(offset, headerSize);
+    (secondary
+        ? new byte[] { (byte)'S', (byte)'K', (byte)'U', (byte)'L', 0xba, 0xbe }
+        : new byte[] { (byte)'L', (byte)'U', (byte)'K', (byte)'S', 0xba, 0xbe }).CopyTo(header);
+    BinaryPrimitives.WriteUInt16BigEndian(header[6..], 2);
+    BinaryPrimitives.WriteUInt64BigEndian(header[8..], checked((ulong)headerSize));
+    BinaryPrimitives.WriteUInt64BigEndian(header[16..], 1);
+    Encoding.ASCII.GetBytes("sha256").CopyTo(header[72..]);
+    for (var index = 0; index < 64; index++)
+    {
+        header[104 + index] = checked((byte)(index + (secondary ? 0x60 : 0x10)));
+    }
+    Encoding.ASCII.GetBytes("ecf2ec2e-bf5f-4ca7-a095-3ee86d9f8478").CopyTo(header[168..]);
+    BinaryPrimitives.WriteUInt64BigEndian(header[256..], checked((ulong)offset));
+    json.CopyTo(header[Luks2MetadataReader.BinaryHeaderSize..]);
+    var checksum = SHA256.HashData(header);
+    checksum.CopyTo(header[448..]);
+    CryptographicOperations.ZeroMemory(checksum);
+}
+
+static void ReplaceLuks2HeaderText(byte[] image, string oldText, string newText)
+{
+    Assert(Encoding.UTF8.GetByteCount(oldText) == Encoding.UTF8.GetByteCount(newText), "LUKS2 test replacement length");
+    var oldBytes = Encoding.UTF8.GetBytes(oldText);
+    var newBytes = Encoding.UTF8.GetBytes(newText);
+    try
+    {
+        for (var headerOffset = 0; headerOffset <= 16384; headerOffset += 16384)
+        {
+            var header = image.AsSpan(headerOffset, 16384);
+            var relativeOffset = header.IndexOf(oldBytes);
+            Assert(relativeOffset >= 0, "LUKS2 test JSON replacement target");
+            newBytes.CopyTo(header[relativeOffset..]);
+        }
+        RecalculateLuks2HeaderChecksums(image);
+    }
+    finally
+    {
+        CryptographicOperations.ZeroMemory(oldBytes);
+        CryptographicOperations.ZeroMemory(newBytes);
+    }
+}
+
+static void RecalculateLuks2HeaderChecksums(byte[] image)
+{
+    for (var headerOffset = 0; headerOffset <= 16384; headerOffset += 16384)
+    {
+        var header = image.AsSpan(headerOffset, 16384);
+        header.Slice(448, 64).Clear();
+        var checksum = SHA256.HashData(header);
+        checksum.CopyTo(header[448..]);
+        CryptographicOperations.ZeroMemory(checksum);
     }
 }
 

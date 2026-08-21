@@ -1,4 +1,3 @@
-using System.Buffers.Binary;
 using System.Security.Cryptography;
 using System.Text;
 using Qcow2Explorer.Core;
@@ -82,7 +81,7 @@ public static class Luks1MetadataReader
                 return false;
             }
 
-            if (!TryGetHashAlgorithm(hashSpec, out _, out _))
+            if (!LuksCryptoUtilities.TryGetHashAlgorithm(hashSpec, out _, out _))
             {
                 error = $"未対応のLUKS1ハッシュ方式です: {hashSpec}";
                 return false;
@@ -193,29 +192,6 @@ public static class Luks1MetadataReader
         {
             error = ex.Message;
             return false;
-        }
-    }
-
-    internal static bool TryGetHashAlgorithm(string hashSpec, out HashAlgorithmName algorithm, out int digestSize)
-    {
-        switch (hashSpec.ToLowerInvariant())
-        {
-            case "sha1":
-                algorithm = HashAlgorithmName.SHA1;
-                digestSize = 20;
-                return true;
-            case "sha256":
-                algorithm = HashAlgorithmName.SHA256;
-                digestSize = 32;
-                return true;
-            case "sha512":
-                algorithm = HashAlgorithmName.SHA512;
-                digestSize = 64;
-                return true;
-            default:
-                algorithm = default;
-                digestSize = 0;
-                return false;
         }
     }
 
@@ -358,7 +334,7 @@ public static class Luks1Unlock
             return false;
         }
 
-        if (!Luks1MetadataReader.TryGetHashAlgorithm(metadata.HashSpec, out var hashAlgorithm, out var digestSize))
+        if (!LuksCryptoUtilities.TryGetHashAlgorithm(metadata.HashSpec, out var hashAlgorithm, out var digestSize))
         {
             error = $"未対応のLUKS1ハッシュ方式です: {metadata.HashSpec}";
             return false;
@@ -401,8 +377,8 @@ public static class Luks1Unlock
                         encryptedReader,
                         checked((long)slot.KeyMaterialOffsetSectors * Luks1MetadataReader.SectorSize),
                         materialBytes);
-                    decryptedMaterial = DecryptKeyMaterial(encryptedMaterial, derivedKey);
-                    masterKey = MergeAntiForensicStripes(
+                    decryptedMaterial = LuksCryptoUtilities.DecryptKeyMaterial(encryptedMaterial, derivedKey);
+                    masterKey = LuksCryptoUtilities.MergeAntiForensicStripes(
                         decryptedMaterial.AsSpan(0, splitBytes),
                         metadata.KeyBytes,
                         slot.Stripes,
@@ -429,11 +405,11 @@ public static class Luks1Unlock
                 }
                 finally
                 {
-                    Zero(derivedKey);
-                    Zero(encryptedMaterial);
-                    Zero(decryptedMaterial);
-                    Zero(masterKey);
-                    Zero(candidateDigest);
+                    LuksCryptoUtilities.Zero(derivedKey);
+                    LuksCryptoUtilities.Zero(encryptedMaterial);
+                    LuksCryptoUtilities.Zero(decryptedMaterial);
+                    LuksCryptoUtilities.Zero(masterKey);
+                    LuksCryptoUtilities.Zero(candidateDigest);
                 }
             }
 
@@ -451,105 +427,4 @@ public static class Luks1Unlock
         }
     }
 
-    private static byte[] DecryptKeyMaterial(byte[] ciphertext, byte[] xtsKey)
-    {
-        var half = xtsKey.Length / 2;
-        var plaintext = new byte[ciphertext.Length];
-        try
-        {
-            for (var offset = 0; offset < ciphertext.Length; offset += Luks1MetadataReader.SectorSize)
-            {
-                var sector = AesXtsSectorCipher.DecryptSector(
-                    ciphertext.AsSpan(offset, Luks1MetadataReader.SectorSize),
-                    xtsKey.AsSpan(0, half),
-                    xtsKey.AsSpan(half),
-                    checked((ulong)(offset / Luks1MetadataReader.SectorSize)));
-                try
-                {
-                    sector.CopyTo(plaintext, offset);
-                }
-                finally
-                {
-                    CryptographicOperations.ZeroMemory(sector);
-                }
-            }
-
-            return plaintext;
-        }
-        catch
-        {
-            CryptographicOperations.ZeroMemory(plaintext);
-            throw;
-        }
-    }
-
-    private static byte[] MergeAntiForensicStripes(
-        ReadOnlySpan<byte> splitKey,
-        int keyBytes,
-        int stripes,
-        HashAlgorithmName hashAlgorithm,
-        int digestSize)
-    {
-        if (stripes < 2 || splitKey.Length != checked(keyBytes * stripes))
-        {
-            throw new InvalidDataException("LUKS1 anti-forensic key materialのサイズが不正です。");
-        }
-
-        var accumulator = new byte[keyBytes];
-        var digest = new byte[digestSize];
-        try
-        {
-            using var hash = IncrementalHash.CreateHash(hashAlgorithm);
-            Span<byte> blockIndex = stackalloc byte[4];
-            for (var stripe = 0; stripe < stripes - 1; stripe++)
-            {
-                var stripeData = splitKey.Slice(stripe * keyBytes, keyBytes);
-                for (var index = 0; index < keyBytes; index++)
-                {
-                    accumulator[index] ^= stripeData[index];
-                }
-
-                var chunkIndex = 0;
-                for (var offset = 0; offset < keyBytes; offset += digestSize)
-                {
-                    var chunkLength = Math.Min(digestSize, keyBytes - offset);
-                    BinaryPrimitives.WriteUInt32BigEndian(blockIndex, checked((uint)chunkIndex));
-                    hash.AppendData(blockIndex);
-                    hash.AppendData(accumulator.AsSpan(offset, chunkLength));
-                    if (!hash.TryGetHashAndReset(digest, out var bytesWritten) || bytesWritten != digestSize)
-                    {
-                        throw new CryptographicException("LUKS1 AF diffuse hashの計算に失敗しました。");
-                    }
-
-                    digest.AsSpan(0, chunkLength).CopyTo(accumulator.AsSpan(offset, chunkLength));
-                    chunkIndex++;
-                }
-            }
-
-            var finalStripe = splitKey.Slice((stripes - 1) * keyBytes, keyBytes);
-            for (var index = 0; index < keyBytes; index++)
-            {
-                accumulator[index] ^= finalStripe[index];
-            }
-
-            return accumulator;
-        }
-        catch
-        {
-            CryptographicOperations.ZeroMemory(accumulator);
-            throw;
-        }
-        finally
-        {
-            CryptographicOperations.ZeroMemory(digest);
-        }
-    }
-
-    private static void Zero(byte[]? data)
-    {
-        if (data is not null)
-        {
-            CryptographicOperations.ZeroMemory(data);
-        }
-    }
 }
