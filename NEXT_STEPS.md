@@ -70,6 +70,14 @@
 - Argon2 keyslotはクラッシュや誤復号をせず、未対応理由を表示
 - cryptsetup 2.7生成LUKS2 + ext4 fixtureをcryptsetup自身と本アプリの双方で解除して検証
 
+### LUKS2 Argon2idパスフレーズ対応（第2段階）
+
+- MIT・純managed・lane単位の連続メモリを使うKonscious Argon2idを固定versionで導入
+- memory 1 GiB、time cost 10、parallelism 16のmetadata上限と実行前メモリ余力検査を追加
+- 小容量Argon2id合成fixture、誤パスフレーズ、異常memory cost、秘密情報非出力を検証
+- cryptsetup 2.7のcalibrated default（検証環境では1 GiB、7 passes、4 lanes）で生成・解除し、内部ext4を実イメージ回帰で確認
+- NuGetの既知脆弱性・非推奨package監査、Debug/Release、self-contained配布を確認
+
 ### LZO高速モードのキャッシュ再利用
 
 - 「終了時に削除」「検証済みキャッシュとして保持・再利用」「指定場所へ通常RAWとして保存」を選択可能
@@ -89,12 +97,11 @@
 
 ## 次回の推奨作業
 
-### 1. LUKS2 Argon2id keyslot対応（第2段階）
+### 1. E01/EWF対応の仕様・ライセンス調査
 
-- Argon2idの一次仕様と利用可能な.NET実装について、安全性、保守状況、ライセンス、ネイティブ依存を比較する
-- memory、time、cpusの上限を設け、悪意あるmetadataによる過大メモリ確保や長時間処理を拒否する
-- Argon2id専用の合成テストとcryptsetup既定設定のLUKS2 fixtureを追加する
-- 既存PBKDF2 keyslot、secondary header復旧、秘密情報非出力の回帰を維持する
+- EWF/E01の一次仕様、圧縮、segment分割、chunk checksum、metadata構造を調査する
+- libewf等の実装候補について、ライセンス、Windows self-contained配布、native依存を比較する
+- 読み取り専用の最小対応範囲と、再配布可能なfixtureの生成方法を決定する
 
 ## 保守・品質改善
 

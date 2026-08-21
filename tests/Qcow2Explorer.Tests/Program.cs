@@ -4,6 +4,7 @@ using System.IO.Compression;
 using System.Formats.Tar;
 using System.Security.Cryptography;
 using System.Text;
+using Konscious.Security.Cryptography;
 using Qcow2Explorer;
 using Qcow2Explorer.Core;
 using Qcow2Explorer.FileSystems;
@@ -810,6 +811,71 @@ static void TestLuks2Unlock()
         && argon2Metadata.UnsupportedKeySlots.Single().UnsupportedReason.Contains("argon2", StringComparison.OrdinalIgnoreCase),
         "LUKS2 Argon2 keyslot is reported as unsupported without crashing");
 
+    var argon2idImage = CreateLuks2TestImage(
+        passphrase,
+        volumeKey,
+        passwordSalt,
+        digestSalt,
+        plaintext,
+        kdfType: "argon2id",
+        argon2MemoryKiB: 32,
+        argon2Iterations: 2,
+        argon2Parallelism: 2);
+    var argon2idReader = new MemorySectorReader(argon2idImage, 512);
+    Assert(
+        Luks2MetadataReader.TryRead(argon2idReader, out var argon2idMetadata, out var argon2idError),
+        argon2idError);
+    Assert(
+        argon2idMetadata is not null
+        && argon2idMetadata.SupportedKeySlots.Single() is
+        {
+            KdfType: "argon2id",
+            KdfMemoryKiB: 32,
+            KdfIterations: 2,
+            KdfParallelism: 2
+        },
+        "LUKS2 Argon2id cost parsing");
+    Assert(
+        Luks2Unlock.TryCreateReader(
+            argon2idReader,
+            argon2idMetadata!,
+            passphrase,
+            out var argon2idDecryptedReader,
+            out var argon2idUnlockError),
+        argon2idUnlockError);
+    ValidateBitLockerReaderReads(argon2idDecryptedReader!, plaintext, "LUKS2 Argon2id AES-XTS/plain64 unlock");
+    ((IDisposable)argon2idDecryptedReader!).Dispose();
+    Assert(
+        !Luks2Unlock.TryCreateReader(
+            argon2idReader,
+            argon2idMetadata!,
+            wrongPassphrase,
+            out _,
+            out var wrongArgon2idPassphraseError)
+        && !wrongArgon2idPassphraseError.Contains(passphrase, StringComparison.Ordinal)
+        && !wrongArgon2idPassphraseError.Contains(wrongPassphrase, StringComparison.Ordinal)
+        && !wrongArgon2idPassphraseError.Contains(Convert.ToHexString(volumeKey), StringComparison.OrdinalIgnoreCase),
+        "wrong LUKS2 Argon2id passphrase fails without exposing secrets");
+
+    var excessiveArgon2Memory = CreateLuks2TestImage(
+        passphrase,
+        volumeKey,
+        passwordSalt,
+        digestSalt,
+        plaintext,
+        kdfType: "argon2id",
+        argon2MemoryKiB: 32,
+        argon2Iterations: 2,
+        argon2Parallelism: 2,
+        jsonArgon2MemoryKiB: Luks2MetadataReader.MaximumArgon2MemoryKiB + 1);
+    Assert(
+        !Luks2MetadataReader.TryRead(
+            new MemorySectorReader(excessiveArgon2Memory, 512),
+            out _,
+            out var argon2MemoryError)
+        && argon2MemoryError.Contains("memory cost", StringComparison.OrdinalIgnoreCase),
+        "LUKS2 rejects unsafe Argon2 memory cost");
+
     var invalidJsonPadding = image.ToArray();
     for (var headerOffset = 0; headerOffset <= 16384; headerOffset += 16384)
     {
@@ -843,6 +909,8 @@ static void TestLuks2Unlock()
     CryptographicOperations.ZeroMemory(corruptPrimary);
     CryptographicOperations.ZeroMemory(corruptBoth);
     CryptographicOperations.ZeroMemory(argon2Slot);
+    CryptographicOperations.ZeroMemory(argon2idImage);
+    CryptographicOperations.ZeroMemory(excessiveArgon2Memory);
     CryptographicOperations.ZeroMemory(invalidJsonPadding);
     CryptographicOperations.ZeroMemory(invalidIterations);
 }
@@ -1408,7 +1476,12 @@ static byte[] CreateLuks2TestImage(
     byte[] passwordSalt,
     byte[] digestSalt,
     byte[] plaintext,
-    int jsonKdfIterations = 1000)
+    int jsonKdfIterations = 1000,
+    string kdfType = "pbkdf2",
+    int argon2MemoryKiB = 32,
+    int argon2Iterations = 2,
+    int argon2Parallelism = 2,
+    int? jsonArgon2MemoryKiB = null)
 {
     const int headerSize = 16384;
     const int keyslotAreaOffset = headerSize * 2;
@@ -1425,12 +1498,34 @@ static byte[] CreateLuks2TestImage(
     var splitKey = CreateLuks1AntiForensicSplit(volumeKey, stripes);
     try
     {
-        Rfc2898DeriveBytes.Pbkdf2(
-            passphraseBytes,
-            passwordSalt,
-            derivedKey,
-            cryptoIterations,
-            HashAlgorithmName.SHA256);
+        if (kdfType == "argon2id")
+        {
+            using var argon2 = new Argon2id(passphraseBytes)
+            {
+                Salt = passwordSalt,
+                MemorySize = argon2MemoryKiB,
+                Iterations = argon2Iterations,
+                DegreeOfParallelism = argon2Parallelism
+            };
+            var argon2Key = argon2.GetBytes(volumeKey.Length);
+            try
+            {
+                argon2Key.CopyTo(derivedKey, 0);
+            }
+            finally
+            {
+                CryptographicOperations.ZeroMemory(argon2Key);
+            }
+        }
+        else
+        {
+            Rfc2898DeriveBytes.Pbkdf2(
+                passphraseBytes,
+                passwordSalt,
+                derivedKey,
+                cryptoIterations,
+                HashAlgorithmName.SHA256);
+        }
         Rfc2898DeriveBytes.Pbkdf2(
             volumeKey,
             digestSalt,
@@ -1441,12 +1536,15 @@ static byte[] CreateLuks2TestImage(
         var encryptedPayload = EncryptBitLockerXts(plaintext, volumeKey);
         try
         {
+            var kdfJson = kdfType == "argon2id"
+                ? $"{{\"type\":\"argon2id\",\"time\":{argon2Iterations},\"memory\":{jsonArgon2MemoryKiB ?? argon2MemoryKiB},\"cpus\":{argon2Parallelism},\"salt\":\"{Convert.ToBase64String(passwordSalt)}\"}}"
+                : $"{{\"type\":\"pbkdf2\",\"hash\":\"sha256\",\"iterations\":{jsonKdfIterations},\"salt\":\"{Convert.ToBase64String(passwordSalt)}\"}}";
             var json = "{" +
                 "\"keyslots\":{\"0\":{" +
                     "\"type\":\"luks2\",\"key_size\":64," +
                     "\"af\":{\"type\":\"luks1\",\"stripes\":4000,\"hash\":\"sha256\"}," +
                     $"\"area\":{{\"type\":\"raw\",\"encryption\":\"aes-xts-plain64\",\"key_size\":64,\"offset\":\"{keyslotAreaOffset}\",\"size\":\"{keyslotAreaSize}\"}}," +
-                    $"\"kdf\":{{\"type\":\"pbkdf2\",\"hash\":\"sha256\",\"iterations\":{jsonKdfIterations},\"salt\":\"{Convert.ToBase64String(passwordSalt)}\"}}" +
+                    $"\"kdf\":{kdfJson}" +
                 "}}," +
                 "\"tokens\":{}," +
                 $"\"segments\":{{\"0\":{{\"type\":\"crypt\",\"offset\":\"{payloadOffset}\",\"size\":\"dynamic\",\"iv_tweak\":\"0\",\"encryption\":\"aes-xts-plain64\",\"sector_size\":512}}}}," +

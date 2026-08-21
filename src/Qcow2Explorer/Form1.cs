@@ -2200,7 +2200,8 @@ public partial class Form1 : Form
                 Cursor = Cursors.Default;
                 while (TryPromptForLuksPassphrase(
                     "LUKS2",
-                    $"暗号方式: {luks2Metadata.Segment.Encryption}, sector: {luks2Metadata.Segment.SectorSize} bytes",
+                    $"暗号方式: {luks2Metadata.Segment.Encryption}, sector: {luks2Metadata.Segment.SectorSize} bytes, " +
+                    $"KDF: {string.Join(", ", luks2Metadata.SupportedKeySlots.Select(slot => slot.KdfType).Distinct())}",
                     luks2Metadata.SupportedKeySlots.Select(slot => slot.Index),
                     out var passphrase))
                 {

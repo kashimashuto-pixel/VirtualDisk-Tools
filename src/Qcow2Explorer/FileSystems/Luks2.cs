@@ -1,6 +1,7 @@
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using Konscious.Security.Cryptography;
 using Qcow2Explorer.Core;
 
 namespace Qcow2Explorer.FileSystems;
@@ -24,6 +25,8 @@ public sealed class Luks2KeySlot
     public string KdfType { get; init; } = "";
     public string KdfHash { get; init; } = "";
     public int KdfIterations { get; init; }
+    public int KdfMemoryKiB { get; init; }
+    public int KdfParallelism { get; init; }
     public byte[] KdfSalt { get; init; } = Array.Empty<byte>();
     public long AreaOffset { get; init; }
     public long AreaSize { get; init; }
@@ -58,6 +61,9 @@ public static class Luks2MetadataReader
     public const int BinaryHeaderSize = 4096;
     public const int StripeCount = 4000;
     public const int MaximumPbkdf2Iterations = Luks1MetadataReader.MaximumPbkdf2Iterations;
+    public const int MaximumArgon2MemoryKiB = 1024 * 1024;
+    public const int MaximumArgon2Iterations = 10;
+    public const int MaximumArgon2Parallelism = 16;
     private const int MaximumJsonObjects = 32;
     private static readonly long[] AllowedHeaderSizes =
     [
@@ -427,6 +433,8 @@ public static class Luks2MetadataReader
         var unsupportedReason = "";
         var kdfHash = "";
         var kdfIterations = 0;
+        var kdfMemoryKiB = 0;
+        var kdfParallelism = 0;
         var kdfSalt = Array.Empty<byte>();
         if (kdfType == "pbkdf2")
         {
@@ -437,6 +445,28 @@ public static class Luks2MetadataReader
             {
                 supported = false;
                 unsupportedReason = $"PBKDF2 hash {kdfHash}は未対応です";
+            }
+        }
+        else if (kdfType == "argon2id")
+        {
+            kdfIterations = GetInt32(kdf, "time");
+            kdfMemoryKiB = GetInt32(kdf, "memory");
+            kdfParallelism = GetInt32(kdf, "cpus");
+            kdfSalt = ReadBase64(kdf, "salt", 16, 128);
+            if (kdfIterations <= 0 || kdfIterations > MaximumArgon2Iterations)
+            {
+                throw new InvalidDataException(
+                    $"LUKS2 keyslot {index}のArgon2 time costが不正です: {kdfIterations}");
+            }
+            if (kdfParallelism <= 0 || kdfParallelism > MaximumArgon2Parallelism)
+            {
+                throw new InvalidDataException(
+                    $"LUKS2 keyslot {index}のArgon2 parallelismが不正です: {kdfParallelism}");
+            }
+            if (kdfMemoryKiB < checked(8 * kdfParallelism) || kdfMemoryKiB > MaximumArgon2MemoryKiB)
+            {
+                throw new InvalidDataException(
+                    $"LUKS2 keyslot {index}のArgon2 memory costが不正です: {kdfMemoryKiB} KiB");
             }
         }
         else
@@ -468,6 +498,8 @@ public static class Luks2MetadataReader
             KdfType = kdfType,
             KdfHash = kdfHash,
             KdfIterations = kdfIterations,
+            KdfMemoryKiB = kdfMemoryKiB,
+            KdfParallelism = kdfParallelism,
             KdfSalt = kdfSalt,
             AreaOffset = areaOffset,
             AreaSize = areaSize,
@@ -744,16 +776,42 @@ public static class Luks2Unlock
                 byte[]? candidateDigest = null;
                 try
                 {
-                    if (!LuksCryptoUtilities.TryGetHashAlgorithm(slot.KdfHash, out var kdfHash, out _)
-                        || !LuksCryptoUtilities.TryGetHashAlgorithm(slot.AfHash, out var afHash, out var afDigestSize)
+                    if (!LuksCryptoUtilities.TryGetHashAlgorithm(slot.AfHash, out var afHash, out var afDigestSize)
                         || slot.Digest is null
                         || !LuksCryptoUtilities.TryGetHashAlgorithm(slot.Digest.Hash, out var digestHash, out _))
                     {
                         continue;
                     }
-                    derivedKey = new byte[slot.AreaKeyBytes];
-                    Rfc2898DeriveBytes.Pbkdf2(
-                        passphraseBytes, slot.KdfSalt, derivedKey, slot.KdfIterations, kdfHash);
+                    if (slot.KdfType == "pbkdf2")
+                    {
+                        if (!LuksCryptoUtilities.TryGetHashAlgorithm(slot.KdfHash, out var kdfHash, out _))
+                        {
+                            continue;
+                        }
+                        derivedKey = new byte[slot.AreaKeyBytes];
+                        Rfc2898DeriveBytes.Pbkdf2(
+                            passphraseBytes, slot.KdfSalt, derivedKey, slot.KdfIterations, kdfHash);
+                    }
+                    else if (slot.KdfType == "argon2id")
+                    {
+                        if (!TryCheckArgon2MemoryAvailability(slot.KdfMemoryKiB, out error))
+                        {
+                            return false;
+                        }
+                        using var argon2 = new Argon2id(passphraseBytes)
+                        {
+                            Salt = slot.KdfSalt,
+                            Iterations = slot.KdfIterations,
+                            MemorySize = slot.KdfMemoryKiB,
+                            DegreeOfParallelism = slot.KdfParallelism
+                        };
+                        derivedKey = argon2.GetBytesAsync(slot.AreaKeyBytes).GetAwaiter().GetResult();
+                        cancellationToken.ThrowIfCancellationRequested();
+                    }
+                    else
+                    {
+                        continue;
+                    }
                     var splitBytes = checked(slot.KeyBytes * slot.Stripes);
                     var materialBytes = checked((splitBytes + LuksCryptoUtilities.SectorSize - 1)
                         / LuksCryptoUtilities.SectorSize * LuksCryptoUtilities.SectorSize);
@@ -796,7 +854,7 @@ public static class Luks2Unlock
             return false;
         }
         catch (Exception ex) when (ex is IOException or InvalidDataException or OverflowException
-            or ArgumentOutOfRangeException or CryptographicException)
+            or ArgumentOutOfRangeException or InvalidOperationException or CryptographicException or OutOfMemoryException)
         {
             error = ex.Message;
             return false;
@@ -805,5 +863,20 @@ public static class Luks2Unlock
         {
             CryptographicOperations.ZeroMemory(passphraseBytes);
         }
+    }
+
+    private static bool TryCheckArgon2MemoryAvailability(int memoryKiB, out string error)
+    {
+        error = "";
+        var requiredBytes = checked((long)memoryKiB * 1024);
+        var memoryInfo = GC.GetGCMemoryInfo();
+        var remainingBudget = Math.Max(0, memoryInfo.TotalAvailableMemoryBytes - memoryInfo.MemoryLoadBytes);
+        const long reserveBytes = 256L * 1024 * 1024;
+        if (requiredBytes > Math.Max(0, remainingBudget - reserveBytes))
+        {
+            error = $"LUKS2 Argon2id解除には約{requiredBytes / (1024 * 1024):N0} MiBの空きメモリが必要です。";
+            return false;
+        }
+        return true;
     }
 }

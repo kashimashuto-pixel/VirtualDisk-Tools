@@ -521,6 +521,7 @@ public static class FileSystemDetector
                     {
                         "LUKS2暗号化ボリュームです。",
                         $"暗号方式: {metadata.Segment.Encryption}",
+                        $"KDF: {string.Join(", ", metadata.SupportedKeySlots.Select(slot => $"{slot.Index}={slot.KdfType}"))}",
                         $"対応keyslot: {string.Join(", ", metadata.SupportedKeySlots.Select(slot => slot.Index))}",
                         metadata.UnsupportedKeySlots.Count == 0
                             ? ""

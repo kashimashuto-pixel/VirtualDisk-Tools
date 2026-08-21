@@ -22,7 +22,7 @@ C# / Windows Forms で作成した、読み取り専用の仮想ディスク解�
   - 回復パスワードは8組の6桁ブロックを検証し、VMK/FVEKを解除して内部FSを読み取り
   - `.BEK`はヘッダー・外部キー・保護子IDを検証し、対応するVMK/FVEKだけを解除
   - LUKS1 はAES-XTS/plain64、PBKDF2（SHA-1/SHA-256/SHA-512）、標準4000 AF stripesのパスフレーズ解除に対応
-  - LUKS2 は冗長headerとJSON metadataを検証し、PBKDF2 keyslot、単一crypt segment、AES-XTS/plain64のパスフレーズ解除に対応
+  - LUKS2 は冗長headerとJSON metadataを検証し、PBKDF2/Argon2id keyslot、単一crypt segment、AES-XTS/plain64のパスフレーズ解除に対応
 - LVM2 論理ボリュームの検出と読み取り
   - 通常のlinear構成（LVMメタデータ上は`striped`、`stripe_count = 1`）を読み取り
   - 読めない場合は不足PV、未対応segment type、複数stripe、メタデータ未検出、または内部例外を警告欄と解析レポートへ表示
@@ -187,7 +187,7 @@ ProjFS マウントは Windows の Client-ProjFS 機能を使い、選択した�
 - BitLockerはAES-XTS（128/256）に対応します。TPM単独保護、TPMとの複合保護、AES-CBC/Elephant Diffuserは未対応です。
 - BitLocker回復パスワード、通常パスワード、スタートアップキー、VMK、FVEKは設定・ログ・解析レポートへ保存しません。不要になったキー配列は可能な範囲で消去します。
 - LUKS1はAES-XTS/plain64の256/512-bit合成キーに対応します。detached header、AES-CBC、ESSIV、plain/plain64以外のIV方式は未対応です。
-- LUKS2は有効なprimary/secondary headerのうちsequence IDが新しいものを使用し、PBKDF2 keyslot、標準4000 AF stripes、単一dynamic crypt segment、AES-XTS/plain64に対応します。Argon2、reencryption、複数・固定長segment、detached headerは未対応です。
+- LUKS2は有効なprimary/secondary headerのうちsequence IDが新しいものを使用し、PBKDF2/Argon2id keyslot、標準4000 AF stripes、単一dynamic crypt segment、AES-XTS/plain64に対応します。Argon2idはmemory 1 GiB、time cost 10、parallelism 16を上限とし、実行時のメモリ余力も確認します。Argon2i/d、reencryption、複数・固定長segment、detached headerは未対応です。
 - LUKS1/LUKS2パスフレーズとvolume keyは設定・ログ・解析レポートへ保存せず、一時配列と復号リーダーのキーを使用後に消去します。
 - NTFSの主 `$MFT` 先頭レコードが破損している場合は `$MFTMirr` から復旧を試みます。ルートレコードなど主MFTの必須データ自体が欠落しているイメージは、元ディスクまたはバックアップからの再取得が必要です。
 - NTFS削除済みファイルはMFTに残っている情報を表示します。削除後に再利用されたクラスタの内容は復旧できません。
@@ -214,6 +214,8 @@ ProjFS マウントは Windows の Client-ProjFS 機能を使い、選択した�
 - `LTRData.DiscUtils.Xfs`
 - `Microsoft.Windows.ProjFS`
 - `ZstdSharp.Port`
+- `Konscious.Security.Cryptography.Argon2`
+- `Konscious.Security.Cryptography.Blake2`
 
 これらは NuGet メタデータ上で MIT License として公開されています。
 MIT License は著作権表示とライセンス表示の保持が必要なため、再配布時は下記の表示を含めてください。
@@ -301,6 +303,34 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
+### Konscious.Security.Cryptography.Argon2 / Blake2
+
+Project: https://github.com/kmaragon/Konscious.Security.Cryptography
+
+```text
+MIT License
+
+Copyright (c) 2017 Keef Aragon
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
 ### lzokay由来のLZO1Xデコーダ
 
 Project: https://github.com/AxioDL/lzokay
@@ -354,3 +384,5 @@ SOFTWARE.
 - BitLocker/FVEメタデータ・鍵導出形式: https://github.com/libyal/libbde/blob/main/documentation/BitLocker%20Drive%20Encryption%20%28BDE%29%20format.asciidoc
 - LUKS1 on-disk format: https://cdn.kernel.org/pub/linux/utils/cryptsetup/LUKS_docs/on-disk-format.pdf
 - LUKS2 on-disk format: https://gitlab.com/cryptsetup/cryptsetup/-/blob/master/docs/on-disk-format-luks2.pdf
+- Argon2 reference implementation: https://github.com/P-H-C/phc-winner-argon2
+- Konscious Argon2 for .NET: https://github.com/kmaragon/Konscious.Security.Cryptography

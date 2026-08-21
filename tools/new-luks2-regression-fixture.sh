@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-output_file=${1:?usage: new-luks2-regression-fixture.sh OUTPUT_FILE KEY_FILE SIZE_MIB}
-key_file=${2:?usage: new-luks2-regression-fixture.sh OUTPUT_FILE KEY_FILE SIZE_MIB}
-size_mib=${3:?usage: new-luks2-regression-fixture.sh OUTPUT_FILE KEY_FILE SIZE_MIB}
+output_file=${1:?usage: new-luks2-regression-fixture.sh OUTPUT_FILE KEY_FILE SIZE_MIB KDF}
+key_file=${2:?usage: new-luks2-regression-fixture.sh OUTPUT_FILE KEY_FILE SIZE_MIB KDF}
+size_mib=${3:?usage: new-luks2-regression-fixture.sh OUTPUT_FILE KEY_FILE SIZE_MIB KDF}
+kdf=${4:?usage: new-luks2-regression-fixture.sh OUTPUT_FILE KEY_FILE SIZE_MIB KDF}
 mount_dir=$(mktemp -d)
 loop_device=""
 mapper_name="vdt_luks2_$$"
@@ -63,22 +64,43 @@ if [[ ! -b "$partition" ]]; then
     exit 5
 fi
 
-# PBKDF2 is selected explicitly because the first LUKS2 implementation does
-# not support Argon2 keyslots. The short target is only for local regression.
-cryptsetup luksFormat \
-    --type luks2 \
-    --batch-mode \
-    --cipher aes-xts-plain64 \
-    --key-size 512 \
-    --hash sha256 \
-    --pbkdf pbkdf2 \
-    --iter-time 10 \
-    --key-file "$key_file" \
-    "$partition"
+case "$kdf" in
+    pbkdf2)
+        # The short target is only for local regression and is not a
+        # production cryptsetup security recommendation.
+        cryptsetup luksFormat \
+            --type luks2 \
+            --batch-mode \
+            --cipher aes-xts-plain64 \
+            --key-size 512 \
+            --hash sha256 \
+            --pbkdf pbkdf2 \
+            --iter-time 10 \
+            --key-file "$key_file" \
+            "$partition"
+        ;;
+    argon2id)
+        # Leave time, memory, and parallelism at cryptsetup's calibrated
+        # defaults so this fixture covers the normal LUKS2 format path.
+        cryptsetup luksFormat \
+            --type luks2 \
+            --batch-mode \
+            --cipher aes-xts-plain64 \
+            --key-size 512 \
+            --hash sha256 \
+            --pbkdf argon2id \
+            --key-file "$key_file" \
+            "$partition"
+        ;;
+    *)
+        echo "Unsupported LUKS2 fixture KDF: $kdf" >&2
+        exit 6
+        ;;
+esac
 cryptsetup open --type luks2 --key-file "$key_file" "$partition" "$mapper_name"
 mkfs.ext4 -F -L VDT_LUKS2 "$mapper_path"
 mount "$mapper_path" "$mount_dir"
-printf 'LUKS2 PBKDF2 AES-XTS fixture\n' > "$mount_dir/fixture.txt"
+printf 'LUKS2 %s AES-XTS fixture\n' "$kdf" > "$mount_dir/fixture.txt"
 sync
 
 stat --format='fixture_size=%s' "$mount_dir/fixture.txt"

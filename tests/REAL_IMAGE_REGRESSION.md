@@ -97,6 +97,20 @@ fixtureを高速に再生成するためPBKDF2の短いiteration targetを使用
 PBKDF2の短いiteration targetはローカルfixtureを高速に再生成するためのもので、実運用向けのセキュリティ設定例ではありません。
 ローカルmanifestでは`"luksPassphraseEnvironmentVariable": "VDT_LUKS2_PASSPHRASE"`を指定します。fixture、manifest、パスフレーズをコミットしないでください。
 
+### LUKS2 Argon2id AES-XTS
+
+`-Kdf Argon2id`を指定すると、cryptsetupのcalibrated defaultを使用した通常のLUKS2 fixtureを生成します。
+
+```powershell
+.\tools\New-Luks2RegressionFixture.ps1 `
+  -OutputPath .\.tmp\real-images\luks2-argon2id-default.raw `
+  -PassphraseEnvironmentVariable VDT_LUKS2_ARGON2ID_PASSPHRASE `
+  -Kdf Argon2id
+```
+
+環境に応じて最大1 GiB程度のメモリを使用し、生成時と回帰実行時の解除に数秒以上かかります。
+ローカルmanifestでは`"luksPassphraseEnvironmentVariable": "VDT_LUKS2_ARGON2ID_PASSPHRASE"`を指定します。
+
 ## Manifest例
 
 ```json
