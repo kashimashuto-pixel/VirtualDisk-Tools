@@ -510,6 +510,11 @@ static void TestBitLockerXtsUnlockVariant(
             .Children.Single().ValueType == 0x0005,
         $"{variantName} recovery protector metadata parsing and encryption method normalization");
 
+    if (runRecoveryFailureChecks)
+    {
+        TestBitLockerMetadataCopyFallback(metadataImage, intermediateKey, fvek);
+    }
+
     var encryptedReader = new MemorySectorReader(encryptedVolume, 512);
     Assert(
         BitLockerUnlock.TryCreateReaderWithRecoveryKey(
@@ -626,6 +631,53 @@ static void TestBitLockerXtsUnlockVariant(
     ValidateBitLockerReaderReads(clearReader!, plaintext, $"{variantName} clear-key unlock");
     ((IDisposable)clearReader!).Dispose();
 
+    if (runRecoveryFailureChecks)
+    {
+        var corruptedFvekData = encryptedFvek.Data.ToArray();
+        corruptedFvekData[^1] ^= 0xff;
+        var corruptedFvekMetadata = new BitLockerMetadata
+        {
+            EncryptedVolumeSize = encryptedVolume.Length,
+            EncryptionMethod = encryptionMethod,
+            KeyProtectors = [clearProtector],
+            Entries =
+            [
+                new BitLockerMetadataEntry
+                {
+                    EntryType = encryptedFvek.EntryType,
+                    ValueType = encryptedFvek.ValueType,
+                    Data = corruptedFvekData
+                }
+            ]
+        };
+        Assert(
+            !BitLockerUnlock.TryCreateReaderWithClearKey(
+                encryptedReader,
+                corruptedFvekMetadata,
+                out _,
+                out var corruptedFvekError)
+            && !corruptedFvekError.Contains(Convert.ToHexString(clearKey), StringComparison.OrdinalIgnoreCase)
+            && !corruptedFvekError.Contains(Convert.ToHexString(fvek), StringComparison.OrdinalIgnoreCase),
+            "corrupted BitLocker FVEK authentication tag fails without exposing keys");
+
+        var unsupportedMetadata = new BitLockerMetadata
+        {
+            EncryptedVolumeSize = encryptedVolume.Length,
+            EncryptionMethod = 0x8002
+        };
+        Assert(
+            !BitLockerUnlock.TryCreateReaderWithRawFvek(
+                encryptedReader,
+                unsupportedMetadata,
+                fvek,
+                out _,
+                out var unsupportedMethodError)
+            && unsupportedMethodError.Contains("AES-CBC", StringComparison.Ordinal)
+            && !unsupportedMethodError.Contains(Convert.ToHexString(fvek), StringComparison.OrdinalIgnoreCase),
+            "unsupported BitLocker encryption method fails without exposing the FVEK");
+        CryptographicOperations.ZeroMemory(corruptedFvekData);
+    }
+
     var invalidFvek = new byte[fvekLength - 1];
     Assert(
         !BitLockerUnlock.TryCreateReaderWithRawFvek(
@@ -677,6 +729,70 @@ static void ValidateBitLockerReaderReads(IBlockReader reader, byte[] plaintext, 
     CryptographicOperations.ZeroMemory(tailRead);
 }
 
+static void TestBitLockerMetadataCopyFallback(byte[] sourceImage, byte[] intermediateKey, byte[] fvek)
+{
+    int[] metadataOffsets = [4096, 8192, 12288];
+
+    var firstSignatureDamaged = sourceImage.ToArray();
+    firstSignatureDamaged[metadataOffsets[0]] ^= 0xff;
+    AssertBitLockerMetadataCopySelected(firstSignatureDamaged, metadataOffsets[1], "backup after primary signature damage");
+
+    var firstTwoSignaturesDamaged = firstSignatureDamaged.ToArray();
+    firstTwoSignaturesDamaged[metadataOffsets[1]] ^= 0xff;
+    AssertBitLockerMetadataCopySelected(firstTwoSignaturesDamaged, metadataOffsets[2], "third copy after two damaged signatures");
+
+    var unsupportedPrimaryVersion = sourceImage.ToArray();
+    BinaryPrimitives.WriteUInt16LittleEndian(unsupportedPrimaryVersion.AsSpan(metadataOffsets[0] + 10), 0xffff);
+    AssertBitLockerMetadataCopySelected(unsupportedPrimaryVersion, metadataOffsets[1], "backup after unsupported block version");
+
+    var overflowingPrimarySize = sourceImage.ToArray();
+    BinaryPrimitives.WriteUInt32LittleEndian(overflowingPrimarySize.AsSpan(metadataOffsets[0] + 64), uint.MaxValue);
+    AssertBitLockerMetadataCopySelected(overflowingPrimarySize, metadataOffsets[1], "backup after overflowing metadata size");
+
+    var outOfRangePrimarySize = sourceImage.ToArray();
+    BinaryPrimitives.WriteUInt32LittleEndian(outOfRangePrimarySize.AsSpan(metadataOffsets[0] + 64), 900_000);
+    AssertBitLockerMetadataCopySelected(outOfRangePrimarySize, metadataOffsets[1], "backup after out-of-range metadata size");
+
+    var truncatedPrimaryEntry = sourceImage.ToArray();
+    const int metadataHeaderSize = 48;
+    BinaryPrimitives.WriteUInt16LittleEndian(
+        truncatedPrimaryEntry.AsSpan(metadataOffsets[0] + 64 + metadataHeaderSize),
+        ushort.MaxValue);
+    AssertBitLockerMetadataCopySelected(truncatedPrimaryEntry, metadataOffsets[1], "backup after truncated metadata entry");
+
+    var outOfRangePrimaryPointer = sourceImage.ToArray();
+    BinaryPrimitives.WriteUInt64LittleEndian(outOfRangePrimaryPointer.AsSpan(176), ulong.MaxValue);
+    AssertBitLockerMetadataCopySelected(outOfRangePrimaryPointer, metadataOffsets[1], "backup after out-of-range primary pointer");
+
+    var allCopiesDamaged = sourceImage.ToArray();
+    foreach (var offset in metadataOffsets)
+    {
+        allCopiesDamaged[offset] ^= 0xff;
+    }
+
+    Assert(
+        !BitLockerMetadataReader.TryRead(
+            new MemorySectorReader(allCopiesDamaged, 512),
+            out var damagedMetadata,
+            out var damagedError)
+        && damagedMetadata is null
+        && metadataOffsets.All(offset => damagedError.Contains($"0x{offset:X}", StringComparison.Ordinal))
+        && !damagedError.Contains(Convert.ToHexString(intermediateKey), StringComparison.OrdinalIgnoreCase)
+        && !damagedError.Contains(Convert.ToHexString(fvek), StringComparison.OrdinalIgnoreCase),
+        "all damaged BitLocker metadata copies fail safely without exposing keys");
+}
+
+static void AssertBitLockerMetadataCopySelected(byte[] image, int expectedOffset, string testName)
+{
+    Assert(
+        BitLockerMetadataReader.TryRead(
+            new MemorySectorReader(image, 512),
+            out var metadata,
+            out var error),
+        error);
+    Assert(metadata?.MetadataBlockOffset == expectedOffset, $"BitLocker metadata {testName}");
+}
+
 static byte[] CreateBitLockerKeyData(uint method, byte[] key)
 {
     var data = new byte[4 + key.Length];
@@ -692,7 +808,7 @@ static byte[] CreateBitLockerMetadataTestImage(
     byte[] encryptedFvekData,
     uint encryptionMethod)
 {
-    const int metadataBlockOffset = 4096;
+    int[] metadataBlockOffsets = [4096, 8192, 12288];
     var encryptedVmkEntry = CreateBitLockerMetadataEntry(0x0003, 0x0005, encryptedVmkData);
     var decoyEncryptedVmkData = encryptedVmkData.ToArray();
     decoyEncryptedVmkData[^1] ^= 0xff;
@@ -711,26 +827,38 @@ static byte[] CreateBitLockerMetadataTestImage(
 
     const int metadataHeaderSize = 48;
     var metadataSize = metadataHeaderSize + protectorEntry.Length + fvekEntry.Length;
-    var image = new byte[metadataBlockOffset + 64 + metadataSize + 512];
+    var image = new byte[metadataBlockOffsets[^1] + 64 + metadataSize + 512];
     Encoding.ASCII.GetBytes("-FVE-FS-").CopyTo(image, 3);
-    BinaryPrimitives.WriteUInt64LittleEndian(image.AsSpan(176), metadataBlockOffset);
+    for (var index = 0; index < metadataBlockOffsets.Length; index++)
+    {
+        BinaryPrimitives.WriteUInt64LittleEndian(image.AsSpan(176 + index * sizeof(ulong)), checked((ulong)metadataBlockOffsets[index]));
+    }
 
-    Encoding.ASCII.GetBytes("-FVE-FS-").CopyTo(image, metadataBlockOffset);
-    BinaryPrimitives.WriteUInt16LittleEndian(image.AsSpan(metadataBlockOffset + 10), 2);
-    BinaryPrimitives.WriteUInt64LittleEndian(image.AsSpan(metadataBlockOffset + 16), checked((ulong)image.Length));
-    BinaryPrimitives.WriteUInt32LittleEndian(image.AsSpan(metadataBlockOffset + 28), 1);
-    BinaryPrimitives.WriteUInt64LittleEndian(image.AsSpan(metadataBlockOffset + 32), metadataBlockOffset);
+    foreach (var metadataBlockOffset in metadataBlockOffsets)
+    {
+        Encoding.ASCII.GetBytes("-FVE-FS-").CopyTo(image, metadataBlockOffset);
+        BinaryPrimitives.WriteUInt16LittleEndian(image.AsSpan(metadataBlockOffset + 10), 2);
+        BinaryPrimitives.WriteUInt64LittleEndian(image.AsSpan(metadataBlockOffset + 16), checked((ulong)image.Length));
+        BinaryPrimitives.WriteUInt32LittleEndian(image.AsSpan(metadataBlockOffset + 28), 1);
+        for (var index = 0; index < metadataBlockOffsets.Length; index++)
+        {
+            BinaryPrimitives.WriteUInt64LittleEndian(
+                image.AsSpan(metadataBlockOffset + 32 + index * sizeof(ulong)),
+                checked((ulong)metadataBlockOffsets[index]));
+        }
 
-    var metadataOffset = metadataBlockOffset + 64;
-    BinaryPrimitives.WriteUInt32LittleEndian(image.AsSpan(metadataOffset), checked((uint)metadataSize));
-    BinaryPrimitives.WriteUInt32LittleEndian(image.AsSpan(metadataOffset + 4), 2);
-    BinaryPrimitives.WriteUInt32LittleEndian(image.AsSpan(metadataOffset + 8), metadataHeaderSize);
-    Guid.Parse("511c4978-8ba7-4da5-a4f8-63d8f37460e2").ToByteArray().CopyTo(image, metadataOffset + 16);
-    BinaryPrimitives.WriteUInt32LittleEndian(
-        image.AsSpan(metadataOffset + 36),
-        encryptionMethod | (encryptionMethod << 16));
-    protectorEntry.CopyTo(image, metadataOffset + metadataHeaderSize);
-    fvekEntry.CopyTo(image, metadataOffset + metadataHeaderSize + protectorEntry.Length);
+        var metadataOffset = metadataBlockOffset + 64;
+        BinaryPrimitives.WriteUInt32LittleEndian(image.AsSpan(metadataOffset), checked((uint)metadataSize));
+        BinaryPrimitives.WriteUInt32LittleEndian(image.AsSpan(metadataOffset + 4), 2);
+        BinaryPrimitives.WriteUInt32LittleEndian(image.AsSpan(metadataOffset + 8), metadataHeaderSize);
+        Guid.Parse("511c4978-8ba7-4da5-a4f8-63d8f37460e2").ToByteArray().CopyTo(image, metadataOffset + 16);
+        BinaryPrimitives.WriteUInt32LittleEndian(
+            image.AsSpan(metadataOffset + 36),
+            encryptionMethod | (encryptionMethod << 16));
+        protectorEntry.CopyTo(image, metadataOffset + metadataHeaderSize);
+        fvekEntry.CopyTo(image, metadataOffset + metadataHeaderSize + protectorEntry.Length);
+    }
+
     return image;
 }
 
