@@ -507,6 +507,84 @@ static void TestGeneratedBtrfsImage()
             Assert(ex.Message.Contains("padding", StringComparison.Ordinal), "corrupt Btrfs zstd padding diagnostic");
         }
     }
+
+    var subvolumePath = Path.Combine(AppContext.BaseDirectory, "synthetic-btrfs-subvolumes.raw");
+    BtrfsTestImageFactory.Create(subvolumePath, includeSubvolumes: true);
+    using (var reader = DiskImageReaderFactory.Open(subvolumePath))
+    {
+        var partition = PartitionTableReader.ReadPartitions(reader).Single();
+        partition.FileSystem = FileSystemDetector.Detect(reader, partition);
+        var fs = FileSystemDetector.TryOpen(reader, partition, out var error);
+        Assert(fs is not null, error);
+        var topLevel = fs!.ListDirectory(fs.Root);
+        var subvolume = topLevel.Single(node => node.Name == "subvol");
+        var snapshot = topLevel.Single(node => node.Name == "snapshot");
+        var subvolumeEntries = fs.ListDirectory(subvolume);
+        var subvolumeFile = subvolumeEntries.Single(node => node.Name == "subvolume.txt");
+        var nestedSubvolume = subvolumeEntries.Single(node => node.Name == "nested-subvol");
+        var nestedFile = fs.ListDirectory(nestedSubvolume).Single(node => node.Name == "nested.txt");
+        var snapshotEntries = fs.ListDirectory(snapshot);
+        var snapshotFile = snapshotEntries.Single(node => node.Name == "snapshot.txt");
+        var snapshotNestedBoundary = snapshotEntries.Single(node => node.Name == "nested-subvol");
+        Assert(
+            Encoding.UTF8.GetString(fs.ReadFile(subvolumeFile, 0, checked((int)subvolumeFile.Size))) == "inside subvolume\n",
+            "generated Btrfs subvolume contents");
+        Assert(
+            Encoding.UTF8.GetString(fs.ReadFile(nestedFile, 0, checked((int)nestedFile.Size))) == "inside nested subvolume\n",
+            "generated Btrfs nested subvolume contents");
+        Assert(
+            Encoding.UTF8.GetString(fs.ReadFile(snapshotFile, 0, checked((int)snapshotFile.Size))) == "inside snapshot\n",
+            "generated Btrfs snapshot contents");
+        Assert(
+            fs.ListDirectory(snapshotNestedBoundary).Count == 0,
+            "generated Btrfs snapshot nested subvolume boundary");
+    }
+
+    var defaultSubvolumePath = Path.Combine(AppContext.BaseDirectory, "synthetic-btrfs-default-subvolume.raw");
+    BtrfsTestImageFactory.Create(defaultSubvolumePath, includeSubvolumes: true, defaultSubvolume: true);
+    using (var reader = DiskImageReaderFactory.Open(defaultSubvolumePath))
+    {
+        var partition = PartitionTableReader.ReadPartitions(reader).Single();
+        partition.FileSystem = FileSystemDetector.Detect(reader, partition);
+        var fs = FileSystemDetector.TryOpen(reader, partition, out var error);
+        Assert(fs is not null, error);
+        var defaultRoot = fs!.ListDirectory(fs.Root);
+        Assert(defaultRoot.Any(node => node.Name == "subvolume.txt"), "generated Btrfs default subvolume root");
+        Assert(defaultRoot.Any(node => node.Name == "nested-subvol"), "generated Btrfs default nested subvolume");
+        Assert(defaultRoot.All(node => node.Name != "hello.txt"), "generated Btrfs default hides top-level tree");
+    }
+
+    var rootBackReferenceCorruptPath = Path.Combine(
+        AppContext.BaseDirectory,
+        "synthetic-btrfs-root-backref-corrupt.raw");
+    BtrfsTestImageFactory.Create(
+        rootBackReferenceCorruptPath,
+        includeSubvolumes: true,
+        corruptRootBackReference: true);
+    using (var reader = DiskImageReaderFactory.Open(rootBackReferenceCorruptPath))
+    {
+        var partition = PartitionTableReader.ReadPartitions(reader).Single();
+        partition.FileSystem = FileSystemDetector.Detect(reader, partition);
+        var fs = FileSystemDetector.TryOpen(reader, partition, out var error);
+        Assert(fs is null, "corrupt Btrfs ROOT_BACKREF is rejected");
+        Assert(error.Contains("ROOT_REF", StringComparison.Ordinal), "corrupt Btrfs ROOT_BACKREF diagnostic");
+    }
+
+    var subvolumeGenerationCorruptPath = Path.Combine(
+        AppContext.BaseDirectory,
+        "synthetic-btrfs-subvolume-generation-corrupt.raw");
+    BtrfsTestImageFactory.Create(
+        subvolumeGenerationCorruptPath,
+        includeSubvolumes: true,
+        corruptSubvolumeGeneration: true);
+    using (var reader = DiskImageReaderFactory.Open(subvolumeGenerationCorruptPath))
+    {
+        var partition = PartitionTableReader.ReadPartitions(reader).Single();
+        partition.FileSystem = FileSystemDetector.Detect(reader, partition);
+        var fs = FileSystemDetector.TryOpen(reader, partition, out var error);
+        Assert(fs is null, "corrupt Btrfs subvolume generation is rejected");
+        Assert(error.Contains("generation", StringComparison.Ordinal), "corrupt Btrfs subvolume generation diagnostic");
+    }
 }
 
 static void TestGeneratedEwfE01Image()

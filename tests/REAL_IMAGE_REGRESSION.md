@@ -44,7 +44,7 @@ wsl --distribution Ubuntu-24.04 --user root -- sh -lc `
   -OutputPath .\.tmp\real-images\btrfs-single.raw
 ```
 
-スクリプトはインラインファイル、通常extent、スパースファイル、zlib圧縮ファイル、通常・inline LZO／zstd圧縮ファイルを作成し、`btrfs check --readonly`と各ファイルのSHA-256を表示します。
+スクリプトはインラインファイル、通常extent、スパースファイル、zlib圧縮ファイル、通常・inline LZO／zstd圧縮ファイル、subvolume、入れ子subvolume、snapshotを作成し、作成したsubvolumeをdefaultに設定します。最後に`btrfs check --readonly`と各ファイルのSHA-256を表示します。
 既存fixtureは上書きせず、生成物とローカルmanifestはGitへ追加しません。
 
 ### BitLocker XTS-AES
@@ -207,54 +207,20 @@ fixture本体とローカルmanifestはコミットしないでください。
           "expectedFileSystem": "Btrfs",
           "files": [
             {
-              "path": "/hello.txt",
+              "path": "/subvolume.txt",
               "expectedDirectory": false,
               "expectedLength": 17,
-              "sha256": "1E7E7CAE2B00EF869EE050726D5D1747FDE1CBCE9726DAC9E05C088046EEA037",
-              "expectedModifiedUtc": "2046-02-03T04:05:06Z",
-              "timestampToleranceSeconds": 0
+              "sha256": "765E8528AC299FB0EEA4CE08845B694C107F577FB39CC1C5558E82DD048074D8"
             },
             {
-              "path": "/nested/regular.bin",
-              "expectedDirectory": false,
-              "expectedLength": 131072,
-              "sha256": "FA43239BCEE7B97CA62F007CC68487560A39E19F74F3DDE7486DB3F98DF8E471"
+              "path": "/nested-subvol",
+              "expectedDirectory": true
             },
             {
-              "path": "/compressed-zlib.bin",
+              "path": "/nested-subvol/nested.txt",
               "expectedDirectory": false,
-              "expectedLength": 262144,
-              "sha256": "8A39D2ABD3999AB73C34DB2476849CDDF303CE389B35826850F9A700589B4A90"
-            },
-            {
-              "path": "/compressed-lzo.bin",
-              "expectedDirectory": false,
-              "expectedLength": 262144,
-              "sha256": "8A39D2ABD3999AB73C34DB2476849CDDF303CE389B35826850F9A700589B4A90"
-            },
-            {
-              "path": "/compressed-inline-lzo.bin",
-              "expectedDirectory": false,
-              "expectedLength": 1024,
-              "sha256": "5F70BF18A086007016E948B04AED3B82103A36BEA41755B6CDDFAF10ACE3C6EF"
-            },
-            {
-              "path": "/compressed-zstd.bin",
-              "expectedDirectory": false,
-              "expectedLength": 262144,
-              "sha256": "8A39D2ABD3999AB73C34DB2476849CDDF303CE389B35826850F9A700589B4A90"
-            },
-            {
-              "path": "/compressed-inline-zstd.bin",
-              "expectedDirectory": false,
-              "expectedLength": 1024,
-              "sha256": "5F70BF18A086007016E948B04AED3B82103A36BEA41755B6CDDFAF10ACE3C6EF"
-            },
-            {
-              "path": "/sparse.bin",
-              "expectedDirectory": false,
-              "expectedLength": 1048588,
-              "sha256": "EC33A976122A647689AE42EFAFF7F114E6F5460B313690EB212C96EADA0C375C"
+              "expectedLength": 24,
+              "sha256": "87B1422F3A4F5CD3F295930A9BC7A9C918138C2497E27A288760BE59A9C1A6A5"
             }
           ]
         }

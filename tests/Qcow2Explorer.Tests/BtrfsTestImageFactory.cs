@@ -20,6 +20,9 @@ internal static class BtrfsTestImageFactory
     private const int ChunkTreeLogicalOffset = 1024 * 1024;
     private const int RootTreeLogicalOffset = ChunkTreeLogicalOffset + NodeSize;
     private const int ChecksumTreeLogicalOffset = ChunkTreeLogicalOffset + 3 * NodeSize;
+    private const int SubvolumeTreeLogicalOffset = ChunkTreeLogicalOffset + 4 * NodeSize;
+    private const int NestedSubvolumeTreeLogicalOffset = ChunkTreeLogicalOffset + 5 * NodeSize;
+    private const int SnapshotTreeLogicalOffset = ChunkTreeLogicalOffset + 6 * NodeSize;
     private const int SparseDataLogicalOffset = RegularDataLogicalOffset + 2 * SectorSize;
     private const int ZlibDataLogicalOffset = RegularDataLogicalOffset + 3 * SectorSize;
     private const int LzoDataLogicalOffset = RegularDataLogicalOffset + 4 * SectorSize;
@@ -36,8 +39,17 @@ internal static class BtrfsTestImageFactory
         bool corruptLzoPayload = false,
         bool corruptLzoHeader = false,
         bool corruptZstdPayload = false,
-        bool corruptZstdPadding = false)
+        bool corruptZstdPadding = false,
+        bool includeSubvolumes = false,
+        bool defaultSubvolume = false,
+        bool corruptRootBackReference = false,
+        bool corruptSubvolumeGeneration = false)
     {
+        if (defaultSubvolume && !includeSubvolumes)
+        {
+            throw new ArgumentException("A default subvolume requires subvolume fixtures.", nameof(defaultSubvolume));
+        }
+
         var disk = new byte[DiskSize];
         var partitionLength = DiskSize - PartitionStart;
         WriteMbr(disk, partitionLength);
@@ -46,7 +58,7 @@ internal static class BtrfsTestImageFactory
         var chunkUuid = Guid.Parse("f61c47e6-f8c5-44d8-971c-d48e90f5a325").ToByteArray();
         var chunk = CreateChunk(partitionLength, fsid);
 
-        var superblock = CreateSuperblock(partitionLength, fsid, chunk);
+        var superblock = CreateSuperblock(partitionLength, fsid, chunk, defaultSubvolume);
         superblock.CopyTo(disk, PartitionStart + SuperblockLogicalOffset);
 
         var chunkTree = CreateLeaf(
@@ -57,27 +69,48 @@ internal static class BtrfsTestImageFactory
             [(new BtrfsKey(256, 228, 0), chunk)]);
         chunkTree.CopyTo(disk, PartitionStart + ChunkTreeLogicalOffset);
 
+        var rootTreeItems = new List<(BtrfsKey Key, byte[] Data)>
+        {
+            (new BtrfsKey(5, 132, 0), CreateRootItem(256, FileSystemTreeLogicalOffset)),
+            (new BtrfsKey(7, 132, 0), CreateRootItem(0, ChecksumTreeLogicalOffset)),
+        };
+        if (includeSubvolumes)
+        {
+            rootTreeItems.Add((new BtrfsKey(256, 132, 0), CreateRootItem(
+                256,
+                SubvolumeTreeLogicalOffset,
+                corruptSubvolumeGeneration ? Generation + 1 : Generation)));
+            rootTreeItems.Add((new BtrfsKey(257, 132, 0), CreateRootItem(256, NestedSubvolumeTreeLogicalOffset)));
+            rootTreeItems.Add((new BtrfsKey(258, 132, Generation), CreateRootItem(256, SnapshotTreeLogicalOffset)));
+            rootTreeItems.Add((new BtrfsKey(5, 156, 256), CreateRootReference(256, 3, "subvol")));
+            rootTreeItems.Add((new BtrfsKey(256, 144, 5), CreateRootReference(
+                256,
+                3,
+                corruptRootBackReference ? "broken" : "subvol")));
+            rootTreeItems.Add((new BtrfsKey(256, 156, 257), CreateRootReference(256, 3, "nested-subvol")));
+            rootTreeItems.Add((new BtrfsKey(257, 144, 256), CreateRootReference(256, 3, "nested-subvol")));
+            rootTreeItems.Add((new BtrfsKey(5, 156, 258), CreateRootReference(256, 4, "snapshot")));
+            rootTreeItems.Add((new BtrfsKey(258, 144, 5), CreateRootReference(256, 4, "snapshot")));
+            if (defaultSubvolume)
+            {
+                rootTreeItems.Add((new BtrfsKey(6, 84, 0), CreateDirectoryEntries((256, 132, 2, "default"))));
+            }
+        }
+
         var rootTree = CreateLeaf(
             RootTreeLogicalOffset,
             owner: 1,
             fsid,
             chunkUuid,
-            [
-                (new BtrfsKey(5, 132, Generation), CreateRootItem(256, FileSystemTreeLogicalOffset)),
-                (new BtrfsKey(7, 132, Generation), CreateRootItem(0, ChecksumTreeLogicalOffset))
-            ]);
+            rootTreeItems);
         rootTree.CopyTo(disk, PartitionStart + RootTreeLogicalOffset);
 
         var helloBytes = Encoding.UTF8.GetBytes(HelloText);
         var sparseTailBytes = Encoding.UTF8.GetBytes(SparseTail);
         var inlineLzoData = CompressBtrfsLzoZeros(1024, padToSector: false);
         var inlineZstdData = CompressZstdZeros(1024, padToSector: false);
-        var fileSystemTree = CreateLeaf(
-            FileSystemTreeLogicalOffset,
-            owner: 5,
-            fsid,
-            chunkUuid,
-            [
+        var fileSystemTreeItems = new List<(BtrfsKey Key, byte[] Data)>
+        {
                 (new BtrfsKey(256, 1, 0), CreateInode(0, 0x41ed)),
                 (new BtrfsKey(256, 96, 2), CreateDirectoryEntries(
                     (257, 1, 1, "hello.txt"),
@@ -124,8 +157,52 @@ internal static class BtrfsTestImageFactory
                     ramBytes: 128 * 1024)),
                 (new BtrfsKey(266, 1, 0), CreateInode(1024, 0x81a4)),
                 (new BtrfsKey(266, 108, 0), CreateCompressedInlineExtent(inlineZstdData, 1024, compression: 3))
-            ]);
+        };
+        if (includeSubvolumes)
+        {
+            fileSystemTreeItems.Add((new BtrfsKey(256, 96, 3), CreateDirectoryEntries((256, 132, 2, "subvol"))));
+            fileSystemTreeItems.Add((new BtrfsKey(256, 96, 4), CreateDirectoryEntries((258, 132, 2, "snapshot"))));
+        }
+
+        var fileSystemTree = CreateLeaf(
+            FileSystemTreeLogicalOffset,
+            owner: 5,
+            fsid,
+            chunkUuid,
+            fileSystemTreeItems);
         fileSystemTree.CopyTo(disk, PartitionStart + FileSystemTreeLogicalOffset);
+
+        if (includeSubvolumes)
+        {
+            CreateSubvolumeTree(
+                SubvolumeTreeLogicalOffset,
+                owner: 256,
+                fsid,
+                chunkUuid,
+                "subvolume.txt",
+                "inside subvolume\n",
+                nestedSubvolumeId: 257,
+                nestedSubvolumeName: "nested-subvol")
+                .CopyTo(disk, PartitionStart + SubvolumeTreeLogicalOffset);
+            CreateSubvolumeTree(
+                NestedSubvolumeTreeLogicalOffset,
+                owner: 257,
+                fsid,
+                chunkUuid,
+                "nested.txt",
+                "inside nested subvolume\n")
+                .CopyTo(disk, PartitionStart + NestedSubvolumeTreeLogicalOffset);
+            CreateSubvolumeTree(
+                SnapshotTreeLogicalOffset,
+                owner: 258,
+                fsid,
+                chunkUuid,
+                "snapshot.txt",
+                "inside snapshot\n",
+                nestedSubvolumeId: 257,
+                nestedSubvolumeName: "nested-subvol")
+                .CopyTo(disk, PartitionStart + SnapshotTreeLogicalOffset);
+        }
 
         RegularData.CopyTo(disk, PartitionStart + RegularDataLogicalOffset);
         sparseTailBytes.CopyTo(disk, PartitionStart + SparseDataLogicalOffset);
@@ -182,7 +259,11 @@ internal static class BtrfsTestImageFactory
             PartitionStart + RegularDataLogicalOffset);
     }
 
-    private static byte[] CreateSuperblock(int partitionLength, byte[] fsid, byte[] chunk)
+    private static byte[] CreateSuperblock(
+        int partitionLength,
+        byte[] fsid,
+        byte[] chunk,
+        bool defaultSubvolume)
     {
         var superblock = new byte[4096];
         fsid.CopyTo(superblock, 0x20);
@@ -200,7 +281,10 @@ internal static class BtrfsTestImageFactory
         WriteU32(superblock, 0x9c, SectorSize);
         WriteU32(superblock, 0xa0, 17 + chunk.Length);
         WriteU64(superblock, 0xa4, Generation);
-        WriteU64(superblock, 0xbc, 0x5); // MIXED_BACKREF | MIXED_GROUPS
+        WriteU64(
+            superblock,
+            0xbc,
+            defaultSubvolume ? 0x7 : 0x5); // MIXED_BACKREF | DEFAULT_SUBVOL | MIXED_GROUPS
         WriteKey(superblock, 0x32b, new BtrfsKey(256, 228, 0));
         chunk.CopyTo(superblock, 0x32b + 17);
         WriteU32(superblock, 0, ComputeCrc32C(superblock.AsSpan(32)));
@@ -225,14 +309,55 @@ internal static class BtrfsTestImageFactory
         return chunk;
     }
 
-    private static byte[] CreateRootItem(ulong rootDirectoryId, ulong bytenr)
+    private static byte[] CreateRootItem(
+        ulong rootDirectoryId,
+        ulong bytenr,
+        ulong generation = Generation)
     {
         var item = new byte[239];
+        WriteU64(item, 160, generation);
         WriteU64(item, 168, rootDirectoryId);
         WriteU64(item, 176, bytenr);
         WriteU64(item, 184, 1);
         item[238] = 0;
         return item;
+    }
+
+    private static byte[] CreateRootReference(ulong directoryId, ulong sequence, string nameValue)
+    {
+        var name = Encoding.UTF8.GetBytes(nameValue);
+        var item = new byte[18 + name.Length];
+        WriteU64(item, 0, directoryId);
+        WriteU64(item, 8, sequence);
+        WriteU16(item, 16, name.Length);
+        name.CopyTo(item, 18);
+        return item;
+    }
+
+    private static byte[] CreateSubvolumeTree(
+        ulong bytenr,
+        ulong owner,
+        byte[] fsid,
+        byte[] chunkUuid,
+        string fileName,
+        string contents,
+        ulong? nestedSubvolumeId = null,
+        string? nestedSubvolumeName = null)
+    {
+        var contentBytes = Encoding.UTF8.GetBytes(contents);
+        var items = new List<(BtrfsKey Key, byte[] Data)>
+        {
+            (new BtrfsKey(256, 1, 0), CreateInode(0, 0x41ed)),
+            (new BtrfsKey(256, 96, 2), CreateDirectoryEntries((257, 1, 1, fileName))),
+            (new BtrfsKey(257, 1, 0), CreateInode(contentBytes.Length, 0x81a4)),
+            (new BtrfsKey(257, 108, 0), CreateInlineExtent(contentBytes)),
+        };
+        if (nestedSubvolumeId is ulong childId && nestedSubvolumeName is not null)
+        {
+            items.Add((new BtrfsKey(256, 96, 3), CreateDirectoryEntries((childId, 132, 2, nestedSubvolumeName))));
+        }
+
+        return CreateLeaf(bytenr, owner, fsid, chunkUuid, items);
     }
 
     private static byte[] CreateInode(int size, uint mode)

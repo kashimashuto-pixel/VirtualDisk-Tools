@@ -24,14 +24,20 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
     private const ulong RootTreeObjectId = 1;
     private const ulong ChunkTreeObjectId = 3;
     private const ulong FileSystemTreeObjectId = 5;
+    private const ulong RootTreeDirectoryObjectId = 6;
     private const ulong ChecksumTreeObjectId = 7;
+    private const ulong FirstFreeObjectId = 256;
+    private const ulong LastFreeObjectId = unchecked((ulong)-256L);
     private const ulong ExtentChecksumObjectId = unchecked((ulong)-10L);
 
     private const byte InodeItemKey = 1;
+    private const byte DirectoryItemKey = 84;
     private const byte DirectoryIndexKey = 96;
     private const byte ExtentDataKey = 108;
     private const byte ExtentChecksumKey = 128;
     private const byte RootItemKey = 132;
+    private const byte RootBackReferenceKey = 144;
+    private const byte RootReferenceKey = 156;
     private const byte ChunkItemKey = 228;
 
     private const ulong ChunkTypeData = 1UL << 0;
@@ -45,6 +51,7 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
 
     private const ulong SupportedIncompatibilityFlags =
         (1UL << 0)   // MIXED_BACKREF
+        | (1UL << 1) // DEFAULT_SUBVOL
         | (1UL << 2) // MIXED_GROUPS
         | (1UL << 3) // COMPRESS_LZO
         | (1UL << 4) // COMPRESS_ZSTD
@@ -60,9 +67,11 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
     private readonly int _sectorSize;
     private readonly int _nodeSize;
     private readonly List<BtrfsChunk> _chunks = [];
-    private readonly Dictionary<ulong, BtrfsInode> _inodes = [];
-    private readonly Dictionary<ulong, List<BtrfsDirectoryEntry>> _directories = [];
-    private readonly Dictionary<ulong, List<BtrfsFileExtent>> _fileExtents = [];
+    private readonly Dictionary<BtrfsObjectReference, BtrfsInode> _inodes = [];
+    private readonly Dictionary<BtrfsObjectReference, List<BtrfsDirectoryEntry>> _directories = [];
+    private readonly Dictionary<BtrfsObjectReference, List<BtrfsFileExtent>> _fileExtents = [];
+    private readonly Dictionary<ulong, ulong> _rootDirectoryIds = [];
+    private readonly HashSet<BtrfsSubvolumeLink> _subvolumeLinks = [];
     private readonly Dictionary<ulong, uint> _dataChecksums = [];
     private readonly Dictionary<BtrfsCompressedExtentKey, byte[]> _decodedExtentCache = [];
     private readonly object _decodedExtentCacheLock = new();
@@ -83,9 +92,15 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
         _nodeSize = checked((int)EndianUtilities.ReadUInt32Little(superblock, 0x94));
 
         ParseSystemChunkArray(superblock);
+        var superGeneration = EndianUtilities.ReadUInt64Little(superblock, 0x48);
         var chunkTreeRoot = EndianUtilities.ReadUInt64Little(superblock, 0x58);
         var chunkTreeLevel = superblock[0xc7];
-        foreach (var item in ReadTreeItems(chunkTreeRoot, ChunkTreeObjectId, chunkTreeLevel))
+        var chunkTreeGeneration = EndianUtilities.ReadUInt64Little(superblock, 0xa4);
+        foreach (var item in ReadTreeItems(
+            chunkTreeRoot,
+            ChunkTreeObjectId,
+            chunkTreeLevel,
+            chunkTreeGeneration))
         {
             if (item.Key.Type == ChunkItemKey)
             {
@@ -97,21 +112,51 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
 
         var rootTreeRoot = EndianUtilities.ReadUInt64Little(superblock, 0x50);
         var rootTreeLevel = superblock[0xc6];
-        var rootItems = ReadTreeItems(rootTreeRoot, RootTreeObjectId, rootTreeLevel);
+        var rootItems = ReadTreeItems(rootTreeRoot, RootTreeObjectId, rootTreeLevel, superGeneration);
         var fileSystemRoot = ParseTreeRoot(rootItems, FileSystemTreeObjectId, "FS tree");
         var checksumRoot = TryParseTreeRoot(rootItems, ChecksumTreeObjectId);
+        var fileSystemRoots = ParseFileSystemRoots(rootItems, fileSystemRoot);
+        var rootReferences = ParseRootReferences(rootItems, fileSystemRoots);
+        var reachableTreeIds = FindReachableFileSystemTrees(rootReferences);
+        var hasDefaultSubvolumeFeature =
+            (EndianUtilities.ReadUInt64Little(superblock, 0xbc) & (1UL << 1)) != 0;
+        var defaultTreeId = ParseDefaultTreeId(
+            rootItems,
+            reachableTreeIds,
+            hasDefaultSubvolumeFeature);
 
-        var fileSystemItems = ReadTreeItems(fileSystemRoot.Bytenr, FileSystemTreeObjectId, fileSystemRoot.Level);
-        ParseFileSystemTree(fileSystemItems);
-        if (!_inodes.TryGetValue(fileSystemRoot.RootDirectoryId, out var rootInode) || !rootInode.IsDirectory)
+        foreach (var treeId in reachableTreeIds)
         {
-            throw new InvalidDataException("Btrfs FS treeのroot directory inodeが見つかりません。");
+            var treeRoot = fileSystemRoots[treeId];
+            _rootDirectoryIds.Add(treeId, treeRoot.RootDirectoryId);
+            var fileSystemItems = ReadTreeItems(
+                treeRoot.Bytenr,
+                treeId,
+                treeRoot.Level,
+                treeRoot.Generation);
+            ParseFileSystemTree(fileSystemItems, treeId);
+            var rootReference = new BtrfsObjectReference(treeId, treeRoot.RootDirectoryId);
+            if (!_inodes.TryGetValue(rootReference, out var treeRootInode) || !treeRootInode.IsDirectory)
+            {
+                throw new InvalidDataException(
+                    $"Btrfs FS treeのroot directory inodeが見つかりません: tree={treeId}");
+            }
         }
+
+        ValidateRootReferenceDirectoryEntries(rootReferences, reachableTreeIds, fileSystemRoots);
 
         if (checksumRoot is not null)
         {
-            ParseChecksumTree(ReadTreeItems(checksumRoot.Bytenr, ChecksumTreeObjectId, checksumRoot.Level));
+            ParseChecksumTree(ReadTreeItems(
+                checksumRoot.Bytenr,
+                ChecksumTreeObjectId,
+                checksumRoot.Level,
+                checksumRoot.Generation));
         }
+
+        var defaultRoot = fileSystemRoots[defaultTreeId];
+        var defaultRootReference = new BtrfsObjectReference(defaultTreeId, defaultRoot.RootDirectoryId);
+        var rootInode = _inodes[defaultRootReference];
 
         Root = new VfsNode
         {
@@ -119,7 +164,7 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
             IsDirectory = true,
             Attributes = FileAttributes.Directory,
             ModifiedUtc = rootInode.ModifiedUtc,
-            Metadata = new BtrfsNodeReference(fileSystemRoot.RootDirectoryId)
+            Metadata = new BtrfsNodeReference(defaultRootReference)
         };
     }
 
@@ -134,7 +179,7 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
             return Array.Empty<VfsNode>();
         }
 
-        if (!_directories.TryGetValue(nodeReference.InodeNumber, out var entries))
+        if (!_directories.TryGetValue(nodeReference.Object, out var entries))
         {
             return Array.Empty<VfsNode>();
         }
@@ -142,14 +187,48 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
         var nodes = new List<VfsNode>(entries.Count);
         foreach (var entry in entries)
         {
-            if (entry.LocationType != InodeItemKey)
+            BtrfsObjectReference target;
+            if (entry.LocationType == InodeItemKey)
             {
-                throw new NotSupportedException($"Btrfs subvolumeまたは特殊directory entryには未対応です: {entry.Name}");
+                target = new BtrfsObjectReference(nodeReference.Object.TreeId, entry.ObjectId);
+            }
+            else if (entry.LocationType == RootItemKey)
+            {
+                var subvolumeLink = new BtrfsSubvolumeLink(
+                    nodeReference.Object.TreeId,
+                    nodeReference.Object.InodeNumber,
+                    entry.ObjectId,
+                    entry.Sequence,
+                    entry.Name);
+                if (!_subvolumeLinks.Contains(subvolumeLink))
+                {
+                    nodes.Add(new VfsNode
+                    {
+                        Name = entry.Name,
+                        IsDirectory = true,
+                        Attributes = FileAttributes.Directory,
+                        Metadata = new BtrfsSnapshotBoundaryReference()
+                    });
+                    continue;
+                }
+
+                if (entry.FileType != 2 || !_rootDirectoryIds.TryGetValue(entry.ObjectId, out var rootDirectoryId))
+                {
+                    throw new InvalidDataException($"Btrfs subvolume directory entryが不正です: {entry.Name}");
+                }
+
+                target = new BtrfsObjectReference(entry.ObjectId, rootDirectoryId);
+            }
+            else
+            {
+                throw new NotSupportedException($"Btrfs特殊directory entryには未対応です: {entry.Name}");
             }
 
-            if (!_inodes.TryGetValue(entry.InodeNumber, out var inode))
+            if (!_inodes.TryGetValue(target, out var inode))
             {
-                throw new InvalidDataException($"Btrfs directory entryが存在しないinodeを参照しています: {entry.InodeNumber}");
+                throw new InvalidDataException(
+                    $"Btrfs directory entryが存在しないinodeを参照しています: "
+                    + $"tree={target.TreeId}, inode={target.InodeNumber}");
             }
 
             nodes.Add(new VfsNode
@@ -159,7 +238,7 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
                 Size = inode.IsDirectory ? 0 : ToLongSize(inode.Size),
                 ModifiedUtc = inode.ModifiedUtc,
                 Attributes = inode.IsDirectory ? FileAttributes.Directory : FileAttributes.Normal,
-                Metadata = new BtrfsNodeReference(entry.InodeNumber)
+                Metadata = new BtrfsNodeReference(target)
             });
         }
 
@@ -178,9 +257,11 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
             return Array.Empty<byte>();
         }
 
-        if (!_inodes.TryGetValue(nodeReference.InodeNumber, out var inode))
+        if (!_inodes.TryGetValue(nodeReference.Object, out var inode))
         {
-            throw new InvalidDataException($"Btrfs inodeが見つかりません: {nodeReference.InodeNumber}");
+            throw new InvalidDataException(
+                $"Btrfs inodeが見つかりません: "
+                + $"tree={nodeReference.Object.TreeId}, inode={nodeReference.Object.InodeNumber}");
         }
 
         if (!inode.IsRegularFile)
@@ -195,7 +276,7 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
 
         var available = checked((int)Math.Min((ulong)count, inode.Size - (ulong)offset));
         var output = new byte[available];
-        if (!_fileExtents.TryGetValue(nodeReference.InodeNumber, out var extents))
+        if (!_fileExtents.TryGetValue(nodeReference.Object, out var extents))
         {
             return output;
         }
@@ -445,7 +526,11 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
         }
     }
 
-    private List<BtrfsLeafItem> ReadTreeItems(ulong rootBytenr, ulong expectedOwner, byte expectedLevel)
+    private List<BtrfsLeafItem> ReadTreeItems(
+        ulong rootBytenr,
+        ulong expectedOwner,
+        byte expectedLevel,
+        ulong? expectedGeneration = null)
     {
         if (rootBytenr == 0 || expectedLevel > MaximumTreeLevel)
         {
@@ -455,7 +540,7 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
         var items = new List<BtrfsLeafItem>();
         var visited = new HashSet<ulong>();
         var pending = new Stack<BtrfsTreePointer>();
-        pending.Push(new BtrfsTreePointer(rootBytenr, expectedLevel, null));
+        pending.Push(new BtrfsTreePointer(rootBytenr, expectedLevel, expectedGeneration));
         while (pending.Count > 0)
         {
             if (visited.Count >= MaximumTreeBlocks)
@@ -483,10 +568,10 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
             }
 
             var generation = EndianUtilities.ReadUInt64Little(block, 0x50);
-            if (pointer.Generation is ulong expectedGeneration && generation != expectedGeneration)
+            if (pointer.Generation is ulong pointerGeneration && generation != pointerGeneration)
             {
                 throw new InvalidDataException(
-                    $"Btrfs tree block generationが一致しません: expected={expectedGeneration}, actual={generation}");
+                    $"Btrfs tree block generationが一致しません: expected={pointerGeneration}, actual={generation}");
             }
 
             var owner = EndianUtilities.ReadUInt64Little(block, 0x58);
@@ -591,7 +676,7 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
         }
     }
 
-    private void ParseFileSystemTree(IReadOnlyList<BtrfsLeafItem> items)
+    private void ParseFileSystemTree(IReadOnlyList<BtrfsLeafItem> items, ulong treeId)
     {
         foreach (var item in items.Where(item => item.Key.Type == InodeItemKey))
         {
@@ -602,16 +687,18 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
 
             var size = EndianUtilities.ReadUInt64Little(item.Data, 16);
             var mode = EndianUtilities.ReadUInt32Little(item.Data, 52);
-            _inodes.Add(item.Key.ObjectId, new BtrfsInode(item.Key.ObjectId, size, mode, ReadTimestamp(item.Data, 136)));
+            var reference = new BtrfsObjectReference(treeId, item.Key.ObjectId);
+            _inodes.Add(reference, new BtrfsInode(item.Key.ObjectId, size, mode, ReadTimestamp(item.Data, 136)));
         }
 
         foreach (var item in items.Where(item => item.Key.Type == DirectoryIndexKey))
         {
-            var entries = ParseDirectoryEntries(item.Data);
-            if (!_directories.TryGetValue(item.Key.ObjectId, out var directoryEntries))
+            var entries = ParseDirectoryEntries(item.Data, item.Key.Offset);
+            var reference = new BtrfsObjectReference(treeId, item.Key.ObjectId);
+            if (!_directories.TryGetValue(reference, out var directoryEntries))
             {
                 directoryEntries = [];
-                _directories.Add(item.Key.ObjectId, directoryEntries);
+                _directories.Add(reference, directoryEntries);
             }
 
             directoryEntries.AddRange(entries);
@@ -620,10 +707,11 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
         foreach (var item in items.Where(item => item.Key.Type == ExtentDataKey))
         {
             var extent = ParseFileExtent(item);
-            if (!_fileExtents.TryGetValue(item.Key.ObjectId, out var extents))
+            var reference = new BtrfsObjectReference(treeId, item.Key.ObjectId);
+            if (!_fileExtents.TryGetValue(reference, out var extents))
             {
                 extents = [];
-                _fileExtents.Add(item.Key.ObjectId, extents);
+                _fileExtents.Add(reference, extents);
             }
 
             extents.Add(extent);
@@ -638,7 +726,8 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
                 var extent = pair.Value[index];
                 if (index > 0 && extent.FileOffset < previousEnd)
                 {
-                    throw new InvalidDataException($"Btrfs inode {pair.Key}のfile extentが重複しています。");
+                    throw new InvalidDataException(
+                        $"Btrfs tree {pair.Key.TreeId} inode {pair.Key.InodeNumber}のfile extentが重複しています。");
                 }
 
                 previousEnd = checked(extent.FileOffset + extent.Length);
@@ -646,7 +735,7 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
         }
     }
 
-    private static IReadOnlyList<BtrfsDirectoryEntry> ParseDirectoryEntries(byte[] data)
+    private static IReadOnlyList<BtrfsDirectoryEntry> ParseDirectoryEntries(byte[] data, ulong sequence)
     {
         var entries = new List<BtrfsDirectoryEntry>();
         var offset = 0;
@@ -667,26 +756,38 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
                 throw new InvalidDataException("Btrfs directory entryの長さが不正です。");
             }
 
-            string name;
-            try
-            {
-                name = StrictUtf8.GetString(data, offset + 30, nameLength);
-            }
-            catch (DecoderFallbackException ex)
-            {
-                throw new InvalidDataException("Btrfs directory entry名がUTF-8ではありません。", ex);
-            }
+            var name = ReadName(data, offset + 30, nameLength, "Btrfs directory entry");
 
-            if (name is "." or ".." || name.IndexOfAny(['/', '\\', '\0']) >= 0)
-            {
-                throw new InvalidDataException($"Btrfs directory entry名が不正です: {name}");
-            }
-
-            entries.Add(new BtrfsDirectoryEntry(location.ObjectId, location.Type, fileType, name));
+            entries.Add(new BtrfsDirectoryEntry(
+                location.ObjectId,
+                location.Type,
+                fileType,
+                name,
+                sequence));
             offset += totalLength;
         }
 
         return entries;
+    }
+
+    private static string ReadName(byte[] data, int offset, int length, string label)
+    {
+        string name;
+        try
+        {
+            name = StrictUtf8.GetString(data, offset, length);
+        }
+        catch (DecoderFallbackException ex)
+        {
+            throw new InvalidDataException($"{label}名がUTF-8ではありません。", ex);
+        }
+
+        if (name is "." or ".." || name.IndexOfAny(['/', '\\', '\0']) >= 0)
+        {
+            throw new InvalidDataException($"{label}名が不正です: {name}");
+        }
+
+        return name;
     }
 
     private BtrfsFileExtent ParseFileExtent(BtrfsLeafItem item)
@@ -1300,6 +1401,228 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
         throw new InvalidDataException($"Btrfs logical addressに対応するchunkがありません: {logical:N0}");
     }
 
+    private static Dictionary<ulong, BtrfsTreeRoot> ParseFileSystemRoots(
+        IReadOnlyList<BtrfsLeafItem> rootItems,
+        BtrfsTreeRoot fileSystemRoot)
+    {
+        var roots = new Dictionary<ulong, BtrfsTreeRoot>
+        {
+            [FileSystemTreeObjectId] = fileSystemRoot,
+        };
+        var subvolumeIds = rootItems
+            .Where(item => item.Key.Type == RootItemKey
+                && item.Key.ObjectId >= FirstFreeObjectId
+                && item.Key.ObjectId <= LastFreeObjectId)
+            .Select(item => item.Key.ObjectId)
+            .Distinct()
+            .ToArray();
+        foreach (var subvolumeId in subvolumeIds)
+        {
+            var root = ParseTreeRoot(rootItems, subvolumeId, $"subvolume {subvolumeId}");
+            if (root.RootDirectoryId < FirstFreeObjectId || root.Generation == 0)
+            {
+                throw new InvalidDataException($"Btrfs subvolume ROOT_ITEMが不正です: tree={subvolumeId}");
+            }
+
+            roots.Add(subvolumeId, root);
+        }
+
+        return roots;
+    }
+
+    private static IReadOnlyList<BtrfsRootReference> ParseRootReferences(
+        IReadOnlyList<BtrfsLeafItem> rootItems,
+        IReadOnlyDictionary<ulong, BtrfsTreeRoot> roots)
+    {
+        var forwardReferences = rootItems
+            .Where(item => item.Key.Type == RootReferenceKey)
+            .Select(item => ParseRootReference(item, isBackReference: false))
+            .ToArray();
+        var backReferences = rootItems
+            .Where(item => item.Key.Type == RootBackReferenceKey)
+            .Select(item => ParseRootReference(item, isBackReference: true))
+            .ToArray();
+        if (forwardReferences.Length != backReferences.Length
+            || !forwardReferences.ToHashSet().SetEquals(backReferences))
+        {
+            throw new InvalidDataException("Btrfs ROOT_REFとROOT_BACKREFが一致しません。");
+        }
+
+        var parentByChild = new Dictionary<ulong, ulong>();
+        foreach (var reference in forwardReferences)
+        {
+            if (reference.ParentTreeId == reference.ChildTreeId
+                || reference.ChildTreeId == FileSystemTreeObjectId
+                || !roots.ContainsKey(reference.ParentTreeId)
+                || !roots.ContainsKey(reference.ChildTreeId))
+            {
+                throw new InvalidDataException(
+                    $"Btrfs root referenceのtree IDが不正です: "
+                    + $"parent={reference.ParentTreeId}, child={reference.ChildTreeId}");
+            }
+
+            if (!parentByChild.TryAdd(reference.ChildTreeId, reference.ParentTreeId))
+            {
+                throw new InvalidDataException(
+                    $"Btrfs subvolumeが複数の親から参照されています: {reference.ChildTreeId}");
+            }
+        }
+
+        foreach (var child in parentByChild.Keys)
+        {
+            var path = new HashSet<ulong>();
+            var current = child;
+            while (parentByChild.TryGetValue(current, out var parent))
+            {
+                if (!path.Add(current))
+                {
+                    throw new InvalidDataException($"Btrfs root referenceに循環があります: tree={current}");
+                }
+
+                current = parent;
+            }
+        }
+
+        return forwardReferences;
+    }
+
+    private static BtrfsRootReference ParseRootReference(BtrfsLeafItem item, bool isBackReference)
+    {
+        if (item.Data.Length < 18)
+        {
+            throw new InvalidDataException("Btrfs root referenceが短すぎます。");
+        }
+
+        var directoryId = EndianUtilities.ReadUInt64Little(item.Data, 0);
+        var sequence = EndianUtilities.ReadUInt64Little(item.Data, 8);
+        var nameLength = EndianUtilities.ReadUInt16Little(item.Data, 16);
+        if (directoryId < FirstFreeObjectId
+            || sequence < 2
+            || nameLength == 0
+            || nameLength > 255
+            || item.Data.Length != 18 + nameLength)
+        {
+            throw new InvalidDataException("Btrfs root referenceのdirectory情報が不正です。");
+        }
+
+        var name = ReadName(item.Data, 18, nameLength, "Btrfs root reference");
+        return isBackReference
+            ? new BtrfsRootReference(item.Key.Offset, item.Key.ObjectId, directoryId, sequence, name)
+            : new BtrfsRootReference(item.Key.ObjectId, item.Key.Offset, directoryId, sequence, name);
+    }
+
+    private static HashSet<ulong> FindReachableFileSystemTrees(
+        IReadOnlyList<BtrfsRootReference> rootReferences)
+    {
+        var referencesByParent = rootReferences.ToLookup(reference => reference.ParentTreeId);
+        var reachable = new HashSet<ulong> { FileSystemTreeObjectId };
+        var pending = new Queue<ulong>();
+        pending.Enqueue(FileSystemTreeObjectId);
+        while (pending.Count > 0)
+        {
+            var parent = pending.Dequeue();
+            foreach (var reference in referencesByParent[parent])
+            {
+                if (reachable.Add(reference.ChildTreeId))
+                {
+                    pending.Enqueue(reference.ChildTreeId);
+                }
+            }
+        }
+
+        return reachable;
+    }
+
+    private static ulong ParseDefaultTreeId(
+        IReadOnlyList<BtrfsLeafItem> rootItems,
+        IReadOnlySet<ulong> reachableTreeIds,
+        bool hasDefaultSubvolumeFeature)
+    {
+        var defaultEntries = rootItems
+            .Where(item => item.Key.ObjectId == RootTreeDirectoryObjectId
+                && item.Key.Type == DirectoryItemKey)
+            .SelectMany(item => ParseDirectoryEntries(item.Data, sequence: 0))
+            .Where(entry => entry.Name == "default")
+            .ToArray();
+        if (defaultEntries.Length == 0)
+        {
+            if (hasDefaultSubvolumeFeature)
+            {
+                throw new InvalidDataException("Btrfs default subvolumeのdirectory entryがありません。");
+            }
+
+            return FileSystemTreeObjectId;
+        }
+
+        if (defaultEntries.Length != 1)
+        {
+            throw new InvalidDataException("Btrfs default subvolumeのdirectory entryが重複しています。");
+        }
+
+        var entry = defaultEntries[0];
+        if (entry.LocationType != RootItemKey
+            || entry.FileType != 2
+            || !reachableTreeIds.Contains(entry.ObjectId)
+            || (entry.ObjectId != FileSystemTreeObjectId && !hasDefaultSubvolumeFeature))
+        {
+            throw new InvalidDataException(
+                $"Btrfs default subvolumeの参照先が不正です: tree={entry.ObjectId}");
+        }
+
+        return entry.ObjectId;
+    }
+
+    private void ValidateRootReferenceDirectoryEntries(
+        IReadOnlyList<BtrfsRootReference> rootReferences,
+        IReadOnlySet<ulong> reachableTreeIds,
+        IReadOnlyDictionary<ulong, BtrfsTreeRoot> roots)
+    {
+        foreach (var reference in rootReferences.Where(
+            reference => reachableTreeIds.Contains(reference.ParentTreeId)))
+        {
+            _subvolumeLinks.Add(new BtrfsSubvolumeLink(
+                reference.ParentTreeId,
+                reference.DirectoryId,
+                reference.ChildTreeId,
+                reference.Sequence,
+                reference.Name));
+            var directory = new BtrfsObjectReference(reference.ParentTreeId, reference.DirectoryId);
+            if (!_directories.TryGetValue(directory, out var entries)
+                || entries.Count(entry =>
+                    entry.LocationType == RootItemKey
+                    && entry.ObjectId == reference.ChildTreeId
+                    && entry.FileType == 2
+                    && entry.Sequence == reference.Sequence
+                    && entry.Name == reference.Name) != 1)
+            {
+                throw new InvalidDataException(
+                    $"Btrfs root referenceに対応するdirectory entryがありません: "
+                    + $"parent={reference.ParentTreeId}, child={reference.ChildTreeId}, name={reference.Name}");
+            }
+        }
+
+        foreach (var pair in _directories.Where(pair => reachableTreeIds.Contains(pair.Key.TreeId)))
+        {
+            foreach (var entry in pair.Value.Where(entry => entry.LocationType == RootItemKey))
+            {
+                var hasRootReference = _subvolumeLinks.Contains(new BtrfsSubvolumeLink(
+                    pair.Key.TreeId,
+                    pair.Key.InodeNumber,
+                    entry.ObjectId,
+                    entry.Sequence,
+                    entry.Name));
+                if (!hasRootReference
+                    && (!roots[pair.Key.TreeId].IsSnapshot
+                        || entry.FileType != 2
+                        || !roots.ContainsKey(entry.ObjectId)))
+                {
+                    throw new InvalidDataException(
+                        $"Btrfs subvolume directory entryに対応するROOT_REFがありません: {entry.Name}");
+                }
+            }
+        }
+    }
+
     private static BtrfsTreeRoot ParseTreeRoot(
         IReadOnlyList<BtrfsLeafItem> rootItems,
         ulong objectId,
@@ -1325,15 +1648,26 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
             throw new InvalidDataException($"Btrfs ROOT_ITEMが短すぎます: objectid={objectId}");
         }
 
+        var generation = EndianUtilities.ReadUInt64Little(item.Data, 160);
         var rootDirectoryId = EndianUtilities.ReadUInt64Little(item.Data, 168);
         var bytenr = EndianUtilities.ReadUInt64Little(item.Data, 176);
         var level = item.Data[238];
-        if (bytenr == 0 || level > MaximumTreeLevel)
+        if (generation == 0 || bytenr == 0 || level > MaximumTreeLevel)
         {
             throw new InvalidDataException($"Btrfs ROOT_ITEMのtree rootが不正です: objectid={objectId}");
         }
 
-        return new BtrfsTreeRoot(rootDirectoryId, bytenr, level);
+        var isSnapshot = item.Key.Offset != 0;
+        if (item.Data.Length >= 279)
+        {
+            var generationV2 = EndianUtilities.ReadUInt64Little(item.Data, 239);
+            if (generationV2 == generation)
+            {
+                isSnapshot = item.Data.AsSpan(263, 16).IndexOfAnyExcept((byte)0) >= 0;
+            }
+        }
+
+        return new BtrfsTreeRoot(rootDirectoryId, bytenr, level, generation, isSnapshot);
     }
 
     private static DateTime? ReadTimestamp(byte[] data, int offset)
@@ -1393,10 +1727,34 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
     private sealed record BtrfsKey(ulong ObjectId, byte Type, ulong Offset);
     private sealed record BtrfsLeafItem(BtrfsKey Key, byte[] Data);
     private sealed record BtrfsTreePointer(ulong Bytenr, byte Level, ulong? Generation);
-    private sealed record BtrfsTreeRoot(ulong RootDirectoryId, ulong Bytenr, byte Level);
+    private sealed record BtrfsTreeRoot(
+        ulong RootDirectoryId,
+        ulong Bytenr,
+        byte Level,
+        ulong Generation,
+        bool IsSnapshot);
     private sealed record BtrfsChunk(ulong LogicalStart, ulong Length, ulong PhysicalStart, ulong Type);
-    private sealed record BtrfsNodeReference(ulong InodeNumber);
-    private sealed record BtrfsDirectoryEntry(ulong InodeNumber, byte LocationType, byte FileType, string Name);
+    private readonly record struct BtrfsObjectReference(ulong TreeId, ulong InodeNumber);
+    private sealed record BtrfsNodeReference(BtrfsObjectReference Object);
+    private sealed record BtrfsSnapshotBoundaryReference;
+    private sealed record BtrfsDirectoryEntry(
+        ulong ObjectId,
+        byte LocationType,
+        byte FileType,
+        string Name,
+        ulong Sequence);
+    private sealed record BtrfsRootReference(
+        ulong ParentTreeId,
+        ulong ChildTreeId,
+        ulong DirectoryId,
+        ulong Sequence,
+        string Name);
+    private sealed record BtrfsSubvolumeLink(
+        ulong ParentTreeId,
+        ulong DirectoryId,
+        ulong ChildTreeId,
+        ulong Sequence,
+        string Name);
     private readonly record struct BtrfsCompressedExtentKey(
         ulong DiskBytenr,
         ulong DiskBytes,
