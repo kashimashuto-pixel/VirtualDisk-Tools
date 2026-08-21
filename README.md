@@ -18,7 +18,7 @@ C# / Windows Forms で作成した、読み取り専用の仮想ディスク解�
   - XFS（従来形式・bigtimeの更新日時に対応）
   - ext2 / ext3 / ext4
   - SquashFS
-  - BitLocker/FVE はクリアキーの自動解除と48桁回復パスワードによる解除に対応
+  - BitLocker/FVE はクリアキーの自動解除、48桁回復パスワード、通常パスワードによる解除に対応
   - 回復パスワードは8組の6桁ブロックを検証し、VMK/FVEKを解除して内部FSを読み取り
 - LVM2 論理ボリュームの検出と読み取り
   - 通常のlinear構成（LVMメタデータ上は`striped`、`stripe_count = 1`）を読み取り
@@ -181,7 +181,7 @@ ProjFS マウントは Windows の Client-ProjFS 機能を使い、選択した�
 - ext4 の journal replay は行いません。
 - SquashFS はライブラリが対応する圧縮形式のみ読み取れます。
 - Linux md RAID は検出のみです。
-- BitLockerはAES-XTS（128/256）に対応します。TPM単独保護、パスワード保護、スタートアップキー、AES-CBC/Elephant Diffuserは未対応です。
+- BitLockerはAES-XTS（128/256）に対応します。TPM単独保護、スタートアップキー、AES-CBC/Elephant Diffuserは未対応です。
 - BitLocker回復パスワード、VMK、FVEKは設定・ログ・解析レポートへ保存しません。不要になったキー配列は可能な範囲で消去します。
 - NTFSの主 `$MFT` 先頭レコードが破損している場合は `$MFTMirr` から復旧を試みます。ルートレコードなど主MFTの必須データ自体が欠落しているイメージは、元ディスクまたはバックアップからの再取得が必要です。
 - NTFS削除済みファイルはMFTに残っている情報を表示します。削除後に再利用されたクラスタの内容は復旧できません。

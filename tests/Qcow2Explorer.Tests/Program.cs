@@ -81,6 +81,7 @@ static void RunGeneratedImageTests()
     Assert(PhysicalDiskReader.IsPhysicalDiskPath(@"\\.\PhysicalDrive0"), "physical disk path detection");
     Assert(!PhysicalDiskReader.IsPhysicalDiskPath("PhysicalDrive0"), "physical disk path rejection");
     TestBitLockerRecoveryPasswordUnlock();
+    TestBitLockerPasswordUnlock();
     TestXfsTimestampDecoding();
     Test4KnGptParsing();
     TestLvmMetadataDiagnostics();
@@ -426,6 +427,100 @@ static void TestBitLockerRecoveryPasswordUnlock()
     CryptographicOperations.ZeroMemory(intermediateKey);
     CryptographicOperations.ZeroMemory(wrongKey);
     CryptographicOperations.ZeroMemory(stretchedKey);
+}
+
+static void TestBitLockerPasswordUnlock()
+{
+    const string password = "BitLocker test password";
+    const string expectedInitialHash = "8171698DF3AA33249CA29C61FB4CA5CF07A280DF2B5A20619F0E73E2AF211852";
+    const string expectedStretchedKey = "7104933C486DD6531BE09AEE5D3A1BDB64463793F297A4DEA0CD678EF3460C46";
+    Assert(
+        BitLockerPassword.TryDeriveInitialHash(password, out var initialHash, out var passwordError),
+        passwordError);
+    Assert(Convert.ToHexString(initialHash) == expectedInitialHash, "BitLocker UTF-16 password double SHA-256");
+    Assert(
+        !BitLockerPassword.TryDeriveInitialHash(ReadOnlySpan<char>.Empty, out _, out _),
+        "BitLocker empty password rejection");
+
+    var salt = Enumerable.Range(16, BitLockerRecoveryPassword.SaltSize).Select(value => (byte)value).ToArray();
+    var stretchedKey = BitLockerRecoveryPassword.DeriveStretchedKeyFromInitialHash(initialHash, salt);
+    Assert(Convert.ToHexString(stretchedKey) == expectedStretchedKey, "BitLocker password stretch-key derivation");
+    var vmk = Enumerable.Range(0x30, 32).Select(value => (byte)value).ToArray();
+    var fvek = Enumerable.Range(0, 64).Select(value => (byte)(0x80 + value)).ToArray();
+    var plaintext = Enumerable.Range(0, 1536).Select(value => (byte)(value * 19 + 7)).ToArray();
+    var encryptedVolume = EncryptBitLockerXts(plaintext, fvek);
+    var encryptedVmk = new BitLockerMetadataEntry
+    {
+        EntryType = 0x0003,
+        ValueType = 0x0005,
+        Data = EncryptBitLockerAesCcm(stretchedKey, CreateBitLockerKeyData(0x2000, vmk), nonceSeed: 0x41)
+    };
+    var stretchData = new byte[4 + BitLockerRecoveryPassword.SaltSize];
+    BinaryPrimitives.WriteUInt32LittleEndian(stretchData, 0x1000);
+    salt.CopyTo(stretchData, 4);
+    var passwordProtector = new BitLockerKeyProtector
+    {
+        Identifier = Guid.Parse("78ea24df-8ebc-4c12-8464-1f92ea4fc7ca"),
+        ProtectionType = BitLockerProtectionType.Password,
+        RawProtectionType = 0x2000,
+        Properties =
+        [
+            new BitLockerMetadataEntry
+            {
+                EntryType = 0x0003,
+                ValueType = 0x0003,
+                Data = stretchData
+            },
+            encryptedVmk
+        ]
+    };
+    var metadata = new BitLockerMetadata
+    {
+        EncryptedVolumeSize = encryptedVolume.Length,
+        EncryptionMethod = 0x8005,
+        KeyProtectors = [passwordProtector],
+        Entries =
+        [
+            new BitLockerMetadataEntry
+            {
+                EntryType = 0x0003,
+                ValueType = 0x0005,
+                Data = EncryptBitLockerAesCcm(vmk, CreateBitLockerKeyData(0x8005, fvek), nonceSeed: 0x51)
+            }
+        ]
+    };
+    var encryptedReader = new MemorySectorReader(encryptedVolume, 512);
+    Assert(
+        BitLockerUnlock.TryCreateReaderWithPassword(
+            encryptedReader,
+            metadata,
+            password,
+            out var passwordReader,
+            out var unlockError),
+        unlockError);
+    Assert(passwordReader is not null, "BitLocker password reader created");
+    ValidateBitLockerReaderReads(passwordReader!, plaintext, "XTS-AES 256 password unlock");
+    ((IDisposable)passwordReader!).Dispose();
+
+    const string wrongPassword = "wrong BitLocker password";
+    Assert(
+        !BitLockerUnlock.TryCreateReaderWithPassword(
+            encryptedReader,
+            metadata,
+            wrongPassword,
+            out _,
+            out var wrongPasswordError)
+        && !wrongPasswordError.Contains(password, StringComparison.Ordinal)
+        && !wrongPasswordError.Contains(wrongPassword, StringComparison.Ordinal)
+        && !wrongPasswordError.Contains(Convert.ToHexString(initialHash), StringComparison.OrdinalIgnoreCase)
+        && !wrongPasswordError.Contains(Convert.ToHexString(fvek), StringComparison.OrdinalIgnoreCase),
+        "wrong BitLocker password fails without exposing passwords or keys");
+
+    CryptographicOperations.ZeroMemory(initialHash);
+    CryptographicOperations.ZeroMemory(stretchedKey);
+    CryptographicOperations.ZeroMemory(vmk);
+    CryptographicOperations.ZeroMemory(fvek);
+    CryptographicOperations.ZeroMemory(plaintext);
 }
 
 static void TestBitLockerXtsUnlockVariant(

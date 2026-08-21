@@ -226,7 +226,7 @@ public static class FileSystemDetector
 
     public static IReadOnlyFileSystem? TryOpen(IBlockReader disk, PartitionInfo partition, out string error)
     {
-        return TryOpenCore(disk, partition, ReadOnlySpan<byte>.Empty, out error);
+        return TryOpenCore(disk, partition, ReadOnlySpan<byte>.Empty, ReadOnlySpan<char>.Empty, out error);
     }
 
     public static IReadOnlyFileSystem? TryOpen(
@@ -235,13 +235,23 @@ public static class FileSystemDetector
         ReadOnlySpan<byte> recoveryPasswordKey,
         out string error)
     {
-        return TryOpenCore(disk, partition, recoveryPasswordKey, out error);
+        return TryOpenCore(disk, partition, recoveryPasswordKey, ReadOnlySpan<char>.Empty, out error);
+    }
+
+    public static IReadOnlyFileSystem? TryOpenWithBitLockerPassword(
+        IBlockReader disk,
+        PartitionInfo partition,
+        ReadOnlySpan<char> password,
+        out string error)
+    {
+        return TryOpenCore(disk, partition, ReadOnlySpan<byte>.Empty, password, out error);
     }
 
     private static IReadOnlyFileSystem? TryOpenCore(
         IBlockReader disk,
         PartitionInfo partition,
         ReadOnlySpan<byte> recoveryPasswordKey,
+        ReadOnlySpan<char> password,
         out string error)
     {
         error = "";
@@ -274,6 +284,16 @@ public static class FileSystemDetector
                             slice,
                             metadata,
                             recoveryPasswordKey,
+                            out decryptedReader,
+                            out unlockError);
+                    }
+
+                    if (!unlocked && !password.IsEmpty)
+                    {
+                        unlocked = BitLockerUnlock.TryCreateReaderWithPassword(
+                            slice,
+                            metadata,
+                            password,
                             out decryptedReader,
                             out unlockError);
                     }

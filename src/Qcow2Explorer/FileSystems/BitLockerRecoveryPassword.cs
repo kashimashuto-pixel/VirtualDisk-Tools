@@ -110,6 +110,29 @@ public static class BitLockerRecoveryPassword
                 nameof(intermediateKey));
         }
 
+        var initialHash = SHA256.HashData(intermediateKey);
+        try
+        {
+            return DeriveStretchedKeyFromInitialHash(initialHash, salt, cancellationToken);
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(initialHash);
+        }
+    }
+
+    public static byte[] DeriveStretchedKeyFromInitialHash(
+        ReadOnlySpan<byte> initialHash,
+        ReadOnlySpan<byte> salt,
+        CancellationToken cancellationToken = default)
+    {
+        if (initialHash.Length != StretchedKeySize)
+        {
+            throw new ArgumentException(
+                $"BitLocker stretch keyの初期SHA-256は{StretchedKeySize} bytesである必要があります。",
+                nameof(initialHash));
+        }
+
         if (salt.Length != SaltSize)
         {
             throw new ArgumentException(
@@ -121,7 +144,7 @@ public static class BitLockerRecoveryPassword
         var nextHash = new byte[StretchedKeySize];
         try
         {
-            SHA256.HashData(intermediateKey, state.AsSpan(32, 32));
+            initialHash.CopyTo(state.AsSpan(32, StretchedKeySize));
             salt.CopyTo(state.AsSpan(64, SaltSize));
 
             for (var iteration = 0; iteration < StretchIterationCount; iteration++)
