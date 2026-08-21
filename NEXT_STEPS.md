@@ -120,15 +120,17 @@
 - primaryが無効な場合だけ64 MiB／256 GiBのbackup superblockを検証し、同一FSIDの最新世代へ読み取り専用で復旧
 - primary有効時はbackupの世代にかかわらずprimaryを優先し、backup間のFSID・同一世代tree state不一致は拒否
 - primary checksum／magic、backup checksum、全superblock破損、primary優先を合成回帰テストで確認
+- 複数デバイスのsuperblock dev_item、chunk tree DEVICE_ITEM、devid、FSID、device UUID、single profile stripeを相互検証
+- 複数partition readerをdevidで経路選択し、不足device、別FS、重複devid、stripe UUID不一致を安全に拒否
+- メタデータをdevid 1、通常・圧縮data extentをdevid 2へ置いた2デバイス合成fixtureで、reader順序に依存しない読み取りを確認
 
 ## 次回の推奨作業
 
 ### 1. Btrfs対応の第2段階
 
-- 複数デバイスのDEVICE_ITEM、stripe、devidとFSIDを検証し、まずsingle profileの複数デバイス構成を扱う
-- 不足デバイスを具体的に表示し、別FSのデバイスや重複devidを安全に拒否する
 - RAID1は検証済みmirrorから読み取り、checksum不一致時の代替mirror選択を追加する
 - 複数RAWイメージを一組として指定するUIとmanifest形式を設計してから実装する
+- `mkfs.btrfs -m single -d single`の複数loop device由来fixtureを作成し、`btrfs check --readonly`と実イメージ回帰を追加する
 
 ## 保守・品質改善
 
