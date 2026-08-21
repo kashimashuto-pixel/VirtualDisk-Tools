@@ -2140,7 +2140,11 @@ public partial class Form1 : Form
             if (fs is null && TryReadLuks1UnlockMetadata(partition, out var luksMetadata))
             {
                 Cursor = Cursors.Default;
-                while (TryPromptForLuks1Passphrase(luksMetadata, out var passphrase))
+                while (TryPromptForLuksPassphrase(
+                    "LUKS1",
+                    $"暗号方式: {luksMetadata.CipherName}-{luksMetadata.CipherMode}, hash: {luksMetadata.HashSpec}",
+                    luksMetadata.ActiveKeySlots.Select(slot => slot.Index),
+                    out var passphrase))
                 {
                     try
                     {
@@ -2174,6 +2178,64 @@ public partial class Form1 : Form
                 if (fs is null)
                 {
                     _statusLabel.Text = "LUKS1解除をキャンセルしました";
+                    return null;
+                }
+            }
+
+            if (fs is null && TryReadLuks2UnlockMetadata(partition, out var luks2Metadata))
+            {
+                if (luks2Metadata.SupportedKeySlots.Count == 0)
+                {
+                    MessageBox.Show(
+                        this,
+                        $"対応するLUKS2 keyslotがありません。{Environment.NewLine}" +
+                        string.Join(Environment.NewLine, luks2Metadata.UnsupportedKeySlots.Select(
+                            slot => $"keyslot {slot.Index}: {slot.UnsupportedReason}")),
+                        "LUKS2解除未対応",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Information);
+                    return null;
+                }
+
+                Cursor = Cursors.Default;
+                while (TryPromptForLuksPassphrase(
+                    "LUKS2",
+                    $"暗号方式: {luks2Metadata.Segment.Encryption}, sector: {luks2Metadata.Segment.SectorSize} bytes",
+                    luks2Metadata.SupportedKeySlots.Select(slot => slot.Index),
+                    out var passphrase))
+                {
+                    try
+                    {
+                        Cursor = Cursors.WaitCursor;
+                        fs = FileSystemDetector.TryOpenWithLuksPassphrase(_reader, partition, passphrase, out error);
+                    }
+                    finally
+                    {
+                        Array.Clear(passphrase);
+                    }
+
+                    if (fs is not null)
+                    {
+                        break;
+                    }
+
+                    Cursor = Cursors.Default;
+                    var retry = MessageBox.Show(
+                        this,
+                        $"{error}{Environment.NewLine}{Environment.NewLine}パスフレーズを再入力しますか？",
+                        "LUKS2解除失敗",
+                        MessageBoxButtons.RetryCancel,
+                        MessageBoxIcon.Warning);
+                    if (retry != DialogResult.Retry)
+                    {
+                        _statusLabel.Text = "LUKS2解除をキャンセルしました";
+                        return null;
+                    }
+                }
+
+                if (fs is null)
+                {
+                    _statusLabel.Text = "LUKS2解除をキャンセルしました";
                     return null;
                 }
             }
@@ -2228,6 +2290,25 @@ public partial class Form1 : Form
 
         var slice = new PartitionSliceReader(_reader, partition);
         if (!Luks1MetadataReader.TryRead(slice, out var parsed, out _) || parsed is null)
+        {
+            return false;
+        }
+
+        metadata = parsed;
+        return true;
+    }
+
+    private bool TryReadLuks2UnlockMetadata(PartitionInfo partition, out Luks2Metadata metadata)
+    {
+        metadata = null!;
+        if (_reader is null
+            || !partition.FileSystem.Equals("LUKS2", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var slice = new PartitionSliceReader(_reader, partition);
+        if (!Luks2MetadataReader.TryRead(slice, out var parsed, out _) || parsed is null)
         {
             return false;
         }
@@ -2468,13 +2549,17 @@ public partial class Form1 : Form
         return true;
     }
 
-    private bool TryPromptForLuks1Passphrase(Luks1Metadata metadata, out char[] passphrase)
+    private bool TryPromptForLuksPassphrase(
+        string version,
+        string details,
+        IEnumerable<int> keySlots,
+        out char[] passphrase)
     {
         passphrase = Array.Empty<char>();
         char[]? passphraseCharacters = null;
         using var dialog = new Form
         {
-            Text = "LUKS1解除",
+            Text = $"{version}解除",
             ClientSize = new Size(620, 220),
             FormBorderStyle = FormBorderStyle.FixedDialog,
             MaximizeBox = false,
@@ -2487,9 +2572,8 @@ public partial class Form1 : Form
             AutoSize = false,
             Location = new Point(16, 14),
             Size = new Size(588, 62),
-            Text = $"LUKS1パスフレーズを入力してください。暗号方式: {metadata.CipherName}-{metadata.CipherMode}, " +
-                $"hash: {metadata.HashSpec}{Environment.NewLine}" +
-                $"有効key slot: {string.Join(", ", metadata.ActiveKeySlots.Select(slot => slot.Index))}。" +
+            Text = $"{version}パスフレーズを入力してください。{details}{Environment.NewLine}" +
+                $"対応keyslot: {string.Join(", ", keySlots)}。" +
                 "パスフレーズは保存・ログ出力されません。"
         };
         var passphraseBox = new TextBox
@@ -2527,7 +2611,7 @@ public partial class Form1 : Form
             {
                 MessageBox.Show(
                     dialog,
-                    "LUKS1パスフレーズを入力してください。",
+                    $"{version}パスフレーズを入力してください。",
                     "パスフレーズの確認",
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Warning);

@@ -33,7 +33,7 @@ public static class FileSystemDetector
             return EndianUtilities.ReadUInt16Big(boot, 6) switch
             {
                 1 => "LUKS1",
-                2 => "LUKS2 (検出のみ)",
+                2 => "LUKS2",
                 var version => $"LUKS{version} (検出のみ)"
             };
         }
@@ -491,6 +491,84 @@ public static class FileSystemDetector
 
                     partition.FileSystem = $"LUKS1 -> {innerPartition.FileSystem}";
                     var luksFileSystem = new Luks1FileSystem(
+                        innerFileSystem,
+                        decryptedReader,
+                        partition,
+                        innerPartition);
+                    ownershipTransferred = true;
+                    return luksFileSystem;
+                }
+                finally
+                {
+                    if (!ownershipTransferred && decryptedReader is IDisposable disposable)
+                    {
+                        disposable.Dispose();
+                    }
+                }
+            }
+
+            if (string.Equals(detected, "LUKS2", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!Luks2MetadataReader.TryRead(slice, out var metadata, out var metadataError) || metadata is null)
+                {
+                    error = $"LUKS2ボリュームですが、ヘッダーを読めませんでした: {metadataError}";
+                    return null;
+                }
+
+                if (luksPassphrase.IsEmpty)
+                {
+                    error = string.Join(Environment.NewLine, new[]
+                    {
+                        "LUKS2暗号化ボリュームです。",
+                        $"暗号方式: {metadata.Segment.Encryption}",
+                        $"対応keyslot: {string.Join(", ", metadata.SupportedKeySlots.Select(slot => slot.Index))}",
+                        metadata.UnsupportedKeySlots.Count == 0
+                            ? ""
+                            : $"未対応keyslot: {string.Join(", ", metadata.UnsupportedKeySlots.Select(slot => $"{slot.Index} ({slot.UnsupportedReason})"))}",
+                        metadata.SupportedKeySlots.Count == 0
+                            ? "このボリュームにはPBKDF2対応keyslotがありません。"
+                            : "パスフレーズを入力して解除できます。"
+                    }.Where(s => !string.IsNullOrWhiteSpace(s)));
+                    return null;
+                }
+
+                if (!Luks2Unlock.TryCreateReader(
+                    slice,
+                    metadata,
+                    luksPassphrase,
+                    out var decryptedReader,
+                    out var unlockError)
+                    || decryptedReader is null)
+                {
+                    error = unlockError;
+                    return null;
+                }
+
+                var ownershipTransferred = false;
+                try
+                {
+                    var innerPartition = new PartitionInfo
+                    {
+                        Number = partition.Number,
+                        Scheme = "LUKS2",
+                        Name = partition.Name,
+                        Type = partition.Type,
+                        TypeId = partition.TypeId,
+                        StartLba = 0,
+                        SectorCount = checked((ulong)(decryptedReader.Length / 512)),
+                        ReaderOverride = decryptedReader,
+                        LengthOverrideBytes = decryptedReader.Length
+                    };
+                    innerPartition.FileSystem = Detect(decryptedReader, innerPartition);
+                    var innerFileSystem = OpenSupportedFileSystem(decryptedReader, innerPartition, innerPartition.FileSystem);
+                    if (innerFileSystem is null)
+                    {
+                        error = $"LUKS2の解除は成功しましたが、内部ファイルシステムを開けませんでした: {innerPartition.FileSystem}";
+                        return null;
+                    }
+
+                    partition.FileSystem = $"LUKS2 -> {innerPartition.FileSystem}";
+                    var luksFileSystem = new Luks2FileSystem(
                         innerFileSystem,
                         decryptedReader,
                         partition,

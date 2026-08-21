@@ -61,6 +61,15 @@
 - パスフレーズ、key slot派生キー、master keyを保存・ログ出力せず、使用後に一時配列を消去
 - cryptsetup 2.7生成LUKS1 + ext4 fixtureをcryptsetup自身と本アプリの双方で解除して検証
 
+### LUKS2 PBKDF2パスフレーズ対応（第1段階）
+
+- 4096-byte binary header、primary/secondary metadata、sequence ID、SHA-256/SHA-512 checksumを検証
+- JSON metadataの境界、zero padding、keyslot area、digest、単一dynamic crypt segmentを厳格に検証
+- PBKDF2（SHA-1/SHA-256/SHA-512）、標準4000 AF stripes、AES-XTS/plain64の解除に対応
+- primary破損時は検証済みsecondaryへ復旧し、両方が破損している場合は安全に拒否
+- Argon2 keyslotはクラッシュや誤復号をせず、未対応理由を表示
+- cryptsetup 2.7生成LUKS2 + ext4 fixtureをcryptsetup自身と本アプリの双方で解除して検証
+
 ### LZO高速モードのキャッシュ再利用
 
 - 「終了時に削除」「検証済みキャッシュとして保持・再利用」「指定場所へ通常RAWとして保存」を選択可能
@@ -80,12 +89,12 @@
 
 ## 次回の推奨作業
 
-### 1. LUKS2対応の仕様調査と段階実装
+### 1. LUKS2 Argon2id keyslot対応（第2段階）
 
-- cryptsetupの一次仕様と生成fixtureでbinary header、JSON metadata、keyslot area、segmentを検証する
-- まず単一crypt segment、LUKS2 keyslot、PBKDF2またはArgon2id、AES-XTS/plain64を読み取り専用で解除する
-- パスフレーズを設定・ログ・解析レポートへ保存せず、一時配列を使用後に消去する
-- 合成テストとLinux生成fixtureの両方で内部ファイルシステム読み取りを確認する
+- Argon2idの一次仕様と利用可能な.NET実装について、安全性、保守状況、ライセンス、ネイティブ依存を比較する
+- memory、time、cpusの上限を設け、悪意あるmetadataによる過大メモリ確保や長時間処理を拒否する
+- Argon2id専用の合成テストとcryptsetup既定設定のLUKS2 fixtureを追加する
+- 既存PBKDF2 keyslot、secondary header復旧、秘密情報非出力の回帰を維持する
 
 ## 保守・品質改善
 
@@ -99,17 +108,14 @@
 
 利用目的に応じ、次の順で検討します。
 
-1. LUKS2
-   - Linux暗号化パーティションを対象とする
-   - パスフレーズを保存・ログ出力しない
-2. E01/EWF
+1. E01/EWF
    - フォレンジック用途向け
    - 分割セグメント、圧縮、整合性情報、ライセンスと配布方法を事前調査する
-3. Btrfs
+2. Btrfs
    - サブボリューム、圧縮、チェックサム、複数デバイスを段階的に扱う
-4. Linux md RAIDの実読み取り
+3. Linux md RAIDの実読み取り
    - まずRAID1から開始し、その後RAID0/5/6を検討する
-5. LVM2の拡張
+4. LVM2の拡張
    - 複数PV、thin、snapshot、cache、mirror、RAID segmentを段階的に対応する
 
 ## 維持する既存仕様

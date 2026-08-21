@@ -83,6 +83,20 @@ wsl --distribution Ubuntu-24.04 --user root -- sh -lc `
 fixtureを高速に再生成するためPBKDF2の短いiteration targetを使用しており、実運用向けのセキュリティ設定例ではありません。
 ローカルmanifestでは`"luksPassphraseEnvironmentVariable": "VDT_LUKS1_PASSPHRASE"`を指定します。fixture、manifest、パスフレーズをコミットしないでください。
 
+### LUKS2 PBKDF2 AES-XTS
+
+同じWSL環境で、PBKDF2 keyslotを明示したLUKS2 + ext4のRAW fixtureを生成します。
+
+```powershell
+.\tools\New-Luks2RegressionFixture.ps1 `
+  -OutputPath .\.tmp\real-images\luks2-pbkdf2-xts256.raw `
+  -PassphraseEnvironmentVariable VDT_LUKS2_PASSPHRASE
+```
+
+スクリプトは`--type luks2 --pbkdf pbkdf2 --cipher aes-xts-plain64 --key-size 512`を明示し、cryptsetup自身で生成・解除を確認します。
+PBKDF2の短いiteration targetはローカルfixtureを高速に再生成するためのもので、実運用向けのセキュリティ設定例ではありません。
+ローカルmanifestでは`"luksPassphraseEnvironmentVariable": "VDT_LUKS2_PASSPHRASE"`を指定します。fixture、manifest、パスフレーズをコミットしないでください。
+
 ## Manifest例
 
 ```json
@@ -148,5 +162,5 @@ fixtureを高速に再生成するためPBKDF2の短いiteration targetを使用
 
 BitLockerの回復パスワード・通常パスワード・`.BEK`パスはmanifestへ直接書かず、指定した環境変数から実行時だけ読み込みます。
 ランナーは入力イメージのSHA-256を先に照合し、回復キー・パスワード・外部キーを使用後に消去します。
-LUKS1パスフレーズも環境変数から実行時だけ読み込み、使用後に文字配列を消去します。
+LUKS1/LUKS2パスフレーズも環境変数から実行時だけ読み込み、使用後に文字配列を消去します。
 LZOキャッシュcaseでは、初回展開時間と再利用時間を表示し、任意でキャンセル後に部分ファイルが残らないことも確認します。
