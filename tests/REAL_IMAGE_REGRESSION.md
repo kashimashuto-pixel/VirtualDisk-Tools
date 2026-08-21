@@ -48,13 +48,23 @@ BitLocker fixtureの生成は管理者PowerShellで実行します。
   -RecoveryPasswordEnvironmentVariable VDT_BITLOCKER_XTS256_RECOVERY `
   -PasswordEnvironmentVariable VDT_BITLOCKER_XTS256_PASSWORD `
   -FixtureText "BitLocker XTS-AES 256 fixture`n"
+
+.\tools\New-BitLockerRegressionFixture.ps1 `
+  -OutputPath .\.tmp\real-images\bitlocker-startup-xts256.vhdx `
+  -EncryptionMethod XtsAes256 `
+  -RecoveryPasswordEnvironmentVariable VDT_BITLOCKER_STARTUP_RECOVERY `
+  -StartupKeyPathEnvironmentVariable VDT_BITLOCKER_STARTUP_KEY_PATH `
+  -StartupKeyDirectory .\.tmp\real-images\startup-keys `
+  -FixtureText "BitLocker startup-key XTS-AES 256 fixture`n"
 ```
 
 `PasswordEnvironmentVariable`を指定すると、ランダムな通常パスワード保護子も追加し、Windowsでの解除確認後に値を指定したユーザー環境変数へ保存します。
 ローカルmanifestでは回復パスワードの代わりに`"passwordEnvironmentVariable": "VDT_BITLOCKER_XTS256_PASSWORD"`を指定して、通常パスワード経路を検証できます。
+`StartupKeyPathEnvironmentVariable`と`StartupKeyDirectory`を指定すると、Windowsが生成した`.BEK`保護子も追加します。Windows自身で解除確認後、`.BEK`のパスだけを指定したユーザー環境変数へ保存します。
+ローカルmanifestでは`"startupKeyPathEnvironmentVariable": "VDT_BITLOCKER_STARTUP_KEY_PATH"`を指定して、スタートアップキー経路を検証できます。
 
 生成後は`Get-FileHash -Algorithm SHA256`でイメージのハッシュを取得し、ローカルmanifestへ登録します。
-fixture本体、manifest、回復パスワードをコミットしないでください。
+fixture本体、manifest、回復パスワード、通常パスワード、`.BEK`をコミットしないでください。
 
 ## Manifest例
 
@@ -119,6 +129,6 @@ fixture本体、manifest、回復パスワードをコミットしないでく�
 }
 ```
 
-BitLocker回復パスワード自体はmanifestへ書かず、指定した環境変数から実行時だけ読み込みます。
-ランナーは入力イメージのSHA-256を先に照合し、回復キーのバイト配列を使用後に消去します。
+BitLockerの回復パスワード・通常パスワード・`.BEK`パスはmanifestへ直接書かず、指定した環境変数から実行時だけ読み込みます。
+ランナーは入力イメージのSHA-256を先に照合し、回復キー・パスワード・外部キーを使用後に消去します。
 LZOキャッシュcaseでは、初回展開時間と再利用時間を表示し、任意でキャンセル後に部分ファイルが残らないことも確認します。

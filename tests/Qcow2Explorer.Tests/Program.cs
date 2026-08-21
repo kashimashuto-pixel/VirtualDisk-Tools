@@ -82,6 +82,7 @@ static void RunGeneratedImageTests()
     Assert(!PhysicalDiskReader.IsPhysicalDiskPath("PhysicalDrive0"), "physical disk path rejection");
     TestBitLockerRecoveryPasswordUnlock();
     TestBitLockerPasswordUnlock();
+    TestBitLockerStartupKeyUnlock();
     TestXfsTimestampDecoding();
     Test4KnGptParsing();
     TestLvmMetadataDiagnostics();
@@ -521,6 +522,107 @@ static void TestBitLockerPasswordUnlock()
     CryptographicOperations.ZeroMemory(vmk);
     CryptographicOperations.ZeroMemory(fvek);
     CryptographicOperations.ZeroMemory(plaintext);
+}
+
+static void TestBitLockerStartupKeyUnlock()
+{
+    var protectorIdentifier = Guid.Parse("1d2c2e42-054d-4e4d-bc4c-e3e117782a4c");
+    var otherIdentifier = Guid.Parse("fe2e542f-05c5-4ce3-a0bd-38d6126f06e4");
+    var externalKey = Enumerable.Range(0x10, 32).Select(value => (byte)value).ToArray();
+    var vmk = Enumerable.Range(0x40, 32).Select(value => (byte)value).ToArray();
+    var fvek = Enumerable.Range(0, 64).Select(value => (byte)(0x90 + value)).ToArray();
+    var plaintext = Enumerable.Range(0, 1536).Select(value => (byte)(value * 29 + 3)).ToArray();
+    var encryptedVolume = EncryptBitLockerXts(plaintext, fvek);
+    var bek = CreateBitLockerStartupKeyFile(protectorIdentifier, externalKey);
+    Assert(
+        BitLockerStartupKey.TryParse(bek, out var startupKey, out var parseError) && startupKey is not null,
+        parseError);
+    Assert(startupKey!.Identifier == protectorIdentifier, "BitLocker BEK identifier parsing");
+
+    var metadata = new BitLockerMetadata
+    {
+        EncryptedVolumeSize = encryptedVolume.Length,
+        EncryptionMethod = 0x8005,
+        KeyProtectors =
+        [
+            new BitLockerKeyProtector
+            {
+                Identifier = protectorIdentifier,
+                ProtectionType = BitLockerProtectionType.StartupKey,
+                RawProtectionType = 0x0200,
+                Properties =
+                [
+                    new BitLockerMetadataEntry
+                    {
+                        EntryType = 0x0003,
+                        ValueType = 0x0005,
+                        Data = EncryptBitLockerAesCcm(externalKey, CreateBitLockerKeyData(0x2000, vmk), nonceSeed: 0x61)
+                    }
+                ]
+            }
+        ],
+        Entries =
+        [
+            new BitLockerMetadataEntry
+            {
+                EntryType = 0x0003,
+                ValueType = 0x0005,
+                Data = EncryptBitLockerAesCcm(vmk, CreateBitLockerKeyData(0x8005, fvek), nonceSeed: 0x71)
+            }
+        ]
+    };
+    var encryptedReader = new MemorySectorReader(encryptedVolume, 512);
+    Assert(
+        BitLockerUnlock.TryCreateReaderWithStartupKey(
+            encryptedReader,
+            metadata,
+            startupKey,
+            out var decryptedReader,
+            out var unlockError),
+        unlockError);
+    Assert(decryptedReader is not null, "BitLocker startup-key reader created");
+    ValidateBitLockerReaderReads(decryptedReader!, plaintext, "XTS-AES 256 startup-key unlock");
+    ((IDisposable)decryptedReader!).Dispose();
+
+    var otherBek = CreateBitLockerStartupKeyFile(otherIdentifier, externalKey);
+    Assert(BitLockerStartupKey.TryParse(otherBek, out var otherKey, out _), "alternate BitLocker BEK parsing");
+    using (otherKey)
+    {
+        Assert(
+            !BitLockerUnlock.TryCreateReaderWithStartupKey(encryptedReader, metadata, otherKey!, out _, out var mismatchError)
+            && mismatchError.Contains("識別子", StringComparison.Ordinal),
+            "BitLocker BEK identifier mismatch rejection");
+    }
+
+    var wrongKeyBek = bek.ToArray();
+    wrongKeyBek[^1] ^= 0xff;
+    Assert(BitLockerStartupKey.TryParse(wrongKeyBek, out var wrongKey, out _), "alternate BitLocker BEK key parsing");
+    using (wrongKey)
+    {
+        Assert(
+            !BitLockerUnlock.TryCreateReaderWithStartupKey(encryptedReader, metadata, wrongKey!, out _, out var wrongKeyError)
+            && !wrongKeyError.Contains(Convert.ToHexString(externalKey), StringComparison.OrdinalIgnoreCase)
+            && !wrongKeyError.Contains(Convert.ToHexString(fvek), StringComparison.OrdinalIgnoreCase),
+            "wrong BitLocker BEK fails without exposing keys");
+    }
+
+    var invalidSizeCopy = bek.ToArray();
+    invalidSizeCopy[12] ^= 0x01;
+    Assert(
+        !BitLockerStartupKey.TryParse(invalidSizeCopy, out _, out var invalidSizeError)
+        && invalidSizeError.Contains("サイズ", StringComparison.Ordinal),
+        "BitLocker BEK copied-size validation");
+
+    startupKey.Dispose();
+    Assert(startupKey.IsDisposed, "BitLocker BEK key disposal");
+    CryptographicOperations.ZeroMemory(externalKey);
+    CryptographicOperations.ZeroMemory(vmk);
+    CryptographicOperations.ZeroMemory(fvek);
+    CryptographicOperations.ZeroMemory(plaintext);
+    CryptographicOperations.ZeroMemory(bek);
+    CryptographicOperations.ZeroMemory(otherBek);
+    CryptographicOperations.ZeroMemory(wrongKeyBek);
+    CryptographicOperations.ZeroMemory(invalidSizeCopy);
 }
 
 static void TestBitLockerXtsUnlockVariant(
@@ -966,6 +1068,26 @@ static byte[] CreateBitLockerMetadataEntry(ushort entryType, ushort valueType, b
     BinaryPrimitives.WriteUInt16LittleEndian(result.AsSpan(6), 1);
     data.CopyTo(result, 8);
     return result;
+}
+
+static byte[] CreateBitLockerStartupKeyFile(Guid identifier, byte[] externalKey)
+{
+    Assert(externalKey.Length == 32, "BitLocker test BEK key length");
+    var identifierProperty = CreateBitLockerMetadataEntry(0x0019, 0x0017, identifier.ToByteArray());
+    var keyProperty = CreateBitLockerMetadataEntry(0x0000, 0x0001, CreateBitLockerKeyData(0x2002, externalKey));
+    var externalKeyData = new byte[24 + identifierProperty.Length + keyProperty.Length];
+    identifier.ToByteArray().CopyTo(externalKeyData, 0);
+    identifierProperty.CopyTo(externalKeyData, 24);
+    keyProperty.CopyTo(externalKeyData, 24 + identifierProperty.Length);
+    var externalKeyEntry = CreateBitLockerMetadataEntry(0x0006, 0x0009, externalKeyData);
+    var bek = new byte[48 + externalKeyEntry.Length];
+    BinaryPrimitives.WriteUInt32LittleEndian(bek, checked((uint)bek.Length));
+    BinaryPrimitives.WriteUInt32LittleEndian(bek.AsSpan(4), 1);
+    BinaryPrimitives.WriteUInt32LittleEndian(bek.AsSpan(8), 48);
+    BinaryPrimitives.WriteUInt32LittleEndian(bek.AsSpan(12), checked((uint)bek.Length));
+    identifier.ToByteArray().CopyTo(bek, 16);
+    externalKeyEntry.CopyTo(bek, 48);
+    return bek;
 }
 
 static byte[] EncryptBitLockerAesCcm(byte[] key, byte[] plaintext, byte nonceSeed)

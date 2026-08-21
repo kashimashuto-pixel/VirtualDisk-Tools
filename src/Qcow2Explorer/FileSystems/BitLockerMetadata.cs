@@ -25,6 +25,7 @@ public sealed class BitLockerMetadata
     public bool HasClearKeyProtector => KeyProtectors.Any(p => p.ProtectionType == BitLockerProtectionType.ClearKey);
     public bool HasRecoveryPasswordProtector => KeyProtectors.Any(p => p.ProtectionType == BitLockerProtectionType.RecoveryPassword);
     public bool HasPasswordProtector => KeyProtectors.Any(p => p.ProtectionType == BitLockerProtectionType.Password);
+    public bool HasStartupKeyProtector => KeyProtectors.Any(p => p.ProtectionType == BitLockerProtectionType.StartupKey);
 }
 
 public sealed class BitLockerKeyProtector

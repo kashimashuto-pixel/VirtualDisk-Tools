@@ -2089,19 +2089,26 @@ public partial class Form1 : Form
             if (fs is null && TryReadBitLockerUnlockMetadata(partition, out var metadata))
             {
                 Cursor = Cursors.Default;
-                while (TryPromptForBitLockerCredential(metadata, out var recoveryPasswordKey, out var password))
+                while (TryPromptForBitLockerCredential(
+                    metadata,
+                    out var recoveryPasswordKey,
+                    out var password,
+                    out var startupKey))
                 {
                     try
                     {
                         Cursor = Cursors.WaitCursor;
                         fs = recoveryPasswordKey.Length > 0
                             ? FileSystemDetector.TryOpen(_reader, partition, recoveryPasswordKey, out error)
-                            : FileSystemDetector.TryOpenWithBitLockerPassword(_reader, partition, password, out error);
+                            : password.Length > 0
+                                ? FileSystemDetector.TryOpenWithBitLockerPassword(_reader, partition, password, out error)
+                                : FileSystemDetector.TryOpenWithBitLockerStartupKey(_reader, partition, startupKey!, out error);
                     }
                     finally
                     {
                         CryptographicOperations.ZeroMemory(recoveryPasswordKey);
                         Array.Clear(password);
+                        startupKey?.Dispose();
                     }
 
                     if (fs is not null)
@@ -2158,7 +2165,9 @@ public partial class Form1 : Form
         var slice = new PartitionSliceReader(_reader, partition);
         if (!BitLockerMetadataReader.TryRead(slice, out var parsed, out _)
             || parsed is null
-            || (!parsed.HasRecoveryPasswordProtector && !parsed.HasPasswordProtector))
+            || (!parsed.HasRecoveryPasswordProtector
+                && !parsed.HasPasswordProtector
+                && !parsed.HasStartupKeyProtector))
         {
             return false;
         }
@@ -2170,12 +2179,15 @@ public partial class Form1 : Form
     private bool TryPromptForBitLockerCredential(
         BitLockerMetadata metadata,
         out byte[] recoveryPasswordKey,
-        out char[] password)
+        out char[] password,
+        out BitLockerStartupKey? startupKey)
     {
         recoveryPasswordKey = Array.Empty<byte>();
         password = Array.Empty<char>();
+        startupKey = null;
         byte[]? decodedKey = null;
         char[]? passwordCharacters = null;
+        BitLockerStartupKey? selectedStartupKey = null;
 
         using var dialog = new Form
         {
@@ -2211,6 +2223,10 @@ public partial class Form1 : Form
         {
             credentialType.Items.Add("BitLockerパスワード");
         }
+        if (metadata.HasStartupKeyProtector)
+        {
+            credentialType.Items.Add("スタートアップキー (.BEK)");
+        }
         credentialType.SelectedIndex = 0;
         var passwordBox = new TextBox
         {
@@ -2218,6 +2234,20 @@ public partial class Form1 : Form
             Size = new Size(588, 27),
             UseSystemPasswordChar = true,
             MaxLength = 96
+        };
+        var startupKeyPath = new TextBox
+        {
+            Location = new Point(16, 120),
+            Size = new Size(484, 27),
+            ReadOnly = true,
+            Visible = false
+        };
+        var browseStartupKey = new Button
+        {
+            Location = new Point(508, 119),
+            Size = new Size(96, 29),
+            Text = "参照...",
+            Visible = false
         };
         var showPassword = new CheckBox
         {
@@ -2240,24 +2270,79 @@ public partial class Form1 : Form
         };
 
         bool UsesRecoveryPassword() => credentialType.SelectedItem?.ToString()?.StartsWith("48", StringComparison.Ordinal) == true;
+        bool UsesStartupKey() => credentialType.SelectedItem?.ToString()?.StartsWith("スタートアップ", StringComparison.Ordinal) == true;
         void UpdateCredentialExplanation()
         {
             var recovery = UsesRecoveryPassword();
+            var external = UsesStartupKey();
             explanation.Text = recovery
                 ? $"このボリュームはBitLockerで保護されています。48桁の回復パスワードを入力してください。{Environment.NewLine}" +
                     $"形式: 000000-000000-000000-000000-000000-000000-000000-000000{Environment.NewLine}" +
                     $"回復キーID: {string.Join(", ", recoveryProtectorIds)}"
-                : $"このボリュームはBitLockerで保護されています。設定したBitLockerパスワードを入力してください。{Environment.NewLine}" +
-                    "パスワードは保存・ログ出力されません。";
+                : external
+                    ? $"このボリュームに対応するBitLockerスタートアップキー（.BEK）を選択してください。{Environment.NewLine}" +
+                        "キーデータは解除中のみ保持し、保存・ログ出力しません。"
+                    : $"このボリュームはBitLockerで保護されています。設定したBitLockerパスワードを入力してください。{Environment.NewLine}" +
+                        "パスワードは保存・ログ出力されません。";
             passwordBox.MaxLength = recovery ? 96 : short.MaxValue;
             passwordBox.Clear();
+            passwordBox.Visible = !external;
+            showPassword.Visible = !external;
+            startupKeyPath.Visible = external;
+            browseStartupKey.Visible = external;
+            if (external)
+            {
+                startupKeyPath.Focus();
+            }
         }
 
         credentialType.SelectedIndexChanged += (_, _) => UpdateCredentialExplanation();
         showPassword.CheckedChanged += (_, _) => passwordBox.UseSystemPasswordChar = !showPassword.Checked;
+        browseStartupKey.Click += (_, _) =>
+        {
+            using var picker = new OpenFileDialog
+            {
+                Title = "BitLockerスタートアップキーを選択",
+                Filter = "BitLocker startup key (*.bek)|*.bek|すべてのファイル (*.*)|*.*",
+                CheckFileExists = true,
+                Multiselect = false
+            };
+            if (picker.ShowDialog(dialog) == DialogResult.OK)
+            {
+                startupKeyPath.Text = picker.FileName;
+            }
+        };
         okButton.Click += (_, _) =>
         {
-            if (UsesRecoveryPassword())
+            if (UsesStartupKey())
+            {
+                if (!BitLockerStartupKey.TryRead(startupKeyPath.Text, out var candidate, out var validationError)
+                    || candidate is null)
+                {
+                    MessageBox.Show(dialog, validationError, "スタートアップキーの確認", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    browseStartupKey.Focus();
+                    return;
+                }
+
+                if (!metadata.KeyProtectors.Any(protector =>
+                    protector.ProtectionType == BitLockerProtectionType.StartupKey
+                    && protector.Identifier == candidate.Identifier))
+                {
+                    candidate.Dispose();
+                    MessageBox.Show(
+                        dialog,
+                        "選択したスタートアップキーの識別子は、このボリュームの保護子と一致しません。",
+                        "スタートアップキーの確認",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Warning);
+                    browseStartupKey.Focus();
+                    return;
+                }
+
+                selectedStartupKey?.Dispose();
+                selectedStartupKey = candidate;
+            }
+            else if (UsesRecoveryPassword())
             {
                 if (!BitLockerRecoveryPassword.TryDecode(passwordBox.Text, out var candidate, out var validationError))
                 {
@@ -2286,13 +2371,23 @@ public partial class Form1 : Form
             dialog.Close();
         };
         dialog.FormClosed += (_, _) => passwordBox.Clear();
-        dialog.Controls.AddRange([explanation, credentialType, passwordBox, showPassword, okButton, cancelButton]);
+        dialog.Controls.AddRange([
+            explanation,
+            credentialType,
+            passwordBox,
+            startupKeyPath,
+            browseStartupKey,
+            showPassword,
+            okButton,
+            cancelButton
+        ]);
         dialog.AcceptButton = okButton;
         dialog.CancelButton = cancelButton;
         dialog.Shown += (_, _) => passwordBox.Focus();
         UpdateCredentialExplanation();
 
-        if (dialog.ShowDialog(this) != DialogResult.OK || decodedKey is null && passwordCharacters is null)
+        if (dialog.ShowDialog(this) != DialogResult.OK
+            || decodedKey is null && passwordCharacters is null && selectedStartupKey is null)
         {
             if (decodedKey is not null)
             {
@@ -2302,12 +2397,14 @@ public partial class Form1 : Form
             {
                 Array.Clear(passwordCharacters);
             }
+            selectedStartupKey?.Dispose();
 
             return false;
         }
 
         recoveryPasswordKey = decodedKey ?? Array.Empty<byte>();
         password = passwordCharacters ?? Array.Empty<char>();
+        startupKey = selectedStartupKey;
         return true;
     }
 

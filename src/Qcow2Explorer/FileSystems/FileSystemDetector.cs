@@ -226,7 +226,7 @@ public static class FileSystemDetector
 
     public static IReadOnlyFileSystem? TryOpen(IBlockReader disk, PartitionInfo partition, out string error)
     {
-        return TryOpenCore(disk, partition, ReadOnlySpan<byte>.Empty, ReadOnlySpan<char>.Empty, out error);
+        return TryOpenCore(disk, partition, ReadOnlySpan<byte>.Empty, ReadOnlySpan<char>.Empty, null, out error);
     }
 
     public static IReadOnlyFileSystem? TryOpen(
@@ -235,7 +235,7 @@ public static class FileSystemDetector
         ReadOnlySpan<byte> recoveryPasswordKey,
         out string error)
     {
-        return TryOpenCore(disk, partition, recoveryPasswordKey, ReadOnlySpan<char>.Empty, out error);
+        return TryOpenCore(disk, partition, recoveryPasswordKey, ReadOnlySpan<char>.Empty, null, out error);
     }
 
     public static IReadOnlyFileSystem? TryOpenWithBitLockerPassword(
@@ -244,7 +244,17 @@ public static class FileSystemDetector
         ReadOnlySpan<char> password,
         out string error)
     {
-        return TryOpenCore(disk, partition, ReadOnlySpan<byte>.Empty, password, out error);
+        return TryOpenCore(disk, partition, ReadOnlySpan<byte>.Empty, password, null, out error);
+    }
+
+    public static IReadOnlyFileSystem? TryOpenWithBitLockerStartupKey(
+        IBlockReader disk,
+        PartitionInfo partition,
+        BitLockerStartupKey startupKey,
+        out string error)
+    {
+        ArgumentNullException.ThrowIfNull(startupKey);
+        return TryOpenCore(disk, partition, ReadOnlySpan<byte>.Empty, ReadOnlySpan<char>.Empty, startupKey, out error);
     }
 
     private static IReadOnlyFileSystem? TryOpenCore(
@@ -252,6 +262,7 @@ public static class FileSystemDetector
         PartitionInfo partition,
         ReadOnlySpan<byte> recoveryPasswordKey,
         ReadOnlySpan<char> password,
+        BitLockerStartupKey? startupKey,
         out string error)
     {
         error = "";
@@ -294,6 +305,16 @@ public static class FileSystemDetector
                             slice,
                             metadata,
                             password,
+                            out decryptedReader,
+                            out unlockError);
+                    }
+
+                    if (!unlocked && startupKey is not null)
+                    {
+                        unlocked = BitLockerUnlock.TryCreateReaderWithStartupKey(
+                            slice,
+                            metadata,
+                            startupKey,
                             out decryptedReader,
                             out unlockError);
                     }
