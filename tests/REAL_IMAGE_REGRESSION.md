@@ -46,8 +46,12 @@ BitLocker fixtureの生成は管理者PowerShellで実行します。
   -OutputPath .\.tmp\real-images\bitlocker-xts256.vhdx `
   -EncryptionMethod XtsAes256 `
   -RecoveryPasswordEnvironmentVariable VDT_BITLOCKER_XTS256_RECOVERY `
+  -PasswordEnvironmentVariable VDT_BITLOCKER_XTS256_PASSWORD `
   -FixtureText "BitLocker XTS-AES 256 fixture`n"
 ```
+
+`PasswordEnvironmentVariable`を指定すると、ランダムな通常パスワード保護子も追加し、Windowsでの解除確認後に値を指定したユーザー環境変数へ保存します。
+ローカルmanifestでは回復パスワードの代わりに`"passwordEnvironmentVariable": "VDT_BITLOCKER_XTS256_PASSWORD"`を指定して、通常パスワード経路を検証できます。
 
 生成後は`Get-FileHash -Algorithm SHA256`でイメージのハッシュを取得し、ローカルmanifestへ登録します。
 fixture本体、manifest、回復パスワードをコミットしないでください。
