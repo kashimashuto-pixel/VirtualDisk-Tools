@@ -400,6 +400,101 @@ internal static class BtrfsTestImageFactory
         return new BtrfsMultiDeviceTestFixture(firstPath, secondPath);
     }
 
+    public static BtrfsMultiDeviceTestFixture CreateRaid1(
+        string firstPath,
+        string secondPath,
+        bool corruptFirstDataMirror = false,
+        bool corruptSecondDataMirror = false,
+        bool corruptFirstMetadataMirror = false,
+        bool corruptSecondMetadataMirror = false,
+        bool duplicateStripeDevice = false)
+    {
+        _ = Create(firstPath);
+        var firstDisk = File.ReadAllBytes(firstPath);
+        var partitionLength = DiskSize - PartitionStart;
+        var fileSystemLength = checked(partitionLength * 2);
+        var fsid = Guid.Parse("8e0a61a3-fbcb-4a76-b16e-777579eecdc6").ToByteArray();
+        var chunkUuid = Guid.Parse("f61c47e6-f8c5-44d8-971c-d48e90f5a325").ToByteArray();
+        var firstDeviceUuid = Guid.Parse("56ca9a70-b88c-4ba2-855a-e2ac5bec938c").ToByteArray();
+        var secondDeviceUuid = Guid.Parse("1bf62a80-1b07-451c-9f20-d51717f2ecb3").ToByteArray();
+        var stripes = new[]
+        {
+            new BtrfsTestStripe(1, 0, firstDeviceUuid),
+            duplicateStripeDevice
+                ? new BtrfsTestStripe(1, 0, firstDeviceUuid)
+                : new BtrfsTestStripe(2, 0, secondDeviceUuid),
+        };
+        var metadataChunk = CreateChunk(
+            RegularDataLogicalOffset,
+            stripes,
+            type: 0x16); // SYSTEM | METADATA | RAID1
+        var dataChunk = CreateChunk(
+            4 * 1024 * 1024,
+            stripes.Select(stripe => stripe with { PhysicalStart = RegularDataLogicalOffset }).ToArray(),
+            type: 0x11); // DATA | RAID1
+        var firstDeviceItem = CreateDeviceItem(1, partitionLength, firstDeviceUuid, fsid);
+        var secondDeviceItem = CreateDeviceItem(2, partitionLength, secondDeviceUuid, fsid);
+        var chunkTree = CreateLeaf(
+            ChunkTreeLogicalOffset,
+            owner: 3,
+            fsid,
+            chunkUuid,
+            [
+                (new BtrfsKey(1, 216, 1), firstDeviceItem),
+                (new BtrfsKey(1, 216, 2), secondDeviceItem),
+                (new BtrfsKey(256, 228, 0), metadataChunk),
+                (new BtrfsKey(256, 228, RegularDataLogicalOffset), dataChunk),
+            ]);
+        chunkTree.CopyTo(firstDisk, PartitionStart + ChunkTreeLogicalOffset);
+
+        var firstSuperblock = CreateSuperblock(
+            fileSystemLength,
+            partitionLength,
+            numberOfDevices: 2,
+            deviceId: 1,
+            fsid,
+            firstDeviceUuid,
+            metadataChunk,
+            defaultSubvolume: false);
+        firstSuperblock.CopyTo(firstDisk, PartitionStart + SuperblockLogicalOffset);
+
+        var secondDisk = firstDisk.ToArray();
+        var secondSuperblock = CreateSuperblock(
+            fileSystemLength,
+            partitionLength,
+            numberOfDevices: 2,
+            deviceId: 2,
+            fsid,
+            secondDeviceUuid,
+            metadataChunk,
+            defaultSubvolume: false);
+        secondSuperblock.CopyTo(secondDisk, PartitionStart + SuperblockLogicalOffset);
+
+        if (corruptFirstDataMirror)
+        {
+            firstDisk[PartitionStart + RegularDataLogicalOffset + 17] ^= 1;
+        }
+
+        if (corruptSecondDataMirror)
+        {
+            secondDisk[PartitionStart + RegularDataLogicalOffset + 17] ^= 1;
+        }
+
+        if (corruptFirstMetadataMirror)
+        {
+            firstDisk[PartitionStart + FileSystemTreeLogicalOffset + 0x200] ^= 1;
+        }
+
+        if (corruptSecondMetadataMirror)
+        {
+            secondDisk[PartitionStart + FileSystemTreeLogicalOffset + 0x200] ^= 1;
+        }
+
+        File.WriteAllBytes(firstPath, firstDisk);
+        File.WriteAllBytes(secondPath, secondDisk);
+        return new BtrfsMultiDeviceTestFixture(firstPath, secondPath);
+    }
+
     private static byte[] CreateSuperblock(
         int fileSystemLength,
         int deviceLength,
@@ -444,7 +539,18 @@ internal static class BtrfsTestImageFactory
         ulong physicalStart = 0,
         ulong type = 0x7)
     {
-        var chunk = new byte[80];
+        return CreateChunk(
+            chunkLength,
+            [new BtrfsTestStripe(deviceId, physicalStart, deviceUuid)],
+            type);
+    }
+
+    private static byte[] CreateChunk(
+        int chunkLength,
+        IReadOnlyList<BtrfsTestStripe> stripes,
+        ulong type)
+    {
+        var chunk = new byte[48 + stripes.Count * 32];
         WriteU64(chunk, 0, chunkLength);
         WriteU64(chunk, 8, 2);
         WriteU64(chunk, 16, 64 * 1024);
@@ -452,11 +558,17 @@ internal static class BtrfsTestImageFactory
         WriteU32(chunk, 32, SectorSize);
         WriteU32(chunk, 36, SectorSize);
         WriteU32(chunk, 40, SectorSize);
-        WriteU16(chunk, 44, 1);
+        WriteU16(chunk, 44, stripes.Count);
         WriteU16(chunk, 46, 1);
-        WriteU64(chunk, 48, deviceId);
-        WriteU64(chunk, 56, physicalStart);
-        deviceUuid.CopyTo(chunk, 64);
+        for (var index = 0; index < stripes.Count; index++)
+        {
+            var stripe = stripes[index];
+            var offset = 48 + index * 32;
+            WriteU64(chunk, offset, stripe.DeviceId);
+            WriteU64(chunk, offset + 8, stripe.PhysicalStart);
+            stripe.DeviceUuid.CopyTo(chunk, offset + 16);
+        }
+
         return chunk;
     }
 
@@ -785,6 +897,7 @@ internal static class BtrfsTestImageFactory
         BinaryPrimitives.WriteInt64LittleEndian(data.AsSpan(offset, sizeof(long)), value);
 
     private sealed record BtrfsKey(ulong ObjectId, byte Type, ulong Offset);
+    private sealed record BtrfsTestStripe(ulong DeviceId, ulong PhysicalStart, byte[] DeviceUuid);
 }
 
 internal sealed record BtrfsTestFixture(

@@ -1,6 +1,6 @@
 # 次回対応予定
 
-- 最終更新: 2026-08-21
+- 最終更新: 2026-08-25
 - 基準ブランチ: `main`
 
 この文書は、次回の開発作業へ引き継ぐための優先順位付きロードマップです。
@@ -123,14 +123,17 @@
 - 複数デバイスのsuperblock dev_item、chunk tree DEVICE_ITEM、devid、FSID、device UUID、single profile stripeを相互検証
 - 複数partition readerをdevidで経路選択し、不足device、別FS、重複devid、stripe UUID不一致を安全に拒否
 - メタデータをdevid 1、通常・圧縮data extentをdevid 2へ置いた2デバイス合成fixtureで、reader順序に依存しない読み取りを確認
+- 2-copy RAID1 chunkの2 stripeを異なるdeviceとして検証し、論理アドレスを各mirrorへ読み取り専用で写像
+- metadata tree blockはCRC32Cとheader、data sectorはchecksum treeのCRC32Cをmirrorごとに検証し、片系不一致時は健全なmirrorへ切替
+- RAID1の片系metadata/data破損からの復旧、両系破損、同一deviceの重複stripeを2デバイス合成fixtureで回帰確認
 
 ## 次回の推奨作業
 
 ### 1. Btrfs対応の第2段階
 
-- RAID1は検証済みmirrorから読み取り、checksum不一致時の代替mirror選択を追加する
 - 複数RAWイメージを一組として指定するUIとmanifest形式を設計してから実装する
-- `mkfs.btrfs -m single -d single`の複数loop device由来fixtureを作成し、`btrfs check --readonly`と実イメージ回帰を追加する
+- `mkfs.btrfs -m single -d single`および`-m raid1 -d raid1`の複数loop device由来fixtureを作成し、`btrfs check --readonly`と実イメージ回帰を追加する
+- 複数イメージ指定と実fixture回帰の後、RAID1 degraded読取、RAID1C3／RAID1C4、RAID10を順に検討する
 
 ## 保守・品質改善
 

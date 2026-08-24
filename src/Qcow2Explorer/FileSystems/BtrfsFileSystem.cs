@@ -45,6 +45,7 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
     private const ulong ChunkTypeData = 1UL << 0;
     private const ulong ChunkTypeSystem = 1UL << 1;
     private const ulong ChunkTypeMetadata = 1UL << 2;
+    private const ulong ChunkProfileRaid1 = 1UL << 4;
     private const ulong ChunkProfileMask = 0x7f8;
 
     private const uint DirectoryMode = 0x4000;
@@ -651,11 +652,26 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
             throw new InvalidDataException($"Btrfs chunk allocation typeが不正です: 0x{type:X}");
         }
 
-        if ((type & ChunkProfileMask) != 0 || stripeCount != 1 || subStripeCount != 1)
+        var profile = type & ChunkProfileMask;
+        var expectedStripeCount = profile switch
+        {
+            0 => 1,
+            ChunkProfileRaid1 => 2,
+            _ => 0,
+        };
+        if (expectedStripeCount == 0)
         {
             throw new NotSupportedException(
-                $"Btrfsは現在single profileだけに対応しています: "
+                $"未対応のBtrfs chunk profileです: "
                 + $"type=0x{type:X}, stripes={stripeCount}, sub_stripes={subStripeCount}");
+        }
+
+        if (stripeCount != expectedStripeCount || subStripeCount != 1)
+        {
+            var profileName = profile == ChunkProfileRaid1 ? "RAID1" : "single";
+            throw new InvalidDataException(
+                $"Btrfs {profileName} chunkのstripe数が不正です: "
+                + $"stripes={stripeCount}, sub_stripes={subStripeCount}");
         }
 
         if (data.Length != 48 + stripeCount * 32)
@@ -663,31 +679,51 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
             throw new InvalidDataException("Btrfs chunk item sizeがstripe数と一致しません。");
         }
 
-        var deviceId = EndianUtilities.ReadUInt64Little(data, 48);
-        var physicalStart = EndianUtilities.ReadUInt64Little(data, 56);
-        if (!_devices.TryGetValue(deviceId, out var device))
-        {
-            throw new InvalidDataException(
-                $"Btrfs chunkが参照するdeviceが不足しています: devid={deviceId}");
-        }
-
-        if (!data.AsSpan(64, 16).SequenceEqual(device.Uuid))
-        {
-            throw new InvalidDataException(
-                $"Btrfs chunk stripeのdevice UUIDが一致しません: devid={deviceId}");
-        }
-
         if (sectorSize != (uint)_sectorSize
             || logicalStart % (ulong)_sectorSize != 0
-            || physicalStart % (ulong)_sectorSize != 0
-            || length % (ulong)_sectorSize != 0)
+            || length % (ulong)_sectorSize != 0
+            || stripeLength % (ulong)_sectorSize != 0)
         {
             throw new InvalidDataException(
                 $"Btrfs chunkのsector sizeまたはalignmentが不正です: sector={sectorSize}, "
-                + $"logical={logicalStart}, physical={physicalStart}, length={length}");
+                + $"logical={logicalStart}, length={length}, stripe_length={stripeLength}");
         }
 
-        return new BtrfsChunk(logicalStart, length, deviceId, physicalStart, type);
+        var stripes = new BtrfsStripe[stripeCount];
+        for (var index = 0; index < stripeCount; index++)
+        {
+            var stripeOffset = 48 + index * 32;
+            var deviceId = EndianUtilities.ReadUInt64Little(data, stripeOffset);
+            var physicalStart = EndianUtilities.ReadUInt64Little(data, stripeOffset + 8);
+            if (!_devices.TryGetValue(deviceId, out var device))
+            {
+                throw new InvalidDataException(
+                    $"Btrfs chunkが参照するdeviceが不足しています: devid={deviceId}");
+            }
+
+            if (!data.AsSpan(stripeOffset + 16, 16).SequenceEqual(device.Uuid))
+            {
+                throw new InvalidDataException(
+                    $"Btrfs chunk stripeのdevice UUIDが一致しません: devid={deviceId}");
+            }
+
+            if (physicalStart % (ulong)_sectorSize != 0)
+            {
+                throw new InvalidDataException(
+                    $"Btrfs chunk stripeの物理位置がsector境界に揃っていません: "
+                    + $"devid={deviceId}, physical={physicalStart}");
+            }
+
+            stripes[index] = new BtrfsStripe(deviceId, physicalStart);
+        }
+
+        if (profile == ChunkProfileRaid1
+            && stripes.Select(stripe => stripe.DeviceId).Distinct().Count() != stripes.Length)
+        {
+            throw new InvalidDataException("Btrfs RAID1 chunkのstripeが異なるdeviceを参照していません。");
+        }
+
+        return new BtrfsChunk(logicalStart, length, type, stripes);
     }
 
     private BtrfsDeviceItem ParseDeviceItem(BtrfsLeafItem item)
@@ -800,7 +836,7 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
         var existing = _chunks.FirstOrDefault(item => item.LogicalStart == chunk.LogicalStart);
         if (existing is not null)
         {
-            if (existing != chunk)
+            if (!HaveMatchingChunkMapping(existing, chunk))
             {
                 throw new InvalidDataException($"Btrfs chunk mappingが競合しています: {chunk.LogicalStart:N0}");
             }
@@ -811,6 +847,14 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
         _chunks.Add(chunk);
     }
 
+    private static bool HaveMatchingChunkMapping(BtrfsChunk left, BtrfsChunk right)
+    {
+        return left.LogicalStart == right.LogicalStart
+            && left.Length == right.Length
+            && left.Type == right.Type
+            && left.Stripes.SequenceEqual(right.Stripes);
+    }
+
     private void ValidateChunkMappings()
     {
         _chunks.Sort((left, right) => left.LogicalStart.CompareTo(right.LogicalStart));
@@ -818,13 +862,16 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
         {
             var chunk = _chunks[index];
             var logicalEnd = checked(chunk.LogicalStart + chunk.Length);
-            var physicalEnd = checked(chunk.PhysicalStart + chunk.Length);
-            var device = _devices[chunk.DeviceId];
-            if (physicalEnd > (ulong)device.Reader.Length || physicalEnd > device.TotalBytes)
+            foreach (var stripe in chunk.Stripes)
             {
-                throw new InvalidDataException(
-                    $"Btrfs chunkの物理範囲がdevice外です: "
-                    + $"devid={chunk.DeviceId}, end={physicalEnd:N0}");
+                var physicalEnd = checked(stripe.PhysicalStart + chunk.Length);
+                var device = _devices[stripe.DeviceId];
+                if (physicalEnd > (ulong)device.Reader.Length || physicalEnd > device.TotalBytes)
+                {
+                    throw new InvalidDataException(
+                        $"Btrfs chunk stripeの物理範囲がdevice外です: "
+                        + $"devid={stripe.DeviceId}, end={physicalEnd:N0}");
+                }
             }
 
             if (index > 0)
@@ -869,39 +916,10 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
                 throw new InvalidDataException($"Btrfs treeに循環または重複参照があります: {pointer.Bytenr:N0}");
             }
 
-            var block = new byte[_nodeSize];
-            ReadLogical(pointer.Bytenr, block, 0, block.Length);
-            VerifyChecksum(block, $"Btrfs tree block {pointer.Bytenr:N0}");
-            if (!block.AsSpan(0x20, 16).SequenceEqual(_fileSystemId))
-            {
-                throw new InvalidDataException("Btrfs tree blockのFSIDがsuperblockと一致しません。");
-            }
-
-            if (EndianUtilities.ReadUInt64Little(block, 0x30) != pointer.Bytenr)
-            {
-                throw new InvalidDataException("Btrfs tree blockのbytenrが参照先と一致しません。");
-            }
-
-            var generation = EndianUtilities.ReadUInt64Little(block, 0x50);
-            if (pointer.Generation is ulong pointerGeneration && generation != pointerGeneration)
-            {
-                throw new InvalidDataException(
-                    $"Btrfs tree block generationが一致しません: expected={pointerGeneration}, actual={generation}");
-            }
-
-            var owner = EndianUtilities.ReadUInt64Little(block, 0x58);
-            if (owner != expectedOwner)
-            {
-                throw new InvalidDataException($"Btrfs tree block ownerが一致しません: expected={expectedOwner}, actual={owner}");
-            }
+            var block = ReadVerifiedTreeBlock(pointer, expectedOwner);
 
             var itemCount = EndianUtilities.ReadUInt32Little(block, 0x60);
             var level = block[0x64];
-            if (level != pointer.Level || level > MaximumTreeLevel)
-            {
-                throw new InvalidDataException(
-                    $"Btrfs tree block levelが一致しません: expected={pointer.Level}, actual={level}");
-            }
 
             if (level == 0)
             {
@@ -944,6 +962,79 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
 
         items.Sort((left, right) => CompareKeys(left.Key, right.Key));
         return items;
+    }
+
+    private byte[] ReadVerifiedTreeBlock(BtrfsTreePointer pointer, ulong expectedOwner)
+    {
+        var chunk = FindChunk(pointer.Bytenr);
+        var chunkEnd = checked(chunk.LogicalStart + chunk.Length);
+        if (pointer.Bytenr > chunkEnd || (ulong)_nodeSize > chunkEnd - pointer.Bytenr)
+        {
+            throw new InvalidDataException(
+                $"Btrfs tree blockがchunk境界をまたいでいます: {pointer.Bytenr:N0}");
+        }
+
+        var errors = new List<string>(chunk.Stripes.Count);
+        Exception? lastError = null;
+        for (var mirrorIndex = 0; mirrorIndex < chunk.Stripes.Count; mirrorIndex++)
+        {
+            var block = new byte[_nodeSize];
+            try
+            {
+                ReadLogical(pointer.Bytenr, block, 0, block.Length, mirrorIndex);
+                VerifyChecksum(block, $"Btrfs tree block {pointer.Bytenr:N0}");
+                ValidateTreeBlockHeader(block, pointer, expectedOwner);
+                return block;
+            }
+            catch (Exception ex) when (ex is IOException or InvalidDataException)
+            {
+                lastError = ex;
+                errors.Add($"mirror {mirrorIndex + 1}: {ex.Message}");
+            }
+        }
+
+        throw new InvalidDataException(
+            $"Btrfs tree block {pointer.Bytenr:N0}の全mirror検証に失敗しました: "
+            + string.Join(" | ", errors),
+            lastError);
+    }
+
+    private void ValidateTreeBlockHeader(
+        byte[] block,
+        BtrfsTreePointer pointer,
+        ulong expectedOwner)
+    {
+        if (!block.AsSpan(0x20, 16).SequenceEqual(_fileSystemId))
+        {
+            throw new InvalidDataException("Btrfs tree blockのFSIDがsuperblockと一致しません。");
+        }
+
+        if (EndianUtilities.ReadUInt64Little(block, 0x30) != pointer.Bytenr)
+        {
+            throw new InvalidDataException("Btrfs tree blockのbytenrが参照先と一致しません。");
+        }
+
+        var generation = EndianUtilities.ReadUInt64Little(block, 0x50);
+        if (pointer.Generation is ulong pointerGeneration && generation != pointerGeneration)
+        {
+            throw new InvalidDataException(
+                $"Btrfs tree block generationが一致しません: "
+                + $"expected={pointerGeneration}, actual={generation}");
+        }
+
+        var owner = EndianUtilities.ReadUInt64Little(block, 0x58);
+        if (owner != expectedOwner)
+        {
+            throw new InvalidDataException(
+                $"Btrfs tree block ownerが一致しません: expected={expectedOwner}, actual={owner}");
+        }
+
+        var level = block[0x64];
+        if (level != pointer.Level || level > MaximumTreeLevel)
+        {
+            throw new InvalidDataException(
+                $"Btrfs tree block levelが一致しません: expected={pointer.Level}, actual={level}");
+        }
     }
 
     private void ParseLeaf(byte[] block, uint itemCountValue, List<BtrfsLeafItem> output)
@@ -1223,20 +1314,57 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
             var sectorStart = logical / (ulong)_sectorSize * (ulong)_sectorSize;
             var withinSector = checked((int)(logical - sectorStart));
             var copyLength = Math.Min(remaining, _sectorSize - withinSector);
-            var sector = new byte[_sectorSize];
-            ReadLogical(sectorStart, sector, 0, sector.Length);
-            if (_dataChecksums.TryGetValue(sectorStart, out var expectedChecksum))
+            var chunk = FindChunk(sectorStart);
+            var chunkEnd = checked(chunk.LogicalStart + chunk.Length);
+            if (sectorStart > chunkEnd || (ulong)_sectorSize > chunkEnd - sectorStart)
             {
-                var actualChecksum = BtrfsCrc32C.Compute(sector);
-                if (actualChecksum != expectedChecksum)
+                throw new InvalidDataException(
+                    $"Btrfs data sectorがchunk境界をまたいでいます: logical={sectorStart:N0}");
+            }
+
+            var errors = new List<string>(chunk.Stripes.Count);
+            Exception? lastError = null;
+            byte[]? verifiedSector = null;
+            var hasChecksum = _dataChecksums.TryGetValue(sectorStart, out var expectedChecksum);
+            for (var mirrorIndex = 0; mirrorIndex < chunk.Stripes.Count; mirrorIndex++)
+            {
+                var candidate = new byte[_sectorSize];
+                try
                 {
-                    throw new InvalidDataException(
-                        $"Btrfs data checksumが一致しません: logical={sectorStart:N0}, "
-                        + $"expected=0x{expectedChecksum:X8}, actual=0x{actualChecksum:X8}");
+                    ReadLogical(sectorStart, candidate, 0, candidate.Length, mirrorIndex);
+                    if (hasChecksum)
+                    {
+                        var actualChecksum = BtrfsCrc32C.Compute(candidate);
+                        if (actualChecksum != expectedChecksum)
+                        {
+                            errors.Add(
+                                $"mirror {mirrorIndex + 1}: expected=0x{expectedChecksum:X8}, "
+                                + $"actual=0x{actualChecksum:X8}");
+                            continue;
+                        }
+                    }
+
+                    verifiedSector = candidate;
+                    break;
+                }
+                catch (Exception ex) when (ex is IOException or InvalidDataException)
+                {
+                    lastError = ex;
+                    errors.Add($"mirror {mirrorIndex + 1}: {ex.Message}");
                 }
             }
 
-            sector.AsSpan(withinSector, copyLength)
+            if (verifiedSector is null)
+            {
+                throw new InvalidDataException(
+                    (hasChecksum
+                        ? $"Btrfs data checksumが全mirrorで一致しません: logical={sectorStart:N0}; "
+                        : $"Btrfs dataを全mirrorから読み取れません: logical={sectorStart:N0}; ")
+                    + string.Join(" | ", errors),
+                    lastError);
+            }
+
+            verifiedSector.AsSpan(withinSector, copyLength)
                 .CopyTo(destination.AsSpan(destinationOffset, copyLength));
             logical += (ulong)copyLength;
             destinationOffset += copyLength;
@@ -1669,22 +1797,37 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
         };
     }
 
-    private void ReadLogical(ulong logical, byte[] destination, int destinationOffset, int count)
+    private void ReadLogical(
+        ulong logical,
+        byte[] destination,
+        int destinationOffset,
+        int count,
+        int mirrorIndex = 0)
     {
+        ArgumentOutOfRangeException.ThrowIfNegative(mirrorIndex);
         var remaining = count;
         while (remaining > 0)
         {
             var chunk = FindChunk(logical);
+            if (mirrorIndex >= chunk.Stripes.Count)
+            {
+                throw new InvalidDataException(
+                    $"Btrfs chunkに要求されたmirrorがありません: "
+                    + $"logical={logical:N0}, mirror={mirrorIndex + 1}");
+            }
+
             var withinChunk = logical - chunk.LogicalStart;
             var available = chunk.Length - withinChunk;
             var readLength = checked((int)Math.Min((ulong)remaining, available));
-            var physical = checked(chunk.PhysicalStart + withinChunk);
-            var device = _devices[chunk.DeviceId];
-            if (physical + (ulong)readLength > (ulong)device.Reader.Length
-                || physical + (ulong)readLength > device.TotalBytes)
+            var stripe = chunk.Stripes[mirrorIndex];
+            var physical = checked(stripe.PhysicalStart + withinChunk);
+            var device = _devices[stripe.DeviceId];
+            var physicalEnd = checked(physical + (ulong)readLength);
+            if (physicalEnd > (ulong)device.Reader.Length
+                || physicalEnd > device.TotalBytes)
             {
                 throw new InvalidDataException(
-                    $"Btrfs logical mappingがdevice外を参照しています: devid={chunk.DeviceId}");
+                    $"Btrfs logical mappingがdevice外を参照しています: devid={stripe.DeviceId}");
             }
 
             device.Reader.ReadAt(checked((long)physical), destination, destinationOffset, readLength);
@@ -2053,12 +2196,12 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
         bool IsSnapshot);
     private sealed record BtrfsDevice(ulong DeviceId, IBlockReader Reader, byte[] Uuid, ulong TotalBytes);
     private sealed record BtrfsDeviceItem(ulong DeviceId, ulong TotalBytes, byte[] Uuid);
+    private readonly record struct BtrfsStripe(ulong DeviceId, ulong PhysicalStart);
     private sealed record BtrfsChunk(
         ulong LogicalStart,
         ulong Length,
-        ulong DeviceId,
-        ulong PhysicalStart,
-        ulong Type);
+        ulong Type,
+        IReadOnlyList<BtrfsStripe> Stripes);
     private readonly record struct BtrfsObjectReference(ulong TreeId, ulong InodeNumber);
     private sealed record BtrfsNodeReference(BtrfsObjectReference Object);
     private sealed record BtrfsSnapshotBoundaryReference;
