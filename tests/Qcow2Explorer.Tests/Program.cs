@@ -93,6 +93,7 @@ static void RunGeneratedImageTests()
     TestGeneratedLzopExt4Image();
     TestGeneratedBtrfsImage();
     TestGeneratedBtrfsMultiDeviceImage();
+    TestGeneratedBtrfsRaid1Image();
     TestGeneratedEwfE01Image();
     TestRealImageRegressionRunner();
     TestGeneratedVmaLzopImage();
@@ -789,6 +790,135 @@ static void TestGeneratedBtrfsMultiDeviceImage()
                 ex.Message.Contains("stripe", StringComparison.Ordinal)
                     && ex.Message.Contains("UUID", StringComparison.Ordinal),
                 "Btrfs stripe UUID diagnostic");
+        }
+    }
+}
+
+static void TestGeneratedBtrfsRaid1Image()
+{
+    var fallbackFirstPath = Path.Combine(AppContext.BaseDirectory, "synthetic-btrfs-raid1-fallback-1.raw");
+    var fallbackSecondPath = Path.Combine(AppContext.BaseDirectory, "synthetic-btrfs-raid1-fallback-2.raw");
+    _ = BtrfsTestImageFactory.CreateRaid1(
+        fallbackFirstPath,
+        fallbackSecondPath,
+        corruptFirstDataMirror: true,
+        corruptFirstMetadataMirror: true);
+    using (var first = DiskImageReaderFactory.Open(fallbackFirstPath))
+    using (var second = DiskImageReaderFactory.Open(fallbackSecondPath))
+    {
+        var firstPartition = PartitionTableReader.ReadPartitions(first).Single();
+        var secondPartition = PartitionTableReader.ReadPartitions(second).Single();
+        var fs = new BtrfsFileSystem(
+            [
+                new PartitionSliceReader(first, firstPartition),
+                new PartitionSliceReader(second, secondPartition),
+            ],
+            firstPartition);
+        var entries = fs.ListDirectory(fs.Root);
+        var regular = entries.Single(node => node.Name == "regular.bin");
+        var zlib = entries.Single(node => node.Name == "zlib.bin");
+        Assert(
+            fs.ReadFile(regular, 0, checked((int)regular.Size))
+                .SequenceEqual(BtrfsTestImageFactory.RegularData),
+            "generated Btrfs RAID1 data mirror fallback");
+        Assert(
+            fs.ReadFile(zlib, 65530, 32).All(value => value == 0),
+            "generated Btrfs RAID1 compressed data");
+        Assert(
+            entries.Any(node => node.Name == "hello.txt"),
+            "generated Btrfs RAID1 metadata mirror fallback");
+    }
+
+    var dataCorruptFirstPath = Path.Combine(AppContext.BaseDirectory, "synthetic-btrfs-raid1-data-corrupt-1.raw");
+    var dataCorruptSecondPath = Path.Combine(AppContext.BaseDirectory, "synthetic-btrfs-raid1-data-corrupt-2.raw");
+    _ = BtrfsTestImageFactory.CreateRaid1(
+        dataCorruptFirstPath,
+        dataCorruptSecondPath,
+        corruptFirstDataMirror: true,
+        corruptSecondDataMirror: true);
+    using (var first = DiskImageReaderFactory.Open(dataCorruptFirstPath))
+    using (var second = DiskImageReaderFactory.Open(dataCorruptSecondPath))
+    {
+        var firstPartition = PartitionTableReader.ReadPartitions(first).Single();
+        var secondPartition = PartitionTableReader.ReadPartitions(second).Single();
+        var fs = new BtrfsFileSystem(
+            [
+                new PartitionSliceReader(first, firstPartition),
+                new PartitionSliceReader(second, secondPartition),
+            ],
+            firstPartition);
+        var regular = fs.ListDirectory(fs.Root).Single(node => node.Name == "regular.bin");
+        try
+        {
+            _ = fs.ReadFile(regular, 0, checked((int)regular.Size));
+            Assert(false, "Btrfs RAID1 rejects all corrupt data mirrors");
+        }
+        catch (InvalidDataException ex)
+        {
+            Assert(
+                ex.Message.Contains("全mirror", StringComparison.Ordinal)
+                    && ex.Message.Contains("checksum", StringComparison.Ordinal),
+                "Btrfs RAID1 all data mirrors corrupt diagnostic");
+        }
+    }
+
+    var metadataCorruptFirstPath = Path.Combine(AppContext.BaseDirectory, "synthetic-btrfs-raid1-metadata-corrupt-1.raw");
+    var metadataCorruptSecondPath = Path.Combine(AppContext.BaseDirectory, "synthetic-btrfs-raid1-metadata-corrupt-2.raw");
+    _ = BtrfsTestImageFactory.CreateRaid1(
+        metadataCorruptFirstPath,
+        metadataCorruptSecondPath,
+        corruptFirstMetadataMirror: true,
+        corruptSecondMetadataMirror: true);
+    using (var first = DiskImageReaderFactory.Open(metadataCorruptFirstPath))
+    using (var second = DiskImageReaderFactory.Open(metadataCorruptSecondPath))
+    {
+        var firstPartition = PartitionTableReader.ReadPartitions(first).Single();
+        var secondPartition = PartitionTableReader.ReadPartitions(second).Single();
+        try
+        {
+            _ = new BtrfsFileSystem(
+                [
+                    new PartitionSliceReader(first, firstPartition),
+                    new PartitionSliceReader(second, secondPartition),
+                ],
+                firstPartition);
+            Assert(false, "Btrfs RAID1 rejects all corrupt metadata mirrors");
+        }
+        catch (InvalidDataException ex)
+        {
+            Assert(
+                ex.Message.Contains("全mirror", StringComparison.Ordinal)
+                    && ex.Message.Contains("tree block", StringComparison.Ordinal),
+                "Btrfs RAID1 all metadata mirrors corrupt diagnostic");
+        }
+    }
+
+    var duplicateFirstPath = Path.Combine(AppContext.BaseDirectory, "synthetic-btrfs-raid1-duplicate-1.raw");
+    var duplicateSecondPath = Path.Combine(AppContext.BaseDirectory, "synthetic-btrfs-raid1-duplicate-2.raw");
+    _ = BtrfsTestImageFactory.CreateRaid1(
+        duplicateFirstPath,
+        duplicateSecondPath,
+        duplicateStripeDevice: true);
+    using (var first = DiskImageReaderFactory.Open(duplicateFirstPath))
+    using (var second = DiskImageReaderFactory.Open(duplicateSecondPath))
+    {
+        var firstPartition = PartitionTableReader.ReadPartitions(first).Single();
+        var secondPartition = PartitionTableReader.ReadPartitions(second).Single();
+        try
+        {
+            _ = new BtrfsFileSystem(
+                [
+                    new PartitionSliceReader(first, firstPartition),
+                    new PartitionSliceReader(second, secondPartition),
+                ],
+                firstPartition);
+            Assert(false, "Btrfs RAID1 rejects duplicate stripe devices");
+        }
+        catch (InvalidDataException ex)
+        {
+            Assert(
+                ex.Message.Contains("異なるdevice", StringComparison.Ordinal),
+                "Btrfs RAID1 duplicate stripe device diagnostic");
         }
     }
 }
