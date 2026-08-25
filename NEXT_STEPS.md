@@ -126,14 +126,15 @@
 - 2-copy RAID1 chunkの2 stripeを異なるdeviceとして検証し、論理アドレスを各mirrorへ読み取り専用で写像
 - metadata tree blockはCRC32Cとheader、data sectorはchecksum treeのCRC32Cをmirrorごとに検証し、片系不一致時は健全なmirrorへ切替
 - RAID1の片系metadata/data破損からの復旧、両系破損、同一deviceの重複stripeを2デバイス合成fixtureで回帰確認
+- ツールバーの「Btrfs複数RAW」で同一FSIDのRAW一式を選択し、画面上のprimary partitionを複数device readerで開く経路を追加
+- 実イメージ回帰manifestへ`companionImages`を追加し、各RAWのSHA-256と全入力に共通するFSIDを検証
+- 2台用`mkfs.btrfs -m single -d single`／`-m raid1 -d raid1` fixture生成スクリプトを追加し、両profileを`btrfs check --readonly`と実イメージ回帰で確認
 
 ## 次回の推奨作業
 
 ### 1. Btrfs対応の第2段階
 
-- 複数RAWイメージを一組として指定するUIとmanifest形式を設計してから実装する
-- `mkfs.btrfs -m single -d single`および`-m raid1 -d raid1`の複数loop device由来fixtureを作成し、`btrfs check --readonly`と実イメージ回帰を追加する
-- 複数イメージ指定と実fixture回帰の後、RAID1 degraded読取、RAID1C3／RAID1C4、RAID10を順に検討する
+- RAID1 degraded読取、RAID1C3／RAID1C4、RAID10を順に検討する
 
 ## 保守・品質改善
 

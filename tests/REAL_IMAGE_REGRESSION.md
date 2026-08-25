@@ -48,6 +48,20 @@ wsl --distribution Ubuntu-24.04 --user root -- sh -lc `
 64 MiB mirrorが収まるfixtureでは、primaryを変更せず`btrfs inspect-internal dump-super -s 1`でbackup superblockも確認できます。破損回帰用コピーを作る場合も、元fixtureは保持してください。
 既存fixtureは上書きせず、生成物とローカルmanifestはGitへ追加しません。
 
+### Btrfs multiple device single／RAID1
+
+同じWSL環境で2個のRAWとloop deviceを使うfixtureを生成します。`-Profile Single`はmetadata/dataともsingle、`-Profile Raid1`はmetadata/dataとも2-copy RAID1です。
+
+```powershell
+.\tools\New-BtrfsMultiDeviceRegressionFixture.ps1 `
+  -FirstOutputPath .\.tmp\real-images\btrfs-raid1-1.raw `
+  -SecondOutputPath .\.tmp\real-images\btrfs-raid1-2.raw `
+  -Profile Raid1
+```
+
+生成処理は2台を同時にloop deviceへ割り当て、`btrfs check --readonly`と各RAW・内部ファイルのSHA-256を表示します。single profileは`-Profile Single`で別名の出力先を指定してください。
+manifestではprimaryを従来の`path`／`sha256`に置き、残りを`companionImages`へ記録します。ランナーは全RAWのSHA-256を照合し、すべてに共通するBtrfs FSIDがない構成を拒否します。
+
 ### BitLocker XTS-AES
 
 BitLocker fixtureの生成は管理者PowerShellで実行します。
@@ -222,6 +236,33 @@ fixture本体とローカルmanifestはコミットしないでください。
               "expectedDirectory": false,
               "expectedLength": 24,
               "sha256": "87B1422F3A4F5CD3F295930A9BC7A9C918138C2497E27A288760BE59A9C1A6A5"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Btrfs RAID1 two-device fixture",
+      "path": "%VDT_FIXTURE_ROOT%\\btrfs-raid1-1.raw",
+      "sha256": "REPLACE_WITH_64_HEX_CHARACTERS",
+      "companionImages": [
+        {
+          "path": "%VDT_FIXTURE_ROOT%\\btrfs-raid1-2.raw",
+          "sha256": "REPLACE_WITH_64_HEX_CHARACTERS"
+        }
+      ],
+      "expectedFormatContains": "raw/dd",
+      "expectedPartitionCount": 1,
+      "partitions": [
+        {
+          "number": 1,
+          "expectedFileSystem": "Btrfs",
+          "files": [
+            {
+              "path": "/hello.txt",
+              "expectedDirectory": false,
+              "expectedLength": 30,
+              "sha256": "REPLACE_WITH_64_HEX_CHARACTERS"
             }
           ]
         }

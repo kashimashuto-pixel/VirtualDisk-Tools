@@ -690,6 +690,20 @@ static void TestGeneratedBtrfsMultiDeviceImage()
             reversed.ReadFile(reversedRegular, 4090, 32)
                 .SequenceEqual(BtrfsTestImageFactory.RegularData.AsSpan(4090, 32).ToArray()),
             "generated multi-device Btrfs device-order independence");
+
+        var discoveredDevices = BtrfsDeviceSet.Discover([first, second]);
+        Assert(discoveredDevices.Count == 2, "Btrfs device set discovery");
+        Assert(
+            discoveredDevices.Select(item => item.Identity.DeviceId).Order().SequenceEqual([1UL, 2UL]),
+            "Btrfs device set devid identity");
+        var discovered = BtrfsDeviceSet.TryOpen(first, firstPartition, discoveredDevices, out var discoveryError);
+        Assert(discovered is not null, discoveryError);
+        var discoveredRegular = discovered!.ListDirectory(discovered.Root)
+            .Single(node => node.Name == "regular.bin");
+        Assert(
+            discovered.ReadFile(discoveredRegular, 0, checked((int)discoveredRegular.Size))
+                .SequenceEqual(BtrfsTestImageFactory.RegularData),
+            "Btrfs device set open");
     }
 
     using (var first = DiskImageReaderFactory.Open(firstPath))
@@ -999,6 +1013,10 @@ static void TestRealImageRegressionRunner()
     var imagePath = Path.Combine(AppContext.BaseDirectory, "sample-regression-fat16.qcow2");
     TestImageFactory.CreateFat16Qcow2(imagePath);
     var helloSha256 = Convert.ToHexString(SHA256.HashData(Encoding.ASCII.GetBytes(TestImageFactory.HelloText)));
+    var btrfsFirstPath = Path.Combine(AppContext.BaseDirectory, "sample-regression-btrfs-1.raw");
+    var btrfsSecondPath = Path.Combine(AppContext.BaseDirectory, "sample-regression-btrfs-2.raw");
+    _ = BtrfsTestImageFactory.CreateRaid1(btrfsFirstPath, btrfsSecondPath);
+    var regularSha256 = Convert.ToHexString(SHA256.HashData(BtrfsTestImageFactory.RegularData));
     var manifestPath = Path.Combine(AppContext.BaseDirectory, "real-image-regression.generated.json");
     var manifest = $$"""
         {
@@ -1025,13 +1043,40 @@ static void TestRealImageRegressionRunner()
                   ]
                 }
               ]
+            },
+            {
+              "name": "generated Btrfs RAID1 runner",
+              "path": "{{Path.GetFileName(btrfsFirstPath)}}",
+              "sha256": "{{Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(btrfsFirstPath)))}}",
+              "companionImages": [
+                {
+                  "path": "{{Path.GetFileName(btrfsSecondPath)}}",
+                  "sha256": "{{Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(btrfsSecondPath)))}}"
+                }
+              ],
+              "expectedFormatContains": "raw/dd",
+              "expectedPartitionCount": 1,
+              "partitions": [
+                {
+                  "number": 1,
+                  "expectedFileSystem": "Btrfs",
+                  "files": [
+                    {
+                      "path": "/regular.bin",
+                      "expectedDirectory": false,
+                      "expectedLength": {{BtrfsTestImageFactory.RegularData.Length}},
+                      "sha256": "{{regularSha256}}"
+                    }
+                  ]
+                }
+              ]
             }
           ]
         }
         """;
     File.WriteAllText(manifestPath, manifest, new UTF8Encoding(false));
     var summary = RealImageRegressionRunner.Run(manifestPath);
-    Assert(summary.CaseCount == 1, "real-image regression runner case count");
+    Assert(summary.CaseCount == 2, "real-image regression runner case count");
 }
 
 static void TestBitLockerRecoveryPasswordUnlock()
