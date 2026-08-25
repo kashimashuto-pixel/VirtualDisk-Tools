@@ -590,7 +590,11 @@ public sealed class MdRaid10Reader : IMdRaidReader
     private readonly IReadOnlyDictionary<ushort, MdRaidComponent> _membersByRole;
     private readonly uint _raidDisks;
     private readonly uint _nearCopies;
+    private readonly uint _farCopies;
+    private readonly bool _farOffset;
+    private readonly uint _farSetSize;
     private readonly uint _chunkSectors;
+    private readonly ulong _strideSectors;
 
     internal MdRaid10Reader(
         IReadOnlyList<MdRaidComponent> members,
@@ -601,25 +605,59 @@ public sealed class MdRaid10Reader : IMdRaidReader
     {
         _raidDisks = members[0].Metadata.RaidDisks;
         _nearCopies = layout & 0xff;
-        var farCopies = (layout >> 8) & 0xff;
-        var layoutFlags = layout >> 16;
-        if (_nearCopies < 2
-            || farCopies != 1
-            || layoutFlags != 0
-            || _nearCopies > _raidDisks)
+        _farCopies = (layout >> 8) & 0xff;
+        _farOffset = (layout & (1U << 16)) != 0;
+        var farSetMode = layout >> 17;
+        var copies = checked(_nearCopies * _farCopies);
+        if (_nearCopies == 0
+            || _farCopies == 0
+            || copies < 2
+            || copies > _raidDisks
+            || farSetMode > 2)
         {
             throw new NotSupportedException(
-                $"RAID10 layout 0x{layout:X8}は未対応です。現在はnear copies 2以上、far copies 1のlayoutに対応します。");
+                $"RAID10 layout 0x{layout:X8}は未対応または不正です。near×far copiesは2以上かつdevice数以下、far-set modeは0～2が必要です。");
+        }
+
+        _farSetSize = farSetMode switch
+        {
+            0 => _raidDisks,
+            1 => _raidDisks / _farCopies,
+            2 => copies,
+            _ => 0
+        };
+        if (_farSetSize == 0)
+        {
+            throw new InvalidDataException("RAID10 far-set sizeが0です。");
         }
 
         _chunkSectors = chunkSectors;
         _membersByRole = members.ToDictionary(member => member.Metadata.Role);
         AvailableRoles = members.Select(member => member.Metadata.Role).Order().ToArray();
         var sizeChunks = sizeSectors / chunkSectors;
-        var arrayChunks = checked(sizeChunks * _raidDisks / _nearCopies);
+        var arrayChunks = sizeChunks / _farCopies;
+        arrayChunks = checked(arrayChunks * _raidDisks / _nearCopies);
         if (arrayChunks == 0)
         {
             throw new InvalidDataException("RAID10 array sizeがchunk sizeより小さいです。");
+        }
+
+        var usedChunksPerDevice = DivideRoundUp(
+            checked(arrayChunks * copies),
+            _raidDisks);
+        var usedSectorsPerDevice = checked(usedChunksPerDevice * chunkSectors);
+        if (usedSectorsPerDevice > sizeSectors)
+        {
+            throw new InvalidDataException(
+                $"RAID10 geometryがcomponent sizeを超えます: used={usedSectorsPerDevice}, size={sizeSectors}");
+        }
+
+        _strideSectors = _farOffset
+            ? chunkSectors
+            : checked(usedChunksPerDevice / _farCopies * chunkSectors);
+        if (_strideSectors == 0)
+        {
+            throw new InvalidDataException("RAID10 far strideが0です。");
         }
 
         Length = checked((long)(arrayChunks * chunkSectors * 512UL));
@@ -703,11 +741,40 @@ public sealed class MdRaid10Reader : IMdRaidReader
         var scaledChunk = checked(chunk * _nearCopies);
         var stripe = scaledChunk / _raidDisks;
         var role = scaledChunk % _raidDisks;
+        if (_farOffset)
+        {
+            stripe = checked(stripe * _farCopies);
+        }
+
         var deviceSector = checked(stripe * _chunkSectors + sectorInChunk);
-        var mappings = new List<MdRaid10Mapping>(checked((int)_nearCopies));
-        for (var copy = 0U; copy < _nearCopies; copy++)
+        var mappings = new List<MdRaid10Mapping>(checked((int)(_nearCopies * _farCopies)));
+        var lastFarSetStart = checked((_raidDisks / _farSetSize - 1) * _farSetSize);
+        var lastFarSetSize = checked(_farSetSize + _raidDisks % _farSetSize);
+        for (var near = 0U; near < _nearCopies; near++)
         {
             mappings.Add(new MdRaid10Mapping(checked((ushort)role), deviceSector));
+            var farRole = role;
+            var farSector = deviceSector;
+            for (var far = 1U; far < _farCopies; far++)
+            {
+                var set = farRole / _farSetSize;
+                farRole += _nearCopies;
+                if (_raidDisks % _farSetSize != 0 && farRole > lastFarSetStart)
+                {
+                    farRole -= lastFarSetStart;
+                    farRole %= lastFarSetSize;
+                    farRole += lastFarSetStart;
+                }
+                else
+                {
+                    farRole %= _farSetSize;
+                    farRole += _farSetSize * set;
+                }
+
+                farSector = checked(farSector + _strideSectors);
+                mappings.Add(new MdRaid10Mapping(checked((ushort)farRole), farSector));
+            }
+
             role++;
             if (role == _raidDisks)
             {
@@ -751,6 +818,11 @@ public sealed class MdRaid10Reader : IMdRaidReader
     }
 
     private sealed record MdRaid10Mapping(ushort Role, ulong DeviceSector);
+
+    private static ulong DivideRoundUp(ulong value, ulong divisor)
+    {
+        return value / divisor + (value % divisor == 0 ? 0UL : 1UL);
+    }
 }
 
 public sealed record MdRaidMetadata(

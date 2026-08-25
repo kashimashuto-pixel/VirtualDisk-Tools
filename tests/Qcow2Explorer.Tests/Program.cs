@@ -1359,6 +1359,12 @@ static void TestRealImageRegressionRunner()
     var mdRaid10Paths = Enumerable.Range(0, 4)
         .Select(index => Path.Combine(AppContext.BaseDirectory, $"synthetic-md-raid10-{index}.raw"))
         .ToArray();
+    var mdRaid10FarPaths = Enumerable.Range(0, 4)
+        .Select(index => Path.Combine(AppContext.BaseDirectory, $"synthetic-md-raid10-far-{index}.raw"))
+        .ToArray();
+    var mdRaid10OffsetPaths = Enumerable.Range(0, 4)
+        .Select(index => Path.Combine(AppContext.BaseDirectory, $"synthetic-md-raid10-offset-{index}.raw"))
+        .ToArray();
     var manifestPath = Path.Combine(AppContext.BaseDirectory, "real-image-regression.generated.json");
     var manifest = $$"""
         {
@@ -1523,13 +1529,67 @@ static void TestRealImageRegressionRunner()
                   ]
                 }
               ]
+            },
+            {
+              "name": "generated Linux md RAID10 far runner",
+              "path": "{{Path.GetFileName(mdRaid10FarPaths[0])}}",
+              "sha256": "{{Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(mdRaid10FarPaths[0])))}}",
+              "companionImages": [
+                { "path": "{{Path.GetFileName(mdRaid10FarPaths[1])}}", "sha256": "{{Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(mdRaid10FarPaths[1])))}}" },
+                { "path": "{{Path.GetFileName(mdRaid10FarPaths[2])}}", "sha256": "{{Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(mdRaid10FarPaths[2])))}}" },
+                { "path": "{{Path.GetFileName(mdRaid10FarPaths[3])}}", "sha256": "{{Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(mdRaid10FarPaths[3])))}}" }
+              ],
+              "deviceSet": "Linux md RAID10",
+              "expectedDiskLength": {{TestImageFactory.VirtualSize}},
+              "expectedPartitionCount": 1,
+              "partitions": [
+                {
+                  "number": 1,
+                  "expectedFileSystem": "FAT16",
+                  "files": [
+                    {
+                      "path": "/HELLO.TXT",
+                      "expectedDirectory": false,
+                      "expectedLength": {{Encoding.ASCII.GetByteCount(TestImageFactory.HelloText)}},
+                      "sha256": "{{helloSha256}}"
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "name": "generated Linux md RAID10 offset runner",
+              "path": "{{Path.GetFileName(mdRaid10OffsetPaths[0])}}",
+              "sha256": "{{Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(mdRaid10OffsetPaths[0])))}}",
+              "companionImages": [
+                { "path": "{{Path.GetFileName(mdRaid10OffsetPaths[1])}}", "sha256": "{{Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(mdRaid10OffsetPaths[1])))}}" },
+                { "path": "{{Path.GetFileName(mdRaid10OffsetPaths[2])}}", "sha256": "{{Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(mdRaid10OffsetPaths[2])))}}" },
+                { "path": "{{Path.GetFileName(mdRaid10OffsetPaths[3])}}", "sha256": "{{Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(mdRaid10OffsetPaths[3])))}}" }
+              ],
+              "deviceSet": "Linux md RAID10",
+              "expectedDiskLength": {{TestImageFactory.VirtualSize}},
+              "expectedPartitionCount": 1,
+              "partitions": [
+                {
+                  "number": 1,
+                  "expectedFileSystem": "FAT16",
+                  "files": [
+                    {
+                      "path": "/HELLO.TXT",
+                      "expectedDirectory": false,
+                      "expectedLength": {{Encoding.ASCII.GetByteCount(TestImageFactory.HelloText)}},
+                      "sha256": "{{helloSha256}}"
+                    }
+                  ]
+                }
+              ]
             }
           ]
         }
         """;
     File.WriteAllText(manifestPath, manifest, new UTF8Encoding(false));
     var summary = RealImageRegressionRunner.Run(manifestPath);
-    Assert(summary.CaseCount == 6, "real-image regression runner case count");
+    Assert(summary.CaseCount == 8, "real-image regression runner case count");
 }
 
 static void TestBitLockerRecoveryPasswordUnlock()
@@ -3319,20 +3379,78 @@ static void TestGeneratedMdRaid10Image()
             "Linux md RAID10 three-device wrapping near layout");
     }
 
-    var farPaths = Enumerable.Range(0, 4)
-        .Select(index => Path.Combine(AppContext.BaseDirectory, $"synthetic-md-raid10-far-{index}.raw"))
-        .ToArray();
-    _ = TestImageFactory.CreateMdRaid10Fat16(farPaths, layout: 0x0201);
-    using (var first = DiskImageReaderFactory.Open(farPaths[0]))
-    using (var second = DiskImageReaderFactory.Open(farPaths[1]))
-    using (var third = DiskImageReaderFactory.Open(farPaths[2]))
-    using (var fourth = DiskImageReaderFactory.Open(farPaths[3]))
+    (uint Layout, string Name)[] extendedLayouts =
+    [
+        (0x000201, "far"),
+        (0x010201, "offset"),
+        (0x020201, "far-set-legacy"),
+        (0x040201, "far-set-fixed")
+    ];
+    foreach (var (layout, name) in extendedLayouts)
     {
-        var discovery = MdRaidDeviceSet.Discover([first, second, third, fourth]);
-        Assert(discovery.Arrays.Count == 0, "Linux md RAID10 rejects unsupported far layout");
+        var extendedPaths = Enumerable.Range(0, 4)
+            .Select(index => Path.Combine(AppContext.BaseDirectory, $"synthetic-md-raid10-{name}-{index}.raw"))
+            .ToArray();
+        var extendedExpected = TestImageFactory.CreateMdRaid10Fat16(extendedPaths, layout);
+        var readers = extendedPaths.Select(path => DiskImageReaderFactory.Open(path)).ToList();
+        try
+        {
+            var discovery = MdRaidDeviceSet.Discover(readers.Cast<IBlockReader>().Reverse().ToList());
+            Assert(discovery.Arrays.Count == 1, string.Join(Environment.NewLine, discovery.Diagnostics));
+            Assert(
+                Qcow2Explorer.Core.EndianUtilities.ReadBytes(
+                    discovery.Arrays[0].Reader,
+                    0,
+                    extendedExpected.Length).SequenceEqual(extendedExpected),
+                $"Linux md RAID10 {name} full mapping");
+            Assert(
+                Qcow2Explorer.Core.EndianUtilities.ReadBytes(
+                    discovery.Arrays[0].Reader,
+                    64 * 1024 - 19,
+                    128).SequenceEqual(extendedExpected.AsSpan(64 * 1024 - 19, 128)),
+                $"Linux md RAID10 {name} chunk-boundary mapping");
+
+            var degraded = MdRaidDeviceSet.Discover([readers[2], readers[0]]);
+            Assert(degraded.Arrays.Count == 1, string.Join(Environment.NewLine, degraded.Diagnostics));
+            Assert(degraded.Arrays[0].Reader.IsDegraded, $"Linux md RAID10 {name} degraded state");
+            Assert(
+                Qcow2Explorer.Core.EndianUtilities.ReadBytes(
+                    degraded.Arrays[0].Reader,
+                    0,
+                    extendedExpected.Length).SequenceEqual(extendedExpected),
+                $"Linux md RAID10 {name} degraded mapping");
+
+            var missingGroup = MdRaidDeviceSet.Discover([readers[0], readers[1]]);
+            Assert(missingGroup.Arrays.Count == 0, $"Linux md RAID10 {name} rejects missing mirror group");
+        }
+        finally
+        {
+            foreach (var reader in readers)
+            {
+                reader.Dispose();
+            }
+        }
+    }
+
+    var invalidLayoutPaths = Enumerable.Range(0, 4)
+        .Select(index => Path.Combine(AppContext.BaseDirectory, $"synthetic-md-raid10-invalid-layout-{index}.raw"))
+        .ToArray();
+    _ = TestImageFactory.CreateMdRaid10Fat16(invalidLayoutPaths, layout: 0x060201);
+    var invalidReaders = invalidLayoutPaths.Select(path => DiskImageReaderFactory.Open(path)).ToList();
+    try
+    {
+        var invalid = MdRaidDeviceSet.Discover(invalidReaders.Cast<IBlockReader>().ToList());
+        Assert(invalid.Arrays.Count == 0, "Linux md RAID10 rejects invalid far-set mode");
         Assert(
-            discovery.Diagnostics.Any(message => message.Contains("near copies", StringComparison.Ordinal)),
-            "Linux md RAID10 unsupported-layout diagnostic");
+            invalid.Diagnostics.Any(message => message.Contains("far-set mode", StringComparison.Ordinal)),
+            "Linux md RAID10 invalid far-set diagnostic");
+    }
+    finally
+    {
+        foreach (var reader in invalidReaders)
+        {
+            reader.Dispose();
+        }
     }
 }
 
@@ -5074,9 +5192,9 @@ internal static class TestImageFactory
         uint layout = 0x0102,
         int? corruptRole = null)
     {
-        if (paths.Count is < 3 or > 4)
+        if (paths.Count is < 2 or > 4)
         {
-            throw new ArgumentException("Synthetic RAID10 requires three or four paths.", nameof(paths));
+            throw new ArgumentException("Synthetic RAID10 requires two to four paths.", nameof(paths));
         }
 
         const int dataOffset = 1024 * 1024;
@@ -5085,12 +5203,20 @@ internal static class TestImageFactory
         const int memberDataLength = 8 * 1024 * 1024;
         var nearCopies = layout & 0xff;
         var farCopies = (layout >> 8) & 0xff;
-        if (nearCopies == 0 || farCopies == 0)
+        var farOffset = (layout & (1U << 16)) != 0;
+        var farSetMode = layout >> 17;
+        var copies = checked(nearCopies * farCopies);
+        if (nearCopies == 0
+            || farCopies == 0
+            || copies > checked((uint)paths.Count))
         {
             throw new ArgumentException("Synthetic RAID10 layout requires near and far copies.", nameof(layout));
         }
 
-        var arrayLength = checked((int)((long)memberDataLength * paths.Count / (nearCopies * farCopies)));
+        var memberChunks = checked((ulong)(memberDataLength / chunkBytes));
+        var arrayChunks = memberChunks / farCopies;
+        arrayChunks = checked(arrayChunks * (uint)paths.Count / nearCopies);
+        var arrayLength = checked((int)(arrayChunks * (ulong)chunkBytes));
         var source = CreateVirtualDisk();
         if (arrayLength > source.Length || arrayLength % chunkBytes != 0)
         {
@@ -5102,26 +5228,77 @@ internal static class TestImageFactory
         var components = Enumerable.Range(0, paths.Count)
             .Select(_ => new byte[componentLength])
             .ToArray();
+        var usedChunksPerDevice = checked(
+            (arrayChunks * copies + (uint)paths.Count - 1) / (uint)paths.Count);
+        var strideSectors = farOffset
+            ? chunkSectors
+            : checked(usedChunksPerDevice / farCopies * chunkSectors);
+        var farSetSize = farSetMode switch
+        {
+            0 => checked((uint)paths.Count),
+            1 => checked((uint)paths.Count) / farCopies,
+            2 => copies,
+            _ => checked((uint)paths.Count)
+        };
+        if (farSetSize == 0)
+        {
+            throw new InvalidOperationException("Synthetic RAID10 far-set size is invalid.");
+        }
+
+        var lastFarSetStart = checked((checked((uint)paths.Count) / farSetSize - 1) * farSetSize);
+        var lastFarSetSize = checked(farSetSize + checked((uint)paths.Count) % farSetSize);
         for (var logicalOffset = 0; logicalOffset < arrayData.Length; logicalOffset += chunkBytes)
         {
             var logicalChunk = checked((ulong)(logicalOffset / chunkBytes));
             var scaledChunk = logicalChunk * nearCopies;
             var stripe = scaledChunk / checked((uint)paths.Count);
-            var role = checked((int)(scaledChunk % checked((uint)paths.Count)));
-            var memberChunk = stripe;
-            for (var copy = 0U; copy < nearCopies; copy++)
+            var role = checked((uint)(scaledChunk % checked((uint)paths.Count)));
+            if (farOffset)
+            {
+                stripe *= farCopies;
+            }
+
+            var deviceSector = checked(stripe * chunkSectors);
+            for (var near = 0U; near < nearCopies; near++)
             {
                 Array.Copy(
                     arrayData,
                     logicalOffset,
-                    components[role],
-                    checked(dataOffset + (int)memberChunk * chunkBytes),
+                    components[checked((int)role)],
+                    checked(dataOffset + (int)(deviceSector * BytesPerSector)),
                     chunkBytes);
+                var farRole = role;
+                var farSector = deviceSector;
+                for (var far = 1U; far < farCopies; far++)
+                {
+                    var set = farRole / farSetSize;
+                    farRole += nearCopies;
+                    if (checked((uint)paths.Count) % farSetSize != 0 && farRole > lastFarSetStart)
+                    {
+                        farRole -= lastFarSetStart;
+                        farRole %= lastFarSetSize;
+                        farRole += lastFarSetStart;
+                    }
+                    else
+                    {
+                        farRole %= farSetSize;
+                        farRole += farSetSize * set;
+                    }
+
+                    farSector += strideSectors;
+                    Array.Copy(
+                        arrayData,
+                        logicalOffset,
+                        components[checked((int)farRole)],
+                        checked(dataOffset + (int)(farSector * BytesPerSector)),
+                        chunkBytes);
+                }
+
                 role++;
-                if (role == paths.Count)
+                if (role == checked((uint)paths.Count))
                 {
                     role = 0;
-                    memberChunk++;
+                    deviceSector += chunkSectors;
                 }
             }
         }
