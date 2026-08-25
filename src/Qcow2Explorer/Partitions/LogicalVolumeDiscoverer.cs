@@ -15,29 +15,57 @@ public static class LogicalVolumeDiscoverer
         List<IDisposable> ownedReaders,
         CancellationToken cancellationToken = default)
     {
+        return Discover(
+            [disk],
+            lvmPartitions,
+            firstNumber,
+            ownedReaders,
+            cancellationToken);
+    }
+
+    public static LvmDiscoveryResult Discover(
+        IReadOnlyList<IBlockReader> disks,
+        IReadOnlyList<PartitionInfo> lvmPartitions,
+        int firstNumber,
+        List<IDisposable> ownedReaders,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(disks);
+        if (disks.Count == 0)
+        {
+            throw new ArgumentException("LVM2 discovery requires at least one disk.", nameof(disks));
+        }
+
         cancellationToken.ThrowIfCancellationRequested();
         EnsureRegistered();
 
         var volumes = new List<PartitionInfo>();
         var diagnostics = new List<LvmDiagnostic>();
-        var diskStream = new BlockReaderStream(disk);
-        var keepDiskStream = false;
+        var diskStreams = disks.Select(disk => new BlockReaderStream(disk)).ToList();
+        var keepDiskStreams = false;
 
         try
         {
-            var metadataInspection = LvmMetadataInspector.Inspect(disk, lvmPartitions, cancellationToken);
+            var metadataInspection = LvmMetadataInspector.Inspect(disks[0], lvmPartitions, cancellationToken);
             var metadataSummaries = metadataInspection.Summaries;
             diagnostics.AddRange(metadataInspection.Errors.Select(error => new LvmDiagnostic(error, true)));
             AppendMetadataDiagnostics(metadataSummaries, lvmPartitions.Count, diagnostics);
 
-            var manager = new VolumeManager(diskStream);
+            var manager = new VolumeManager();
+            foreach (var diskStream in diskStreams)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                manager.AddDisk(diskStream);
+            }
+
             cancellationToken.ThrowIfCancellationRequested();
             var physicalVolumes = manager.GetPhysicalVolumes();
             var lvmPhysicalVolumes = physicalVolumes
                 .Where(LogicalVolumeManager.HandlesPhysicalVolume)
                 .ToList();
             diagnostics.Add(new LvmDiagnostic(
-                $"LVM2: {lvmPhysicalVolumes.Count:N0}個のPhysical VolumeをDiscUtilsが認識しました。",
+                $"LVM2: {disks.Count:N0}個の入力deviceから"
+                + $"{lvmPhysicalVolumes.Count:N0}個のPhysical VolumeをDiscUtilsが認識しました。",
                 false));
 
             var logicalVolumes = manager.GetLogicalVolumes()
@@ -54,7 +82,7 @@ public static class LogicalVolumeDiscoverer
                     var stream = volume.Open();
                     var reader = new StreamBlockReader(stream);
                     ownedReaders.Add(reader);
-                    keepDiskStream = true;
+                    keepDiskStreams = true;
 
                     var identity = volume.Identity ?? "";
                     volumes.Add(new PartitionInfo
@@ -109,13 +137,16 @@ public static class LogicalVolumeDiscoverer
         }
         finally
         {
-            if (keepDiskStream)
+            if (keepDiskStreams)
             {
-                ownedReaders.Add(diskStream);
+                ownedReaders.AddRange(diskStreams);
             }
             else
             {
-                diskStream.Dispose();
+                foreach (var diskStream in diskStreams)
+                {
+                    diskStream.Dispose();
+                }
             }
         }
 

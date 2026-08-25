@@ -150,12 +150,26 @@
 - checksum破損、旧event、mirror不一致、完全／degraded構成を合成fixtureで回帰確認
 - 実`mdadm 4.3 --metadata=1.2` RAID1 + ext4を生成し、`e2fsck -fn`と完全／degraded manifest回帰を実行
 
+### LVM2複数PV対応
+
+- 「複数ディスク」で指定した全入力をDiscUtilsのVolumeManagerへ登録し、VGに必要なPVを横断して検出
+- companion側のパーティションもLVM2検出・メタデータ診断対象へ追加
+- 複数PVに複数segmentでまたがるlinear LVを既存のファイルシステム検出・読み取りへ接続
+- 必要PVが不足している構成を安全に拒否し、メタデータ上の必要数を診断へ表示
+- 2個の合成PVに分割したFAT16 LVで、PV境界をまたぐ読み取りと欠損PVを回帰確認
+- 実`lvm2 2.03.16`で2個のPVにまたがるext4 LVを生成し、`e2fsck -fn`と160 MiBの境界横断ファイルをmanifest回帰で確認
+
 ## 次回の推奨作業
 
-### 1. LVM2対応の第2段階
+### 1. Linux md RAID0／RAID10
 
-- 複数ディスク入力にあるPVをVG UUIDで束ね、複数PVにまたがるlinear LVを読み取る
-- その後に複数stripe、thin、snapshot、cache、mirror／RAID segmentを段階的に検討する
+- 既存のmetadata 1.x検証を共通化し、RAID0のchunk単位stripingを追加する
+- 次にRAID10のnear layoutを追加し、必要なmirror組が不足する構成を安全に拒否する
+
+### 2. LVM2 striped LV
+
+- `stripe_count > 1`のsegmentを複数PVへ写像し、stripe境界をまたぐ読み取りを追加する
+- その後にthin、snapshot、cache、mirror／RAID segmentを段階的に検討する
 
 ## 保守・品質改善
 
@@ -169,12 +183,12 @@
 
 利用目的に応じ、次の順で検討します。
 
-1. Btrfs
-   - 圧縮、サブボリューム、backup superblock、複数デバイスを段階的に扱う
-2. Linux md RAIDの拡張
+1. Linux md RAIDの拡張
    - RAID1対応を基盤に、RAID0/10、その後RAID5/6を検討する
-3. LVM2の拡張
-   - 複数PV、thin、snapshot、cache、mirror、RAID segmentを段階的に対応する
+2. LVM2の拡張
+   - striped、thin、snapshot、cache、mirror、RAID segmentを段階的に対応する
+3. 証拠・暗号化形式の拡張
+   - EWF2/Ex01、LUKS detached header／複数segmentを検討する
 
 ## 維持する既存仕様
 
