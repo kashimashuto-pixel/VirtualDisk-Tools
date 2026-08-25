@@ -89,6 +89,7 @@ static void RunGeneratedImageTests()
     TestXfsTimestampDecoding();
     Test4KnGptParsing();
     TestGeneratedMdRaid1Image();
+    TestGeneratedMdRaid0Image();
     TestLvmMetadataDiagnostics();
     TestGeneratedLvm2Image();
     TestGeneratedLvm2MultiPvImage();
@@ -1349,6 +1350,8 @@ static void TestRealImageRegressionRunner()
     var regularSha256 = Convert.ToHexString(SHA256.HashData(BtrfsTestImageFactory.RegularData));
     var lvmFirstPath = Path.Combine(AppContext.BaseDirectory, "sample-lvm2-multipv-1.img");
     var lvmSecondPath = Path.Combine(AppContext.BaseDirectory, "sample-lvm2-multipv-2.img");
+    var mdRaid0FirstPath = Path.Combine(AppContext.BaseDirectory, "synthetic-md-raid0-1.raw");
+    var mdRaid0SecondPath = Path.Combine(AppContext.BaseDirectory, "synthetic-md-raid0-2.raw");
     var manifestPath = Path.Combine(AppContext.BaseDirectory, "real-image-regression.generated.json");
     var manifest = $$"""
         {
@@ -1430,13 +1433,41 @@ static void TestRealImageRegressionRunner()
                   ]
                 }
               ]
+            },
+            {
+              "name": "generated Linux md RAID0 runner",
+              "path": "{{Path.GetFileName(mdRaid0FirstPath)}}",
+              "sha256": "{{Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(mdRaid0FirstPath)))}}",
+              "companionImages": [
+                {
+                  "path": "{{Path.GetFileName(mdRaid0SecondPath)}}",
+                  "sha256": "{{Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(mdRaid0SecondPath)))}}"
+                }
+              ],
+              "deviceSet": "Linux md RAID0",
+              "expectedDiskLength": {{TestImageFactory.VirtualSize}},
+              "expectedPartitionCount": 1,
+              "partitions": [
+                {
+                  "number": 1,
+                  "expectedFileSystem": "FAT16",
+                  "files": [
+                    {
+                      "path": "/HELLO.TXT",
+                      "expectedDirectory": false,
+                      "expectedLength": {{Encoding.ASCII.GetByteCount(TestImageFactory.HelloText)}},
+                      "sha256": "{{helloSha256}}"
+                    }
+                  ]
+                }
+              ]
             }
           ]
         }
         """;
     File.WriteAllText(manifestPath, manifest, new UTF8Encoding(false));
     var summary = RealImageRegressionRunner.Run(manifestPath);
-    Assert(summary.CaseCount == 3, "real-image regression runner case count");
+    Assert(summary.CaseCount == 4, "real-image regression runner case count");
 }
 
 static void TestBitLockerRecoveryPasswordUnlock()
@@ -3024,6 +3055,107 @@ static void TestGeneratedMdRaid1Image()
     }
 }
 
+static void TestGeneratedMdRaid0Image()
+{
+    var firstPath = Path.Combine(AppContext.BaseDirectory, "synthetic-md-raid0-1.raw");
+    var secondPath = Path.Combine(AppContext.BaseDirectory, "synthetic-md-raid0-2.raw");
+    var expected = TestImageFactory.CreateMdRaid0Fat16(firstPath, secondPath);
+    using (var first = DiskImageReaderFactory.Open(firstPath))
+    using (var second = DiskImageReaderFactory.Open(secondPath))
+    {
+        var discovery = MdRaidDeviceSet.Discover([second, first]);
+        Assert(discovery.Components.Count == 2, "Linux md RAID0 component discovery");
+        Assert(discovery.Arrays.Count == 1, string.Join(Environment.NewLine, discovery.Diagnostics));
+        var array = discovery.Arrays[0];
+        Assert(array.Level == 0 && array.LevelName == "RAID0", "Linux md RAID0 level");
+        Assert(!array.Reader.IsDegraded, "Linux md RAID0 complete array");
+        Assert(array.Reader.AvailableRoles.SequenceEqual(new ushort[] { 0, 1 }), "Linux md RAID0 role ordering");
+        Assert(array.Reader.Length == expected.Length, "Linux md RAID0 length");
+        Assert(
+            Qcow2Explorer.Core.EndianUtilities.ReadBytes(array.Reader, 0, expected.Length).SequenceEqual(expected),
+            "Linux md RAID0 full striped mapping");
+        Assert(
+            Qcow2Explorer.Core.EndianUtilities.ReadBytes(array.Reader, 64 * 1024 - 17, 96)
+                .SequenceEqual(expected.AsSpan(64 * 1024 - 17, 96)),
+            "Linux md RAID0 chunk-boundary mapping");
+
+        var partitions = PartitionTableReader.ReadPartitions(array.Reader);
+        Assert(partitions.Count == 1, "partition table inside Linux md RAID0");
+        var partition = partitions[0];
+        partition.FileSystem = FileSystemDetector.Detect(array.Reader, partition);
+        Assert(partition.FileSystem == "FAT16", "FAT16 inside Linux md RAID0");
+        var fs = FileSystemDetector.TryOpen(array.Reader, partition, out var error);
+        Assert(fs is not null, error);
+        var hello = fs!.ListDirectory(fs.Root).Single(node => node.Name == "HELLO.TXT");
+        Assert(
+            Encoding.ASCII.GetString(fs.ReadFile(hello, 0, (int)hello.Size)) == TestImageFactory.HelloText,
+            "Linux md RAID0 file read");
+    }
+
+    using (var first = DiskImageReaderFactory.Open(firstPath))
+    {
+        var discovery = MdRaidDeviceSet.Discover([first]);
+        Assert(discovery.Arrays.Count == 0, "Linux md RAID0 rejects a missing member");
+        Assert(
+            discovery.Diagnostics.Any(message => message.Contains("全active role", StringComparison.Ordinal)),
+            "Linux md RAID0 missing-member diagnostic");
+    }
+
+    var staleFirstPath = Path.Combine(AppContext.BaseDirectory, "synthetic-md-raid0-stale-1.raw");
+    var staleSecondPath = Path.Combine(AppContext.BaseDirectory, "synthetic-md-raid0-stale-2.raw");
+    _ = TestImageFactory.CreateMdRaid0Fat16(
+        staleFirstPath,
+        staleSecondPath,
+        firstEvents: 51,
+        secondEvents: 52);
+    using (var first = DiskImageReaderFactory.Open(staleFirstPath))
+    using (var second = DiskImageReaderFactory.Open(staleSecondPath))
+    {
+        var discovery = MdRaidDeviceSet.Discover([first, second]);
+        Assert(discovery.Arrays.Count == 0, "Linux md RAID0 rejects a stale member");
+        Assert(
+            discovery.Diagnostics.Any(message => message.Contains("全active role", StringComparison.Ordinal)),
+            "Linux md RAID0 stale-member diagnostic");
+    }
+
+    foreach (var layout in new uint[] { 1, 2 })
+    {
+        var paths = Enumerable.Range(0, 3)
+            .Select(index => Path.Combine(AppContext.BaseDirectory, $"synthetic-md-raid0-layout{layout}-{index}.raw"))
+            .ToArray();
+        var multiZoneExpected = TestImageFactory.CreateMdRaid0MultiZone(paths, layout);
+        using var first = DiskImageReaderFactory.Open(paths[0]);
+        using var second = DiskImageReaderFactory.Open(paths[1]);
+        using var third = DiskImageReaderFactory.Open(paths[2]);
+        var discovery = MdRaidDeviceSet.Discover([third, first, second]);
+        Assert(discovery.Arrays.Count == 1, string.Join(Environment.NewLine, discovery.Diagnostics));
+        Assert(
+            Qcow2Explorer.Core.EndianUtilities.ReadBytes(
+                discovery.Arrays[0].Reader,
+                0,
+                multiZoneExpected.Length).SequenceEqual(multiZoneExpected),
+            $"Linux md RAID0 multi-zone layout {layout} mapping");
+    }
+
+    var unspecifiedPaths = Enumerable.Range(0, 3)
+        .Select(index => Path.Combine(AppContext.BaseDirectory, $"synthetic-md-raid0-unspecified-{index}.raw"))
+        .ToArray();
+    _ = TestImageFactory.CreateMdRaid0MultiZone(
+        unspecifiedPaths,
+        layout: 1,
+        includeLayoutFeature: false);
+    using (var first = DiskImageReaderFactory.Open(unspecifiedPaths[0]))
+    using (var second = DiskImageReaderFactory.Open(unspecifiedPaths[1]))
+    using (var third = DiskImageReaderFactory.Open(unspecifiedPaths[2]))
+    {
+        var discovery = MdRaidDeviceSet.Discover([first, second, third]);
+        Assert(discovery.Arrays.Count == 0, "Linux md RAID0 rejects ambiguous multi-zone layout");
+        Assert(
+            discovery.Diagnostics.Any(message => message.Contains("layout feature", StringComparison.Ordinal)),
+            "Linux md RAID0 ambiguous-layout diagnostic");
+    }
+}
+
 static void TestLvmMetadataDiagnostics()
 {
     const string metadata = """
@@ -4391,27 +4523,174 @@ internal static class TestImageFactory
         }
     }
 
+    public static byte[] CreateMdRaid0Fat16(
+        string firstPath,
+        string secondPath,
+        ulong firstEvents = 42,
+        ulong secondEvents = 42)
+    {
+        const int dataOffset = 1024 * 1024;
+        const uint chunkSectors = 128;
+        const int chunkBytes = checked((int)chunkSectors * BytesPerSector);
+        var arrayData = CreateVirtualDisk();
+        if (arrayData.Length % (chunkBytes * 2) != 0)
+        {
+            throw new InvalidOperationException("Synthetic RAID0 data must fill complete stripes.");
+        }
+
+        var memberDataLength = arrayData.Length / 2;
+        var componentLength = checked(dataOffset + memberDataLength + 1024 * 1024);
+        var components = new[] { new byte[componentLength], new byte[componentLength] };
+        for (var logicalOffset = 0; logicalOffset < arrayData.Length; logicalOffset += chunkBytes)
+        {
+            var logicalChunk = logicalOffset / chunkBytes;
+            var memberIndex = logicalChunk % components.Length;
+            var memberChunk = logicalChunk / components.Length;
+            Array.Copy(
+                arrayData,
+                logicalOffset,
+                components[memberIndex],
+                dataOffset + memberChunk * chunkBytes,
+                chunkBytes);
+        }
+
+        var setUuid = Guid.Parse("9d83120a-b116-493a-a77f-a9093d82cad7").ToByteArray();
+        byte[][] deviceUuids =
+        [
+            Guid.Parse("57581919-f1e4-4af2-9875-2b1ca75b198d").ToByteArray(),
+            Guid.Parse("ee55f914-f6a5-4eca-9a3e-c8893ad09176").ToByteArray(),
+        ];
+        var events = new[] { firstEvents, secondEvents };
+        var paths = new[] { firstPath, secondPath };
+        var memberSizeSectors = checked((ulong)(memberDataLength / BytesPerSector));
+        for (var index = 0; index < components.Length; index++)
+        {
+            var superblock = CreateMdSuperblock(
+                setUuid,
+                deviceUuids[index],
+                checked((uint)index),
+                checked((ushort)index),
+                memberSizeSectors,
+                events[index],
+                level: 0,
+                chunkSectors: chunkSectors);
+            superblock.CopyTo(components[index], 4096);
+            File.WriteAllBytes(paths[index], components[index]);
+        }
+
+        return arrayData;
+    }
+
+    public static byte[] CreateMdRaid0MultiZone(
+        IReadOnlyList<string> paths,
+        uint layout,
+        bool includeLayoutFeature = true)
+    {
+        if (paths.Count != 3 || layout is not 1 and not 2)
+        {
+            throw new ArgumentException("Synthetic multi-zone RAID0 requires three paths and layout 1 or 2.");
+        }
+
+        const int dataOffset = 1024 * 1024;
+        const uint chunkSectors = 128;
+        const int chunkBytes = checked((int)chunkSectors * BytesPerSector);
+        int[] memberChunks = [1, 3, 3];
+        var components = memberChunks
+            .Select(count => new byte[dataOffset + count * chunkBytes + 1024 * 1024])
+            .ToArray();
+        var expected = new byte[memberChunks.Sum() * chunkBytes];
+        for (var logicalChunk = 0; logicalChunk < memberChunks.Sum(); logicalChunk++)
+        {
+            expected.AsSpan(logicalChunk * chunkBytes, chunkBytes)
+                .Fill(checked((byte)(0x31 + logicalChunk)));
+        }
+
+        for (var logicalChunk = 0; logicalChunk < 3; logicalChunk++)
+        {
+            Array.Copy(
+                expected,
+                logicalChunk * chunkBytes,
+                components[logicalChunk],
+                dataOffset,
+                chunkBytes);
+        }
+
+        int[] originalZoneRoles = [2, 1, 2, 1];
+        int[] alternateZoneRoles = [1, 2, 1, 2];
+        var zoneRoles = layout == 1 ? originalZoneRoles : alternateZoneRoles;
+        var writtenChunks = new int[components.Length];
+        writtenChunks[0] = 1;
+        writtenChunks[1] = 1;
+        writtenChunks[2] = 1;
+        for (var zoneChunk = 0; zoneChunk < zoneRoles.Length; zoneChunk++)
+        {
+            var role = zoneRoles[zoneChunk];
+            Array.Copy(
+                expected,
+                (3 + zoneChunk) * chunkBytes,
+                components[role],
+                dataOffset + writtenChunks[role] * chunkBytes,
+                chunkBytes);
+            writtenChunks[role]++;
+        }
+
+        var setUuid = Guid.Parse("c66d27eb-2497-4118-a72b-8ffb17f2795a").ToByteArray();
+        byte[][] deviceUuids =
+        [
+            Guid.Parse("9e51f784-b812-4b05-9140-1b6908411bd0").ToByteArray(),
+            Guid.Parse("25c66a1c-73e1-413a-8a76-722b7c139b58").ToByteArray(),
+            Guid.Parse("b8f74a14-70f8-42c1-aeab-6c8157d5d9f5").ToByteArray(),
+        ];
+        for (var index = 0; index < components.Length; index++)
+        {
+            var superblock = CreateMdSuperblock(
+                setUuid,
+                deviceUuids[index],
+                checked((uint)index),
+                checked((ushort)index),
+                sizeSectors: 0,
+                events: 61,
+                level: 0,
+                layout: layout,
+                chunkSectors: chunkSectors,
+                dataSizeSectors: checked((ulong)memberChunks[index] * chunkSectors),
+                raidDisks: 3,
+                featureMap: includeLayoutFeature ? 4096U : 0);
+            superblock.CopyTo(components[index], 4096);
+            File.WriteAllBytes(paths[index], components[index]);
+        }
+
+        return expected;
+    }
+
     private static byte[] CreateMdSuperblock(
         byte[] setUuid,
         byte[] deviceUuid,
         uint deviceNumber,
         ushort role,
         ulong sizeSectors,
-        ulong events)
+        ulong events,
+        int level = 1,
+        uint layout = 0,
+        uint chunkSectors = 128,
+        ulong? dataSizeSectors = null,
+        uint raidDisks = 2,
+        uint featureMap = 0)
     {
         var data = new byte[4096];
         WriteU32Le(data, 0, 0xa92b4efc);
         WriteU32Le(data, 4, 1);
+        WriteU32Le(data, 8, featureMap);
         setUuid.CopyTo(data, 16);
         Encoding.ASCII.GetBytes("vdt:synthetic").CopyTo(data, 32);
         WriteU64Le(data, 64, 1);
-        WriteU32Le(data, 72, 1);
-        WriteU32Le(data, 76, 0);
+        WriteU32Le(data, 72, checked((uint)level));
+        WriteU32Le(data, 76, layout);
         BinaryPrimitives.WriteUInt64LittleEndian(data.AsSpan(80), sizeSectors);
-        WriteU32Le(data, 88, 128);
-        WriteU32Le(data, 92, 2);
+        WriteU32Le(data, 88, chunkSectors);
+        WriteU32Le(data, 92, raidDisks);
         WriteU64Le(data, 128, 2048);
-        BinaryPrimitives.WriteUInt64LittleEndian(data.AsSpan(136), sizeSectors);
+        BinaryPrimitives.WriteUInt64LittleEndian(data.AsSpan(136), dataSizeSectors ?? sizeSectors);
         WriteU64Le(data, 144, 8);
         BinaryPrimitives.WriteUInt64LittleEndian(data.AsSpan(152), ulong.MaxValue);
         WriteU32Le(data, 160, deviceNumber);
@@ -4419,12 +4698,14 @@ internal static class TestImageFactory
         WriteU64Le(data, 192, 1);
         BinaryPrimitives.WriteUInt64LittleEndian(data.AsSpan(200), events);
         BinaryPrimitives.WriteUInt64LittleEndian(data.AsSpan(208), ulong.MaxValue);
-        WriteU32Le(data, 220, 2);
+        WriteU32Le(data, 220, raidDisks);
         WriteU32Le(data, 224, 512);
-        WriteU16Le(data, 256, 0);
-        WriteU16Le(data, 258, 1);
+        for (var index = 0; index < raidDisks; index++)
+        {
+            WriteU16Le(data, checked(256 + (int)index * 2), checked((ushort)index));
+        }
         WriteU16Le(data, checked(256 + (int)deviceNumber * 2), role);
-        WriteU32Le(data, 216, CalculateMdChecksum(data, 260));
+        WriteU32Le(data, 216, CalculateMdChecksum(data, checked(256 + (int)raidDisks * 2)));
         return data;
     }
 
