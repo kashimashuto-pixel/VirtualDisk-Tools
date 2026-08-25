@@ -129,12 +129,15 @@
 - ツールバーの「Btrfs複数RAW」で同一FSIDのRAW一式を選択し、画面上のprimary partitionを複数device readerで開く経路を追加
 - 実イメージ回帰manifestへ`companionImages`を追加し、各RAWのSHA-256と全入力に共通するFSIDを検証
 - 2台用`mkfs.btrfs -m single -d single`／`-m raid1 -d raid1` fixture生成スクリプトを追加し、両profileを`btrfs check --readonly`と実イメージ回帰で確認
+- 欠損deviceのUUIDをDEVICE_ITEMで検証し、すべてのchunkに利用可能なstripeが残る場合だけdegraded読み取りを許可
+- RAID1のどちらか1台だけ、および未使用deviceだけが欠損したsingle profileを実`mkfs.btrfs` fixtureで読み取り確認
+- 残存RAID1 mirrorのmetadata/data破損と、欠損側にsingle chunkがある構成を合成fixtureで安全に拒否
 
 ## 次回の推奨作業
 
 ### 1. Btrfs対応の第2段階
 
-- RAID1 degraded読取、RAID1C3／RAID1C4、RAID10を順に検討する
+- RAID1C3／RAID1C4、RAID10を順に検討する
 
 ## 保守・品質改善
 

@@ -806,10 +806,54 @@ static void TestGeneratedBtrfsMultiDeviceImage()
                 "Btrfs stripe UUID diagnostic");
         }
     }
+
+    using (var first = DiskImageReaderFactory.Open(stripeFirstPath))
+    {
+        var partition = PartitionTableReader.ReadPartitions(first).Single();
+        try
+        {
+            _ = new BtrfsFileSystem([new PartitionSliceReader(first, partition)], partition);
+            Assert(false, "missing Btrfs device stripe UUID mismatch is rejected");
+        }
+        catch (InvalidDataException ex)
+        {
+            Assert(
+                ex.Message.Contains("stripe", StringComparison.Ordinal)
+                    && ex.Message.Contains("UUID", StringComparison.Ordinal),
+                "missing Btrfs device stripe UUID diagnostic");
+        }
+    }
 }
 
 static void TestGeneratedBtrfsRaid1Image()
 {
+    var degradedFirstPath = Path.Combine(AppContext.BaseDirectory, "synthetic-btrfs-raid1-degraded-1.raw");
+    var degradedSecondPath = Path.Combine(AppContext.BaseDirectory, "synthetic-btrfs-raid1-degraded-2.raw");
+    _ = BtrfsTestImageFactory.CreateRaid1(degradedFirstPath, degradedSecondPath);
+    using (var first = DiskImageReaderFactory.Open(degradedFirstPath))
+    {
+        var partition = PartitionTableReader.ReadPartitions(first).Single();
+        var fs = new BtrfsFileSystem([new PartitionSliceReader(first, partition)], partition);
+        Assert(fs.IsDegraded, "Btrfs RAID1 first-device degraded state");
+        Assert(fs.MissingDeviceIds.SequenceEqual([2UL]), "Btrfs RAID1 first-device missing devid");
+        var regular = fs.ListDirectory(fs.Root).Single(node => node.Name == "regular.bin");
+        Assert(
+            fs.ReadFile(regular, 0, checked((int)regular.Size))
+                .SequenceEqual(BtrfsTestImageFactory.RegularData),
+            "Btrfs RAID1 first-device degraded read");
+    }
+
+    using (var second = DiskImageReaderFactory.Open(degradedSecondPath))
+    {
+        var partition = PartitionTableReader.ReadPartitions(second).Single();
+        var fs = new BtrfsFileSystem([new PartitionSliceReader(second, partition)], partition);
+        Assert(fs.IsDegraded, "Btrfs RAID1 second-device degraded state");
+        Assert(fs.MissingDeviceIds.SequenceEqual([1UL]), "Btrfs RAID1 second-device missing devid");
+        Assert(
+            fs.ListDirectory(fs.Root).Any(node => node.Name == "hello.txt"),
+            "Btrfs RAID1 second-device degraded metadata read");
+    }
+
     var fallbackFirstPath = Path.Combine(AppContext.BaseDirectory, "synthetic-btrfs-raid1-fallback-1.raw");
     var fallbackSecondPath = Path.Combine(AppContext.BaseDirectory, "synthetic-btrfs-raid1-fallback-2.raw");
     _ = BtrfsTestImageFactory.CreateRaid1(
@@ -841,6 +885,62 @@ static void TestGeneratedBtrfsRaid1Image()
         Assert(
             entries.Any(node => node.Name == "hello.txt"),
             "generated Btrfs RAID1 metadata mirror fallback");
+    }
+
+    var degradedCorruptDataFirstPath = Path.Combine(
+        AppContext.BaseDirectory,
+        "synthetic-btrfs-raid1-degraded-corrupt-data-1.raw");
+    var degradedCorruptDataSecondPath = Path.Combine(
+        AppContext.BaseDirectory,
+        "synthetic-btrfs-raid1-degraded-corrupt-data-2.raw");
+    _ = BtrfsTestImageFactory.CreateRaid1(
+        degradedCorruptDataFirstPath,
+        degradedCorruptDataSecondPath,
+        corruptFirstDataMirror: true);
+    using (var first = DiskImageReaderFactory.Open(degradedCorruptDataFirstPath))
+    {
+        var partition = PartitionTableReader.ReadPartitions(first).Single();
+        var fs = new BtrfsFileSystem([new PartitionSliceReader(first, partition)], partition);
+        var regular = fs.ListDirectory(fs.Root).Single(node => node.Name == "regular.bin");
+        try
+        {
+            _ = fs.ReadFile(regular, 0, checked((int)regular.Size));
+            Assert(false, "Btrfs degraded RAID1 rejects corrupt available data mirror");
+        }
+        catch (InvalidDataException ex)
+        {
+            Assert(
+                ex.Message.Contains("全mirror", StringComparison.Ordinal)
+                    && ex.Message.Contains("devid=2", StringComparison.Ordinal),
+                "Btrfs degraded RAID1 corrupt available data diagnostic");
+        }
+    }
+
+    var degradedCorruptMetadataFirstPath = Path.Combine(
+        AppContext.BaseDirectory,
+        "synthetic-btrfs-raid1-degraded-corrupt-metadata-1.raw");
+    var degradedCorruptMetadataSecondPath = Path.Combine(
+        AppContext.BaseDirectory,
+        "synthetic-btrfs-raid1-degraded-corrupt-metadata-2.raw");
+    _ = BtrfsTestImageFactory.CreateRaid1(
+        degradedCorruptMetadataFirstPath,
+        degradedCorruptMetadataSecondPath,
+        corruptFirstMetadataMirror: true);
+    using (var first = DiskImageReaderFactory.Open(degradedCorruptMetadataFirstPath))
+    {
+        var partition = PartitionTableReader.ReadPartitions(first).Single();
+        try
+        {
+            _ = new BtrfsFileSystem([new PartitionSliceReader(first, partition)], partition);
+            Assert(false, "Btrfs degraded RAID1 rejects corrupt available metadata mirror");
+        }
+        catch (InvalidDataException ex)
+        {
+            Assert(
+                ex.Message.Contains("全mirror", StringComparison.Ordinal)
+                    && ex.Message.Contains("devid=2", StringComparison.Ordinal),
+                "Btrfs degraded RAID1 corrupt available metadata diagnostic");
+        }
     }
 
     var dataCorruptFirstPath = Path.Combine(AppContext.BaseDirectory, "synthetic-btrfs-raid1-data-corrupt-1.raw");

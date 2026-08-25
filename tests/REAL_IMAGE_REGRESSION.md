@@ -61,6 +61,7 @@ wsl --distribution Ubuntu-24.04 --user root -- sh -lc `
 
 生成処理は2台を同時にloop deviceへ割り当て、`btrfs check --readonly`と各RAW・内部ファイルのSHA-256を表示します。single profileは`-Profile Single`で別名の出力先を指定してください。
 manifestではprimaryを従来の`path`／`sha256`に置き、残りを`companionImages`へ記録します。ランナーは全RAWのSHA-256を照合し、すべてに共通するBtrfs FSIDがない構成を拒否します。
+2-copy RAID1の片方だけを通常の`path`として登録し`companionImages`を省略すると、degraded読み取りも回帰確認できます。欠損deviceがあっても、すべてのchunkに利用可能なstripeが残る場合だけ開きます。single profileでも、欠損device上に割り当て済みchunkがなければ同じ基準で読み取れます。
 
 ### BitLocker XTS-AES
 
