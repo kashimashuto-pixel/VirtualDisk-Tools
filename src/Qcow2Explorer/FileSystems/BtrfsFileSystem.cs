@@ -45,6 +45,7 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
     private const ulong ChunkTypeData = 1UL << 0;
     private const ulong ChunkTypeSystem = 1UL << 1;
     private const ulong ChunkTypeMetadata = 1UL << 2;
+    private const ulong ChunkProfileRaid0 = 1UL << 3;
     private const ulong ChunkProfileRaid1 = 1UL << 4;
     private const ulong ChunkProfileRaid10 = 1UL << 6;
     private const ulong ChunkProfileRaid1C3 = 1UL << 9;
@@ -674,6 +675,7 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
         var expectedStripeCount = profile switch
         {
             0 => 1,
+            ChunkProfileRaid0 => stripeCount,
             ChunkProfileRaid1 => 2,
             ChunkProfileRaid10 => stripeCount,
             ChunkProfileRaid1C3 => 3,
@@ -687,9 +689,12 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
                 + $"type=0x{type:X}, stripes={stripeCount}, sub_stripes={subStripeCount}");
         }
 
-        var validStripeLayout = profile == ChunkProfileRaid10
-            ? stripeCount >= 2 && stripeCount % 2 == 0 && subStripeCount == 2
-            : stripeCount == expectedStripeCount && subStripeCount is 0 or 1;
+        var validStripeLayout = profile switch
+        {
+            ChunkProfileRaid0 => stripeCount >= 1 && subStripeCount is 0 or 1,
+            ChunkProfileRaid10 => stripeCount >= 2 && stripeCount % 2 == 0 && subStripeCount == 2,
+            _ => stripeCount == expectedStripeCount && subStripeCount is 0 or 1,
+        };
         if (!validStripeLayout)
         {
             var profileName = GetProfileName(profile);
@@ -746,7 +751,7 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
                 Convert.ToHexString(stripeUuid));
         }
 
-        if (IsMirroredProfile(profile)
+        if ((IsMirroredProfile(profile) || profile == ChunkProfileRaid0)
             && stripes.Select(stripe => stripe.DeviceId).Distinct().Count() != stripes.Length)
         {
             throw new InvalidDataException(
@@ -1917,7 +1922,7 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
         int mirrorIndex)
     {
         var profile = chunk.Type & ChunkProfileMask;
-        if (profile != ChunkProfileRaid10)
+        if (profile is not ChunkProfileRaid0 and not ChunkProfileRaid10)
         {
             return new BtrfsStripeMapping(
                 chunk.Stripes[mirrorIndex],
@@ -1925,11 +1930,12 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
                 chunk.Length - withinChunk);
         }
 
-        var dataStripeCount = chunk.Stripes.Count / chunk.SubStripeCount;
+        var copyCount = profile == ChunkProfileRaid10 ? chunk.SubStripeCount : 1;
+        var dataStripeCount = chunk.Stripes.Count / copyCount;
         var logicalStripeNumber = withinChunk / chunk.StripeLength;
         var withinStripe = withinChunk % chunk.StripeLength;
         var groupIndex = checked((int)(logicalStripeNumber % (ulong)dataStripeCount));
-        var stripeIndex = groupIndex * chunk.SubStripeCount + mirrorIndex;
+        var stripeIndex = groupIndex * copyCount + mirrorIndex;
         var physicalStripeNumber = logicalStripeNumber / (ulong)dataStripeCount;
         var stripe = chunk.Stripes[stripeIndex];
         var physical = checked(
@@ -1944,13 +1950,15 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
 
     private static ulong GetStripePhysicalLength(BtrfsChunk chunk, int stripeIndex)
     {
-        if ((chunk.Type & ChunkProfileMask) != ChunkProfileRaid10)
+        var profile = chunk.Type & ChunkProfileMask;
+        if (profile is not ChunkProfileRaid0 and not ChunkProfileRaid10)
         {
             return chunk.Length;
         }
 
-        var dataStripeCount = chunk.Stripes.Count / chunk.SubStripeCount;
-        var groupIndex = stripeIndex / chunk.SubStripeCount;
+        var copyCount = profile == ChunkProfileRaid10 ? chunk.SubStripeCount : 1;
+        var dataStripeCount = chunk.Stripes.Count / copyCount;
+        var groupIndex = stripeIndex / copyCount;
         var logicalStripeCount = checked(
             (chunk.Length + chunk.StripeLength - 1) / chunk.StripeLength);
         if ((ulong)groupIndex >= logicalStripeCount)
@@ -2332,6 +2340,7 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
     {
         return profile switch
         {
+            ChunkProfileRaid0 => "RAID0",
             ChunkProfileRaid1 => "RAID1",
             ChunkProfileRaid10 => "RAID10",
             ChunkProfileRaid1C3 => "RAID1C3",

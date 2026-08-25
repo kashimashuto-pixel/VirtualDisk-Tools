@@ -39,7 +39,7 @@ for command_name in truncate sfdisk losetup mkfs.btrfs btrfs mount mountpoint um
     fi
 done
 
-if [[ "$profile" != "single" && "$profile" != "raid1" ]]; then
+if [[ "$profile" != "single" && "$profile" != "raid0" && "$profile" != "raid1" ]]; then
     echo "Unsupported Btrfs profile: $profile" >&2
     exit 2
 fi

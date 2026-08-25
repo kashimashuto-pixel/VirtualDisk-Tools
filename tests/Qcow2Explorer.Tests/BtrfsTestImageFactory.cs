@@ -687,6 +687,120 @@ internal static class BtrfsTestImageFactory
         return new BtrfsMultiCopyTestFixture(paths.ToArray());
     }
 
+    public static BtrfsMultiDeviceTestFixture CreateRaid0(
+        string firstPath,
+        string secondPath,
+        IReadOnlySet<int>? corruptDataDeviceIds = null)
+    {
+        var paths = new[] { firstPath, secondPath };
+        _ = Create(firstPath);
+        var sourceDisk = File.ReadAllBytes(firstPath);
+        var partitionLength = DiskSize - PartitionStart;
+        var fileSystemLength = checked(partitionLength * paths.Length);
+        var fsid = Guid.Parse("8e0a61a3-fbcb-4a76-b16e-777579eecdc6").ToByteArray();
+        var chunkUuid = Guid.Parse("f61c47e6-f8c5-44d8-971c-d48e90f5a325").ToByteArray();
+        byte[][] deviceUuids =
+        [
+            Guid.Parse("56ca9a70-b88c-4ba2-855a-e2ac5bec938c").ToByteArray(),
+            Guid.Parse("1bf62a80-1b07-451c-9f20-d51717f2ecb3").ToByteArray(),
+        ];
+        var metadataStripes = Enumerable.Range(0, paths.Length)
+            .Select(index => new BtrfsTestStripe((ulong)index + 1, 0, deviceUuids[index]))
+            .ToArray();
+        const int stripeLength = 64 * 1024;
+        var dataLogicalStart = RegularDataLogicalOffset - (stripeLength - SectorSize);
+        var dataStripes = metadataStripes
+            .Select(stripe => stripe with { PhysicalStart = RegularDataLogicalOffset })
+            .ToArray();
+        var metadataChunk = CreateChunk(
+            dataLogicalStart,
+            metadataStripes,
+            type: 0x0e); // SYSTEM | METADATA | RAID0
+        var dataChunk = CreateChunk(
+            4 * 1024 * 1024,
+            dataStripes,
+            type: 0x09); // DATA | RAID0
+        var chunkTreeItems = Enumerable.Range(0, paths.Length)
+            .Select(index => (
+                new BtrfsKey(1, 216, (ulong)index + 1),
+                CreateDeviceItem((ulong)index + 1, partitionLength, deviceUuids[index], fsid)))
+            .ToList();
+        chunkTreeItems.Add((new BtrfsKey(256, 228, 0), metadataChunk));
+        chunkTreeItems.Add((new BtrfsKey(256, 228, (ulong)dataLogicalStart), dataChunk));
+        CreateLeaf(
+            ChunkTreeLogicalOffset,
+            owner: 3,
+            fsid,
+            chunkUuid,
+            chunkTreeItems)
+            .CopyTo(sourceDisk, PartitionStart + ChunkTreeLogicalOffset);
+
+        for (var index = 0; index < paths.Length; index++)
+        {
+            var disk = new byte[DiskSize];
+            WriteMbr(disk, partitionLength);
+            CopyStripedChunkToDevice(sourceDisk, disk, 0, 0, dataLogicalStart, index);
+            CopyStripedChunkToDevice(
+                sourceDisk,
+                disk,
+                dataLogicalStart,
+                RegularDataLogicalOffset,
+                4 * 1024 * 1024,
+                index);
+            CreateSuperblock(
+                fileSystemLength,
+                partitionLength,
+                numberOfDevices: (ulong)paths.Length,
+                deviceId: (ulong)index + 1,
+                fsid,
+                deviceUuids[index],
+                metadataChunk,
+                defaultSubvolume: false)
+                .CopyTo(disk, PartitionStart + SuperblockLogicalOffset);
+
+            if (corruptDataDeviceIds?.Contains(index + 1) == true)
+            {
+                var logical = checked((ulong)(RegularDataLogicalOffset + index * SectorSize + 17));
+                var physical = MapRaid10Physical(
+                    logical - (ulong)dataLogicalStart,
+                    (ulong)RegularDataLogicalOffset);
+                disk[checked(PartitionStart + (int)physical)] ^= 1;
+            }
+
+            File.WriteAllBytes(paths[index], disk);
+        }
+
+        return new BtrfsMultiDeviceTestFixture(firstPath, secondPath);
+    }
+
+    private static void CopyStripedChunkToDevice(
+        byte[] source,
+        byte[] destination,
+        int logicalStart,
+        int physicalStart,
+        int length,
+        int deviceIndex)
+    {
+        const int stripeLength = 64 * 1024;
+        const int stripeCount = 2;
+        var logicalEnd = checked(logicalStart + length);
+        for (var logical = logicalStart; logical < logicalEnd; logical += stripeLength)
+        {
+            var withinChunk = logical - logicalStart;
+            var logicalStripeNumber = withinChunk / stripeLength;
+            if (logicalStripeNumber % stripeCount != deviceIndex)
+            {
+                continue;
+            }
+
+            var copyLength = Math.Min(stripeLength, logicalEnd - logical);
+            var physicalStripeNumber = logicalStripeNumber / stripeCount;
+            source.AsSpan(PartitionStart + logical, copyLength).CopyTo(destination.AsSpan(
+                PartitionStart + physicalStart + physicalStripeNumber * stripeLength,
+                copyLength));
+        }
+    }
+
     private static void CopyRaid10ChunkToDevice(
         byte[] source,
         byte[] destination,

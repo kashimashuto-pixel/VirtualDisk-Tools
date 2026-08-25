@@ -3,7 +3,7 @@ param(
 
     [string]$SecondOutputPath = (Join-Path $PSScriptRoot '..\.tmp\real-images\btrfs-multi-2.raw'),
 
-    [ValidateSet('Single', 'Raid1')]
+    [ValidateSet('Single', 'Raid0', 'Raid1')]
     [string]$Profile = 'Raid1',
 
     [string]$Distribution = 'Ubuntu-24.04',

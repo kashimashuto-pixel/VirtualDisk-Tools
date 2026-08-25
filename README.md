@@ -16,7 +16,7 @@ C# / Windows Forms で作成した、読み取り専用の仮想ディスク解�
   - NTFS
   - exFAT
   - XFS（従来形式・bigtimeの更新日時に対応）
-  - Btrfs（単一／複数デバイスのsingle profile、RAID1／RAID1C3／RAID1C4／RAID10、subvolume／snapshot／default subvolume、backup superblock復旧、インライン／通常／スパース／zlib・LZO・zstd圧縮extent、CRC32C検証に対応）
+  - Btrfs（単一／複数デバイスのsingle profile、RAID0／RAID1／RAID1C3／RAID1C4／RAID10、subvolume／snapshot／default subvolume、backup superblock復旧、インライン／通常／スパース／zlib・LZO・zstd圧縮extent、CRC32C検証に対応）
   - ext2 / ext3 / ext4
   - SquashFS
   - BitLocker/FVE はクリアキーの自動解除、48桁回復パスワード、通常パスワード、スタートアップキー（`.BEK`）による解除に対応
@@ -187,7 +187,7 @@ ProjFS マウントは Windows の Client-ProjFS 機能を使い、選択した�
 - 暗号化されたswtpm状態は、暗号方式と必要な鍵長までは判定できます。swtpmで設定されたファイル鍵または移行鍵がない場合、内部状態は復号できません。
 - 平文のTPM状態データは存在と構造を表示できますが、libtpmsのversion依存な内部構造を秘密鍵単位まで展開する機能ではありません。
 - ext4 の journal replay は行いません。
-- Btrfsは単一／複数デバイスのsingle profile、2-copy RAID1、3-copy RAID1C3、4-copy RAID1C4、striped mirrorのRAID10を読み取り専用で扱い、DEVICE_ITEM、devid、FSID、device UUIDとstripeを相互検証します。mirror profileではmetadata tree blockのCRC32Cまたはdata checksumが一致するコピーだけを採用し、破損時は検証済みの代替コピーへ切り替えます。RAID10はchunkごとの`stripe_length`と`sub_stripes`に従ってmirror組を切り替えます。複数RAWはツールバーから一組として指定でき、実イメージ回帰manifestでも各companionのSHA-256を検証します。deviceが欠損していても、chunk単位ですべてのmirror組に利用可能なstripeが残る場合はdegraded読み取りで開き、欠損devidを警告へ表示します。subvolume、snapshot、default subvolumeとzlib・LZO・zstd圧縮extentを読み取れ、snapshot内に残る入れ子subvolume境界は元subvolumeへ誤接続せず空ディレクトリとして表示します。RAID0／5／6、暗号化extent、書き込みは未対応です。
+- Btrfsは単一／複数デバイスのsingle profile、RAID0、2-copy RAID1、3-copy RAID1C3、4-copy RAID1C4、striped mirrorのRAID10を読み取り専用で扱い、DEVICE_ITEM、devid、FSID、device UUIDとstripeを相互検証します。mirror profileではmetadata tree blockのCRC32Cまたはdata checksumが一致するコピーだけを採用し、破損時は検証済みの代替コピーへ切り替えます。RAID0／RAID10はchunkごとの`stripe_length`に従ってdeviceを切り替え、RAID10はさらに`sub_stripes`単位でmirrorを選択します。複数RAWはツールバーから一組として指定でき、実イメージ回帰manifestでも各companionのSHA-256を検証します。RAID0は全stripe deviceが必要です。mirror profileはchunk単位ですべてのmirror組に利用可能なstripeが残る場合だけdegraded読み取りで開き、欠損devidを警告へ表示します。subvolume、snapshot、default subvolumeとzlib・LZO・zstd圧縮extentを読み取れ、snapshot内に残る入れ子subvolume境界は元subvolumeへ誤接続せず空ディレクトリとして表示します。RAID5／6、暗号化extent、書き込みは未対応です。
 - Btrfsのsuperblock、metadata tree block、checksum treeに記録されたdata sectorのCRC32Cを検証し、不一致は読み取りを中止します。primary superblockが壊れている場合だけ、公式mirror位置（64 MiB／256 GiB）の検証済みbackupへ復旧し、primaryが有効なら常にprimaryを優先します。
 - SquashFS はライブラリが対応する圧縮形式のみ読み取れます。
 - Linux md RAID は検出のみです。

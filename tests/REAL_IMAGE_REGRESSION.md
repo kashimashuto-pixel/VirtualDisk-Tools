@@ -48,9 +48,9 @@ wsl --distribution Ubuntu-24.04 --user root -- sh -lc `
 64 MiB mirrorが収まるfixtureでは、primaryを変更せず`btrfs inspect-internal dump-super -s 1`でbackup superblockも確認できます。破損回帰用コピーを作る場合も、元fixtureは保持してください。
 既存fixtureは上書きせず、生成物とローカルmanifestはGitへ追加しません。
 
-### Btrfs multiple device single／RAID1
+### Btrfs multiple device single／RAID0／RAID1
 
-同じWSL環境で2個のRAWとloop deviceを使うfixtureを生成します。`-Profile Single`はmetadata/dataともsingle、`-Profile Raid1`はmetadata/dataとも2-copy RAID1です。
+同じWSL環境で2個のRAWとloop deviceを使うfixtureを生成します。`-Profile Single`はmetadata/dataともsingle、`-Profile Raid0`はstriping、`-Profile Raid1`は2-copy mirrorです。
 
 ```powershell
 .\tools\New-BtrfsMultiDeviceRegressionFixture.ps1 `
@@ -62,6 +62,7 @@ wsl --distribution Ubuntu-24.04 --user root -- sh -lc `
 生成処理は2台を同時にloop deviceへ割り当て、`btrfs check --readonly`と各RAW・内部ファイルのSHA-256を表示します。single profileは`-Profile Single`で別名の出力先を指定してください。
 manifestではprimaryを従来の`path`／`sha256`に置き、残りを`companionImages`へ記録します。ランナーは全RAWのSHA-256を照合し、すべてに共通するBtrfs FSIDがない構成を拒否します。
 2-copy RAID1の片方だけを通常の`path`として登録し`companionImages`を省略すると、degraded読み取りも回帰確認できます。欠損deviceがあっても、すべてのchunkに利用可能なstripeが残る場合だけ開きます。single profileでも、欠損device上に割り当て済みchunkがなければ同じ基準で読み取れます。
+RAID0は全stripe deviceを必要とするため、2個とも登録してください。`-Profile Raid0`で生成したfixtureは、64 KiB単位のdevice切替と通常・zlib・LZO・zstd extentを回帰確認します。
 
 RAID1C3／RAID1C4は専用スクリプトで3個／4個のRAWを生成します。
 

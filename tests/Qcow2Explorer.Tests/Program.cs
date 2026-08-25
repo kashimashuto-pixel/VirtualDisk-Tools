@@ -96,6 +96,7 @@ static void RunGeneratedImageTests()
     TestGeneratedBtrfsRaid1Image();
     TestGeneratedBtrfsRaid1C34Image();
     TestGeneratedBtrfsRaid10Image();
+    TestGeneratedBtrfsRaid0Image();
     TestGeneratedEwfE01Image();
     TestRealImageRegressionRunner();
     TestGeneratedVmaLzopImage();
@@ -1189,6 +1190,77 @@ static void TestGeneratedBtrfsRaid10Image()
                     && ex.Message.Contains("devid=1", StringComparison.Ordinal)
                     && ex.Message.Contains("devid=2", StringComparison.Ordinal),
                 "Btrfs RAID10 missing mirror group diagnostic");
+        }
+    }
+}
+
+static void TestGeneratedBtrfsRaid0Image()
+{
+    var firstPath = Path.Combine(AppContext.BaseDirectory, "synthetic-btrfs-raid0-1.raw");
+    var secondPath = Path.Combine(AppContext.BaseDirectory, "synthetic-btrfs-raid0-2.raw");
+    _ = BtrfsTestImageFactory.CreateRaid0(firstPath, secondPath);
+    using (var first = DiskImageReaderFactory.Open(firstPath))
+    using (var second = DiskImageReaderFactory.Open(secondPath))
+    {
+        var partition = PartitionTableReader.ReadPartitions(first).Single();
+        var fs = new BtrfsFileSystem(
+            [
+                new PartitionSliceReader(first, partition),
+                new PartitionSliceReader(second, PartitionTableReader.ReadPartitions(second).Single()),
+            ],
+            partition);
+        var regular = fs.ListDirectory(fs.Root).Single(node => node.Name == "regular.bin");
+        Assert(
+            fs.ReadFile(regular, 0, checked((int)regular.Size))
+                .SequenceEqual(BtrfsTestImageFactory.RegularData),
+            "Btrfs RAID0 read across stripe boundary");
+        Assert(!fs.IsDegraded, "Btrfs RAID0 complete device set");
+    }
+
+    using (var first = DiskImageReaderFactory.Open(firstPath))
+    {
+        var partition = PartitionTableReader.ReadPartitions(first).Single();
+        try
+        {
+            _ = new BtrfsFileSystem([new PartitionSliceReader(first, partition)], partition);
+            Assert(false, "Btrfs RAID0 rejects a missing stripe device");
+        }
+        catch (InvalidDataException ex)
+        {
+            Assert(
+                ex.Message.Contains("deviceが不足", StringComparison.Ordinal)
+                    && ex.Message.Contains("devid=2", StringComparison.Ordinal),
+                "Btrfs RAID0 missing stripe diagnostic");
+        }
+    }
+
+    var corruptFirstPath = Path.Combine(AppContext.BaseDirectory, "synthetic-btrfs-raid0-corrupt-1.raw");
+    var corruptSecondPath = Path.Combine(AppContext.BaseDirectory, "synthetic-btrfs-raid0-corrupt-2.raw");
+    _ = BtrfsTestImageFactory.CreateRaid0(
+        corruptFirstPath,
+        corruptSecondPath,
+        corruptDataDeviceIds: new HashSet<int> { 2 });
+    using (var first = DiskImageReaderFactory.Open(corruptFirstPath))
+    using (var second = DiskImageReaderFactory.Open(corruptSecondPath))
+    {
+        var partition = PartitionTableReader.ReadPartitions(first).Single();
+        var fs = new BtrfsFileSystem(
+            [
+                new PartitionSliceReader(first, partition),
+                new PartitionSliceReader(second, PartitionTableReader.ReadPartitions(second).Single()),
+            ],
+            partition);
+        var regular = fs.ListDirectory(fs.Root).Single(node => node.Name == "regular.bin");
+        try
+        {
+            _ = fs.ReadFile(regular, 0, checked((int)regular.Size));
+            Assert(false, "Btrfs RAID0 rejects corrupt striped data");
+        }
+        catch (InvalidDataException ex)
+        {
+            Assert(
+                ex.Message.Contains("checksum", StringComparison.Ordinal),
+                "Btrfs RAID0 corrupt data diagnostic");
         }
     }
 }
