@@ -160,6 +160,16 @@
 - 3台異容量合成fixtureでoriginal／alternate multi-zone layoutの差を回帰確認
 - 実`mdadm 4.3 --metadata=1.2 --level=0 --chunk=64` + ext4を生成し、300 MiBのstripe横断ファイルをmanifest回帰で確認
 
+### Linux md RAID10 near layout読み取り対応
+
+- Linux kernelの`__raid10_find_phys`と同じnear copyのrole・device sector写像を実装
+- near copies 2以上／far copies 1のlayoutを検証し、far／offset／far-set layoutは理由付きで拒否
+- 各論理chunkのmirror groupに同一eventのactive memberが1台以上ある場合だけdegraded組み立てを許可
+- 複数mirrorが入力されている場合は読み取った内容を比較し、不一致時は停止
+- 4台完全構成、mirror groupごとに1台残したdegraded構成、mirror group欠損、mirror不一致を合成回帰
+- 3台near-2構成でrole wrap時にcopy側のdevice sectorが進む写像を合成回帰
+- 実`mdadm 4.3 --metadata=1.2 --level=10 --layout=n2 --chunk=64` + ext4を生成し、完全／2台degraded構成と300 MiBファイルをmanifest回帰で確認
+
 ### LVM2複数PV対応
 
 - 「複数ディスク」で指定した全入力をDiscUtilsのVolumeManagerへ登録し、VGに必要なPVを横断して検出
@@ -171,15 +181,15 @@
 
 ## 次回の推奨作業
 
-### 1. Linux md RAID10
-
-- RAID10のnear layoutを追加し、必要なmirror組が不足する構成を安全に拒否する
-- その後、far／offset layoutを実イメージの需要に応じて検討する
-
-### 2. LVM2 striped LV
+### 1. LVM2 striped LV
 
 - `stripe_count > 1`のsegmentを複数PVへ写像し、stripe境界をまたぐ読み取りを追加する
 - その後にthin、snapshot、cache、mirror／RAID segmentを段階的に検討する
+
+### 2. Linux md RAID10 far／offset layout
+
+- near layoutの基盤を使い、far copyのstride、far set、offset mappingを段階的に追加する
+- 実`mdadm --layout=f2`／`o2` fixtureとdegraded組み合わせを基準に安全条件を検証する
 
 ## 保守・品質改善
 
@@ -194,7 +204,7 @@
 利用目的に応じ、次の順で検討します。
 
 1. Linux md RAIDの拡張
-   - RAID0／RAID1対応を基盤に、RAID10、その後RAID5/6を検討する
+   - RAID0／RAID1／RAID10 near対応を基盤に、RAID10 far/offset、その後RAID5/6を検討する
 2. LVM2の拡張
    - striped、thin、snapshot、cache、mirror、RAID segmentを段階的に対応する
 3. 証拠・暗号化形式の拡張

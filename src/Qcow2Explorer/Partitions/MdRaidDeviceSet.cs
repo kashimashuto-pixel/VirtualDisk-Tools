@@ -123,9 +123,9 @@ public static class MdRaidDeviceSet
                 $"reshape・recovery・bad-block等の未対応featureがあります: 0x{unsupportedFeatures:X8}");
         }
 
-        if (level is not 0 and not 1)
+        if (level is not 0 and not 1 and not 10)
         {
-            throw new NotSupportedException($"RAID level {level}は未対応です（現在はRAID0／RAID1のみ）。");
+            throw new NotSupportedException($"RAID level {level}は未対応です（現在はRAID0／RAID1／RAID10のみ）。");
         }
 
         var sizeSectors = EndianUtilities.ReadUInt64Little(data, 80);
@@ -141,7 +141,7 @@ public static class MdRaidDeviceSet
         var maximumDevices = EndianUtilities.ReadUInt32Little(data, 220);
         var recordedLogicalBlockSize = EndianUtilities.ReadUInt32Little(data, 224);
         var logicalBlockSize = recordedLogicalBlockSize == 0 ? 512U : recordedLogicalBlockSize;
-        if ((level == 1 && sizeSectors == 0)
+        if ((level is 1 or 10 && sizeSectors == 0)
             || (level == 0 && dataSizeSectors == 0)
             || raidDisks < 2
             || raidDisks > 1024)
@@ -171,13 +171,13 @@ public static class MdRaidDeviceSet
                 $"superblock checksumが一致しません: expected=0x{expectedChecksum:X8}, actual=0x{actualChecksum:X8}");
         }
 
-        if (level == 1 && dataSizeSectors < sizeSectors)
+        if (level is 1 or 10 && dataSizeSectors < sizeSectors)
         {
             throw new InvalidDataException(
                 $"component data sizeがarray sizeより小さいです: data={dataSizeSectors}, array={sizeSectors}");
         }
 
-        if (level == 1 && resyncOffsetSectors < sizeSectors)
+        if (level is 1 or 10 && resyncOffsetSectors < sizeSectors)
         {
             throw new NotSupportedException(
                 $"resync未完了のmemberは使用できません: resync={resyncOffsetSectors}, size={sizeSectors}");
@@ -188,6 +188,15 @@ public static class MdRaidDeviceSet
         {
             throw new InvalidDataException(
                 $"RAID0 chunk sizeが不正です: chunk={chunkSectors}, logical_block={logicalBlockSize}");
+        }
+
+        if (level == 10
+            && (chunkSectors < 8
+                || (chunkSectors & (chunkSectors - 1)) != 0
+                || chunkSectors % (logicalBlockSize / 512) != 0))
+        {
+            throw new InvalidDataException(
+                $"RAID10 chunk sizeが不正です: chunk={chunkSectors}, logical_block={logicalBlockSize}");
         }
 
         var requiredDataSectors = level == 0 ? dataSizeSectors : sizeSectors;
@@ -341,9 +350,18 @@ public static class MdRaidDeviceSet
                 reference.FeatureMap,
                 reference.LogicalBlockSize);
         }
-        else
+        else if (reference.Level == 1)
         {
             reader = new MdRaid1Reader(current, reference.SizeSectors, reference.LogicalBlockSize);
+        }
+        else
+        {
+            reader = new MdRaid10Reader(
+                current,
+                reference.SizeSectors,
+                reference.ChunkSectors,
+                reference.Layout,
+                reference.LogicalBlockSize);
         }
 
         return new MdRaidArray(
@@ -565,6 +583,174 @@ public sealed class MdRaid1Reader : IMdRaidReader
 
         verified.CopyTo(buffer, bufferOffset);
     }
+}
+
+public sealed class MdRaid10Reader : IMdRaidReader
+{
+    private readonly IReadOnlyDictionary<ushort, MdRaidComponent> _membersByRole;
+    private readonly uint _raidDisks;
+    private readonly uint _nearCopies;
+    private readonly uint _chunkSectors;
+
+    internal MdRaid10Reader(
+        IReadOnlyList<MdRaidComponent> members,
+        ulong sizeSectors,
+        uint chunkSectors,
+        uint layout,
+        uint logicalSectorSize)
+    {
+        _raidDisks = members[0].Metadata.RaidDisks;
+        _nearCopies = layout & 0xff;
+        var farCopies = (layout >> 8) & 0xff;
+        var layoutFlags = layout >> 16;
+        if (_nearCopies < 2
+            || farCopies != 1
+            || layoutFlags != 0
+            || _nearCopies > _raidDisks)
+        {
+            throw new NotSupportedException(
+                $"RAID10 layout 0x{layout:X8}は未対応です。現在はnear copies 2以上、far copies 1のlayoutに対応します。");
+        }
+
+        _chunkSectors = chunkSectors;
+        _membersByRole = members.ToDictionary(member => member.Metadata.Role);
+        AvailableRoles = members.Select(member => member.Metadata.Role).Order().ToArray();
+        var sizeChunks = sizeSectors / chunkSectors;
+        var arrayChunks = checked(sizeChunks * _raidDisks / _nearCopies);
+        if (arrayChunks == 0)
+        {
+            throw new InvalidDataException("RAID10 array sizeがchunk sizeより小さいです。");
+        }
+
+        Length = checked((long)(arrayChunks * chunkSectors * 512UL));
+        LogicalSectorSize = logicalSectorSize;
+        ValidatePhysicalRanges(sizeSectors, arrayChunks);
+        ValidateReadableMirrorGroups();
+    }
+
+    public long Length { get; }
+    public uint LogicalSectorSize { get; }
+    public bool IsDegraded => _membersByRole.Count < _raidDisks;
+    public IReadOnlyList<ushort> AvailableRoles { get; }
+
+    public void ReadAt(long offset, byte[] buffer, int bufferOffset, int count)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(offset);
+        ArgumentOutOfRangeException.ThrowIfNegative(bufferOffset);
+        ArgumentOutOfRangeException.ThrowIfNegative(count);
+        if (offset > Length - count || bufferOffset > buffer.Length - count)
+        {
+            throw new ArgumentOutOfRangeException(nameof(count));
+        }
+
+        var remaining = count;
+        while (remaining > 0)
+        {
+            var logicalSector = checked((ulong)(offset / 512));
+            var byteInSector = checked((int)(offset % 512));
+            var chunkOffset = logicalSector % _chunkSectors;
+            var chunkRemaining = checked((long)((_chunkSectors - chunkOffset) * 512UL) - byteInSector);
+            var toRead = checked((int)Math.Min(remaining, chunkRemaining));
+            var mappings = MapCopies(logicalSector);
+            byte[]? verified = null;
+            Exception? lastError = null;
+            foreach (var mapping in mappings)
+            {
+                if (!_membersByRole.TryGetValue(mapping.Role, out var member))
+                {
+                    continue;
+                }
+
+                var candidate = new byte[toRead];
+                try
+                {
+                    var physicalOffset = checked(
+                        (long)((member.Metadata.DataOffsetSectors + mapping.DeviceSector) * 512UL)
+                        + byteInSector);
+                    member.Reader.ReadAt(physicalOffset, candidate, 0, toRead);
+                    if (verified is not null && !candidate.AsSpan().SequenceEqual(verified))
+                    {
+                        throw new InvalidDataException(
+                            $"Linux md RAID10 mirror内容が一致しません: offset={offset:N0}, count={toRead:N0}");
+                    }
+
+                    verified ??= candidate;
+                }
+                catch (IOException ex)
+                {
+                    lastError = ex;
+                }
+            }
+
+            if (verified is null)
+            {
+                throw new IOException(
+                    $"Linux md RAID10の利用可能なmirrorがありません: offset={offset:N0}",
+                    lastError);
+            }
+
+            verified.CopyTo(buffer, bufferOffset);
+            offset += toRead;
+            bufferOffset += toRead;
+            remaining -= toRead;
+        }
+    }
+
+    private IReadOnlyList<MdRaid10Mapping> MapCopies(ulong logicalSector)
+    {
+        var chunk = logicalSector / _chunkSectors;
+        var sectorInChunk = logicalSector % _chunkSectors;
+        var scaledChunk = checked(chunk * _nearCopies);
+        var stripe = scaledChunk / _raidDisks;
+        var role = scaledChunk % _raidDisks;
+        var deviceSector = checked(stripe * _chunkSectors + sectorInChunk);
+        var mappings = new List<MdRaid10Mapping>(checked((int)_nearCopies));
+        for (var copy = 0U; copy < _nearCopies; copy++)
+        {
+            mappings.Add(new MdRaid10Mapping(checked((ushort)role), deviceSector));
+            role++;
+            if (role == _raidDisks)
+            {
+                role = 0;
+                deviceSector = checked(deviceSector + _chunkSectors);
+            }
+        }
+
+        return mappings;
+    }
+
+    private void ValidateReadableMirrorGroups()
+    {
+        for (var chunk = 0UL; chunk < _raidDisks; chunk++)
+        {
+            var logicalSector = checked(chunk * _chunkSectors);
+            if (!MapCopies(logicalSector).Any(mapping => _membersByRole.ContainsKey(mapping.Role)))
+            {
+                var roles = string.Join(",", MapCopies(logicalSector).Select(mapping => mapping.Role));
+                throw new InvalidDataException(
+                    $"RAID10 mirror groupに利用可能なmemberがありません: roles={roles}");
+            }
+        }
+    }
+
+    private void ValidatePhysicalRanges(ulong sizeSectors, ulong arrayChunks)
+    {
+        var firstChunk = arrayChunks > _raidDisks ? arrayChunks - _raidDisks : 0;
+        for (var chunk = firstChunk; chunk < arrayChunks; chunk++)
+        {
+            var logicalSector = checked(chunk * _chunkSectors);
+            foreach (var mapping in MapCopies(logicalSector))
+            {
+                if (mapping.DeviceSector > sizeSectors - _chunkSectors)
+                {
+                    throw new InvalidDataException(
+                        $"RAID10 mappingがmember data範囲外です: role={mapping.Role}, sector={mapping.DeviceSector}, size={sizeSectors}");
+                }
+            }
+        }
+    }
+
+    private sealed record MdRaid10Mapping(ushort Role, ulong DeviceSector);
 }
 
 public sealed record MdRaidMetadata(
