@@ -58,6 +58,15 @@ internal static class RealImageRegressionRunner
         {
             throw new InvalidDataException("各回帰テストcaseには一意のnameが必要です。");
         }
+
+        var unsupportedDeviceSet = manifest.Cases.FirstOrDefault(item =>
+            !string.IsNullOrWhiteSpace(item.DeviceSet)
+            && !string.Equals(item.DeviceSet, "Linux md RAID1", StringComparison.OrdinalIgnoreCase));
+        if (unsupportedDeviceSet is not null)
+        {
+            throw new InvalidDataException(
+                $"未対応のdeviceSetです: {unsupportedDeviceSet.DeviceSet}");
+        }
     }
 
     private static void RunCase(RealImageRegressionCase regressionCase, string manifestDirectory)
@@ -92,36 +101,29 @@ internal static class RealImageRegressionRunner
             try
             {
                 companionReaders.AddRange(companionPaths.Select(path =>
-                    (IDiskImageReader)new RawDiskImageReader(path)));
+                    DiskImageReaderFactory.Open(path)));
+                var disks = new List<IBlockReader> { reader };
+                disks.AddRange(companionReaders);
+                var mdDiscovery = MdRaidDeviceSet.Discover(disks);
                 IReadOnlyList<BtrfsDevicePartition> btrfsDevices = [];
                 if (companionReaders.Count > 0)
                 {
-                    var disks = new List<IBlockReader> { reader };
-                    disks.AddRange(companionReaders);
                     btrfsDevices = BtrfsDeviceSet.Discover(disks);
-                    Require(
-                        regressionCase.Partitions.Any(item => string.Equals(
-                            item.ExpectedFileSystem,
-                            "Btrfs",
-                            StringComparison.OrdinalIgnoreCase)),
-                        regressionCase.Name,
-                        "companionImages requires a Btrfs partition expectation");
-                    var primaryFileSystemIds = btrfsDevices
-                        .Where(item => ReferenceEquals(item.Disk, reader))
-                        .Select(item => item.Identity.FileSystemId)
-                        .ToHashSet(StringComparer.OrdinalIgnoreCase);
-                    Require(
-                        primaryFileSystemIds.Any(fileSystemId => disks.All(disk => btrfsDevices.Any(item =>
-                            ReferenceEquals(item.Disk, disk)
-                            && string.Equals(
-                                item.Identity.FileSystemId,
-                                fileSystemId,
-                                StringComparison.OrdinalIgnoreCase)))),
-                        regressionCase.Name,
-                        "the primary image and all companionImages must share a Btrfs FSID");
                 }
 
-                ValidateReader(regressionCase, reader, btrfsDevices);
+                if (string.Equals(regressionCase.DeviceSet, "Linux md RAID1", StringComparison.OrdinalIgnoreCase))
+                {
+                    Require(mdDiscovery.Arrays.Count == 1, regressionCase.Name, $"expected one Linux md RAID1 array, actual={mdDiscovery.Arrays.Count}; {string.Join(" | ", mdDiscovery.Diagnostics)}");
+                    ValidateReader(
+                        regressionCase,
+                        mdDiscovery.Arrays[0].Reader,
+                        [],
+                        synthesizeWholeDisk: true);
+                }
+                else
+                {
+                    ValidateReader(regressionCase, reader, btrfsDevices);
+                }
             }
             finally
             {
@@ -236,15 +238,17 @@ internal static class RealImageRegressionRunner
 
     private static void ValidateReader(
         RealImageRegressionCase regressionCase,
-        IDiskImageReader reader,
-        IReadOnlyList<BtrfsDevicePartition> btrfsDevices)
+        IBlockReader reader,
+        IReadOnlyList<BtrfsDevicePartition> btrfsDevices,
+        bool synthesizeWholeDisk = false)
     {
         if (!string.IsNullOrWhiteSpace(regressionCase.ExpectedFormatContains))
         {
+            Require(reader is IDiskImageReader, regressionCase.Name, "expectedFormatContains requires a disk-image reader");
             Require(
-                reader.FormatName.Contains(regressionCase.ExpectedFormatContains, StringComparison.OrdinalIgnoreCase),
+                ((IDiskImageReader)reader).FormatName.Contains(regressionCase.ExpectedFormatContains, StringComparison.OrdinalIgnoreCase),
                 regressionCase.Name,
-                $"format mismatch: expected contains '{regressionCase.ExpectedFormatContains}', actual='{reader.FormatName}'");
+                $"format mismatch: expected contains '{regressionCase.ExpectedFormatContains}', actual='{((IDiskImageReader)reader).FormatName}'");
         }
 
         if (regressionCase.ExpectedDiskLength is long expectedLength)
@@ -270,6 +274,20 @@ internal static class RealImageRegressionRunner
         }
 
         var partitions = PartitionTableReader.ReadPartitions(reader).ToList();
+        if (synthesizeWholeDisk && partitions.Count == 0 && reader.Length >= 512)
+        {
+            partitions.Add(new PartitionInfo
+            {
+                Number = 1,
+                Scheme = "Linux md RAID1",
+                Name = "Linux md RAID1 array",
+                Type = "Linux md RAID1",
+                StartLba = 0,
+                SectorCount = checked((ulong)(reader.Length / 512)),
+                ReaderOverride = reader,
+                LengthOverrideBytes = reader.Length
+            });
+        }
         if (regressionCase.ExpectedPartitionCount is int expectedPartitionCount)
         {
             Require(
@@ -587,6 +605,7 @@ internal sealed class RealImageRegressionCase
     public string Path { get; set; } = "";
     public string Sha256 { get; set; } = "";
     public List<RealImageCompanionImage> CompanionImages { get; set; } = [];
+    public string DeviceSet { get; set; } = "";
     public string ExpectedFormatContains { get; set; } = "";
     public long? ExpectedDiskLength { get; set; }
     public string ExpectedLogicalSha256 { get; set; } = "";

@@ -88,6 +88,7 @@ static void RunGeneratedImageTests()
     TestLuks2Unlock();
     TestXfsTimestampDecoding();
     Test4KnGptParsing();
+    TestGeneratedMdRaid1Image();
     TestLvmMetadataDiagnostics();
     TestGeneratedLvm2Image();
     TestGeneratedLzopExt4Image();
@@ -2908,6 +2909,90 @@ static void Test4KnGptParsing()
     Assert(partitions[0].StartOffset == sectorSize * 10L, "4Kn GPT partition offset");
 }
 
+static void TestGeneratedMdRaid1Image()
+{
+    var firstPath = Path.Combine(AppContext.BaseDirectory, "synthetic-md-raid1-1.raw");
+    var secondPath = Path.Combine(AppContext.BaseDirectory, "synthetic-md-raid1-2.raw");
+    TestImageFactory.CreateMdRaid1Fat16(firstPath, secondPath);
+    using (var first = DiskImageReaderFactory.Open(firstPath))
+    using (var second = DiskImageReaderFactory.Open(secondPath))
+    {
+        var discovery = MdRaidDeviceSet.Discover([first, second]);
+        Assert(discovery.Components.Count == 2, "Linux md RAID1 component discovery");
+        Assert(discovery.Arrays.Count == 1, string.Join(Environment.NewLine, discovery.Diagnostics));
+        var array = discovery.Arrays[0];
+        Assert(!array.Reader.IsDegraded, "Linux md RAID1 complete array");
+        Assert(array.Reader.AvailableRoles.SequenceEqual(new ushort[] { 0, 1 }), "Linux md RAID1 roles");
+        var partitions = PartitionTableReader.ReadPartitions(array.Reader);
+        Assert(partitions.Count == 1, "partition table inside Linux md RAID1");
+        var partition = partitions[0];
+        partition.FileSystem = FileSystemDetector.Detect(array.Reader, partition);
+        Assert(partition.FileSystem == "FAT16", "FAT16 inside Linux md RAID1");
+        var fs = FileSystemDetector.TryOpen(array.Reader, partition, out var error);
+        Assert(fs is not null, error);
+        var hello = fs!.ListDirectory(fs.Root).Single(node => node.Name == "HELLO.TXT");
+        Assert(
+            Encoding.ASCII.GetString(fs.ReadFile(hello, 0, (int)hello.Size)) == TestImageFactory.HelloText,
+            "Linux md RAID1 file read");
+    }
+
+    using (var first = DiskImageReaderFactory.Open(firstPath))
+    {
+        var discovery = MdRaidDeviceSet.Discover([first]);
+        Assert(discovery.Arrays.Count == 1, "Linux md RAID1 degraded assembly");
+        Assert(discovery.Arrays[0].Reader.IsDegraded, "Linux md RAID1 degraded state");
+        Assert(discovery.Arrays[0].Reader.AvailableRoles.SequenceEqual(new ushort[] { 0 }), "Linux md RAID1 degraded role");
+    }
+
+    var mismatchFirstPath = Path.Combine(AppContext.BaseDirectory, "synthetic-md-mismatch-1.raw");
+    var mismatchSecondPath = Path.Combine(AppContext.BaseDirectory, "synthetic-md-mismatch-2.raw");
+    TestImageFactory.CreateMdRaid1Fat16(
+        mismatchFirstPath,
+        mismatchSecondPath,
+        corruptSecondData: true);
+    using (var first = DiskImageReaderFactory.Open(mismatchFirstPath))
+    using (var second = DiskImageReaderFactory.Open(mismatchSecondPath))
+    {
+        var array = MdRaidDeviceSet.Discover([first, second]).Arrays.Single();
+        try
+        {
+            _ = Qcow2Explorer.Core.EndianUtilities.ReadBytes(array.Reader, 0, 512);
+            Assert(false, "Linux md RAID1 rejects mismatching mirrors");
+        }
+        catch (InvalidDataException ex)
+        {
+            Assert(ex.Message.Contains("mirror内容", StringComparison.Ordinal), "Linux md mirror mismatch diagnostic");
+        }
+    }
+
+    var staleFirstPath = Path.Combine(AppContext.BaseDirectory, "synthetic-md-stale-1.raw");
+    var staleSecondPath = Path.Combine(AppContext.BaseDirectory, "synthetic-md-stale-2.raw");
+    TestImageFactory.CreateMdRaid1Fat16(staleFirstPath, staleSecondPath, firstEvents: 41, secondEvents: 42);
+    using (var first = DiskImageReaderFactory.Open(staleFirstPath))
+    using (var second = DiskImageReaderFactory.Open(staleSecondPath))
+    {
+        var discovery = MdRaidDeviceSet.Discover([first, second]);
+        Assert(discovery.Arrays.Single().Reader.IsDegraded, "Linux md stale member excluded");
+        Assert(discovery.Arrays[0].Reader.AvailableRoles.SequenceEqual(new ushort[] { 1 }), "Linux md current member selected");
+        Assert(discovery.Diagnostics.Any(message => message.Contains("旧event", StringComparison.Ordinal)), "Linux md stale diagnostic");
+    }
+
+    var checksumFirstPath = Path.Combine(AppContext.BaseDirectory, "synthetic-md-checksum-1.raw");
+    var checksumSecondPath = Path.Combine(AppContext.BaseDirectory, "synthetic-md-checksum-2.raw");
+    TestImageFactory.CreateMdRaid1Fat16(
+        checksumFirstPath,
+        checksumSecondPath,
+        corruptFirstChecksum: true);
+    using (var first = DiskImageReaderFactory.Open(checksumFirstPath))
+    using (var second = DiskImageReaderFactory.Open(checksumSecondPath))
+    {
+        var discovery = MdRaidDeviceSet.Discover([first, second]);
+        Assert(discovery.Components.Count == 1 && discovery.Arrays.Count == 1, "Linux md corrupt metadata excluded");
+        Assert(discovery.Arrays[0].Reader.IsDegraded, "Linux md checksum degraded state");
+        Assert(discovery.Diagnostics.Any(message => message.Contains("checksum", StringComparison.Ordinal)), "Linux md checksum diagnostic");
+    }
+}
+
 static void TestLvmMetadataDiagnostics()
 {
     const string metadata = """
@@ -4149,6 +4234,99 @@ internal static class TestImageFactory
     public static void CreateRawFat16Disk(string path)
     {
         File.WriteAllBytes(path, CreateVirtualDisk());
+    }
+
+    public static void CreateMdRaid1Fat16(
+        string firstPath,
+        string secondPath,
+        ulong firstEvents = 42,
+        ulong secondEvents = 42,
+        bool corruptSecondData = false,
+        bool corruptFirstChecksum = false)
+    {
+        const int dataOffset = 1024 * 1024;
+        var arrayData = CreateVirtualDisk();
+        var componentLength = checked(dataOffset + arrayData.Length + 1024 * 1024);
+        var setUuid = Guid.Parse("65b56bc2-cd2c-4e31-982a-7030cca7a56d").ToByteArray();
+        byte[][] deviceUuids =
+        [
+            Guid.Parse("3a3334a8-5d21-49de-b383-96dcdf26af02").ToByteArray(),
+            Guid.Parse("991953b9-f587-4f50-89ec-7f4e93b60957").ToByteArray(),
+        ];
+        var paths = new[] { firstPath, secondPath };
+        var events = new[] { firstEvents, secondEvents };
+        for (var index = 0; index < paths.Length; index++)
+        {
+            var component = new byte[componentLength];
+            arrayData.CopyTo(component, dataOffset);
+            if (index == 1 && corruptSecondData)
+            {
+                component[dataOffset + 17] ^= 1;
+            }
+
+            var superblock = CreateMdSuperblock(
+                setUuid,
+                deviceUuids[index],
+                checked((uint)index),
+                checked((ushort)index),
+                checked((ulong)(arrayData.Length / 512)),
+                events[index]);
+            if (index == 0 && corruptFirstChecksum)
+            {
+                superblock[216] ^= 1;
+            }
+
+            superblock.CopyTo(component, 4096);
+            File.WriteAllBytes(paths[index], component);
+        }
+    }
+
+    private static byte[] CreateMdSuperblock(
+        byte[] setUuid,
+        byte[] deviceUuid,
+        uint deviceNumber,
+        ushort role,
+        ulong sizeSectors,
+        ulong events)
+    {
+        var data = new byte[4096];
+        WriteU32Le(data, 0, 0xa92b4efc);
+        WriteU32Le(data, 4, 1);
+        setUuid.CopyTo(data, 16);
+        Encoding.ASCII.GetBytes("vdt:synthetic").CopyTo(data, 32);
+        WriteU64Le(data, 64, 1);
+        WriteU32Le(data, 72, 1);
+        WriteU32Le(data, 76, 0);
+        BinaryPrimitives.WriteUInt64LittleEndian(data.AsSpan(80), sizeSectors);
+        WriteU32Le(data, 88, 128);
+        WriteU32Le(data, 92, 2);
+        WriteU64Le(data, 128, 2048);
+        BinaryPrimitives.WriteUInt64LittleEndian(data.AsSpan(136), sizeSectors);
+        WriteU64Le(data, 144, 8);
+        BinaryPrimitives.WriteUInt64LittleEndian(data.AsSpan(152), ulong.MaxValue);
+        WriteU32Le(data, 160, deviceNumber);
+        deviceUuid.CopyTo(data, 168);
+        WriteU64Le(data, 192, 1);
+        BinaryPrimitives.WriteUInt64LittleEndian(data.AsSpan(200), events);
+        BinaryPrimitives.WriteUInt64LittleEndian(data.AsSpan(208), ulong.MaxValue);
+        WriteU32Le(data, 220, 2);
+        WriteU32Le(data, 224, 512);
+        WriteU16Le(data, 256, 0);
+        WriteU16Le(data, 258, 1);
+        WriteU16Le(data, checked(256 + (int)deviceNumber * 2), role);
+        WriteU32Le(data, 216, CalculateMdChecksum(data, 260));
+        return data;
+    }
+
+    private static uint CalculateMdChecksum(byte[] data, int length)
+    {
+        ulong sum = 0;
+        for (var offset = 0; offset < length; offset += sizeof(uint))
+        {
+            sum += BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(offset, sizeof(uint)));
+        }
+
+        return unchecked((uint)sum + (uint)(sum >> 32));
     }
 
     public static void CreateExt4LzopDisk(
