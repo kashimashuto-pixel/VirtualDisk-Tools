@@ -197,17 +197,26 @@
 - 2台64 KiB stripeの合成FAT16 fixtureで全体写像、境界、入力順、PV欠損、metadata copy破損、同一seqno不一致を回帰確認
 - 実`lvm2 2.03.16`で2台・64 KiB stripe・384 MiB ext4 LVを生成し、300 MiBファイルをmanifest回帰で確認
 
+### LVM2 thin volume対応
+
+- hiddenな`pool_tmeta`／`pool_tdata`を検証済みlinear／striped readerで組み立て、visible thin LVへ接続
+- 4 KiB thin-pool superblock、version、transaction ID、data block size、metadata/data space-map rootsを検証
+- B-tree、metadata index、bitmapのCRC32C、block number、entry geometry、昇順key、循環、深さ、space-map割当を検証
+- device detailsと2段mapping B-treeからlogical blockをpool data blockへ写像し、未割当blockをゼロとして読み取り
+- 合成FAT16 fixtureで全体写像、64 KiB境界、未割当block、superblock／B-tree／space-map破損、transaction不一致、範囲外／未割当data blockを回帰確認
+- 実`lvm2 2.03.16`／`thin-provisioning-tools 0.9.0`で384 MiB thin LV + ext4を生成し、`thin_check`と160 MiBファイルのmanifest回帰を確認
+
 ## 次回の推奨作業
 
-### 1. LVM2 thin volume
-
-- thin-pool metadata LVのsuperblock、space map、mapping btreeを読み取り専用で検証する
-- 最初に通常thin volume、その後snapshotと外部originを段階的に追加する
-
-### 2. Linux md RAID5
+### 1. Linux md RAID5
 
 - 全memberが揃った正常arrayの主要parity layoutから開始し、その後1台欠損のXOR復元を追加する
 - dirtyかつdegradedなarrayなど、parityを安全に信頼できない状態は拒否する
+
+### 2. LVM2 thin snapshot／external origin
+
+- 通常thin volumeの2段mapping B-treeを再利用し、snapshot固有の共有mappingを実fixtureで検証する
+- external originは未割当blockをorigin LVへフォールバックし、origin長とpool block sizeを検証する
 
 ### 3. LVM2 snapshot／cache／mirror segment
 
@@ -229,7 +238,7 @@
 1. Linux md RAIDの拡張
    - RAID0／RAID1／RAID10 near/far/offset対応を基盤に、RAID5/6を検討する
 2. LVM2の拡張
-   - striped対応を基盤に、thin、snapshot、cache、mirror、RAID segmentを段階的に対応する
+   - striped／通常thin対応を基盤に、thin snapshot、external origin、通常snapshot、cache、mirror、RAID segmentを段階的に対応する
 3. 証拠・暗号化形式の拡張
    - EWF2/Ex01、LUKS detached header／複数segmentを検討する
 

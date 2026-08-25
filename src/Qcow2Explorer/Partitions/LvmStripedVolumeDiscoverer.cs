@@ -40,7 +40,7 @@ internal static class LvmStripedVolumeDiscoverer
             catch (Exception ex) when (ex is InvalidDataException or NotSupportedException or OverflowException)
             {
                 diagnostics.Add(new LvmDiagnostic(
-                    $"LVM2 PV #{partition.Number}: striped LV用メタデータを検証できませんでした: {ex.Message}",
+                    $"LVM2 PV #{partition.Number}: 組み込みLV reader用メタデータを検証できませんでした: {ex.Message}",
                     true));
             }
         }
@@ -78,7 +78,7 @@ internal static class LvmStripedVolumeDiscoverer
         }
 
         var volumes = new List<LvmStripedVolume>();
-        var requiresStripedReader = false;
+        var requiresCustomReader = false;
         var logicalVolumeDefinitionCount = 0;
         var physicalVolumesById = physicalVolumes.ToDictionary(
             volume => volume.Id,
@@ -88,10 +88,12 @@ internal static class LvmStripedVolumeDiscoverer
             StringComparer.OrdinalIgnoreCase))
         {
             cancellationToken.ThrowIfCancellationRequested();
-            requiresStripedReader |= group.Any(candidate => candidate.LogicalVolumes.Any(volume =>
-                volume.Segments.Any(segment => segment.Stripes.Count > 1)));
             var sequence = group.Max(candidate => candidate.Sequence);
             var current = group.Where(candidate => candidate.Sequence == sequence).ToList();
+            requiresCustomReader |= current.Any(candidate => candidate.LogicalVolumes.Any(volume =>
+                volume.Segments.Any(segment => segment.Stripes.Count > 1
+                    || string.Equals(segment.Type, "thin", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(segment.Type, "thin-pool", StringComparison.OrdinalIgnoreCase))));
             logicalVolumeDefinitionCount = checked(
                 logicalVolumeDefinitionCount + current.Max(candidate => candidate.LogicalVolumes.Count));
             var distinctHashes = current
@@ -108,10 +110,12 @@ internal static class LvmStripedVolumeDiscoverer
 
             var volumeGroup = current[0];
             var unsupportedVisibleTypes = volumeGroup.LogicalVolumes
-                .Where(volume => volume.IsReadableVisible)
+                .Where(volume => volume.IsReadable && volume.IsVisible)
                 .SelectMany(volume => volume.Segments)
                 .Select(segment => segment.Type)
-                .Where(type => !string.Equals(type, "striped", StringComparison.OrdinalIgnoreCase))
+                .Where(type => !string.Equals(type, "striped", StringComparison.OrdinalIgnoreCase)
+                    && !string.Equals(type, "thin", StringComparison.OrdinalIgnoreCase)
+                    && !string.Equals(type, "thin-pool", StringComparison.OrdinalIgnoreCase))
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .OrderBy(type => type, StringComparer.OrdinalIgnoreCase)
                 .ToArray();
@@ -132,17 +136,35 @@ internal static class LvmStripedVolumeDiscoverer
                 + $"PV定義={volumeGroup.PhysicalVolumes.Count:N0}、LV定義={volumeGroup.LogicalVolumes.Count:N0}、"
                 + $"segment={string.Join(", ", segmentTypes)}",
                 false));
-            foreach (var logicalVolume in volumeGroup.LogicalVolumes.Where(volume => volume.IsSupportedStriped))
+            var requiredPhysicalNames = volumeGroup.LogicalVolumes
+                .Where(volume => volume.IsSupportedPhysical && volume.IsVisible)
+                .Select(volume => volume.Name)
+                .Concat(volumeGroup.LogicalVolumes
+                    .Where(volume => volume.IsThinPool)
+                    .SelectMany(volume => new[]
+                    {
+                        volume.Segments[0].MetadataVolumeName!,
+                        volume.Segments[0].PoolDataVolumeName!
+                    }))
+                .ToHashSet(StringComparer.Ordinal);
+            var physicalReaders = new Dictionary<string, LvmStripedReader>(StringComparer.Ordinal);
+            foreach (var logicalVolume in volumeGroup.LogicalVolumes.Where(volume =>
+                volume.IsSupportedPhysical && requiredPhysicalNames.Contains(volume.Name)))
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 try
                 {
                     var reader = AssembleReader(volumeGroup, logicalVolume, physicalVolumesById);
-                    volumes.Add(new LvmStripedVolume(
-                        $"{volumeGroup.Name}/{logicalVolume.Name}",
-                        logicalVolume.Id,
-                        reader,
-                        logicalVolume.Segments.Max(segment => segment.Stripes.Count)));
+                    physicalReaders.Add(logicalVolume.Name, reader);
+                    if (logicalVolume.IsVisible)
+                    {
+                        volumes.Add(new LvmStripedVolume(
+                            $"{volumeGroup.Name}/{logicalVolume.Name}",
+                            logicalVolume.Id,
+                            reader,
+                            logicalVolume.Segments.Max(segment => segment.Stripes.Count),
+                            false));
+                    }
                 }
                 catch (Exception ex) when (ex is InvalidDataException or NotSupportedException or OverflowException)
                 {
@@ -151,12 +173,99 @@ internal static class LvmStripedVolumeDiscoverer
                         true));
                 }
             }
+
+            var thinPools = new Dictionary<string, LvmThinPoolMetadata>(StringComparer.Ordinal);
+            foreach (var poolVolume in volumeGroup.LogicalVolumes.Where(volume => volume.IsThinPool))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                try
+                {
+                    var segment = poolVolume.Segments.Single();
+                    if (!physicalReaders.TryGetValue(segment.MetadataVolumeName!, out var metadataReader)
+                        || !physicalReaders.TryGetValue(segment.PoolDataVolumeName!, out var dataReader))
+                    {
+                        throw new InvalidDataException(
+                            $"thin-poolが参照するmetadata/data LVを組み立てられません: metadata={segment.MetadataVolumeName}, data={segment.PoolDataVolumeName}");
+                    }
+
+                    if (string.Equals(segment.MetadataVolumeName, segment.PoolDataVolumeName, StringComparison.Ordinal))
+                    {
+                        throw new InvalidDataException("thin-poolのmetadata LVとdata LVが同一です。");
+                    }
+
+                    var expectedDataLength = checked(
+                        segment.ExtentCount * volumeGroup.ExtentSizeSectors * SectorSize);
+                    if ((ulong)dataReader.Length != expectedDataLength)
+                    {
+                        throw new InvalidDataException(
+                            $"thin-pool data LV長がsegmentと一致しません: segment={expectedDataLength:N0}, LV={dataReader.Length:N0}");
+                    }
+
+                    thinPools.Add(
+                        poolVolume.Name,
+                        new LvmThinPoolMetadata(
+                            metadataReader,
+                            dataReader,
+                            segment.TransactionId!.Value,
+                            segment.ChunkSizeSectors!.Value));
+                }
+                catch (Exception ex) when (ex is InvalidDataException or NotSupportedException or OverflowException)
+                {
+                    diagnostics.Add(new LvmDiagnostic(
+                        $"LVM2 thin-pool {volumeGroup.Name}/{poolVolume.Name}を検証できませんでした: {ex.Message}",
+                        true));
+                }
+            }
+
+            var thinDeviceIds = new HashSet<(string Pool, ulong DeviceId)>();
+            foreach (var logicalVolume in volumeGroup.LogicalVolumes.Where(volume => volume.IsSupportedThin))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                try
+                {
+                    var segment = logicalVolume.Segments.Single();
+                    if (segment.OriginVolumeName is not null || segment.ExternalOriginVolumeName is not null)
+                    {
+                        throw new NotSupportedException("thin snapshot／external originは未対応です。");
+                    }
+
+                    if (!thinPools.TryGetValue(segment.ThinPoolVolumeName!, out var pool))
+                    {
+                        throw new InvalidDataException(
+                            $"参照先thin-pool {segment.ThinPoolVolumeName}を検証できませんでした。");
+                    }
+
+                    if (!thinDeviceIds.Add((segment.ThinPoolVolumeName!, segment.DeviceId!.Value)))
+                    {
+                        throw new InvalidDataException(
+                            $"thin-pool {segment.ThinPoolVolumeName}内でdevice ID {segment.DeviceId:N0}が重複しています。");
+                    }
+
+                    var lengthBytes = checked(segment.ExtentCount * volumeGroup.ExtentSizeSectors * SectorSize);
+                    var reader = pool.OpenDevice(
+                        segment.DeviceId!.Value,
+                        segment.TransactionId!.Value,
+                        lengthBytes);
+                    volumes.Add(new LvmStripedVolume(
+                        $"{volumeGroup.Name}/{logicalVolume.Name}",
+                        logicalVolume.Id,
+                        reader,
+                        0,
+                        true));
+                }
+                catch (Exception ex) when (ex is InvalidDataException or NotSupportedException or OverflowException)
+                {
+                    diagnostics.Add(new LvmDiagnostic(
+                        $"LVM2 thin LV {volumeGroup.Name}/{logicalVolume.Name}を組み立てられませんでした: {ex.Message}",
+                        true));
+                }
+            }
         }
 
         return new LvmStripedDiscoveryResult(
             volumes,
             diagnostics,
-            requiresStripedReader,
+            requiresCustomReader,
             logicalVolumeDefinitionCount);
     }
 
@@ -484,7 +593,8 @@ internal static class LvmStripedVolumeDiscoverer
             logicalVolumes.Add(new LvmLogicalVolume(
                 logicalName,
                 logicalVolumeId,
-                status.Contains("READ") && status.Contains("VISIBLE"),
+                status.Contains("READ"),
+                status.Contains("VISIBLE"),
                 segments));
         }
 
@@ -501,6 +611,47 @@ internal static class LvmStripedVolumeDiscoverer
     private static LvmSegment ParseSegment(string segmentName, LvmConfigObject config)
     {
         var type = config.RequireScalar("type");
+        if (string.Equals(type, "thin-pool", StringComparison.OrdinalIgnoreCase))
+        {
+            var chunkSize = config.RequireUInt64("chunk_size");
+            if (chunkSize < 128 || chunkSize > 2_097_152)
+            {
+                throw new InvalidDataException($"{segmentName}のthin-pool chunk_sizeが不正です: {chunkSize:N0} sectors");
+            }
+
+            return new LvmSegment(
+                config.RequireUInt64("start_extent"),
+                config.RequireUInt64("extent_count"),
+                type,
+                0,
+                [],
+                MetadataVolumeName: config.RequireScalar("metadata"),
+                PoolDataVolumeName: config.RequireScalar("pool"),
+                TransactionId: config.RequireUInt64("transaction_id"),
+                ChunkSizeSectors: chunkSize);
+        }
+
+        if (string.Equals(type, "thin", StringComparison.OrdinalIgnoreCase))
+        {
+            var deviceId = config.RequireUInt64("device_id");
+            if (deviceId > uint.MaxValue)
+            {
+                throw new InvalidDataException($"{segmentName}のthin device_idが不正です: {deviceId:N0}");
+            }
+
+            return new LvmSegment(
+                config.RequireUInt64("start_extent"),
+                config.RequireUInt64("extent_count"),
+                type,
+                0,
+                [],
+                ThinPoolVolumeName: config.RequireScalar("thin_pool"),
+                TransactionId: config.RequireUInt64("transaction_id"),
+                DeviceId: deviceId,
+                OriginVolumeName: config.TryGetScalar("origin"),
+                ExternalOriginVolumeName: config.TryGetScalar("external_origin"));
+        }
+
         if (!string.Equals(type, "striped", StringComparison.OrdinalIgnoreCase))
         {
             return new LvmSegment(
@@ -551,9 +702,9 @@ internal static class LvmStripedVolumeDiscoverer
         LvmLogicalVolume logicalVolume,
         IReadOnlyDictionary<string, LvmPhysicalVolume> physicalVolumesById)
     {
-        if (!logicalVolume.IsReadableVisible)
+        if (!logicalVolume.IsReadable)
         {
-            throw new NotSupportedException("READかつVISIBLEではないLVは表示しません。");
+            throw new NotSupportedException("READ statusがないLVは組み立てません。");
         }
 
         var extentSizeBytes = checked(volumeGroup.ExtentSizeSectors * SectorSize);
@@ -699,12 +850,25 @@ internal static class LvmStripedVolumeDiscoverer
     private sealed record LvmLogicalVolume(
         string Name,
         string Id,
-        bool IsReadableVisible,
+        bool IsReadable,
+        bool IsVisible,
         IReadOnlyList<LvmSegment> Segments)
     {
-        public bool IsSupportedStriped => IsReadableVisible
+        public bool IsSupportedPhysical => IsReadable
             && Segments.Count > 0
             && Segments.All(segment => string.Equals(segment.Type, "striped", StringComparison.OrdinalIgnoreCase));
+
+        public bool IsThinPool => IsReadable
+            && Segments.Count == 1
+            && Segments[0].StartExtent == 0
+            && Segments[0].ExtentCount > 0
+            && string.Equals(Segments[0].Type, "thin-pool", StringComparison.OrdinalIgnoreCase);
+
+        public bool IsSupportedThin => IsReadable && IsVisible
+            && Segments.Count == 1
+            && Segments[0].StartExtent == 0
+            && Segments[0].ExtentCount > 0
+            && string.Equals(Segments[0].Type, "thin", StringComparison.OrdinalIgnoreCase);
     }
 
     private sealed record LvmSegment(
@@ -712,7 +876,15 @@ internal static class LvmStripedVolumeDiscoverer
         ulong ExtentCount,
         string Type,
         ulong StripeSizeSectors,
-        IReadOnlyList<LvmStripe> Stripes);
+        IReadOnlyList<LvmStripe> Stripes,
+        string? MetadataVolumeName = null,
+        string? PoolDataVolumeName = null,
+        string? ThinPoolVolumeName = null,
+        ulong? TransactionId = null,
+        ulong? ChunkSizeSectors = null,
+        ulong? DeviceId = null,
+        string? OriginVolumeName = null,
+        string? ExternalOriginVolumeName = null);
 
     private sealed record LvmStripe(string PhysicalVolumeAlias, ulong StartExtent);
 }
@@ -783,13 +955,14 @@ internal sealed record LvmStripeTarget(IBlockReader Reader, ulong StartByte);
 internal sealed record LvmStripedVolume(
     string Name,
     string LvmId,
-    LvmStripedReader Reader,
-    int StripeCount);
+    IBlockReader Reader,
+    int StripeCount,
+    bool IsThin);
 
 internal sealed record LvmStripedDiscoveryResult(
     IReadOnlyList<LvmStripedVolume> Volumes,
     IReadOnlyList<LvmDiagnostic> Diagnostics,
-    bool RequiresStripedReader,
+    bool RequiresCustomReader,
     int LogicalVolumeDefinitionCount);
 
 internal abstract record LvmConfigValue
@@ -819,6 +992,9 @@ internal sealed record LvmConfigObject(IReadOnlyDictionary<string, LvmConfigValu
     public string RequireScalar(string name) => Require(name).RequireScalar();
 
     public ulong RequireUInt64(string name) => Require(name).RequireUInt64();
+
+    public string? TryGetScalar(string name) =>
+        Values.TryGetValue(name, out var value) ? value.RequireScalar() : null;
 
     public LvmConfigObject RequireObject(string name)
     {

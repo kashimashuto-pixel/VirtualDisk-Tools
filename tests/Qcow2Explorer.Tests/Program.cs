@@ -95,6 +95,7 @@ static void RunGeneratedImageTests()
     TestGeneratedLvm2Image();
     TestGeneratedLvm2MultiPvImage();
     TestGeneratedLvm2StripedImage();
+    TestGeneratedLvm2ThinImage();
     TestGeneratedLzopExt4Image();
     TestGeneratedBtrfsImage();
     TestGeneratedBtrfsMultiDeviceImage();
@@ -1354,6 +1355,7 @@ static void TestRealImageRegressionRunner()
     var lvmSecondPath = Path.Combine(AppContext.BaseDirectory, "sample-lvm2-multipv-2.img");
     var lvmStripedFirstPath = Path.Combine(AppContext.BaseDirectory, "sample-lvm2-striped-1.img");
     var lvmStripedSecondPath = Path.Combine(AppContext.BaseDirectory, "sample-lvm2-striped-2.img");
+    var lvmThinPath = Path.Combine(AppContext.BaseDirectory, "sample-lvm2-thin.img");
     var mdRaid0FirstPath = Path.Combine(AppContext.BaseDirectory, "synthetic-md-raid0-1.raw");
     var mdRaid0SecondPath = Path.Combine(AppContext.BaseDirectory, "synthetic-md-raid0-2.raw");
     var mdRaid10Paths = Enumerable.Range(0, 4)
@@ -1504,6 +1506,28 @@ static void TestRealImageRegressionRunner()
               ]
             },
             {
+              "name": "generated LVM2 thin runner",
+              "path": "{{Path.GetFileName(lvmThinPath)}}",
+              "sha256": "{{Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(lvmThinPath)))}}",
+              "deviceSet": "LVM2",
+              "expectedDiskLength": {{4 * 1024 * 1024}},
+              "expectedPartitionCount": 1,
+              "partitions": [
+                {
+                  "number": 1,
+                  "expectedFileSystem": "FAT16",
+                  "files": [
+                    {
+                      "path": "/HELLO.TXT",
+                      "expectedDirectory": false,
+                      "expectedLength": {{Encoding.ASCII.GetByteCount(TestImageFactory.HelloText)}},
+                      "sha256": "{{helloSha256}}"
+                    }
+                  ]
+                }
+              ]
+            },
+            {
               "name": "generated Linux md RAID10 runner",
               "path": "{{Path.GetFileName(mdRaid10Paths[0])}}",
               "sha256": "{{Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(mdRaid10Paths[0])))}}",
@@ -1589,7 +1613,7 @@ static void TestRealImageRegressionRunner()
         """;
     File.WriteAllText(manifestPath, manifest, new UTF8Encoding(false));
     var summary = RealImageRegressionRunner.Run(manifestPath);
-    Assert(summary.CaseCount == 8, "real-image regression runner case count");
+    Assert(summary.CaseCount == 9, "real-image regression runner case count");
 }
 
 static void TestBitLockerRecoveryPasswordUnlock()
@@ -3830,6 +3854,177 @@ static void TestGeneratedLvm2StripedImage()
     }
 }
 
+static void TestGeneratedLvm2ThinImage()
+{
+    var path = Path.Combine(AppContext.BaseDirectory, "sample-lvm2-thin.img");
+    var expected = TestImageFactory.CreateLvm2ThinFat16Disk(path);
+    using (var disk = DiskImageReaderFactory.Open(path))
+    {
+        var partition = PartitionTableReader.ReadPartitions(disk).Single();
+        partition.FileSystem = FileSystemDetector.Detect(disk, partition);
+        var ownedReaders = new List<IDisposable>();
+        try
+        {
+            var result = LogicalVolumeDiscoverer.Discover(
+                [disk],
+                [partition],
+                2,
+                ownedReaders);
+            Assert(result.Volumes.Count == 1, string.Join(Environment.NewLine, result.Diagnostics.Select(item => item.Message)));
+            Assert(!result.Diagnostics.Any(item => item.IsError), string.Join(Environment.NewLine, result.Diagnostics.Select(item => item.Message)));
+            var volume = result.Volumes[0];
+            Assert(volume.Type == "LVM2 thin logical volume", "thin LVM2 volume description");
+            Assert(volume.LengthBytes == expected.Length, "thin LVM2 volume length");
+            Assert(
+                Qcow2Explorer.Core.EndianUtilities.ReadBytes(volume.ReaderOverride!, 0, expected.Length)
+                    .SequenceEqual(expected),
+                "thin LVM2 full sparse mapping");
+            Assert(
+                Qcow2Explorer.Core.EndianUtilities.ReadBytes(volume.ReaderOverride!, 64 * 1024 - 37, 128)
+                    .SequenceEqual(expected.AsSpan(64 * 1024 - 37, 128)),
+                "thin LVM2 data-block boundary mapping");
+
+            var zeroBlock = Enumerable.Range(0, expected.Length / (64 * 1024))
+                .First(index => expected.AsSpan(index * 64 * 1024, 64 * 1024).IndexOfAnyExcept((byte)0) < 0);
+            Assert(
+                Qcow2Explorer.Core.EndianUtilities.ReadBytes(volume.ReaderOverride!, zeroBlock * 64 * 1024, 64 * 1024)
+                    .All(value => value == 0),
+                "thin LVM2 unmapped block reads as zero");
+
+            volume.FileSystem = FileSystemDetector.Detect(disk, volume);
+            Assert(volume.FileSystem == "FAT16", "FAT16 inside generated thin LVM2 LV");
+            var fs = FileSystemDetector.TryOpen(disk, volume, out var error);
+            Assert(fs is not null, error);
+            var hello = fs!.ListDirectory(fs.Root).Single(node => node.Name == "HELLO.TXT");
+            Assert(
+                Encoding.ASCII.GetString(fs.ReadFile(hello, 0, (int)hello.Size)) == TestImageFactory.HelloText,
+                "generated thin LVM2 HELLO.TXT content");
+        }
+        finally
+        {
+            foreach (var disposable in ownedReaders)
+            {
+                disposable.Dispose();
+            }
+        }
+    }
+
+    (string Name, bool CorruptSuperblock, bool CorruptMapping, bool TransactionMismatch, bool CorruptSpaceMap, bool NeedsCheck, bool IncompatibilityFlag, string Diagnostic)[] corruptCases =
+    [
+        ("superblock", true, false, false, false, false, false, "CRC32C"),
+        ("mapping", false, true, false, false, false, false, "B-tree"),
+        ("transaction", false, false, true, false, false, false, "transaction ID"),
+        ("space-map", false, false, false, true, false, false, "space-map bitmap"),
+        ("needs-check", false, false, false, false, true, false, "needs-check"),
+        ("incompatibility", false, false, false, false, false, true, "incompatibility")
+    ];
+    foreach (var corruptCase in corruptCases)
+    {
+        var corruptPath = Path.Combine(AppContext.BaseDirectory, $"sample-lvm2-thin-{corruptCase.Name}.img");
+        _ = TestImageFactory.CreateLvm2ThinFat16Disk(
+            corruptPath,
+            corruptSuperblock: corruptCase.CorruptSuperblock,
+            corruptMappingNode: corruptCase.CorruptMapping,
+            transactionMismatch: corruptCase.TransactionMismatch,
+            corruptSpaceMapBitmap: corruptCase.CorruptSpaceMap,
+            needsCheck: corruptCase.NeedsCheck,
+            incompatibilityFlag: corruptCase.IncompatibilityFlag);
+        using var corruptDisk = DiskImageReaderFactory.Open(corruptPath);
+        var corruptPartition = PartitionTableReader.ReadPartitions(corruptDisk).Single();
+        corruptPartition.FileSystem = FileSystemDetector.Detect(corruptDisk, corruptPartition);
+        var corruptReaders = new List<IDisposable>();
+        try
+        {
+            var corrupt = LogicalVolumeDiscoverer.Discover(
+                [corruptDisk],
+                [corruptPartition],
+                2,
+                corruptReaders);
+            Assert(corrupt.Volumes.Count == 0, $"thin LVM2 rejects corrupt {corruptCase.Name}");
+            Assert(
+                corrupt.Diagnostics.Any(item =>
+                    item.IsError
+                    && item.Message.Contains(corruptCase.Diagnostic, StringComparison.OrdinalIgnoreCase)),
+                $"thin LVM2 corrupt {corruptCase.Name} diagnostic");
+        }
+        finally
+        {
+            foreach (var disposable in corruptReaders)
+            {
+                disposable.Dispose();
+            }
+        }
+    }
+
+    var outOfRangePath = Path.Combine(AppContext.BaseDirectory, "sample-lvm2-thin-out-of-range.img");
+    _ = TestImageFactory.CreateLvm2ThinFat16Disk(outOfRangePath, outOfRangeMapping: true);
+    using (var outOfRangeDisk = DiskImageReaderFactory.Open(outOfRangePath))
+    {
+        var outOfRangePartition = PartitionTableReader.ReadPartitions(outOfRangeDisk).Single();
+        outOfRangePartition.FileSystem = FileSystemDetector.Detect(outOfRangeDisk, outOfRangePartition);
+        var outOfRangeReaders = new List<IDisposable>();
+        try
+        {
+            var result = LogicalVolumeDiscoverer.Discover(
+                [outOfRangeDisk],
+                [outOfRangePartition],
+                2,
+                outOfRangeReaders);
+            Assert(result.Volumes.Count == 1, string.Join(Environment.NewLine, result.Diagnostics.Select(item => item.Message)));
+            try
+            {
+                _ = Qcow2Explorer.Core.EndianUtilities.ReadBytes(result.Volumes[0].ReaderOverride!, 0, 512);
+                Assert(false, "thin LVM2 rejects out-of-range mapped data block");
+            }
+            catch (InvalidDataException ex)
+            {
+                Assert(ex.Message.Contains("space map範囲外", StringComparison.Ordinal), "thin LVM2 mapped data range diagnostic");
+            }
+        }
+        finally
+        {
+            foreach (var disposable in outOfRangeReaders)
+            {
+                disposable.Dispose();
+            }
+        }
+    }
+
+    var unallocatedPath = Path.Combine(AppContext.BaseDirectory, "sample-lvm2-thin-unallocated.img");
+    _ = TestImageFactory.CreateLvm2ThinFat16Disk(unallocatedPath, unallocatedMapping: true);
+    using (var unallocatedDisk = DiskImageReaderFactory.Open(unallocatedPath))
+    {
+        var unallocatedPartition = PartitionTableReader.ReadPartitions(unallocatedDisk).Single();
+        unallocatedPartition.FileSystem = FileSystemDetector.Detect(unallocatedDisk, unallocatedPartition);
+        var unallocatedReaders = new List<IDisposable>();
+        try
+        {
+            var result = LogicalVolumeDiscoverer.Discover(
+                [unallocatedDisk],
+                [unallocatedPartition],
+                2,
+                unallocatedReaders);
+            Assert(result.Volumes.Count == 1, string.Join(Environment.NewLine, result.Diagnostics.Select(item => item.Message)));
+            try
+            {
+                _ = Qcow2Explorer.Core.EndianUtilities.ReadBytes(result.Volumes[0].ReaderOverride!, 0, 512);
+                Assert(false, "thin LVM2 rejects mapped but unallocated data block");
+            }
+            catch (InvalidDataException ex)
+            {
+                Assert(ex.Message.Contains("space mapで未割当", StringComparison.Ordinal), "thin LVM2 unallocated data diagnostic");
+            }
+        }
+        finally
+        {
+            foreach (var disposable in unallocatedReaders)
+            {
+                disposable.Dispose();
+            }
+        }
+    }
+}
+
 static void TestGeneratedLzopExt4Image()
 {
     var imagePath = Path.Combine(AppContext.BaseDirectory, "sample-ext4.dd.lzo");
@@ -5988,6 +6183,381 @@ internal static class TestImageFactory
                 : metadata,
             componentData[1]);
         return logicalVolumeData;
+    }
+
+    public static byte[] CreateLvm2ThinFat16Disk(
+        string path,
+        bool corruptSuperblock = false,
+        bool corruptMappingNode = false,
+        bool transactionMismatch = false,
+        bool outOfRangeMapping = false,
+        bool unallocatedMapping = false,
+        bool corruptSpaceMapBitmap = false,
+        bool needsCheck = false,
+        bool incompatibilityFlag = false)
+    {
+        const int extentSizeSectors = 128;
+        const int extentSizeBytes = extentSizeSectors * BytesPerSector;
+        const int metadataExtents = 16;
+        const int dataExtents = 128;
+        const int thinExtents = PartitionSectors * BytesPerSector / extentSizeBytes;
+        const int dataAreaOffset = 1024 * 1024;
+        const int metadataAreaOffset = 4096;
+        const int metadataAreaLength = 8192;
+        const int metadataTextOffset = 512;
+        const int lvmPartitionSectors = VirtualSize / BytesPerSector - PartitionStartLba;
+        const string pvId = "abcdef-1234-5678-90ab-cdef-1234-567890";
+        const string pvIdRaw = "abcdef1234567890abcdef1234567890";
+        var partitionLength = lvmPartitionSectors * BytesPerSector;
+        var logicalVolumeData = CreateVirtualDisk().AsSpan(
+            PartitionStartLba * BytesPerSector,
+            PartitionSectors * BytesPerSector).ToArray();
+        var thinMetadata = new byte[metadataExtents * extentSizeBytes];
+        var thinData = new byte[dataExtents * extentSizeBytes];
+        var mappings = new List<(ulong Logical, ulong Physical)>();
+        for (var logicalBlock = 0; logicalBlock < thinExtents; logicalBlock++)
+        {
+            var source = logicalVolumeData.AsSpan(logicalBlock * extentSizeBytes, extentSizeBytes);
+            if (source.IndexOfAnyExcept((byte)0) < 0)
+            {
+                continue;
+            }
+
+            var physicalBlock = checked((ulong)((logicalBlock * 37 + 11) % dataExtents));
+            source.CopyTo(thinData.AsSpan(checked((int)physicalBlock * extentSizeBytes), extentSizeBytes));
+            mappings.Add((checked((ulong)logicalBlock), physicalBlock));
+        }
+
+        CreateThinPoolMetadata(thinMetadata, mappings, dataExtents);
+        if (needsCheck)
+        {
+            WriteU32Le(thinMetadata, 4, 1);
+            WriteThinMetadataChecksum(thinMetadata.AsSpan(0, 4096), 160774);
+        }
+
+        if (incompatibilityFlag)
+        {
+            WriteU32Le(thinMetadata, 360, 1);
+            WriteThinMetadataChecksum(thinMetadata.AsSpan(0, 4096), 160774);
+        }
+        if (unallocatedMapping)
+        {
+            SetThinBitmapReferenceCount(
+                thinMetadata.AsSpan(6 * 4096, 4096),
+                checked((int)mappings[0].Physical),
+                0);
+            WriteThinMetadataChecksum(thinMetadata.AsSpan(6 * 4096, 4096), 240779);
+        }
+
+        if (outOfRangeMapping)
+        {
+            var valueBase = 32 + 252 * sizeof(ulong);
+            WriteU64Le(
+                thinMetadata,
+                8 * 4096 + valueBase,
+                checked((long)(((ulong)dataExtents + 1) << 24)));
+            WriteThinMetadataChecksum(thinMetadata.AsSpan(8 * 4096, 4096), 121107);
+        }
+
+        if (corruptSuperblock)
+        {
+            thinMetadata[0] ^= 1;
+        }
+
+        if (corruptMappingNode)
+        {
+            thinMetadata[8 * 4096] ^= 1;
+        }
+
+        if (corruptSpaceMapBitmap)
+        {
+            thinMetadata[3 * 4096] ^= 1;
+        }
+
+        var poolTransaction = transactionMismatch ? 2 : 1;
+        var metadata = $$"""
+            contents = "Text Format Volume Group"
+            version = 1
+            description = "Qcow2Explorer generated thin LVM2 test"
+            creation_host = "Qcow2Explorer"
+            creation_time = 1
+            vg_thin {
+                id = "cedcba-9876-5432-10fe-dcba-9876-543210"
+                seqno = 11
+                format = "lvm2"
+                status = ["RESIZEABLE", "READ", "WRITE"]
+                flags = []
+                extent_size = {{extentSizeSectors}}
+                max_lv = 0
+                max_pv = 0
+                metadata_copies = 0
+                physical_volumes {
+                    pv0 {
+                        id = "{{pvId}}"
+                        device = "/dev/test"
+                        status = ["ALLOCATABLE"]
+                        flags = []
+                        dev_size = {{lvmPartitionSectors}}
+                        pe_start = {{dataAreaOffset / BytesPerSector}}
+                        pe_count = {{(partitionLength - dataAreaOffset) / extentSizeBytes}}
+                    }
+                }
+                logical_volumes {
+                    pool {
+                        id = "423456-7890-abcd-efgh-ijkl-mnop-qrstuv"
+                        status = ["READ", "WRITE", "VISIBLE"]
+                        flags = []
+                        segment_count = 1
+                        segment1 {
+                            start_extent = 0
+                            extent_count = {{dataExtents}}
+                            type = "thin-pool"
+                            metadata = "pool_tmeta"
+                            pool = "pool_tdata"
+                            transaction_id = {{poolTransaction}}
+                            chunk_size = {{extentSizeSectors}}
+                            discards = "passdown"
+                            zero_new_blocks = 1
+                        }
+                    }
+                    pool_tmeta {
+                        id = "523456-7890-abcd-efgh-ijkl-mnop-qrstuv"
+                        status = ["READ", "WRITE"]
+                        flags = []
+                        segment_count = 1
+                        segment1 {
+                            start_extent = 0
+                            extent_count = {{metadataExtents}}
+                            type = "striped"
+                            stripe_count = 1
+                            stripes = [ "pv0", 0 ]
+                        }
+                    }
+                    pool_tdata {
+                        id = "623456-7890-abcd-efgh-ijkl-mnop-qrstuv"
+                        status = ["READ", "WRITE"]
+                        flags = []
+                        segment_count = 1
+                        segment1 {
+                            start_extent = 0
+                            extent_count = {{dataExtents}}
+                            type = "striped"
+                            stripe_count = 1
+                            stripes = [ "pv0", {{metadataExtents}} ]
+                        }
+                    }
+                    thinvol {
+                        id = "723456-7890-abcd-efgh-ijkl-mnop-qrstuv"
+                        status = ["READ", "WRITE", "VISIBLE"]
+                        flags = []
+                        segment_count = 1
+                        segment1 {
+                            start_extent = 0
+                            extent_count = {{thinExtents}}
+                            type = "thin"
+                            thin_pool = "pool"
+                            transaction_id = 0
+                            device_id = 1
+                        }
+                    }
+                }
+            }
+            """;
+
+        var disk = new byte[VirtualSize];
+        var partitionStart = PartitionStartLba * BytesPerSector;
+        disk[446 + 4] = 0x8e;
+        WriteU32Le(disk, 446 + 8, PartitionStartLba);
+        WriteU32Le(disk, 446 + 12, lvmPartitionSectors);
+        disk[510] = 0x55;
+        disk[511] = 0xaa;
+
+        var metadataBytes = Encoding.ASCII.GetBytes(metadata);
+        if (metadataBytes.Length >= metadataAreaLength - metadataTextOffset)
+        {
+            throw new InvalidOperationException("Generated thin LVM2 metadata exceeds its test area.");
+        }
+
+        var metadataArea = partitionStart + metadataAreaOffset;
+        WriteAscii(disk, metadataArea + 4, " LVM2 x[5A%r0N*>", 16);
+        WriteU32Le(disk, metadataArea + 20, 1);
+        WriteU64Le(disk, metadataArea + 24, metadataAreaOffset);
+        WriteU64Le(disk, metadataArea + 32, metadataAreaLength);
+        WriteU64Le(disk, metadataArea + 40, metadataTextOffset);
+        WriteU64Le(disk, metadataArea + 48, metadataBytes.Length);
+        WriteU32Le(disk, metadataArea + 56, CalculateLvmCrc(metadataBytes, 0, metadataBytes.Length));
+        Array.Copy(metadataBytes, 0, disk, metadataArea + metadataTextOffset, metadataBytes.Length);
+        WriteU32Le(disk, metadataArea, CalculateLvmCrc(disk, metadataArea + 4, 508));
+
+        var label = partitionStart + BytesPerSector;
+        WriteAscii(disk, label, "LABELONE", 8);
+        WriteU64Le(disk, label + 8, 1);
+        WriteU32Le(disk, label + 20, 32);
+        WriteAscii(disk, label + 24, "LVM2 001", 8);
+        var pvHeader = label + 32;
+        WriteAscii(disk, pvHeader, pvIdRaw, 32);
+        WriteU64Le(disk, pvHeader + 32, partitionLength);
+        WriteU64Le(disk, pvHeader + 40, dataAreaOffset);
+        WriteU64Le(disk, pvHeader + 48, partitionLength - dataAreaOffset);
+        WriteU64Le(disk, pvHeader + 72, metadataAreaOffset);
+        WriteU64Le(disk, pvHeader + 80, metadataAreaLength);
+        WriteU32Le(disk, label + 16, CalculateLvmCrc(disk, label + 20, BytesPerSector - 20));
+
+        thinMetadata.CopyTo(disk.AsSpan(partitionStart + dataAreaOffset));
+        thinData.CopyTo(disk.AsSpan(partitionStart + dataAreaOffset + thinMetadata.Length));
+        File.WriteAllBytes(path, disk);
+        return logicalVolumeData;
+    }
+
+    private static void CreateThinPoolMetadata(
+        byte[] metadata,
+        IReadOnlyList<(ulong Logical, ulong Physical)> mappings,
+        ulong dataBlockCount)
+    {
+        const int blockBytes = 4096;
+        const int metadataBlockCount = 256;
+        const int entriesPerBitmap = 16320;
+        WriteThinBTreeLeaf(metadata, 2, sizeof(uint), []);
+        WriteThinBTreeLeaf(metadata, 5, sizeof(uint), []);
+
+        var dataIndexValue = new byte[16];
+        BinaryPrimitives.WriteUInt64LittleEndian(dataIndexValue, 6);
+        BinaryPrimitives.WriteUInt32LittleEndian(dataIndexValue.AsSpan(8), checked((uint)(entriesPerBitmap - mappings.Count)));
+        BinaryPrimitives.WriteUInt32LittleEndian(dataIndexValue.AsSpan(12), 0);
+        WriteThinBTreeLeaf(metadata, 4, 16, [(0UL, dataIndexValue)]);
+
+        var mappingRootValue = new byte[sizeof(ulong)];
+        BinaryPrimitives.WriteUInt64LittleEndian(mappingRootValue, 8);
+        WriteThinBTreeLeaf(metadata, 7, sizeof(ulong), [(1UL, mappingRootValue)]);
+
+        var mappingValues = mappings.Select(mapping =>
+        {
+            var value = new byte[sizeof(ulong)];
+            BinaryPrimitives.WriteUInt64LittleEndian(value, mapping.Physical << 24);
+            return (mapping.Logical, value);
+        }).ToList();
+        WriteThinBTreeLeaf(metadata, 8, sizeof(ulong), mappingValues);
+
+        var detailValue = new byte[24];
+        BinaryPrimitives.WriteUInt64LittleEndian(detailValue, checked((ulong)mappings.Count));
+        BinaryPrimitives.WriteUInt64LittleEndian(detailValue.AsSpan(8), 0);
+        WriteThinBTreeLeaf(metadata, 9, 24, [(1UL, detailValue)]);
+
+        var metadataIndex = metadata.AsSpan(blockBytes, blockBytes);
+        BinaryPrimitives.WriteUInt64LittleEndian(metadataIndex[8..], 1);
+        BinaryPrimitives.WriteUInt64LittleEndian(metadataIndex[16..], 3);
+        BinaryPrimitives.WriteUInt32LittleEndian(metadataIndex[24..], entriesPerBitmap - 10);
+        BinaryPrimitives.WriteUInt32LittleEndian(metadataIndex[28..], 10);
+        WriteThinMetadataChecksum(metadataIndex, 160478);
+
+        var metadataBitmap = metadata.AsSpan(3 * blockBytes, blockBytes);
+        BinaryPrimitives.WriteUInt64LittleEndian(metadataBitmap[8..], 3);
+        for (var block = 0; block < 10; block++)
+        {
+            SetThinBitmapReferenceCount(metadataBitmap, block, 1);
+        }
+        WriteThinMetadataChecksum(metadataBitmap, 240779);
+
+        var dataBitmap = metadata.AsSpan(6 * blockBytes, blockBytes);
+        BinaryPrimitives.WriteUInt64LittleEndian(dataBitmap[8..], 6);
+        foreach (var mapping in mappings)
+        {
+            SetThinBitmapReferenceCount(dataBitmap, checked((int)mapping.Physical), 1);
+        }
+        WriteThinMetadataChecksum(dataBitmap, 240779);
+
+        var superblock = metadata.AsSpan(0, blockBytes);
+        BinaryPrimitives.WriteUInt64LittleEndian(superblock[32..], 27022010);
+        BinaryPrimitives.WriteUInt32LittleEndian(superblock[40..], 2);
+        BinaryPrimitives.WriteUInt64LittleEndian(superblock[48..], 1);
+        WriteThinSpaceMapRoot(superblock[64..], dataBlockCount, checked((ulong)mappings.Count), 4, 5);
+        WriteThinSpaceMapRoot(superblock[192..], metadataBlockCount, 10, 1, 2);
+        BinaryPrimitives.WriteUInt64LittleEndian(superblock[320..], 7);
+        BinaryPrimitives.WriteUInt64LittleEndian(superblock[328..], 9);
+        BinaryPrimitives.WriteUInt32LittleEndian(superblock[336..], 128);
+        BinaryPrimitives.WriteUInt32LittleEndian(superblock[340..], 8);
+        BinaryPrimitives.WriteUInt64LittleEndian(superblock[344..], metadataBlockCount);
+        WriteThinMetadataChecksum(superblock, 160774);
+    }
+
+    private static void WriteThinBTreeLeaf(
+        byte[] metadata,
+        int blockNumber,
+        int valueSize,
+        IReadOnlyList<(ulong Key, byte[] Value)> entries)
+    {
+        const int blockBytes = 4096;
+        var maximumEntries = (blockBytes - 32) / (sizeof(ulong) + valueSize);
+        maximumEntries = maximumEntries / 3 * 3;
+        if (entries.Count > maximumEntries || entries.Any(entry => entry.Value.Length != valueSize))
+        {
+            throw new InvalidOperationException("Generated thin B-tree entries are invalid.");
+        }
+
+        var block = metadata.AsSpan(blockNumber * blockBytes, blockBytes);
+        BinaryPrimitives.WriteUInt32LittleEndian(block[4..], 2);
+        BinaryPrimitives.WriteUInt64LittleEndian(block[8..], checked((ulong)blockNumber));
+        BinaryPrimitives.WriteUInt32LittleEndian(block[16..], checked((uint)entries.Count));
+        BinaryPrimitives.WriteUInt32LittleEndian(block[20..], checked((uint)maximumEntries));
+        BinaryPrimitives.WriteUInt32LittleEndian(block[24..], checked((uint)valueSize));
+        var valueBase = 32 + maximumEntries * sizeof(ulong);
+        for (var index = 0; index < entries.Count; index++)
+        {
+            BinaryPrimitives.WriteUInt64LittleEndian(block[(32 + index * sizeof(ulong))..], entries[index].Key);
+            entries[index].Value.CopyTo(block[(valueBase + index * valueSize)..]);
+        }
+
+        WriteThinMetadataChecksum(block, 121107);
+    }
+
+    private static void WriteThinSpaceMapRoot(
+        Span<byte> destination,
+        ulong blockCount,
+        ulong allocatedBlockCount,
+        ulong bitmapRoot,
+        ulong refCountRoot)
+    {
+        BinaryPrimitives.WriteUInt64LittleEndian(destination, blockCount);
+        BinaryPrimitives.WriteUInt64LittleEndian(destination[8..], allocatedBlockCount);
+        BinaryPrimitives.WriteUInt64LittleEndian(destination[16..], bitmapRoot);
+        BinaryPrimitives.WriteUInt64LittleEndian(destination[24..], refCountRoot);
+    }
+
+    private static void SetThinBitmapReferenceCount(Span<byte> bitmap, int blockNumber, int count)
+    {
+        var encoded = count switch
+        {
+            0 => 0,
+            1 => 2,
+            2 => 1,
+            _ => 3
+        };
+        var byteOffset = 16 + blockNumber / 4;
+        var shift = blockNumber % 4 * 2;
+        var mask = 3 << shift;
+        bitmap[byteOffset] = checked((byte)((bitmap[byteOffset] & ~mask) | encoded << shift));
+    }
+
+    private static void WriteThinMetadataChecksum(Span<byte> block, uint salt)
+    {
+        var checksum = CalculateCrc32C(block[sizeof(uint)..]) ^ uint.MaxValue ^ salt;
+        BinaryPrimitives.WriteUInt32LittleEndian(block, checksum);
+    }
+
+    private static uint CalculateCrc32C(ReadOnlySpan<byte> data)
+    {
+        const uint polynomial = 0x82f63b78;
+        var checksum = uint.MaxValue;
+        foreach (var value in data)
+        {
+            checksum ^= value;
+            for (var bit = 0; bit < 8; bit++)
+            {
+                checksum = (checksum >> 1) ^ ((checksum & 1) == 0 ? 0 : polynomial);
+            }
+        }
+
+        return ~checksum;
     }
 
     public static void CorruptLvmMetadataText(string path)
