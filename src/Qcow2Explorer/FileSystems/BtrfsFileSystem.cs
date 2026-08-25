@@ -79,6 +79,7 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
     private readonly Dictionary<ulong, uint> _dataChecksums = [];
     private readonly Dictionary<BtrfsCompressedExtentKey, byte[]> _decodedExtentCache = [];
     private readonly object _decodedExtentCacheLock = new();
+    private IReadOnlyList<ulong> _missingDeviceIds = [];
 
     public BtrfsFileSystem(IBlockReader reader, PartitionInfo partition)
         : this([reader], partition)
@@ -200,6 +201,8 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
     public string Name => "Btrfs";
     public PartitionInfo Partition { get; }
     public VfsNode Root { get; }
+    public bool IsDegraded => _missingDeviceIds.Count > 0;
+    public IReadOnlyList<ulong> MissingDeviceIds => _missingDeviceIds;
 
     public static BtrfsDeviceIdentity ReadDeviceIdentity(IBlockReader reader)
     {
@@ -709,13 +712,15 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
             var stripeOffset = 48 + index * 32;
             var deviceId = EndianUtilities.ReadUInt64Little(data, stripeOffset);
             var physicalStart = EndianUtilities.ReadUInt64Little(data, stripeOffset + 8);
-            if (!_devices.TryGetValue(deviceId, out var device))
+            var stripeUuid = data.AsSpan(stripeOffset + 16, 16);
+            if (stripeUuid.IndexOfAnyExcept((byte)0) < 0)
             {
                 throw new InvalidDataException(
-                    $"Btrfs chunkが参照するdeviceが不足しています: devid={deviceId}");
+                    $"Btrfs chunk stripeのdevice UUIDが空です: devid={deviceId}");
             }
 
-            if (!data.AsSpan(stripeOffset + 16, 16).SequenceEqual(device.Uuid))
+            if (_devices.TryGetValue(deviceId, out var device)
+                && !stripeUuid.SequenceEqual(device.Uuid))
             {
                 throw new InvalidDataException(
                     $"Btrfs chunk stripeのdevice UUIDが一致しません: devid={deviceId}");
@@ -728,7 +733,10 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
                     + $"devid={deviceId}, physical={physicalStart}");
             }
 
-            stripes[index] = new BtrfsStripe(deviceId, physicalStart);
+            stripes[index] = new BtrfsStripe(
+                deviceId,
+                physicalStart,
+                Convert.ToHexString(stripeUuid));
         }
 
         if (profile == ChunkProfileRaid1
@@ -792,29 +800,9 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
     {
         if ((ulong)_deviceItems.Count != expectedDeviceCount)
         {
-            var missingIds = _deviceItems.Keys
-                .Where(deviceId => !_devices.ContainsKey(deviceId))
-                .Order()
-                .ToArray();
-            if (missingIds.Length > 0)
-            {
-                throw new InvalidDataException(
-                    $"Btrfs deviceが不足しています: devid={string.Join(",", missingIds)}");
-            }
-
             throw new InvalidDataException(
                 $"Btrfs DEVICE_ITEM数がsuperblockと一致しません: "
                 + $"expected={expectedDeviceCount}, actual={_deviceItems.Count}");
-        }
-
-        var missing = _deviceItems.Keys
-            .Where(deviceId => !_devices.ContainsKey(deviceId))
-            .Order()
-            .ToArray();
-        if (missing.Length > 0)
-        {
-            throw new InvalidDataException(
-                $"Btrfs deviceが不足しています: devid={string.Join(",", missing)}");
         }
 
         var extra = _devices.Keys
@@ -829,7 +817,11 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
 
         foreach (var item in _deviceItems.Values)
         {
-            var device = _devices[item.DeviceId];
+            if (!_devices.TryGetValue(item.DeviceId, out var device))
+            {
+                continue;
+            }
+
             if (!item.Uuid.SequenceEqual(device.Uuid))
             {
                 throw new InvalidDataException(
@@ -843,6 +835,11 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
                     + $"devid={item.DeviceId}, bytes={item.TotalBytes:N0}");
             }
         }
+
+        _missingDeviceIds = _deviceItems.Keys
+            .Where(deviceId => !_devices.ContainsKey(deviceId))
+            .Order()
+            .ToArray();
     }
 
     private void AddChunk(BtrfsChunk chunk)
@@ -876,16 +873,51 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
         {
             var chunk = _chunks[index];
             var logicalEnd = checked(chunk.LogicalStart + chunk.Length);
+            var availableStripeCount = 0;
             foreach (var stripe in chunk.Stripes)
             {
+                if (!_deviceItems.TryGetValue(stripe.DeviceId, out var deviceItem))
+                {
+                    throw new InvalidDataException(
+                        $"Btrfs chunkが未知のdeviceを参照しています: devid={stripe.DeviceId}");
+                }
+
+                if (!string.Equals(
+                    stripe.DeviceUuid,
+                    Convert.ToHexString(deviceItem.Uuid),
+                    StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new InvalidDataException(
+                        $"Btrfs chunk stripeとDEVICE_ITEMのUUIDが一致しません: devid={stripe.DeviceId}");
+                }
+
+                if (!_devices.TryGetValue(stripe.DeviceId, out var device))
+                {
+                    continue;
+                }
+
+                availableStripeCount++;
                 var physicalEnd = checked(stripe.PhysicalStart + chunk.Length);
-                var device = _devices[stripe.DeviceId];
                 if (physicalEnd > (ulong)device.Reader.Length || physicalEnd > device.TotalBytes)
                 {
                     throw new InvalidDataException(
                         $"Btrfs chunk stripeの物理範囲がdevice外です: "
                         + $"devid={stripe.DeviceId}, end={physicalEnd:N0}");
                 }
+            }
+
+            var profile = chunk.Type & ChunkProfileMask;
+            if (availableStripeCount == 0
+                || (availableStripeCount < chunk.Stripes.Count && profile != ChunkProfileRaid1))
+            {
+                var missing = chunk.Stripes
+                    .Where(stripe => !_devices.ContainsKey(stripe.DeviceId))
+                    .Select(stripe => stripe.DeviceId)
+                    .Distinct()
+                    .Order();
+                throw new InvalidDataException(
+                    $"Btrfs chunkを読み取るdeviceが不足しています: "
+                    + $"logical={chunk.LogicalStart:N0}, devid={string.Join(",", missing)}");
             }
 
             if (index > 0)
@@ -1835,7 +1867,11 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
             var readLength = checked((int)Math.Min((ulong)remaining, available));
             var stripe = chunk.Stripes[mirrorIndex];
             var physical = checked(stripe.PhysicalStart + withinChunk);
-            var device = _devices[stripe.DeviceId];
+            if (!_devices.TryGetValue(stripe.DeviceId, out var device))
+            {
+                throw new IOException($"Btrfs deviceがありません: devid={stripe.DeviceId}");
+            }
+
             var physicalEnd = checked(physical + (ulong)readLength);
             if (physicalEnd > (ulong)device.Reader.Length
                 || physicalEnd > device.TotalBytes)
@@ -2210,7 +2246,10 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
         bool IsSnapshot);
     private sealed record BtrfsDevice(ulong DeviceId, IBlockReader Reader, byte[] Uuid, ulong TotalBytes);
     private sealed record BtrfsDeviceItem(ulong DeviceId, ulong TotalBytes, byte[] Uuid);
-    private readonly record struct BtrfsStripe(ulong DeviceId, ulong PhysicalStart);
+    private readonly record struct BtrfsStripe(
+        ulong DeviceId,
+        ulong PhysicalStart,
+        string DeviceUuid);
     private sealed record BtrfsChunk(
         ulong LogicalStart,
         ulong Length,

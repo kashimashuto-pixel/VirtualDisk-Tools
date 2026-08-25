@@ -2353,6 +2353,14 @@ public partial class Form1 : Form
                 return null;
             }
 
+            if (fs is BtrfsFileSystem { IsDegraded: true } degradedBtrfs)
+            {
+                _analysisWarnings.Add(
+                    "Btrfsをdegraded読み取りで開きました。欠損device: devid="
+                    + string.Join(",", degradedBtrfs.MissingDeviceIds));
+                RefreshWarnings();
+            }
+
             _fileSystems[partition.Number] = fs;
             _statusLabel.Text = $"{partition.Number}: {fs.Name}";
             return fs;
