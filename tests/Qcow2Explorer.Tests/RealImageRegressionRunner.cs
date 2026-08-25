@@ -64,27 +64,72 @@ internal static class RealImageRegressionRunner
     {
         var expandedPath = Environment.ExpandEnvironmentVariables(regressionCase.Path);
         var imagePath = Path.GetFullPath(expandedPath, manifestDirectory);
-        if (!File.Exists(imagePath))
-        {
-            throw new FileNotFoundException($"[{regressionCase.Name}] 実イメージが見つかりません。", imagePath);
-        }
+        VerifyImageHash(regressionCase.Name, imagePath, regressionCase.Sha256, "image");
 
-        var expectedImageHash = NormalizeSha256(regressionCase.Sha256, regressionCase.Name, "image");
-        Console.WriteLine($"[{regressionCase.Name}] SHA-256を検証中 ({new FileInfo(imagePath).Length:N0} bytes)...");
-        var actualImageHash = ComputeFileSha256(imagePath);
-        Require(
-            string.Equals(actualImageHash, expectedImageHash, StringComparison.OrdinalIgnoreCase),
-            regressionCase.Name,
-            $"image SHA-256 mismatch: expected={expectedImageHash}, actual={actualImageHash}");
+        var companionPaths = regressionCase.CompanionImages
+            .Select((image, index) =>
+            {
+                var path = Path.GetFullPath(
+                    Environment.ExpandEnvironmentVariables(image.Path),
+                    manifestDirectory);
+                VerifyImageHash(regressionCase.Name, path, image.Sha256, $"companion image #{index + 1}");
+                return path;
+            })
+            .ToArray();
 
         if (regressionCase.VerifyLzopCacheReuse)
         {
+            Require(
+                companionPaths.Length == 0,
+                regressionCase.Name,
+                "LZO cache verification cannot be combined with companionImages");
             RunLzopCacheCase(regressionCase, imagePath);
         }
         else
         {
             using var reader = DiskImageReaderFactory.Open(imagePath);
-            ValidateReader(regressionCase, reader);
+            var companionReaders = new List<IDiskImageReader>();
+            try
+            {
+                companionReaders.AddRange(companionPaths.Select(path =>
+                    (IDiskImageReader)new RawDiskImageReader(path)));
+                IReadOnlyList<BtrfsDevicePartition> btrfsDevices = [];
+                if (companionReaders.Count > 0)
+                {
+                    var disks = new List<IBlockReader> { reader };
+                    disks.AddRange(companionReaders);
+                    btrfsDevices = BtrfsDeviceSet.Discover(disks);
+                    Require(
+                        regressionCase.Partitions.Any(item => string.Equals(
+                            item.ExpectedFileSystem,
+                            "Btrfs",
+                            StringComparison.OrdinalIgnoreCase)),
+                        regressionCase.Name,
+                        "companionImages requires a Btrfs partition expectation");
+                    var primaryFileSystemIds = btrfsDevices
+                        .Where(item => ReferenceEquals(item.Disk, reader))
+                        .Select(item => item.Identity.FileSystemId)
+                        .ToHashSet(StringComparer.OrdinalIgnoreCase);
+                    Require(
+                        primaryFileSystemIds.Any(fileSystemId => disks.All(disk => btrfsDevices.Any(item =>
+                            ReferenceEquals(item.Disk, disk)
+                            && string.Equals(
+                                item.Identity.FileSystemId,
+                                fileSystemId,
+                                StringComparison.OrdinalIgnoreCase)))),
+                        regressionCase.Name,
+                        "the primary image and all companionImages must share a Btrfs FSID");
+                }
+
+                ValidateReader(regressionCase, reader, btrfsDevices);
+            }
+            finally
+            {
+                foreach (var companionReader in companionReaders)
+                {
+                    companionReader.Dispose();
+                }
+            }
         }
 
         Console.WriteLine($"[{regressionCase.Name}] passed");
@@ -111,7 +156,7 @@ internal static class RealImageRegressionRunner
                     firstReader is TemporaryLzopDiskImageReader { CacheReused: false },
                     regressionCase.Name,
                     "first LZO cache open must expand a new RAW cache");
-                ValidateReader(regressionCase, firstReader);
+                ValidateReader(regressionCase, firstReader, []);
             }
 
             var reuseStopwatch = Stopwatch.StartNew();
@@ -125,7 +170,7 @@ internal static class RealImageRegressionRunner
                     reusedReader is TemporaryLzopDiskImageReader { CacheReused: true },
                     regressionCase.Name,
                     "second LZO cache open must reuse the verified RAW cache");
-                ValidateReader(regressionCase, reusedReader);
+                ValidateReader(regressionCase, reusedReader, []);
             }
 
             Console.WriteLine(
@@ -189,7 +234,10 @@ internal static class RealImageRegressionRunner
         }
     }
 
-    private static void ValidateReader(RealImageRegressionCase regressionCase, IDiskImageReader reader)
+    private static void ValidateReader(
+        RealImageRegressionCase regressionCase,
+        IDiskImageReader reader,
+        IReadOnlyList<BtrfsDevicePartition> btrfsDevices)
     {
         if (!string.IsNullOrWhiteSpace(regressionCase.ExpectedFormatContains))
         {
@@ -234,7 +282,12 @@ internal static class RealImageRegressionRunner
         {
             var partition = partitions.SingleOrDefault(item => item.Number == partitionExpectation.Number);
             Require(partition is not null, regressionCase.Name, $"partition #{partitionExpectation.Number} was not found");
-            ValidatePartition(regressionCase.Name, reader, partition!, partitionExpectation);
+            ValidatePartition(
+                regressionCase.Name,
+                reader,
+                partition!,
+                partitionExpectation,
+                btrfsDevices);
         }
     }
 
@@ -242,7 +295,8 @@ internal static class RealImageRegressionRunner
         string caseName,
         IBlockReader reader,
         PartitionInfo partition,
-        RealImagePartitionExpectation expectation)
+        RealImagePartitionExpectation expectation,
+        IReadOnlyList<BtrfsDevicePartition> btrfsDevices)
     {
         partition.FileSystem = FileSystemDetector.Detect(reader, partition);
         byte[] recoveryKey = [];
@@ -253,6 +307,8 @@ internal static class RealImageRegressionRunner
         try
         {
             var shouldOpen = expectation.Files.Count > 0
+                || (btrfsDevices.Count > 0
+                    && string.Equals(expectation.ExpectedFileSystem, "Btrfs", StringComparison.OrdinalIgnoreCase))
                 || !string.IsNullOrWhiteSpace(expectation.RecoveryPasswordEnvironmentVariable)
                 || !string.IsNullOrWhiteSpace(expectation.PasswordEnvironmentVariable)
                 || !string.IsNullOrWhiteSpace(expectation.StartupKeyPathEnvironmentVariable)
@@ -313,8 +369,12 @@ internal static class RealImageRegressionRunner
                     luksPassphraseCharacters = passphrase!.ToCharArray();
                 }
 
-                fileSystem = recoveryKey.Length > 0
-                    ? FileSystemDetector.TryOpen(reader, partition, recoveryKey, out var openError)
+                string openError;
+                fileSystem = btrfsDevices.Count > 0
+                    && string.Equals(partition.FileSystem, "Btrfs", StringComparison.OrdinalIgnoreCase)
+                        ? BtrfsDeviceSet.TryOpen(reader, partition, btrfsDevices, out openError)
+                    : recoveryKey.Length > 0
+                    ? FileSystemDetector.TryOpen(reader, partition, recoveryKey, out openError)
                     : passwordCharacters.Length > 0
                         ? FileSystemDetector.TryOpenWithBitLockerPassword(reader, partition, passwordCharacters, out openError)
                         : startupKey is not null
@@ -442,6 +502,22 @@ internal static class RealImageRegressionRunner
         return Convert.ToHexString(SHA256.HashData(stream));
     }
 
+    private static void VerifyImageHash(string caseName, string path, string expectedHash, string label)
+    {
+        if (!File.Exists(path))
+        {
+            throw new FileNotFoundException($"[{caseName}] {label}が見つかりません。", path);
+        }
+
+        var normalizedExpectedHash = NormalizeSha256(expectedHash, caseName, label);
+        Console.WriteLine($"[{caseName}] {label} SHA-256を検証中 ({new FileInfo(path).Length:N0} bytes)...");
+        var actualHash = ComputeFileSha256(path);
+        Require(
+            string.Equals(actualHash, normalizedExpectedHash, StringComparison.OrdinalIgnoreCase),
+            caseName,
+            $"{label} SHA-256 mismatch: expected={normalizedExpectedHash}, actual={actualHash}");
+    }
+
     private static string ComputeReaderSha256(IBlockReader reader)
     {
         using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
@@ -510,6 +586,7 @@ internal sealed class RealImageRegressionCase
     public string Name { get; set; } = "";
     public string Path { get; set; } = "";
     public string Sha256 { get; set; } = "";
+    public List<RealImageCompanionImage> CompanionImages { get; set; } = [];
     public string ExpectedFormatContains { get; set; } = "";
     public long? ExpectedDiskLength { get; set; }
     public string ExpectedLogicalSha256 { get; set; } = "";
@@ -517,6 +594,12 @@ internal sealed class RealImageRegressionCase
     public bool VerifyLzopCacheReuse { get; set; }
     public bool VerifyLzopCacheCancellation { get; set; }
     public List<RealImagePartitionExpectation> Partitions { get; set; } = [];
+}
+
+internal sealed class RealImageCompanionImage
+{
+    public string Path { get; set; } = "";
+    public string Sha256 { get; set; } = "";
 }
 
 internal sealed class RealImagePartitionExpectation

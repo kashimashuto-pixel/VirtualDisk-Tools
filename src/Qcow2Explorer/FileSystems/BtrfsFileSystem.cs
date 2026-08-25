@@ -201,6 +201,17 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
     public PartitionInfo Partition { get; }
     public VfsNode Root { get; }
 
+    public static BtrfsDeviceIdentity ReadDeviceIdentity(IBlockReader reader)
+    {
+        ArgumentNullException.ThrowIfNull(reader);
+        var superblock = SelectSuperblock(reader);
+        return new BtrfsDeviceIdentity(
+            Convert.ToHexString(superblock.AsSpan(0x20, 16)),
+            EndianUtilities.ReadUInt64Little(superblock, 0xc9),
+            Convert.ToHexString(superblock.AsSpan(0x10b, 16)),
+            EndianUtilities.ReadUInt64Little(superblock, 0x88));
+    }
+
     public IReadOnlyList<VfsNode> ListDirectory(VfsNode directory)
     {
         if (!directory.IsDirectory || directory.Metadata is not BtrfsNodeReference nodeReference)
@@ -666,7 +677,10 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
                 + $"type=0x{type:X}, stripes={stripeCount}, sub_stripes={subStripeCount}");
         }
 
-        if (stripeCount != expectedStripeCount || subStripeCount != 1)
+        var validSubStripeCount = profile == ChunkProfileRaid1
+            ? subStripeCount == 1
+            : subStripeCount is 0 or 1;
+        if (stripeCount != expectedStripeCount || !validSubStripeCount)
         {
             var profileName = profile == ChunkProfileRaid1 ? "RAID1" : "single";
             throw new InvalidDataException(
@@ -2254,6 +2268,12 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
         Preallocated
     }
 }
+
+public sealed record BtrfsDeviceIdentity(
+    string FileSystemId,
+    ulong DeviceId,
+    string DeviceUuid,
+    ulong NumberOfDevices);
 
 internal static class BtrfsCrc32C
 {

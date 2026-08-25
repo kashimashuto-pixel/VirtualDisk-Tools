@@ -157,6 +157,7 @@ dotnet run --project tests\Qcow2Explorer.Tests\Qcow2Explorer.Tests.csproj -- "<i
 XFS bigtime、Btrfs、BitLocker、LUKS1/LUKS2、E01、LZOキャッシュなどを実環境由来イメージで回帰確認する場合は、
 [実イメージ回帰テスト手順](tests/REAL_IMAGE_REGRESSION.md)を参照してください。
 イメージとローカルmanifestはGitへ追加せず、SHA-256と期待値を照合して任意実行します。
+Btrfsの複数デバイス構成はツールバーの「Btrfs複数RAW」から同じファイルシステムを構成するRAWをすべて選択します。先頭の選択ファイルを画面表示用ディスクとし、FSID・devid・device UUIDを照合したcompanionを読み取り時に自動使用します。
 
 ## ProjFS マウント
 
@@ -186,7 +187,7 @@ ProjFS マウントは Windows の Client-ProjFS 機能を使い、選択した�
 - 暗号化されたswtpm状態は、暗号方式と必要な鍵長までは判定できます。swtpmで設定されたファイル鍵または移行鍵がない場合、内部状態は復号できません。
 - 平文のTPM状態データは存在と構造を表示できますが、libtpmsのversion依存な内部構造を秘密鍵単位まで展開する機能ではありません。
 - ext4 の journal replay は行いません。
-- Btrfsは単一／複数デバイスのsingle profileと2-copy RAID1を読み取り専用で扱い、DEVICE_ITEM、devid、FSID、device UUIDとstripeを相互検証します。RAID1ではmetadata tree blockのCRC32Cまたはdata checksumが一致するmirrorだけを採用し、片系破損時は検証済みの代替mirrorへ切り替えます。複数デバイス用コアAPIは利用できますが、複数RAWイメージを一組として指定するUIは今後対応です。subvolume、snapshot、default subvolumeとzlib・LZO・zstd圧縮extentを読み取れ、snapshot内に残る入れ子subvolume境界は元subvolumeへ誤接続せず空ディレクトリとして表示します。RAID0／10／5／6、RAID1C3／1C4、暗号化extent、書き込みは未対応です。
+- Btrfsは単一／複数デバイスのsingle profileと2-copy RAID1を読み取り専用で扱い、DEVICE_ITEM、devid、FSID、device UUIDとstripeを相互検証します。RAID1ではmetadata tree blockのCRC32Cまたはdata checksumが一致するmirrorだけを採用し、片系破損時は検証済みの代替mirrorへ切り替えます。複数RAWはツールバーから一組として指定でき、実イメージ回帰manifestでも各companionのSHA-256を検証します。subvolume、snapshot、default subvolumeとzlib・LZO・zstd圧縮extentを読み取れ、snapshot内に残る入れ子subvolume境界は元subvolumeへ誤接続せず空ディレクトリとして表示します。RAID0／10／5／6、RAID1C3／1C4、暗号化extent、書き込みは未対応です。
 - Btrfsのsuperblock、metadata tree block、checksum treeに記録されたdata sectorのCRC32Cを検証し、不一致は読み取りを中止します。primary superblockが壊れている場合だけ、公式mirror位置（64 MiB／256 GiB）の検証済みbackupへ復旧し、primaryが有効なら常にprimaryを優先します。
 - SquashFS はライブラリが対応する圧縮形式のみ読み取れます。
 - Linux md RAID は検出のみです。

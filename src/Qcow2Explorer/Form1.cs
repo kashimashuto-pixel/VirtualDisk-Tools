@@ -43,6 +43,8 @@ public partial class Form1 : Form
     private readonly TextBox _mountText = new() { Dock = DockStyle.Fill, Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical };
 
     private IDiskImageReader? _reader;
+    private readonly List<IDiskImageReader> _companionReaders = new();
+    private IReadOnlyList<BtrfsDevicePartition> _btrfsDevices = [];
     private readonly List<PartitionInfo> _partitions = new();
     private readonly Dictionary<int, IReadOnlyFileSystem> _fileSystems = new();
     private readonly List<IDisposable> _partitionReaders = new();
@@ -80,6 +82,7 @@ public partial class Form1 : Form
             DisposeMounts();
             DisposeFileSystems();
             DisposePartitionReaders();
+            DisposeCompanionReaders();
             _reader?.Dispose();
         };
     }
@@ -117,6 +120,8 @@ public partial class Form1 : Form
         var toolStrip = new ToolStrip { GripStyle = ToolStripGripStyle.Hidden };
         var openButton = new ToolStripButton("開く");
         openButton.Click += async (_, _) => await OpenImageDialogAsync();
+        var openBtrfsDeviceSetButton = new ToolStripButton("Btrfs複数RAW");
+        openBtrfsDeviceSetButton.Click += async (_, _) => await OpenBtrfsDeviceSetDialogAsync();
         var openFolderButton = new ToolStripButton("フォルダ");
         openFolderButton.Click += async (_, _) => await OpenImageFolderDialogAsync();
         var openPhysicalDiskButton = new ToolStripButton("物理ディスク");
@@ -130,6 +135,7 @@ public partial class Form1 : Form
         var ovaDiskButton = new ToolStripButton("OVAディスク");
         ovaDiskButton.Click += (_, _) => SelectOvaDisk();
         toolStrip.Items.Add(openButton);
+        toolStrip.Items.Add(openBtrfsDeviceSetButton);
         toolStrip.Items.Add(openFolderButton);
         toolStrip.Items.Add(openPhysicalDiskButton);
         toolStrip.Items.Add(new ToolStripSeparator());
@@ -475,6 +481,38 @@ public partial class Form1 : Form
         {
             await LoadImageAsync(dialog.FileName);
         }
+    }
+
+    private async Task OpenBtrfsDeviceSetDialogAsync()
+    {
+        using var dialog = new OpenFileDialog
+        {
+            Filter = "RAWディスク (*.raw;*.img;*.dd)|*.raw;*.img;*.dd|All files (*.*)|*.*",
+            Title = "同じBtrfsファイルシステムを構成するRAWイメージをすべて選択",
+            Multiselect = true
+        };
+
+        if (dialog.ShowDialog(this) != DialogResult.OK)
+        {
+            return;
+        }
+
+        var paths = dialog.FileNames
+            .Select(Path.GetFullPath)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        if (paths.Length < 2)
+        {
+            MessageBox.Show(
+                this,
+                "Btrfs複数RAWでは2個以上の異なるイメージを選択してください。",
+                "Btrfs複数RAW",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+            return;
+        }
+
+        await LoadImageAsync(paths[0], paths[1..]);
     }
 
     private async Task OpenImageFolderDialogAsync()
@@ -913,7 +951,7 @@ public partial class Form1 : Form
         dialog.ShowDialog(this);
     }
 
-    private async Task LoadImageAsync(string path)
+    private async Task LoadImageAsync(string path, IReadOnlyList<string>? companionPaths = null)
     {
         if (_isLoadingImage)
         {
@@ -957,6 +995,7 @@ public partial class Form1 : Form
             var progress = new Progress<DiskImageProgress>(UpdateLoadProgress);
             loadResult = await Task.Run(() => LoadAndAnalyzeImage(
                 path,
+                companionPaths ?? [],
                 rawOffset,
                 rawLength,
                 progress,
@@ -973,12 +1012,17 @@ public partial class Form1 : Form
 
             DisposeFileSystems();
             DisposePartitionReaders();
+            DisposeCompanionReaders();
             _reader?.Dispose();
             _reader = loadResult.Reader;
+            _companionReaders.AddRange(loadResult.CompanionReaders);
+            _btrfsDevices = loadResult.BtrfsDevices;
             _partitionReaders.AddRange(loadResult.Analysis.OwnedReaders);
             adopted = true;
             _partitions.Clear();
-            _pathBox.Text = path;
+            _pathBox.Text = _companionReaders.Count == 0
+                ? path
+                : $"{path} (+{_companionReaders.Count:N0} Btrfs device)";
 
             FillHeader();
             _analysisWarnings.AddRange(loadResult.Analysis.Diagnostics.Select(item => item.Message));
@@ -1079,6 +1123,7 @@ public partial class Form1 : Form
 
     private static ImageLoadResult LoadAndAnalyzeImage(
         string path,
+        IReadOnlyList<string> companionPaths,
         long rawOffset,
         int rawLength,
         IProgress<DiskImageProgress> progress,
@@ -1088,6 +1133,7 @@ public partial class Form1 : Form
         bool overwriteSavedRaw)
     {
         IDiskImageReader? reader = null;
+        var companionReaders = new List<IDiskImageReader>();
         var ownedReaders = new List<IDisposable>();
         try
         {
@@ -1099,20 +1145,67 @@ public partial class Form1 : Form
                 lzopTemporaryDirectory,
                 cancellationToken,
                 overwriteSavedRaw);
+            foreach (var companionPath in companionPaths)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                progress.Report(new DiskImageProgress(
+                    $"Btrfs companion RAWを開いています: {companionReaders.Count + 1:N0} / {companionPaths.Count:N0}",
+                    companionReaders.Count + 1,
+                    companionPaths.Count));
+                companionReaders.Add(new RawDiskImageReader(companionPath));
+            }
+
             var analysis = AnalyzeImage(reader, ownedReaders, progress, cancellationToken);
+            IReadOnlyList<BtrfsDevicePartition> btrfsDevices = [];
+            if (companionReaders.Count > 0)
+            {
+                progress.Report(new DiskImageProgress("Btrfs device setを照合中..."));
+                var disks = new List<IBlockReader> { reader };
+                disks.AddRange(companionReaders);
+                btrfsDevices = BtrfsDeviceSet.Discover(disks, cancellationToken);
+                foreach (var disk in disks)
+                {
+                    if (!btrfsDevices.Any(item => ReferenceEquals(item.Disk, disk)))
+                    {
+                        throw new InvalidDataException(
+                            "選択したRAWの一つに検証可能なBtrfs deviceが見つかりません。");
+                    }
+                }
+
+                var primaryFileSystemIds = btrfsDevices
+                    .Where(item => ReferenceEquals(item.Disk, reader))
+                    .Select(item => item.Identity.FileSystemId)
+                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
+                if (!primaryFileSystemIds.Any(fileSystemId => disks.All(disk => btrfsDevices.Any(item =>
+                    ReferenceEquals(item.Disk, disk)
+                    && string.Equals(
+                        item.Identity.FileSystemId,
+                        fileSystemId,
+                        StringComparison.OrdinalIgnoreCase)))))
+                {
+                    throw new InvalidDataException(
+                        "選択したすべてのRAWに共通するBtrfs FSIDが見つかりません。");
+                }
+            }
+
             progress.Report(new DiskImageProgress("先頭データを読み込み中..."));
             cancellationToken.ThrowIfCancellationRequested();
             var rawData = new byte[rawLength];
             reader.ReadAt(rawOffset, rawData, 0, rawLength);
             cancellationToken.ThrowIfCancellationRequested();
             var rawHex = HexFormatter.Format(rawData, rawOffset);
-            return new ImageLoadResult(reader, analysis, rawHex);
+            return new ImageLoadResult(reader, companionReaders, btrfsDevices, analysis, rawHex);
         }
         catch
         {
             foreach (var disposable in ownedReaders)
             {
                 disposable.Dispose();
+            }
+
+            foreach (var companionReader in companionReaders)
+            {
+                companionReader.Dispose();
             }
 
             reader?.Dispose();
@@ -1237,6 +1330,16 @@ public partial class Form1 : Form
         {
             var item = new ListViewItem(row.Key);
             item.SubItems.Add(row.Value);
+            _headerList.Items.Add(item);
+        }
+
+        for (var index = 0; index < _companionReaders.Count; index++)
+        {
+            var path = _companionReaders[index].GetHeaderRows()
+                .FirstOrDefault(row => string.Equals(row.Key, "ファイル", StringComparison.Ordinal))
+                .Value;
+            var item = new ListViewItem($"Btrfs companion {index + 1}");
+            item.SubItems.Add(path ?? "(path unavailable)");
             _headerList.Items.Add(item);
         }
 
@@ -2085,7 +2188,10 @@ public partial class Form1 : Form
         Cursor = Cursors.WaitCursor;
         try
         {
-            var fs = FileSystemDetector.TryOpen(_reader, partition, out var error);
+            var fs = string.Equals(partition.FileSystem, "Btrfs", StringComparison.OrdinalIgnoreCase)
+                && _btrfsDevices.Count > 0
+                    ? BtrfsDeviceSet.TryOpen(_reader, partition, _btrfsDevices, out var error)
+                    : FileSystemDetector.TryOpen(_reader, partition, out error);
             if (fs is null && TryReadBitLockerUnlockMetadata(partition, out var metadata))
             {
                 Cursor = Cursors.Default;
@@ -2662,6 +2768,17 @@ public partial class Form1 : Form
         }
 
         _partitionReaders.Clear();
+    }
+
+    private void DisposeCompanionReaders()
+    {
+        foreach (var reader in _companionReaders)
+        {
+            reader.Dispose();
+        }
+
+        _companionReaders.Clear();
+        _btrfsDevices = [];
     }
 
     private async Task OpenSelectedListItemAsync()
@@ -3288,6 +3405,8 @@ public partial class Form1 : Form
 
     private sealed record ImageLoadResult(
         IDiskImageReader Reader,
+        IReadOnlyList<IDiskImageReader> CompanionReaders,
+        IReadOnlyList<BtrfsDevicePartition> BtrfsDevices,
         ImageAnalysis Analysis,
         string RawHex) : IDisposable
     {
@@ -3296,6 +3415,11 @@ public partial class Form1 : Form
             foreach (var disposable in Analysis.OwnedReaders)
             {
                 disposable.Dispose();
+            }
+
+            foreach (var companionReader in CompanionReaders)
+            {
+                companionReader.Dispose();
             }
 
             Reader.Dispose();

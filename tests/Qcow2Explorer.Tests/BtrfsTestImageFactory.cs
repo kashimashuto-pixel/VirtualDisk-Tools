@@ -345,13 +345,15 @@ internal static class BtrfsTestImageFactory
             RegularDataLogicalOffset,
             deviceId: 1,
             firstDeviceUuid,
-            type: 0x6); // SYSTEM | METADATA
+            type: 0x6,
+            subStripeCount: 0); // SYSTEM | METADATA
         var dataChunk = CreateChunk(
             4 * 1024 * 1024,
             deviceId: 2,
             stripeUuid,
             physicalStart: RegularDataLogicalOffset,
-            type: 0x1); // DATA
+            type: 0x1,
+            subStripeCount: 0); // DATA
         var firstDeviceItem = CreateDeviceItem(1, partitionLength, firstDeviceUuid, fsid);
         var secondDeviceItem = CreateDeviceItem(2, partitionLength, secondDeviceUuid, fsid);
 
@@ -537,18 +539,21 @@ internal static class BtrfsTestImageFactory
         ulong deviceId,
         byte[] deviceUuid,
         ulong physicalStart = 0,
-        ulong type = 0x7)
+        ulong type = 0x7,
+        ushort subStripeCount = 1)
     {
         return CreateChunk(
             chunkLength,
             [new BtrfsTestStripe(deviceId, physicalStart, deviceUuid)],
-            type);
+            type,
+            subStripeCount);
     }
 
     private static byte[] CreateChunk(
         int chunkLength,
         IReadOnlyList<BtrfsTestStripe> stripes,
-        ulong type)
+        ulong type,
+        ushort subStripeCount = 1)
     {
         var chunk = new byte[48 + stripes.Count * 32];
         WriteU64(chunk, 0, chunkLength);
@@ -559,7 +564,7 @@ internal static class BtrfsTestImageFactory
         WriteU32(chunk, 36, SectorSize);
         WriteU32(chunk, 40, SectorSize);
         WriteU16(chunk, 44, stripes.Count);
-        WriteU16(chunk, 46, 1);
+        WriteU16(chunk, 46, subStripeCount);
         for (var index = 0; index < stripes.Count; index++)
         {
             var stripe = stripes[index];
