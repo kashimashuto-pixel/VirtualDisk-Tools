@@ -102,6 +102,18 @@ wsl --distribution Ubuntu-24.04 --user root -- sh -lc `
 
 スクリプトはRAID1同期完了後にext4と検証ファイルを作成し、`e2fsck -fn`、`mdadm --detail`／`--examine`、各RAWと内部ファイルのSHA-256を表示します。manifestでは`"deviceSet": "Linux md RAID1"`を指定し、2台目を`companionImages`へ登録します。1台だけのcaseも登録するとdegraded読み取りを確認できます。
 
+### Linux md RAID0
+
+同じWSL環境で、metadata 1.2、64 KiB chunkのRAID0とext4を生成します。
+
+```powershell
+.\tools\New-MdRaid0RegressionFixture.ps1 `
+  -FirstOutputPath .\.tmp\real-images\md-raid0-1.raw `
+  -SecondOutputPath .\.tmp\real-images\md-raid0-2.raw
+```
+
+スクリプトはstripeを横断する300 MiBファイルを作成し、`e2fsck -fn`、`mdadm --detail`／`--examine`、各RAWと内部ファイルのSHA-256を表示します。manifestでは`"deviceSet": "Linux md RAID0"`を指定し、2台目を`companionImages`へ登録します。RAID0は全memberが必要なため、欠損構成は成功caseとして登録できません。
+
 ### LVM2 multiple PV
 
 WSL 2のUbuntu 24.04へ`lvm2`と`e2fsprogs`をインストールし、2個のPVにまたがるlinear LVとext4を生成します。

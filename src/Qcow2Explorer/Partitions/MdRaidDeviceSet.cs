@@ -7,7 +7,7 @@ public static class MdRaidDeviceSet
 {
     private const uint Magic = 0xa92b4efc;
     private const uint FeatureBitmapOffset = 1;
-    private const uint SupportedFeatureMask = FeatureBitmapOffset;
+    private const uint FeatureRaid0Layout = 4096;
     private const ushort SpareRole = 0xffff;
     private const ushort FaultyRole = 0xfffe;
     private const int SuperblockSize = 4096;
@@ -51,7 +51,7 @@ public static class MdRaidDeviceSet
             cancellationToken.ThrowIfCancellationRequested();
             try
             {
-                arrays.Add(AssembleRaid1(group.ToList(), diagnostics));
+                arrays.Add(AssembleArray(group.ToList(), diagnostics));
             }
             catch (Exception ex) when (ex is InvalidDataException or NotSupportedException or OverflowException)
             {
@@ -113,18 +113,19 @@ public static class MdRaidDeviceSet
             throw new NotSupportedException("metadata major version 1以外は未対応です。");
         }
 
+        var level = EndianUtilities.ReadInt32Little(data, 72);
         var featureMap = EndianUtilities.ReadUInt32Little(data, 8);
-        var unsupportedFeatures = featureMap & ~SupportedFeatureMask;
+        var supportedFeatures = FeatureBitmapOffset | (level == 0 ? FeatureRaid0Layout : 0);
+        var unsupportedFeatures = featureMap & ~supportedFeatures;
         if (unsupportedFeatures != 0)
         {
             throw new NotSupportedException(
                 $"reshape・recovery・bad-block等の未対応featureがあります: 0x{unsupportedFeatures:X8}");
         }
 
-        var level = EndianUtilities.ReadInt32Little(data, 72);
-        if (level != 1)
+        if (level is not 0 and not 1)
         {
-            throw new NotSupportedException($"RAID level {level}は未対応です（現在はRAID1のみ）。");
+            throw new NotSupportedException($"RAID level {level}は未対応です（現在はRAID0／RAID1のみ）。");
         }
 
         var sizeSectors = EndianUtilities.ReadUInt64Little(data, 80);
@@ -140,7 +141,10 @@ public static class MdRaidDeviceSet
         var maximumDevices = EndianUtilities.ReadUInt32Little(data, 220);
         var recordedLogicalBlockSize = EndianUtilities.ReadUInt32Little(data, 224);
         var logicalBlockSize = recordedLogicalBlockSize == 0 ? 512U : recordedLogicalBlockSize;
-        if (sizeSectors == 0 || raidDisks < 2 || raidDisks > 1024)
+        if ((level == 1 && sizeSectors == 0)
+            || (level == 0 && dataSizeSectors == 0)
+            || raidDisks < 2
+            || raidDisks > 1024)
         {
             throw new InvalidDataException(
                 $"array sizeまたはdevice数が不正です: size={sizeSectors}, raid_disks={raidDisks}");
@@ -167,19 +171,27 @@ public static class MdRaidDeviceSet
                 $"superblock checksumが一致しません: expected=0x{expectedChecksum:X8}, actual=0x{actualChecksum:X8}");
         }
 
-        if (dataSizeSectors < sizeSectors)
+        if (level == 1 && dataSizeSectors < sizeSectors)
         {
             throw new InvalidDataException(
                 $"component data sizeがarray sizeより小さいです: data={dataSizeSectors}, array={sizeSectors}");
         }
 
-        if (resyncOffsetSectors < sizeSectors)
+        if (level == 1 && resyncOffsetSectors < sizeSectors)
         {
             throw new NotSupportedException(
                 $"resync未完了のmemberは使用できません: resync={resyncOffsetSectors}, size={sizeSectors}");
         }
 
-        var dataEnd = checked((dataOffsetSectors + sizeSectors) * 512UL);
+        if (level == 0
+            && (chunkSectors == 0 || chunkSectors % (logicalBlockSize / 512) != 0))
+        {
+            throw new InvalidDataException(
+                $"RAID0 chunk sizeが不正です: chunk={chunkSectors}, logical_block={logicalBlockSize}");
+        }
+
+        var requiredDataSectors = level == 0 ? dataSizeSectors : sizeSectors;
+        var dataEnd = checked((dataOffsetSectors + requiredDataSectors) * 512UL);
         if (dataEnd > (ulong)componentLength)
         {
             throw new InvalidDataException(
@@ -244,7 +256,7 @@ public static class MdRaidDeviceSet
         return unchecked((uint)sum + (uint)(sum >> 32));
     }
 
-    private static MdRaidArray AssembleRaid1(
+    private static MdRaidArray AssembleArray(
         IReadOnlyList<MdRaidComponent> candidates,
         List<string> diagnostics)
     {
@@ -301,7 +313,7 @@ public static class MdRaidDeviceSet
 
         if (current.Count == 0)
         {
-            throw new InvalidDataException("現在世代のactive RAID1 memberがありません。");
+            throw new InvalidDataException($"現在世代のactive RAID{reference.Level} memberがありません。");
         }
 
         var staleCount = candidates.Count - current.Count;
@@ -311,10 +323,33 @@ public static class MdRaidDeviceSet
                 $"Linux md {reference.SetUuid}: spare/faultyまたは旧eventのmember {staleCount:N0}個を読み取り対象から除外しました。");
         }
 
-        var reader = new MdRaid1Reader(current, reference.SizeSectors, reference.LogicalBlockSize);
+        IMdRaidReader reader;
+        if (reference.Level == 0)
+        {
+            if (current.Count != reference.RaidDisks
+                || !current.Select(item => (uint)item.Metadata.Role)
+                    .SequenceEqual(Enumerable.Range(0, checked((int)reference.RaidDisks)).Select(index => (uint)index)))
+            {
+                throw new InvalidDataException(
+                    $"RAID0には全active roleが必要です: available={current.Count:N0}/{reference.RaidDisks:N0}");
+            }
+
+            reader = new MdRaid0Reader(
+                current,
+                reference.ChunkSectors,
+                reference.Layout,
+                reference.FeatureMap,
+                reference.LogicalBlockSize);
+        }
+        else
+        {
+            reader = new MdRaid1Reader(current, reference.SizeSectors, reference.LogicalBlockSize);
+        }
+
         return new MdRaidArray(
             reference.SetUuid,
             reference.SetName,
+            reference.Level,
             reference.RaidDisks,
             reference.Events,
             current,
@@ -335,7 +370,142 @@ public static class MdRaidDeviceSet
     }
 }
 
-public sealed class MdRaid1Reader : IBlockReader, ILogicalSectorReader
+public interface IMdRaidReader : IBlockReader, ILogicalSectorReader
+{
+    bool IsDegraded { get; }
+    IReadOnlyList<ushort> AvailableRoles { get; }
+}
+
+public sealed class MdRaid0Reader : IMdRaidReader
+{
+    private const uint OriginalLayout = 1;
+    private const uint AlternateMultiZoneLayout = 2;
+    private const uint Raid0LayoutFeature = 4096;
+    private readonly uint _chunkSectors;
+    private readonly uint _layout;
+    private readonly IReadOnlyList<MdRaid0Zone> _zones;
+
+    internal MdRaid0Reader(
+        IReadOnlyList<MdRaidComponent> members,
+        uint chunkSectors,
+        uint recordedLayout,
+        uint featureMap,
+        uint logicalSectorSize)
+    {
+        _chunkSectors = chunkSectors;
+        LogicalSectorSize = logicalSectorSize;
+        AvailableRoles = members.Select(member => member.Metadata.Role).ToArray();
+
+        var memberSizes = members
+            .Select(member => new MdRaid0MemberSize(
+                member,
+                member.Metadata.DataSizeSectors / chunkSectors * chunkSectors))
+            .ToList();
+        if (memberSizes.Any(item => item.SizeSectors == 0))
+        {
+            throw new InvalidDataException("RAID0 memberのdata sizeがchunk sizeより小さいです。");
+        }
+
+        var zones = new List<MdRaid0Zone>();
+        ulong zoneStart = 0;
+        ulong deviceStart = 0;
+        foreach (var nextDeviceEnd in memberSizes
+            .Select(item => item.SizeSectors)
+            .Distinct()
+            .Order())
+        {
+            var zoneMembers = memberSizes
+                .Where(item => item.SizeSectors >= nextDeviceEnd)
+                .Select(item => item.Component)
+                .ToList();
+            var zoneSectors = checked((nextDeviceEnd - deviceStart) * (ulong)zoneMembers.Count);
+            if (zoneSectors == 0)
+            {
+                continue;
+            }
+
+            zones.Add(new MdRaid0Zone(
+                zoneStart,
+                checked(zoneStart + zoneSectors),
+                deviceStart,
+                zoneMembers));
+            zoneStart += zoneSectors;
+            deviceStart = nextDeviceEnd;
+        }
+
+        if (zones.Count == 0)
+        {
+            throw new InvalidDataException("RAID0 striping zoneを構築できませんでした。");
+        }
+
+        if (zones.Count == 1 || zones[1].Members.Count == 1)
+        {
+            _layout = OriginalLayout;
+        }
+        else if ((featureMap & Raid0LayoutFeature) == 0)
+        {
+            throw new NotSupportedException(
+                "複数zone RAID0ですがlayout featureがなく、original／alternateを安全に判定できません。");
+        }
+        else
+        {
+            _layout = recordedLayout is OriginalLayout or AlternateMultiZoneLayout
+                ? recordedLayout
+                : throw new NotSupportedException(
+                    $"複数zone RAID0 layout {recordedLayout}は未対応です（1または2が必要です）。");
+        }
+        _zones = zones;
+        Length = checked((long)(zones[^1].EndSector * 512UL));
+    }
+
+    public long Length { get; }
+    public uint LogicalSectorSize { get; }
+    public bool IsDegraded => false;
+    public IReadOnlyList<ushort> AvailableRoles { get; }
+
+    public void ReadAt(long offset, byte[] buffer, int bufferOffset, int count)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(offset);
+        ArgumentOutOfRangeException.ThrowIfNegative(bufferOffset);
+        ArgumentOutOfRangeException.ThrowIfNegative(count);
+        if (offset > Length - count || bufferOffset > buffer.Length - count)
+        {
+            throw new ArgumentOutOfRangeException(nameof(count));
+        }
+
+        var remaining = count;
+        while (remaining > 0)
+        {
+            var logicalSector = checked((ulong)(offset / 512));
+            var byteInSector = checked((int)(offset % 512));
+            var zone = _zones.First(item => logicalSector < item.EndSector);
+            var zoneSector = logicalSector - zone.StartSector;
+            var mappingSector = _layout == OriginalLayout ? logicalSector : zoneSector;
+            var chunkOffset = mappingSector % _chunkSectors;
+            var memberIndex = checked((int)((mappingSector / _chunkSectors) % (ulong)zone.Members.Count));
+            var deviceChunk = zoneSector / checked((ulong)_chunkSectors * (ulong)zone.Members.Count);
+            var deviceSector = checked(zone.DeviceStartSector + deviceChunk * _chunkSectors + chunkOffset);
+            var member = zone.Members[memberIndex];
+            var physicalOffset = checked((long)((member.Metadata.DataOffsetSectors + deviceSector) * 512UL) + byteInSector);
+            var chunkRemaining = checked((long)((_chunkSectors - chunkOffset) * 512UL) - byteInSector);
+            var zoneRemaining = checked((long)((zone.EndSector - logicalSector) * 512UL) - byteInSector);
+            var toRead = checked((int)Math.Min(remaining, Math.Min(chunkRemaining, zoneRemaining)));
+            member.Reader.ReadAt(physicalOffset, buffer, bufferOffset, toRead);
+            offset += toRead;
+            bufferOffset += toRead;
+            remaining -= toRead;
+        }
+    }
+
+    private sealed record MdRaid0MemberSize(MdRaidComponent Component, ulong SizeSectors);
+    private sealed record MdRaid0Zone(
+        ulong StartSector,
+        ulong EndSector,
+        ulong DeviceStartSector,
+        IReadOnlyList<MdRaidComponent> Members);
+}
+
+public sealed class MdRaid1Reader : IMdRaidReader
 {
     private readonly IReadOnlyList<MdRaidComponent> _members;
 
@@ -424,10 +594,14 @@ public sealed record MdRaidComponent(
 public sealed record MdRaidArray(
     string SetUuid,
     string SetName,
+    int Level,
     uint ExpectedDeviceCount,
     ulong Events,
     IReadOnlyList<MdRaidComponent> Components,
-    MdRaid1Reader Reader);
+    IMdRaidReader Reader)
+{
+    public string LevelName => $"RAID{Level}";
+}
 
 public sealed record MdRaidDiscoveryResult(
     IReadOnlyList<MdRaidArray> Arrays,

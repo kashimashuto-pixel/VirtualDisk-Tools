@@ -62,6 +62,7 @@ internal static class RealImageRegressionRunner
         var unsupportedDeviceSet = manifest.Cases.FirstOrDefault(item =>
             !string.IsNullOrWhiteSpace(item.DeviceSet)
             && !string.Equals(item.DeviceSet, "Linux md RAID1", StringComparison.OrdinalIgnoreCase)
+            && !string.Equals(item.DeviceSet, "Linux md RAID0", StringComparison.OrdinalIgnoreCase)
             && !string.Equals(item.DeviceSet, "LVM2", StringComparison.OrdinalIgnoreCase));
         if (unsupportedDeviceSet is not null)
         {
@@ -112,15 +113,20 @@ internal static class RealImageRegressionRunner
                     btrfsDevices = BtrfsDeviceSet.Discover(disks);
                 }
 
-                if (string.Equals(regressionCase.DeviceSet, "Linux md RAID1", StringComparison.OrdinalIgnoreCase))
+                if (string.Equals(regressionCase.DeviceSet, "Linux md RAID1", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(regressionCase.DeviceSet, "Linux md RAID0", StringComparison.OrdinalIgnoreCase))
                 {
-                    Require(mdDiscovery.Arrays.Count == 1, regressionCase.Name, $"expected one Linux md RAID1 array, actual={mdDiscovery.Arrays.Count}; {string.Join(" | ", mdDiscovery.Diagnostics)}");
+                    var expectedLevel = regressionCase.DeviceSet.EndsWith("RAID0", StringComparison.OrdinalIgnoreCase)
+                        ? 0
+                        : 1;
+                    Require(mdDiscovery.Arrays.Count == 1, regressionCase.Name, $"expected one {regressionCase.DeviceSet} array, actual={mdDiscovery.Arrays.Count}; {string.Join(" | ", mdDiscovery.Diagnostics)}");
+                    Require(mdDiscovery.Arrays[0].Level == expectedLevel, regressionCase.Name, $"md level mismatch: expected={expectedLevel}, actual={mdDiscovery.Arrays[0].Level}");
                     ValidateReader(
                         regressionCase,
                         mdDiscovery.Arrays[0].Reader,
                         [],
                         synthesizeWholeDisk: true,
-                        synthesizedScheme: "Linux md RAID1");
+                        synthesizedScheme: regressionCase.DeviceSet);
                 }
                 else if (string.Equals(regressionCase.DeviceSet, "LVM2", StringComparison.OrdinalIgnoreCase))
                 {

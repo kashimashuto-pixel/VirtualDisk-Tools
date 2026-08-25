@@ -1288,11 +1288,13 @@ public partial class Form1 : Form
                 discovered.Add(new PartitionInfo
                 {
                     Number = nextNumber++,
-                    Scheme = "Linux md RAID1",
+                    Scheme = $"Linux md {array.LevelName}",
                     Name = string.IsNullOrWhiteSpace(array.SetName)
-                        ? $"md RAID1 {array.SetUuid[..8]}"
+                        ? $"md {array.LevelName} {array.SetUuid[..8]}"
                         : array.SetName,
-                    Type = array.Reader.IsDegraded ? "Linux md RAID1 (degraded)" : "Linux md RAID1",
+                    Type = array.Reader.IsDegraded
+                        ? $"Linux md {array.LevelName} (degraded)"
+                        : $"Linux md {array.LevelName}",
                     TypeId = array.SetUuid,
                     StartLba = 0,
                     SectorCount = checked((ulong)(array.Reader.Length / 512)),
@@ -1308,7 +1310,7 @@ public partial class Form1 : Form
                 discovered.Add(new PartitionInfo
                 {
                     Number = nextNumber++,
-                    Scheme = "Linux md RAID1",
+                    Scheme = $"Linux md {array.LevelName}",
                     Name = $"{array.SetName}: {nested.Name}",
                     Type = nested.Type,
                     TypeId = $"{array.SetUuid}:{nested.TypeId}",
@@ -1335,7 +1337,7 @@ public partial class Form1 : Form
         var diagnostics = new List<LvmDiagnostic>();
         diagnostics.AddRange(mdDiscovery.Diagnostics.Select(message => new LvmDiagnostic(message, false)));
         diagnostics.AddRange(mdDiscovery.Arrays.Select(array => new LvmDiagnostic(
-            $"Linux md RAID1: {array.SetName} ({array.SetUuid})、"
+            $"Linux md {array.LevelName}: {array.SetName} ({array.SetUuid})、"
             + $"member={array.Components.Count:N0}/{array.ExpectedDeviceCount:N0}、"
             + $"event={array.Events:N0}{(array.Reader.IsDegraded ? "、degraded" : "")}",
             false)));

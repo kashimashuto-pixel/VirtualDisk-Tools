@@ -150,6 +150,16 @@
 - checksum破損、旧event、mirror不一致、完全／degraded構成を合成fixtureで回帰確認
 - 実`mdadm 4.3 --metadata=1.2` RAID1 + ext4を生成し、`e2fsck -fn`と完全／degraded manifest回帰を実行
 
+### Linux md RAID0読み取り対応
+
+- metadata 1.xのRAID0 layout feature、chunk size、deviceごとのdata sizeと物理範囲を検証
+- Linux kernelのstrip zone生成と同じ規則で、同容量memberと異容量memberのmulti-zoneを構築
+- original layout／alternate multi-zone layoutのchunk写像を読み取り専用readerへ実装
+- 全active roleと同一eventが揃う場合だけ組み立て、欠損・旧event memberがあるarrayは安全に拒否
+- 2台合成fixtureで入力順非依存、64 KiB境界、全論理領域、内部FAT16を検証
+- 3台異容量合成fixtureでoriginal／alternate multi-zone layoutの差を回帰確認
+- 実`mdadm 4.3 --metadata=1.2 --level=0 --chunk=64` + ext4を生成し、300 MiBのstripe横断ファイルをmanifest回帰で確認
+
 ### LVM2複数PV対応
 
 - 「複数ディスク」で指定した全入力をDiscUtilsのVolumeManagerへ登録し、VGに必要なPVを横断して検出
@@ -161,10 +171,10 @@
 
 ## 次回の推奨作業
 
-### 1. Linux md RAID0／RAID10
+### 1. Linux md RAID10
 
-- 既存のmetadata 1.x検証を共通化し、RAID0のchunk単位stripingを追加する
-- 次にRAID10のnear layoutを追加し、必要なmirror組が不足する構成を安全に拒否する
+- RAID10のnear layoutを追加し、必要なmirror組が不足する構成を安全に拒否する
+- その後、far／offset layoutを実イメージの需要に応じて検討する
 
 ### 2. LVM2 striped LV
 
@@ -184,7 +194,7 @@
 利用目的に応じ、次の順で検討します。
 
 1. Linux md RAIDの拡張
-   - RAID1対応を基盤に、RAID0/10、その後RAID5/6を検討する
+   - RAID0／RAID1対応を基盤に、RAID10、その後RAID5/6を検討する
 2. LVM2の拡張
    - striped、thin、snapshot、cache、mirror、RAID segmentを段階的に対応する
 3. 証拠・暗号化形式の拡張
