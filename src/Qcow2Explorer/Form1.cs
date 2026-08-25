@@ -120,8 +120,8 @@ public partial class Form1 : Form
         var toolStrip = new ToolStrip { GripStyle = ToolStripGripStyle.Hidden };
         var openButton = new ToolStripButton("開く");
         openButton.Click += async (_, _) => await OpenImageDialogAsync();
-        var openBtrfsDeviceSetButton = new ToolStripButton("Btrfs複数RAW");
-        openBtrfsDeviceSetButton.Click += async (_, _) => await OpenBtrfsDeviceSetDialogAsync();
+        var openDeviceSetButton = new ToolStripButton("複数ディスク");
+        openDeviceSetButton.Click += async (_, _) => await OpenDeviceSetDialogAsync();
         var openFolderButton = new ToolStripButton("フォルダ");
         openFolderButton.Click += async (_, _) => await OpenImageFolderDialogAsync();
         var openPhysicalDiskButton = new ToolStripButton("物理ディスク");
@@ -135,7 +135,7 @@ public partial class Form1 : Form
         var ovaDiskButton = new ToolStripButton("OVAディスク");
         ovaDiskButton.Click += (_, _) => SelectOvaDisk();
         toolStrip.Items.Add(openButton);
-        toolStrip.Items.Add(openBtrfsDeviceSetButton);
+        toolStrip.Items.Add(openDeviceSetButton);
         toolStrip.Items.Add(openFolderButton);
         toolStrip.Items.Add(openPhysicalDiskButton);
         toolStrip.Items.Add(new ToolStripSeparator());
@@ -483,12 +483,12 @@ public partial class Form1 : Form
         }
     }
 
-    private async Task OpenBtrfsDeviceSetDialogAsync()
+    private async Task OpenDeviceSetDialogAsync()
     {
         using var dialog = new OpenFileDialog
         {
-            Filter = "RAWディスク (*.raw;*.img;*.dd)|*.raw;*.img;*.dd|All files (*.*)|*.*",
-            Title = "同じBtrfsファイルシステムを構成するRAWイメージをすべて選択",
+            Filter = DiskImageReaderFactory.DialogFilter,
+            Title = "同じBtrfs／Linux md構成に属するディスクイメージをすべて選択",
             Multiselect = true
         };
 
@@ -505,8 +505,8 @@ public partial class Form1 : Form
         {
             MessageBox.Show(
                 this,
-                "Btrfs複数RAWでは2個以上の異なるイメージを選択してください。",
-                "Btrfs複数RAW",
+                "複数ディスクでは2個以上の異なるイメージを選択してください。",
+                "複数ディスク",
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Information);
             return;
@@ -1022,7 +1022,7 @@ public partial class Form1 : Form
             _partitions.Clear();
             _pathBox.Text = _companionReaders.Count == 0
                 ? path
-                : $"{path} (+{_companionReaders.Count:N0} Btrfs device)";
+                : $"{path} (+{_companionReaders.Count:N0} companion disk)";
 
             FillHeader();
             _analysisWarnings.AddRange(loadResult.Analysis.Diagnostics.Select(item => item.Message));
@@ -1149,44 +1149,47 @@ public partial class Form1 : Form
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 progress.Report(new DiskImageProgress(
-                    $"Btrfs companion RAWを開いています: {companionReaders.Count + 1:N0} / {companionPaths.Count:N0}",
+                    $"companion diskを開いています: {companionReaders.Count + 1:N0} / {companionPaths.Count:N0}",
                     companionReaders.Count + 1,
                     companionPaths.Count));
-                companionReaders.Add(new RawDiskImageReader(companionPath));
+                companionReaders.Add(DiskImageReaderFactory.Open(
+                    companionPath,
+                    progress,
+                    cancellationToken: cancellationToken));
             }
 
-            var analysis = AnalyzeImage(reader, ownedReaders, progress, cancellationToken);
+            var disks = new List<IBlockReader> { reader };
+            disks.AddRange(companionReaders);
+            progress.Report(new DiskImageProgress("Linux md arrayを照合中..."));
+            var mdDiscovery = MdRaidDeviceSet.Discover(disks, cancellationToken);
             IReadOnlyList<BtrfsDevicePartition> btrfsDevices = [];
             if (companionReaders.Count > 0)
             {
                 progress.Report(new DiskImageProgress("Btrfs device setを照合中..."));
-                var disks = new List<IBlockReader> { reader };
-                disks.AddRange(companionReaders);
                 btrfsDevices = BtrfsDeviceSet.Discover(disks, cancellationToken);
-                foreach (var disk in disks)
-                {
-                    if (!btrfsDevices.Any(item => ReferenceEquals(item.Disk, disk)))
-                    {
-                        throw new InvalidDataException(
-                            "選択したRAWの一つに検証可能なBtrfs deviceが見つかりません。");
-                    }
-                }
-
                 var primaryFileSystemIds = btrfsDevices
                     .Where(item => ReferenceEquals(item.Disk, reader))
                     .Select(item => item.Identity.FileSystemId)
                     .ToHashSet(StringComparer.OrdinalIgnoreCase);
-                if (!primaryFileSystemIds.Any(fileSystemId => disks.All(disk => btrfsDevices.Any(item =>
+                var hasCommonBtrfsSet = primaryFileSystemIds.Any(fileSystemId => disks.All(disk => btrfsDevices.Any(item =>
                     ReferenceEquals(item.Disk, disk)
                     && string.Equals(
                         item.Identity.FileSystemId,
                         fileSystemId,
-                        StringComparison.OrdinalIgnoreCase)))))
+                        StringComparison.OrdinalIgnoreCase))));
+                if (!hasCommonBtrfsSet && mdDiscovery.Arrays.Count == 0)
                 {
                     throw new InvalidDataException(
-                        "選択したすべてのRAWに共通するBtrfs FSIDが見つかりません。");
+                        "選択したディスクから共通のBtrfs FSIDまたは組み立て可能なLinux md arrayが見つかりません。");
                 }
             }
+
+            var analysis = AnalyzeImage(
+                reader,
+                mdDiscovery,
+                ownedReaders,
+                progress,
+                cancellationToken);
 
             progress.Report(new DiskImageProgress("先頭データを読み込み中..."));
             cancellationToken.ThrowIfCancellationRequested();
@@ -1215,6 +1218,7 @@ public partial class Form1 : Form
 
     private static ImageAnalysis AnalyzeImage(
         IDiskImageReader reader,
+        MdRaidDiscoveryResult mdDiscovery,
         List<IDisposable> ownedReaders,
         IProgress<DiskImageProgress> progress,
         CancellationToken cancellationToken)
@@ -1236,6 +1240,49 @@ public partial class Form1 : Form
             });
         }
 
+        var nextNumber = discovered.Count + 1;
+        foreach (var array in mdDiscovery.Arrays)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var arrayPartitions = PartitionTableReader.ReadPartitions(array.Reader, cancellationToken);
+            if (arrayPartitions.Count == 0)
+            {
+                discovered.Add(new PartitionInfo
+                {
+                    Number = nextNumber++,
+                    Scheme = "Linux md RAID1",
+                    Name = string.IsNullOrWhiteSpace(array.SetName)
+                        ? $"md RAID1 {array.SetUuid[..8]}"
+                        : array.SetName,
+                    Type = array.Reader.IsDegraded ? "Linux md RAID1 (degraded)" : "Linux md RAID1",
+                    TypeId = array.SetUuid,
+                    StartLba = 0,
+                    SectorCount = checked((ulong)(array.Reader.Length / 512)),
+                    ReaderOverride = array.Reader,
+                    LengthOverrideBytes = array.Reader.Length
+                });
+                continue;
+            }
+
+            foreach (var nested in arrayPartitions)
+            {
+                var slice = new PartitionSliceReader(array.Reader, nested);
+                discovered.Add(new PartitionInfo
+                {
+                    Number = nextNumber++,
+                    Scheme = "Linux md RAID1",
+                    Name = $"{array.SetName}: {nested.Name}",
+                    Type = nested.Type,
+                    TypeId = $"{array.SetUuid}:{nested.TypeId}",
+                    Bootable = nested.Bootable,
+                    StartLba = 0,
+                    SectorCount = checked((ulong)(slice.Length / 512)),
+                    ReaderOverride = slice,
+                    LengthOverrideBytes = slice.Length
+                });
+            }
+        }
+
         for (var index = 0; index < discovered.Count; index++)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -1248,6 +1295,12 @@ public partial class Form1 : Form
 
         var allPartitions = new List<PartitionInfo>(discovered);
         var diagnostics = new List<LvmDiagnostic>();
+        diagnostics.AddRange(mdDiscovery.Diagnostics.Select(message => new LvmDiagnostic(message, false)));
+        diagnostics.AddRange(mdDiscovery.Arrays.Select(array => new LvmDiagnostic(
+            $"Linux md RAID1: {array.SetName} ({array.SetUuid})、"
+            + $"member={array.Components.Count:N0}/{array.ExpectedDeviceCount:N0}、"
+            + $"event={array.Events:N0}{(array.Reader.IsDegraded ? "、degraded" : "")}",
+            false)));
         var lvmPartitions = discovered
             .Where(partition => partition.FileSystem.StartsWith("LVM2", StringComparison.OrdinalIgnoreCase))
             .ToList();
@@ -1338,7 +1391,7 @@ public partial class Form1 : Form
             var path = _companionReaders[index].GetHeaderRows()
                 .FirstOrDefault(row => string.Equals(row.Key, "ファイル", StringComparison.Ordinal))
                 .Value;
-            var item = new ListViewItem($"Btrfs companion {index + 1}");
+            var item = new ListViewItem($"Companion disk {index + 1}");
             item.SubItems.Add(path ?? "(path unavailable)");
             _headerList.Items.Add(item);
         }

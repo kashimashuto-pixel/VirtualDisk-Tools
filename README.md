@@ -27,7 +27,7 @@ C# / Windows Forms で作成した、読み取り専用の仮想ディスク解�
 - LVM2 論理ボリュームの検出と読み取り
   - 通常のlinear構成（LVMメタデータ上は`striped`、`stripe_count = 1`）を読み取り
   - 読めない場合は不足PV、未対応segment type、複数stripe、メタデータ未検出、または内部例外を警告欄と解析レポートへ表示
-- Linux md RAID の検出
+- Linux md RAID1の検出・読み取り（metadata 1.x、degraded対応）
 - Windows Explorer風の左ツリー・右詳細一覧画面
   - `Alt + ↑`で親フォルダー、`Alt + ←`で戻る、`Alt + →`で進む
   - 画面上の「戻る」「進む」「上へ」ボタンでも同じ操作が可能
@@ -157,7 +157,7 @@ dotnet run --project tests\Qcow2Explorer.Tests\Qcow2Explorer.Tests.csproj -- "<i
 XFS bigtime、Btrfs、BitLocker、LUKS1/LUKS2、E01、LZOキャッシュなどを実環境由来イメージで回帰確認する場合は、
 [実イメージ回帰テスト手順](tests/REAL_IMAGE_REGRESSION.md)を参照してください。
 イメージとローカルmanifestはGitへ追加せず、SHA-256と期待値を照合して任意実行します。
-Btrfsの複数デバイス構成はツールバーの「Btrfs複数RAW」から同じファイルシステムを構成するRAWをすべて選択します。先頭の選択ファイルを画面表示用ディスクとし、FSID・devid・device UUIDを照合したcompanionを読み取り時に自動使用します。
+BtrfsやLinux mdの複数デバイス構成はツールバーの「複数ディスク」から同じ構成に属するイメージをすべて選択します。先頭の選択ファイルを画面表示用ディスクとし、BtrfsはFSID・devid・device UUID、Linux mdはarray UUID・role・event・device UUIDを照合したcompanionを読み取り時に自動使用します。
 
 ## ProjFS マウント
 
@@ -190,7 +190,7 @@ ProjFS マウントは Windows の Client-ProjFS 機能を使い、選択した�
 - Btrfsは単一／複数デバイスのsingle profile、RAID0、2-copy RAID1、3-copy RAID1C3、4-copy RAID1C4、striped mirrorのRAID10を読み取り専用で扱い、DEVICE_ITEM、devid、FSID、device UUIDとstripeを相互検証します。mirror profileではmetadata tree blockのCRC32Cまたはdata checksumが一致するコピーだけを採用し、破損時は検証済みの代替コピーへ切り替えます。RAID0／RAID10はchunkごとの`stripe_length`に従ってdeviceを切り替え、RAID10はさらに`sub_stripes`単位でmirrorを選択します。複数RAWはツールバーから一組として指定でき、実イメージ回帰manifestでも各companionのSHA-256を検証します。RAID0は全stripe deviceが必要です。mirror profileはchunk単位ですべてのmirror組に利用可能なstripeが残る場合だけdegraded読み取りで開き、欠損devidを警告へ表示します。subvolume、snapshot、default subvolumeとzlib・LZO・zstd圧縮extentを読み取れ、snapshot内に残る入れ子subvolume境界は元subvolumeへ誤接続せず空ディレクトリとして表示します。RAID5／6、暗号化extent、書き込みは未対応です。
 - Btrfsのsuperblock、metadata tree block、checksum treeに記録されたdata sectorのCRC32Cを検証し、不一致は読み取りを中止します。primary superblockが壊れている場合だけ、公式mirror位置（64 MiB／256 GiB）の検証済みbackupへ復旧し、primaryが有効なら常にprimaryを優先します。
 - SquashFS はライブラリが対応する圧縮形式のみ読み取れます。
-- Linux md RAID は検出のみです。
+- Linux mdはmetadata 1.0／1.1／1.2のRAID1を読み取り専用で組み立てます。superblock checksum、array/device UUID、role、event counter、data/super offset、device範囲を検証し、同一eventのactive memberだけを使用します。1台欠損のdegraded読み取りに対応し、複数mirrorがある場合は読み取った内容が一致しなければ停止します。RAID0／4／5／6／10、reshape・recovery中、replacement、bad-block log付きarray、metadata 0.90は未対応です。
 - BitLockerはAES-XTS（128/256）に対応します。TPM単独保護、TPMとの複合保護、AES-CBC/Elephant Diffuserは未対応です。
 - BitLocker回復パスワード、通常パスワード、スタートアップキー、VMK、FVEKは設定・ログ・解析レポートへ保存しません。不要になったキー配列は可能な範囲で消去します。
 - LUKS1はAES-XTS/plain64の256/512-bit合成キーに対応します。detached header、AES-CBC、ESSIV、plain/plain64以外のIV方式は未対応です。

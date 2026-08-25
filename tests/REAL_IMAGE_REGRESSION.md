@@ -87,6 +87,21 @@ RAID10は専用スクリプトで4個のRAWを生成します。
 
 完全構成では残り3個を`companionImages`へ並べます。degraded回帰では、すべてのchunkに対して各mirror組から1台以上残る組み合わせを使用してください。stripeの組み合わせはchunkごとに異なる場合があるため、単純にdevidだけから耐障害性を判断せず、ランナーのchunk検証を通過する構成を登録します。
 
+### Linux md RAID1
+
+WSL 2のUbuntu 24.04へ`mdadm`と`e2fsprogs`をインストールし、metadata 1.2のRAID1とext4を生成します。
+
+```powershell
+wsl --distribution Ubuntu-24.04 --user root -- sh -lc `
+  "apt-get update && apt-get install -y mdadm e2fsprogs util-linux"
+
+.\tools\New-MdRaid1RegressionFixture.ps1 `
+  -FirstOutputPath .\.tmp\real-images\md-raid1-1.raw `
+  -SecondOutputPath .\.tmp\real-images\md-raid1-2.raw
+```
+
+スクリプトはRAID1同期完了後にext4と検証ファイルを作成し、`e2fsck -fn`、`mdadm --detail`／`--examine`、各RAWと内部ファイルのSHA-256を表示します。manifestでは`"deviceSet": "Linux md RAID1"`を指定し、2台目を`companionImages`へ登録します。1台だけのcaseも登録するとdegraded読み取りを確認できます。
+
 ### BitLocker XTS-AES
 
 BitLocker fixtureの生成は管理者PowerShellで実行します。
@@ -287,6 +302,32 @@ fixture本体とローカルmanifestはコミットしないでください。
               "path": "/hello.txt",
               "expectedDirectory": false,
               "expectedLength": 30,
+              "sha256": "REPLACE_WITH_64_HEX_CHARACTERS"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Linux md RAID1 fixture",
+      "path": "%VDT_FIXTURE_ROOT%\\md-raid1-1.raw",
+      "sha256": "REPLACE_WITH_64_HEX_CHARACTERS",
+      "companionImages": [
+        {
+          "path": "%VDT_FIXTURE_ROOT%\\md-raid1-2.raw",
+          "sha256": "REPLACE_WITH_64_HEX_CHARACTERS"
+        }
+      ],
+      "deviceSet": "Linux md RAID1",
+      "expectedPartitionCount": 1,
+      "partitions": [
+        {
+          "number": 1,
+          "expectedFileSystem": "ext4",
+          "files": [
+            {
+              "path": "/hello.txt",
+              "expectedDirectory": false,
               "sha256": "REPLACE_WITH_64_HEX_CHARACTERS"
             }
           ]

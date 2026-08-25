@@ -141,11 +141,21 @@
 - RAID0の`stripe_length`単位のdevice切替と物理範囲検証を追加し、全stripe deviceが揃わない構成は安全に拒否
 - 2台の合成fixtureでstripe境界・checksum破損・device欠損を、実`mkfs.btrfs -m/-d raid0` fixtureで通常／圧縮extentとsubvolumeを回帰確認
 
+### Linux md RAID1読み取り対応
+
+- 「Btrfs複数RAW」を汎用の「複数ディスク」入力へ拡張し、RAW以外の既存対応イメージ形式もcompanionとして選択可能
+- metadata 1.0／1.1／1.2のsuperblock位置、checksum、array/device UUID、role、event、data offsetと範囲を検証
+- 同一eventのactive memberだけでRAID1を組み立て、1台欠損のdegraded読み取りとmirror内容不一致の拒否に対応
+- RAID1上のパーティションテーブルまたは直接配置FSを既存のFAT／ext／XFS等の検出・読み取りへ接続
+- checksum破損、旧event、mirror不一致、完全／degraded構成を合成fixtureで回帰確認
+- 実`mdadm 4.3 --metadata=1.2` RAID1 + ext4を生成し、`e2fsck -fn`と完全／degraded manifest回帰を実行
+
 ## 次回の推奨作業
 
-### 1. Btrfs対応の第4段階
+### 1. LVM2対応の第2段階
 
-- RAID5／RAID6の読み取り対応可否と安全な破損検出方法を調査する
+- 複数ディスク入力にあるPVをVG UUIDで束ね、複数PVにまたがるlinear LVを読み取る
+- その後に複数stripe、thin、snapshot、cache、mirror／RAID segmentを段階的に検討する
 
 ## 保守・品質改善
 
@@ -161,8 +171,8 @@
 
 1. Btrfs
    - 圧縮、サブボリューム、backup superblock、複数デバイスを段階的に扱う
-2. Linux md RAIDの実読み取り
-   - まずRAID1から開始し、その後RAID0/5/6を検討する
+2. Linux md RAIDの拡張
+   - RAID1対応を基盤に、RAID0/10、その後RAID5/6を検討する
 3. LVM2の拡張
    - 複数PV、thin、snapshot、cache、mirror、RAID segmentを段階的に対応する
 
