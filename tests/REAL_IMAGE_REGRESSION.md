@@ -164,6 +164,20 @@ wsl --distribution Ubuntu-24.04 --user root -- sh -lc `
 
 スクリプトは2台のPVへ交互に配置される300 MiBファイルを作成し、`e2fsck -fn`、PV/VG/LV UUID、stripe数・stripe size・device割り当て、各ファイル・RAWのSHA-256を表示します。manifestでは`"deviceSet": "LVM2"`を指定し、2台目を`companionImages`へ登録してください。ランナーはmetadata header/text CRC、PV UUID、extent範囲を検証してLVを組み立て、内部ファイルのSHA-256まで確認します。
 
+### LVM2 thin LV
+
+同じWSL環境へ`thin-provisioning-tools`もインストールし、64 KiB data blockのthin-pool、384 MiBのthin LV、ext4を生成します。
+
+```powershell
+wsl --distribution Ubuntu-24.04 --user root -- sh -lc `
+  "apt-get update && apt-get install -y lvm2 thin-provisioning-tools e2fsprogs python3 util-linux"
+
+.\tools\New-LvmThinRegressionFixture.ps1 `
+  -OutputPath .\.tmp\real-images\lvm-thin\lvm-thin.raw
+```
+
+スクリプトは160 MiBファイルを書き込んだ後に`e2fsck -fn`、`thin_check`、mappingを省略した`thin_dump`、LVM text metadata、各ファイルとRAWのSHA-256を表示します。manifestでは`"deviceSet": "LVM2"`を指定します。ランナーはthin-pool superblock、space map、device details、mapping B-treeを検証して通常thin LVを組み立て、未割当blockをゼロとして扱いながら内部ファイルのSHA-256まで確認します。
+
 ### BitLocker XTS-AES
 
 BitLocker fixtureの生成は管理者PowerShellで実行します。

@@ -54,9 +54,9 @@ public static class LogicalVolumeDiscoverer
                 disks[0],
                 lvmPartitions,
                 cancellationToken);
-            var requiresStripedReader = stripedDiscovery.RequiresStripedReader
+            var requiresCustomReader = stripedDiscovery.RequiresCustomReader
                 || metadataSummaries.Any(summary => summary.MaximumStripeCount > 1);
-            if (requiresStripedReader)
+            if (requiresCustomReader)
             {
                 diagnostics.AddRange(stripedDiscovery.Diagnostics);
                 foreach (var volume in stripedDiscovery.Volumes)
@@ -66,9 +66,11 @@ public static class LogicalVolumeDiscoverer
                         Number = number++,
                         Scheme = "LVM2",
                         Name = ShortenIdentity(volume.Name),
-                        Type = volume.StripeCount > 1
-                            ? $"LVM2 striped logical volume ({volume.StripeCount:N0} stripes)"
-                            : "LVM2 logical volume (linear)",
+                        Type = volume.IsThin
+                            ? "LVM2 thin logical volume"
+                            : volume.StripeCount > 1
+                                ? $"LVM2 striped logical volume ({volume.StripeCount:N0} stripes)"
+                                : "LVM2 logical volume (linear)",
                         TypeId = volume.LvmId,
                         StartLba = 0,
                         SectorCount = checked((ulong)(volume.Reader.Length / 512)),
@@ -78,7 +80,7 @@ public static class LogicalVolumeDiscoverer
                 }
 
                 diagnostics.Add(new LvmDiagnostic(
-                    $"LVM2: 検証済みmetadataから{stripedDiscovery.Volumes.Count:N0}個のstriped/linear LVを組み立てました。",
+                    $"LVM2: 検証済みmetadataから{stripedDiscovery.Volumes.Count:N0}個のlinear/striped/thin LVを組み立てました。",
                     false));
             }
             else
@@ -147,12 +149,12 @@ public static class LogicalVolumeDiscoverer
 
             if (volumes.Count == 0)
             {
-                if (!requiresStripedReader)
+                if (!requiresCustomReader)
                 {
                     diagnostics.AddRange(stripedDiscovery.Diagnostics);
                 }
 
-                var metadataLvCount = requiresStripedReader
+                var metadataLvCount = requiresCustomReader
                     ? stripedDiscovery.LogicalVolumeDefinitionCount
                     : metadataSummaries.Count == 0
                         ? 0
