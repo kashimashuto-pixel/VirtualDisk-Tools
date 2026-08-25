@@ -138,12 +138,14 @@
 - RAID10の`stripe_length`単位のstripingと`sub_stripes`単位のmirror選択を実装し、chunkごとに異なるstripe組を読み取り
 - 各mirror組に少なくとも1台が残る場合だけdegraded読み取りを許可し、片側破損時はCRC32C／data checksumで代替mirrorへ切替
 - 4台の合成fixtureと実`mkfs.btrfs -m/-d raid10` fixtureで完全構成・2台欠損構成・LZO／zstd／subvolumeを回帰確認
+- RAID0の`stripe_length`単位のdevice切替と物理範囲検証を追加し、全stripe deviceが揃わない構成は安全に拒否
+- 2台の合成fixtureでstripe境界・checksum破損・device欠損を、実`mkfs.btrfs -m/-d raid0` fixtureで通常／圧縮extentとsubvolumeを回帰確認
 
 ## 次回の推奨作業
 
-### 1. Btrfs対応の第3段階
+### 1. Btrfs対応の第4段階
 
-- RAID0を検討する
+- RAID5／RAID6の読み取り対応可否と安全な破損検出方法を調査する
 
 ## 保守・品質改善
 
