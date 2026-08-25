@@ -497,6 +497,88 @@ internal static class BtrfsTestImageFactory
         return new BtrfsMultiDeviceTestFixture(firstPath, secondPath);
     }
 
+    public static BtrfsMultiCopyTestFixture CreateRaid1Copies(
+        IReadOnlyList<string> paths,
+        int copies,
+        IReadOnlySet<int>? corruptDataDeviceIds = null,
+        IReadOnlySet<int>? corruptMetadataDeviceIds = null)
+    {
+        if (copies is not 3 and not 4 || paths.Count != copies)
+        {
+            throw new ArgumentException("RAID1C3/C4 requires exactly three/four output paths.", nameof(paths));
+        }
+
+        _ = Create(paths[0]);
+        var firstDisk = File.ReadAllBytes(paths[0]);
+        var partitionLength = DiskSize - PartitionStart;
+        var fileSystemLength = checked(partitionLength * copies);
+        var fsid = Guid.Parse("8e0a61a3-fbcb-4a76-b16e-777579eecdc6").ToByteArray();
+        var chunkUuid = Guid.Parse("f61c47e6-f8c5-44d8-971c-d48e90f5a325").ToByteArray();
+        byte[][] deviceUuids =
+        [
+            Guid.Parse("56ca9a70-b88c-4ba2-855a-e2ac5bec938c").ToByteArray(),
+            Guid.Parse("1bf62a80-1b07-451c-9f20-d51717f2ecb3").ToByteArray(),
+            Guid.Parse("62116149-dab3-44c9-a8d7-b49d5784396a").ToByteArray(),
+            Guid.Parse("38e6fbb9-11ea-49f6-b530-4f354587fb94").ToByteArray(),
+        ];
+        var stripes = Enumerable.Range(0, copies)
+            .Select(index => new BtrfsTestStripe((ulong)index + 1, 0, deviceUuids[index]))
+            .ToArray();
+        var profile = copies == 3 ? 1UL << 9 : 1UL << 10;
+        var metadataChunk = CreateChunk(
+            RegularDataLogicalOffset,
+            stripes,
+            type: 0x6 | profile);
+        var dataChunk = CreateChunk(
+            4 * 1024 * 1024,
+            stripes.Select(stripe => stripe with { PhysicalStart = RegularDataLogicalOffset }).ToArray(),
+            type: 0x1 | profile);
+        var chunkTreeItems = Enumerable.Range(0, copies)
+            .Select(index => (
+                new BtrfsKey(1, 216, (ulong)index + 1),
+                CreateDeviceItem((ulong)index + 1, partitionLength, deviceUuids[index], fsid)))
+            .ToList();
+        chunkTreeItems.Add((new BtrfsKey(256, 228, 0), metadataChunk));
+        chunkTreeItems.Add((new BtrfsKey(256, 228, RegularDataLogicalOffset), dataChunk));
+        var chunkTree = CreateLeaf(
+            ChunkTreeLogicalOffset,
+            owner: 3,
+            fsid,
+            chunkUuid,
+            chunkTreeItems);
+        chunkTree.CopyTo(firstDisk, PartitionStart + ChunkTreeLogicalOffset);
+
+        for (var index = 0; index < copies; index++)
+        {
+            var disk = firstDisk.ToArray();
+            var deviceId = index + 1;
+            var superblock = CreateSuperblock(
+                fileSystemLength,
+                partitionLength,
+                numberOfDevices: (ulong)copies,
+                deviceId: (ulong)deviceId,
+                fsid,
+                deviceUuids[index],
+                metadataChunk,
+                defaultSubvolume: false,
+                additionalIncompatibilityFlags: 1UL << 11);
+            superblock.CopyTo(disk, PartitionStart + SuperblockLogicalOffset);
+            if (corruptDataDeviceIds?.Contains(deviceId) == true)
+            {
+                disk[PartitionStart + RegularDataLogicalOffset + 17] ^= 1;
+            }
+
+            if (corruptMetadataDeviceIds?.Contains(deviceId) == true)
+            {
+                disk[PartitionStart + FileSystemTreeLogicalOffset + 0x200] ^= 1;
+            }
+
+            File.WriteAllBytes(paths[index], disk);
+        }
+
+        return new BtrfsMultiCopyTestFixture(paths.ToArray());
+    }
+
     private static byte[] CreateSuperblock(
         int fileSystemLength,
         int deviceLength,
@@ -505,7 +587,8 @@ internal static class BtrfsTestImageFactory
         byte[] fsid,
         byte[] deviceUuid,
         byte[] chunk,
-        bool defaultSubvolume)
+        bool defaultSubvolume,
+        ulong additionalIncompatibilityFlags = 0)
     {
         var superblock = new byte[4096];
         fsid.CopyTo(superblock, 0x20);
@@ -526,7 +609,8 @@ internal static class BtrfsTestImageFactory
         WriteU64(
             superblock,
             0xbc,
-            defaultSubvolume ? 0x7 : 0x5); // MIXED_BACKREF | DEFAULT_SUBVOL | MIXED_GROUPS
+            (defaultSubvolume ? 0x7UL : 0x5UL)
+            | additionalIncompatibilityFlags); // MIXED_BACKREF | DEFAULT_SUBVOL | MIXED_GROUPS
         CreateDeviceItem(deviceId, deviceLength, deviceUuid, fsid).CopyTo(superblock, 0xc9);
         WriteKey(superblock, 0x32b, new BtrfsKey(256, 228, 0));
         chunk.CopyTo(superblock, 0x32b + 17);
@@ -911,3 +995,4 @@ internal sealed record BtrfsTestFixture(
     int RegularDataPhysicalOffset);
 
 internal sealed record BtrfsMultiDeviceTestFixture(string FirstPath, string SecondPath);
+internal sealed record BtrfsMultiCopyTestFixture(IReadOnlyList<string> Paths);

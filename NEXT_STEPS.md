@@ -132,12 +132,15 @@
 - 欠損deviceのUUIDをDEVICE_ITEMで検証し、すべてのchunkに利用可能なstripeが残る場合だけdegraded読み取りを許可
 - RAID1のどちらか1台だけ、および未使用deviceだけが欠損したsingle profileを実`mkfs.btrfs` fixtureで読み取り確認
 - 残存RAID1 mirrorのmetadata/data破損と、欠損側にsingle chunkがある構成を合成fixtureで安全に拒否
+- RAID1C3／RAID1C4の3・4コピーを異なるdeviceとして検証し、CRC32C／data checksumに基づくmirror選択を一般化
+- C3で2台欠損、C4で3台欠損したdegraded読み取りと、C3の残存metadata破損拒否を合成fixtureで確認
+- 実`mkfs.btrfs -m/-d raid1c3`／`raid1c4`生成スクリプトを追加し、全device入力と最大device欠損のmanifest回帰を実行
 
 ## 次回の推奨作業
 
 ### 1. Btrfs対応の第2段階
 
-- RAID1C3／RAID1C4、RAID10を順に検討する
+- RAID10を検討する
 
 ## 保守・品質改善
 
