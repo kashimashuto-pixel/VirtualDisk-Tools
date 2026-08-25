@@ -1186,6 +1186,7 @@ public partial class Form1 : Form
 
             var analysis = AnalyzeImage(
                 reader,
+                disks,
                 mdDiscovery,
                 ownedReaders,
                 progress,
@@ -1218,6 +1219,7 @@ public partial class Form1 : Form
 
     private static ImageAnalysis AnalyzeImage(
         IDiskImageReader reader,
+        IReadOnlyList<IBlockReader> inputDisks,
         MdRaidDiscoveryResult mdDiscovery,
         List<IDisposable> ownedReaders,
         IProgress<DiskImageProgress> progress,
@@ -1241,6 +1243,42 @@ public partial class Form1 : Form
         }
 
         var nextNumber = discovered.Count + 1;
+        foreach (var companionDisk in inputDisks.Skip(1))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var companionPartitions = PartitionTableReader.ReadPartitions(companionDisk, cancellationToken).ToList();
+            if (companionPartitions.Count == 0 && companionDisk.Length >= 512)
+            {
+                companionPartitions.Add(new PartitionInfo
+                {
+                    Number = 1,
+                    Scheme = "WholeDisk",
+                    Name = "Whole companion disk",
+                    Type = "Unpartitioned",
+                    StartLba = 0,
+                    SectorCount = checked((ulong)(companionDisk.Length / 512))
+                });
+            }
+
+            foreach (var companionPartition in companionPartitions)
+            {
+                var slice = new PartitionSliceReader(companionDisk, companionPartition);
+                discovered.Add(new PartitionInfo
+                {
+                    Number = nextNumber++,
+                    Scheme = $"Companion {companionPartition.Scheme}",
+                    Name = companionPartition.Name,
+                    Type = companionPartition.Type,
+                    TypeId = companionPartition.TypeId,
+                    Bootable = companionPartition.Bootable,
+                    StartLba = 0,
+                    SectorCount = checked((ulong)(slice.Length / 512)),
+                    ReaderOverride = slice,
+                    LengthOverrideBytes = slice.Length
+                });
+            }
+        }
+
         foreach (var array in mdDiscovery.Arrays)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -1308,8 +1346,11 @@ public partial class Form1 : Form
         if (lvmPartitions.Count > 0)
         {
             progress.Report(new DiskImageProgress("LVM2論理ボリュームを解析中..."));
+            var lvmInputDevices = inputDisks
+                .Concat(mdDiscovery.Arrays.Select(array => (IBlockReader)array.Reader))
+                .ToList();
             var lvmResult = LogicalVolumeDiscoverer.Discover(
-                reader,
+                lvmInputDevices,
                 lvmPartitions,
                 allPartitions.Count + 1,
                 ownedReaders,

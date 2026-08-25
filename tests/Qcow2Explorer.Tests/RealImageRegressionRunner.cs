@@ -61,7 +61,8 @@ internal static class RealImageRegressionRunner
 
         var unsupportedDeviceSet = manifest.Cases.FirstOrDefault(item =>
             !string.IsNullOrWhiteSpace(item.DeviceSet)
-            && !string.Equals(item.DeviceSet, "Linux md RAID1", StringComparison.OrdinalIgnoreCase));
+            && !string.Equals(item.DeviceSet, "Linux md RAID1", StringComparison.OrdinalIgnoreCase)
+            && !string.Equals(item.DeviceSet, "LVM2", StringComparison.OrdinalIgnoreCase));
         if (unsupportedDeviceSet is not null)
         {
             throw new InvalidDataException(
@@ -118,7 +119,12 @@ internal static class RealImageRegressionRunner
                         regressionCase,
                         mdDiscovery.Arrays[0].Reader,
                         [],
-                        synthesizeWholeDisk: true);
+                        synthesizeWholeDisk: true,
+                        synthesizedScheme: "Linux md RAID1");
+                }
+                else if (string.Equals(regressionCase.DeviceSet, "LVM2", StringComparison.OrdinalIgnoreCase))
+                {
+                    RunLvm2Case(regressionCase, disks);
                 }
                 else
                 {
@@ -135,6 +141,78 @@ internal static class RealImageRegressionRunner
         }
 
         Console.WriteLine($"[{regressionCase.Name}] passed");
+    }
+
+    private static void RunLvm2Case(
+        RealImageRegressionCase regressionCase,
+        IReadOnlyList<IBlockReader> disks)
+    {
+        var partitions = new List<PartitionInfo>();
+        var number = 1;
+        foreach (var disk in disks)
+        {
+            foreach (var original in PartitionTableReader.ReadPartitions(disk))
+            {
+                var slice = new PartitionSliceReader(disk, original);
+                var partition = new PartitionInfo
+                {
+                    Number = number++,
+                    Scheme = original.Scheme,
+                    Name = original.Name,
+                    Type = original.Type,
+                    TypeId = original.TypeId,
+                    Bootable = original.Bootable,
+                    StartLba = 0,
+                    SectorCount = checked((ulong)(slice.Length / 512)),
+                    ReaderOverride = slice,
+                    LengthOverrideBytes = slice.Length
+                };
+                partition.FileSystem = FileSystemDetector.Detect(disks[0], partition);
+                if (partition.FileSystem.StartsWith("LVM2", StringComparison.OrdinalIgnoreCase))
+                {
+                    partitions.Add(partition);
+                }
+            }
+        }
+
+        Require(
+            partitions.Count > 0,
+            regressionCase.Name,
+            "no LVM2 physical volumes were detected");
+
+        var ownedReaders = new List<IDisposable>();
+        try
+        {
+            var discovery = LogicalVolumeDiscoverer.Discover(
+                disks,
+                partitions,
+                number,
+                ownedReaders);
+            var diagnostic = string.Join(" | ", discovery.Diagnostics.Select(item => item.Message));
+            Require(
+                discovery.Volumes.Count == 1,
+                regressionCase.Name,
+                $"expected one LVM2 logical volume, actual={discovery.Volumes.Count}; {diagnostic}");
+            Require(
+                !discovery.Diagnostics.Any(item => item.IsError),
+                regressionCase.Name,
+                $"LVM2 discovery reported an error: {diagnostic}");
+
+            ValidateReader(
+                regressionCase,
+                discovery.Volumes[0].ReaderOverride
+                    ?? throw new InvalidDataException("LVM2 logical volume has no reader."),
+                [],
+                synthesizeWholeDisk: true,
+                synthesizedScheme: "LVM2");
+        }
+        finally
+        {
+            foreach (var reader in ownedReaders)
+            {
+                reader.Dispose();
+            }
+        }
     }
 
     private static void RunLzopCacheCase(RealImageRegressionCase regressionCase, string imagePath)
@@ -240,7 +318,8 @@ internal static class RealImageRegressionRunner
         RealImageRegressionCase regressionCase,
         IBlockReader reader,
         IReadOnlyList<BtrfsDevicePartition> btrfsDevices,
-        bool synthesizeWholeDisk = false)
+        bool synthesizeWholeDisk = false,
+        string synthesizedScheme = "Virtual device")
     {
         if (!string.IsNullOrWhiteSpace(regressionCase.ExpectedFormatContains))
         {
@@ -279,9 +358,9 @@ internal static class RealImageRegressionRunner
             partitions.Add(new PartitionInfo
             {
                 Number = 1,
-                Scheme = "Linux md RAID1",
-                Name = "Linux md RAID1 array",
-                Type = "Linux md RAID1",
+                Scheme = synthesizedScheme,
+                Name = synthesizedScheme,
+                Type = synthesizedScheme,
                 StartLba = 0,
                 SectorCount = checked((ulong)(reader.Length / 512)),
                 ReaderOverride = reader,

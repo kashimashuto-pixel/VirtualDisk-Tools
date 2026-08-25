@@ -25,7 +25,8 @@ C# / Windows Forms で作成した、読み取り専用の仮想ディスク解�
   - LUKS1 はAES-XTS/plain64、PBKDF2（SHA-1/SHA-256/SHA-512）、標準4000 AF stripesのパスフレーズ解除に対応
   - LUKS2 は冗長headerとJSON metadataを検証し、PBKDF2/Argon2id keyslot、単一crypt segment、AES-XTS/plain64のパスフレーズ解除に対応
 - LVM2 論理ボリュームの検出と読み取り
-  - 通常のlinear構成（LVMメタデータ上は`striped`、`stripe_count = 1`）を読み取り
+  - 単一PV、および複数ディスクのPVにまたがるlinear構成（LVMメタデータ上は`striped`、`stripe_count = 1`）を読み取り
+  - 「複数ディスク」入力からPVをVG UUIDで束ね、必要なPVが揃ったLVを組み立て
   - 読めない場合は不足PV、未対応segment type、複数stripe、メタデータ未検出、または内部例外を警告欄と解析レポートへ表示
 - Linux md RAID1の検出・読み取り（metadata 1.x、degraded対応）
 - Windows Explorer風の左ツリー・右詳細一覧画面
@@ -199,8 +200,8 @@ ProjFS マウントは Windows の Client-ProjFS 機能を使い、選択した�
 - E01はEWF1/EVFのEnCase 6形式、deflateまたは非圧縮chunk、連続したsegmentに対応します。安全なメモリ使用のためchunk数上限は4,194,304です。EWF2/Ex01、bzip2、論理証拠ファイル（L01）、暗号化EWF、旧形式など異なるtable配置は未対応です。
 - NTFSの主 `$MFT` 先頭レコードが破損している場合は `$MFTMirr` から復旧を試みます。ルートレコードなど主MFTの必須データ自体が欠落しているイメージは、元ディスクまたはバックアップからの再取得が必要です。
 - NTFS削除済みファイルはMFTに残っている情報を表示します。削除後に再利用されたクラスタの内容は復旧できません。
-- LVM2 は、現在の入力内に必要なPVがすべてあり、LVが単一stripeのlinear相当である構成を読み取ります。
-- 複数ディスクにまたがり一部PVが入力されていないVG、複数stripe、thin/snapshot/cache/mirror/RAID segmentは未対応です。検出できたメタデータから該当理由を表示します。
+- LVM2 は、単一または複数の入力ディスク内に必要なPVがすべてあり、LVが単一stripeのlinear相当である構成を読み取ります。複数PVにまたがるLVも、各PVを「複数ディスク」で同時に指定すると組み立てます。
+- 一部PVが入力されていないVG、複数stripe、thin/snapshot/cache/mirror/RAID segmentは未対応です。検出できたメタデータから該当理由を表示します。
 - Parallels HDD は単一 Storage の Plain / Compressed image を読み取ります。split image、未知の image type、仕様外の拡張は未対応です。
 - OVAは読み取り中に内容を一時フォルダへ展開するため、アーカイブ内のファイル容量と同程度の空き容量が必要です。一時ファイルはイメージを閉じると削除します。
 - ProjFS マウントはフォルダ投影型です。Windows のドライブ文字としての実マウントではありません。

@@ -91,6 +91,7 @@ static void RunGeneratedImageTests()
     TestGeneratedMdRaid1Image();
     TestLvmMetadataDiagnostics();
     TestGeneratedLvm2Image();
+    TestGeneratedLvm2MultiPvImage();
     TestGeneratedLzopExt4Image();
     TestGeneratedBtrfsImage();
     TestGeneratedBtrfsMultiDeviceImage();
@@ -1346,6 +1347,8 @@ static void TestRealImageRegressionRunner()
     var btrfsSecondPath = Path.Combine(AppContext.BaseDirectory, "sample-regression-btrfs-2.raw");
     _ = BtrfsTestImageFactory.CreateRaid1(btrfsFirstPath, btrfsSecondPath);
     var regularSha256 = Convert.ToHexString(SHA256.HashData(BtrfsTestImageFactory.RegularData));
+    var lvmFirstPath = Path.Combine(AppContext.BaseDirectory, "sample-lvm2-multipv-1.img");
+    var lvmSecondPath = Path.Combine(AppContext.BaseDirectory, "sample-lvm2-multipv-2.img");
     var manifestPath = Path.Combine(AppContext.BaseDirectory, "real-image-regression.generated.json");
     var manifest = $$"""
         {
@@ -1399,13 +1402,41 @@ static void TestRealImageRegressionRunner()
                   ]
                 }
               ]
+            },
+            {
+              "name": "generated LVM2 multi-PV runner",
+              "path": "{{Path.GetFileName(lvmFirstPath)}}",
+              "sha256": "{{Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(lvmFirstPath)))}}",
+              "companionImages": [
+                {
+                  "path": "{{Path.GetFileName(lvmSecondPath)}}",
+                  "sha256": "{{Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(lvmSecondPath)))}}"
+                }
+              ],
+              "deviceSet": "LVM2",
+              "expectedDiskLength": {{4 * 1024 * 1024}},
+              "expectedPartitionCount": 1,
+              "partitions": [
+                {
+                  "number": 1,
+                  "expectedFileSystem": "FAT16",
+                  "files": [
+                    {
+                      "path": "/HELLO.TXT",
+                      "expectedDirectory": false,
+                      "expectedLength": {{Encoding.ASCII.GetByteCount(TestImageFactory.HelloText)}},
+                      "sha256": "{{helloSha256}}"
+                    }
+                  ]
+                }
+              ]
             }
           ]
         }
         """;
     File.WriteAllText(manifestPath, manifest, new UTF8Encoding(false));
     var summary = RealImageRegressionRunner.Run(manifestPath);
-    Assert(summary.CaseCount == 2, "real-image regression runner case count");
+    Assert(summary.CaseCount == 3, "real-image regression runner case count");
 }
 
 static void TestBitLockerRecoveryPasswordUnlock()
@@ -3054,6 +3085,85 @@ static void TestGeneratedLvm2Image()
         Assert(fs is not null, error);
         var hello = fs!.ListDirectory(fs.Root).Single(node => node.Name == "HELLO.TXT");
         Assert(Encoding.ASCII.GetString(fs.ReadFile(hello, 0, (int)hello.Size)) == TestImageFactory.HelloText, "generated LVM2 HELLO.TXT content");
+    }
+    finally
+    {
+        foreach (var disposable in ownedReaders)
+        {
+            disposable.Dispose();
+        }
+    }
+}
+
+static void TestGeneratedLvm2MultiPvImage()
+{
+    var firstPath = Path.Combine(AppContext.BaseDirectory, "sample-lvm2-multipv-1.img");
+    var secondPath = Path.Combine(AppContext.BaseDirectory, "sample-lvm2-multipv-2.img");
+    TestImageFactory.CreateLvm2MultiPvFat16Disks(firstPath, secondPath);
+
+    using var first = DiskImageReaderFactory.Open(firstPath);
+    using var second = DiskImageReaderFactory.Open(secondPath);
+    var firstPartition = PartitionTableReader.ReadPartitions(first).Single();
+    var secondOriginal = PartitionTableReader.ReadPartitions(second).Single();
+    var secondSlice = new PartitionSliceReader(second, secondOriginal);
+    var secondPartition = new PartitionInfo
+    {
+        Number = 2,
+        Scheme = "Companion MBR",
+        Name = secondOriginal.Name,
+        Type = secondOriginal.Type,
+        TypeId = secondOriginal.TypeId,
+        StartLba = 0,
+        SectorCount = checked((ulong)(secondSlice.Length / 512)),
+        ReaderOverride = secondSlice,
+        LengthOverrideBytes = secondSlice.Length,
+        FileSystem = "LVM2 PV (検出のみ)"
+    };
+    firstPartition.FileSystem = FileSystemDetector.Detect(first, firstPartition);
+
+    var missingPvReaders = new List<IDisposable>();
+    try
+    {
+        var missingPv = LogicalVolumeDiscoverer.Discover(
+            [first],
+            [firstPartition],
+            2,
+            missingPvReaders);
+        Assert(missingPv.Volumes.Count == 0, "multi-PV LVM2 rejects a missing PV");
+        Assert(
+            missingPv.Diagnostics.Any(item =>
+                item.IsError
+                && (item.Message.Contains("不足", StringComparison.Ordinal)
+                    || item.Message.Contains("必要", StringComparison.Ordinal))),
+            "multi-PV LVM2 missing-PV diagnostic");
+    }
+    finally
+    {
+        foreach (var disposable in missingPvReaders)
+        {
+            disposable.Dispose();
+        }
+    }
+
+    var ownedReaders = new List<IDisposable>();
+    try
+    {
+        var result = LogicalVolumeDiscoverer.Discover(
+            [first, second],
+            [firstPartition, secondPartition],
+            3,
+            ownedReaders);
+        Assert(result.Volumes.Count == 1, string.Join(Environment.NewLine, result.Diagnostics.Select(item => item.Message)));
+        Assert(!result.Diagnostics.Any(item => item.IsError), string.Join(Environment.NewLine, result.Diagnostics.Select(item => item.Message)));
+        var volume = result.Volumes[0];
+        volume.FileSystem = FileSystemDetector.Detect(first, volume);
+        Assert(volume.FileSystem == "FAT16", "FAT16 inside generated multi-PV LVM2 LV");
+        var fs = FileSystemDetector.TryOpen(first, volume, out var error);
+        Assert(fs is not null, error);
+        var hello = fs!.ListDirectory(fs.Root).Single(node => node.Name == "HELLO.TXT");
+        Assert(
+            Encoding.ASCII.GetString(fs.ReadFile(hello, 0, (int)hello.Size)) == TestImageFactory.HelloText,
+            "generated multi-PV LVM2 HELLO.TXT content");
     }
     finally
     {
@@ -4717,6 +4827,149 @@ internal static class TestImageFactory
             disk,
             partitionStart + dataAreaOffset,
             PartitionSectors * BytesPerSector);
+        File.WriteAllBytes(path, disk);
+    }
+
+    public static void CreateLvm2MultiPvFat16Disks(string firstPath, string secondPath)
+    {
+        const int extentSizeSectors = 8;
+        const int segmentExtents = 512;
+        const string firstPvId = "abcdef-1234-5678-90ab-cdef-1234-567890";
+        const string secondPvId = "112233-4455-6677-8899-aabb-ccdd-eeff00";
+        const string lvId = "223456-7890-abcd-efgh-ijkl-mnop-qrstuv";
+        const int lvmPartitionSectors = VirtualSize / BytesPerSector - PartitionStartLba;
+        const int dataAreaOffset = 1024 * 1024;
+        var partitionLength = lvmPartitionSectors * BytesPerSector;
+        var metadata = $$"""
+            contents = "Text Format Volume Group"
+            version = 1
+            description = "Qcow2Explorer generated multi-PV LVM2 test"
+            creation_host = "Qcow2Explorer"
+            creation_time = 1
+            vg_multi {
+                id = "eedcba-9876-5432-10fe-dcba-9876-543210"
+                seqno = 1
+                format = "lvm2"
+                status = ["RESIZEABLE", "READ", "WRITE"]
+                flags = []
+                extent_size = {{extentSizeSectors}}
+                max_lv = 0
+                max_pv = 0
+                metadata_copies = 0
+                physical_volumes {
+                    pv0 {
+                        id = "{{firstPvId}}"
+                        device = "/dev/test0"
+                        status = ["ALLOCATABLE"]
+                        flags = []
+                        dev_size = {{lvmPartitionSectors}}
+                        pe_start = {{dataAreaOffset / BytesPerSector}}
+                        pe_count = {{(partitionLength - dataAreaOffset) / (extentSizeSectors * BytesPerSector)}}
+                    }
+                    pv1 {
+                        id = "{{secondPvId}}"
+                        device = "/dev/test1"
+                        status = ["ALLOCATABLE"]
+                        flags = []
+                        dev_size = {{lvmPartitionSectors}}
+                        pe_start = {{dataAreaOffset / BytesPerSector}}
+                        pe_count = {{(partitionLength - dataAreaOffset) / (extentSizeSectors * BytesPerSector)}}
+                    }
+                }
+                logical_volumes {
+                    root {
+                        id = "{{lvId}}"
+                        status = ["READ", "WRITE", "VISIBLE"]
+                        flags = []
+                        segment_count = 2
+                        segment1 {
+                            start_extent = 0
+                            extent_count = {{segmentExtents}}
+                            type = "striped"
+                            stripe_count = 1
+                            stripes = [ "pv0", 0 ]
+                        }
+                        segment2 {
+                            start_extent = {{segmentExtents}}
+                            extent_count = {{segmentExtents}}
+                            type = "striped"
+                            stripe_count = 1
+                            stripes = [ "pv1", 0 ]
+                        }
+                    }
+                }
+            }
+            """;
+
+        var fatDisk = CreateVirtualDisk();
+        var fatPartition = fatDisk.AsSpan(
+            PartitionStartLba * BytesPerSector,
+            PartitionSectors * BytesPerSector).ToArray();
+        var halfLength = fatPartition.Length / 2;
+        CreateLvm2MultiPvDisk(
+            firstPath,
+            firstPvId.Replace("-", "", StringComparison.Ordinal),
+            metadata,
+            fatPartition.AsSpan(0, halfLength));
+        CreateLvm2MultiPvDisk(
+            secondPath,
+            secondPvId.Replace("-", "", StringComparison.Ordinal),
+            metadata,
+            fatPartition.AsSpan(halfLength));
+    }
+
+    private static void CreateLvm2MultiPvDisk(
+        string path,
+        string rawPvId,
+        string metadata,
+        ReadOnlySpan<byte> logicalVolumeData)
+    {
+        const int lvmPartitionSectors = VirtualSize / BytesPerSector - PartitionStartLba;
+        const int metadataAreaOffset = 4096;
+        const int metadataAreaLength = 4096;
+        const int metadataTextOffset = 512;
+        const int dataAreaOffset = 1024 * 1024;
+        var disk = new byte[VirtualSize];
+        var partitionStart = PartitionStartLba * BytesPerSector;
+        var partitionLength = lvmPartitionSectors * BytesPerSector;
+        disk[446 + 4] = 0x8e;
+        WriteU32Le(disk, 446 + 8, PartitionStartLba);
+        WriteU32Le(disk, 446 + 12, lvmPartitionSectors);
+        disk[510] = 0x55;
+        disk[511] = 0xaa;
+
+        var metadataBytes = Encoding.ASCII.GetBytes(metadata);
+        if (metadataBytes.Length >= metadataAreaLength - metadataTextOffset)
+        {
+            throw new InvalidOperationException("Generated multi-PV LVM2 metadata exceeds its test area.");
+        }
+
+        var metadataArea = partitionStart + metadataAreaOffset;
+        WriteAscii(disk, metadataArea + 4, " LVM2 x[5A%r0N*>", 16);
+        WriteU32Le(disk, metadataArea + 20, 1);
+        WriteU64Le(disk, metadataArea + 24, metadataAreaOffset);
+        WriteU64Le(disk, metadataArea + 32, metadataAreaLength);
+        WriteU64Le(disk, metadataArea + 40, metadataTextOffset);
+        WriteU64Le(disk, metadataArea + 48, metadataBytes.Length);
+        WriteU32Le(disk, metadataArea + 56, CalculateLvmCrc(metadataBytes, 0, metadataBytes.Length));
+        Array.Copy(metadataBytes, 0, disk, metadataArea + metadataTextOffset, metadataBytes.Length);
+        WriteU32Le(disk, metadataArea, CalculateLvmCrc(disk, metadataArea + 4, 508));
+
+        var label = partitionStart + BytesPerSector;
+        WriteAscii(disk, label, "LABELONE", 8);
+        WriteU64Le(disk, label + 8, 1);
+        WriteU32Le(disk, label + 20, 32);
+        WriteAscii(disk, label + 24, "LVM2 001", 8);
+        var pvHeader = label + 32;
+        WriteAscii(disk, pvHeader, rawPvId, 32);
+        WriteU64Le(disk, pvHeader + 32, partitionLength);
+        WriteU64Le(disk, pvHeader + 40, dataAreaOffset);
+        WriteU64Le(disk, pvHeader + 48, partitionLength - dataAreaOffset);
+        WriteU64Le(disk, pvHeader + 72, metadataAreaOffset);
+        WriteU64Le(disk, pvHeader + 80, metadataAreaLength);
+        WriteU32Le(disk, label + 16, CalculateLvmCrc(disk, label + 20, BytesPerSector - 20));
+
+        logicalVolumeData.CopyTo(disk.AsSpan(partitionStart + dataAreaOffset));
         File.WriteAllBytes(path, disk);
     }
 
