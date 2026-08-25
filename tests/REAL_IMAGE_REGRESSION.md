@@ -63,6 +63,20 @@ wsl --distribution Ubuntu-24.04 --user root -- sh -lc `
 manifestではprimaryを従来の`path`／`sha256`に置き、残りを`companionImages`へ記録します。ランナーは全RAWのSHA-256を照合し、すべてに共通するBtrfs FSIDがない構成を拒否します。
 2-copy RAID1の片方だけを通常の`path`として登録し`companionImages`を省略すると、degraded読み取りも回帰確認できます。欠損deviceがあっても、すべてのchunkに利用可能なstripeが残る場合だけ開きます。single profileでも、欠損device上に割り当て済みchunkがなければ同じ基準で読み取れます。
 
+RAID1C3／RAID1C4は専用スクリプトで3個／4個のRAWを生成します。
+
+```powershell
+.\tools\New-BtrfsRaid1CopiesRegressionFixture.ps1 `
+  -OutputDirectory .\.tmp\real-images\raid1c34 `
+  -Profile Raid1C3
+
+.\tools\New-BtrfsRaid1CopiesRegressionFixture.ps1 `
+  -OutputDirectory .\.tmp\real-images\raid1c34 `
+  -Profile Raid1C4
+```
+
+各生成処理は`btrfs check --readonly`とSHA-256を表示します。完全なdevice setは2個目以降を`companionImages`へ並べます。C3では1個、C4では1個だけを`path`へ登録して残りを省略すると、最大device欠損時のdegraded読み取りも確認できます。
+
 ### BitLocker XTS-AES
 
 BitLocker fixtureの生成は管理者PowerShellで実行します。

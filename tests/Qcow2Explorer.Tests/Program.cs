@@ -94,6 +94,7 @@ static void RunGeneratedImageTests()
     TestGeneratedBtrfsImage();
     TestGeneratedBtrfsMultiDeviceImage();
     TestGeneratedBtrfsRaid1Image();
+    TestGeneratedBtrfsRaid1C34Image();
     TestGeneratedEwfE01Image();
     TestRealImageRegressionRunner();
     TestGeneratedVmaLzopImage();
@@ -1034,6 +1035,83 @@ static void TestGeneratedBtrfsRaid1Image()
                 ex.Message.Contains("異なるdevice", StringComparison.Ordinal),
                 "Btrfs RAID1 duplicate stripe device diagnostic");
         }
+    }
+}
+
+static void TestGeneratedBtrfsRaid1C34Image()
+{
+    var raid1C3Paths = Enumerable.Range(1, 3)
+        .Select(index => Path.Combine(AppContext.BaseDirectory, $"synthetic-btrfs-raid1c3-{index}.raw"))
+        .ToArray();
+    _ = BtrfsTestImageFactory.CreateRaid1Copies(
+        raid1C3Paths,
+        copies: 3,
+        corruptDataDeviceIds: new HashSet<int> { 1 },
+        corruptMetadataDeviceIds: new HashSet<int> { 1 });
+    using (var first = DiskImageReaderFactory.Open(raid1C3Paths[0]))
+    using (var second = DiskImageReaderFactory.Open(raid1C3Paths[1]))
+    using (var third = DiskImageReaderFactory.Open(raid1C3Paths[2]))
+    {
+        var partition = PartitionTableReader.ReadPartitions(first).Single();
+        var fs = new BtrfsFileSystem(
+            [
+                new PartitionSliceReader(first, partition),
+                new PartitionSliceReader(second, PartitionTableReader.ReadPartitions(second).Single()),
+                new PartitionSliceReader(third, PartitionTableReader.ReadPartitions(third).Single()),
+            ],
+            partition);
+        var regular = fs.ListDirectory(fs.Root).Single(node => node.Name == "regular.bin");
+        Assert(
+            fs.ReadFile(regular, 0, checked((int)regular.Size))
+                .SequenceEqual(BtrfsTestImageFactory.RegularData),
+            "Btrfs RAID1C3 corrupt mirror fallback");
+        Assert(!fs.IsDegraded, "Btrfs RAID1C3 complete device set");
+    }
+
+    using (var third = DiskImageReaderFactory.Open(raid1C3Paths[2]))
+    {
+        var partition = PartitionTableReader.ReadPartitions(third).Single();
+        var fs = new BtrfsFileSystem([new PartitionSliceReader(third, partition)], partition);
+        Assert(fs.IsDegraded, "Btrfs RAID1C3 degraded state");
+        Assert(fs.MissingDeviceIds.SequenceEqual([1UL, 2UL]), "Btrfs RAID1C3 missing devids");
+        Assert(
+            fs.ListDirectory(fs.Root).Any(node => node.Name == "hello.txt"),
+            "Btrfs RAID1C3 two-device degraded read");
+    }
+
+    using (var first = DiskImageReaderFactory.Open(raid1C3Paths[0]))
+    {
+        var partition = PartitionTableReader.ReadPartitions(first).Single();
+        try
+        {
+            _ = new BtrfsFileSystem([new PartitionSliceReader(first, partition)], partition);
+            Assert(false, "Btrfs RAID1C3 rejects corrupt only available metadata mirror");
+        }
+        catch (InvalidDataException ex)
+        {
+            Assert(
+                ex.Message.Contains("全mirror", StringComparison.Ordinal)
+                    && ex.Message.Contains("devid=2", StringComparison.Ordinal)
+                    && ex.Message.Contains("devid=3", StringComparison.Ordinal),
+                "Btrfs RAID1C3 corrupt degraded metadata diagnostic");
+        }
+    }
+
+    var raid1C4Paths = Enumerable.Range(1, 4)
+        .Select(index => Path.Combine(AppContext.BaseDirectory, $"synthetic-btrfs-raid1c4-{index}.raw"))
+        .ToArray();
+    _ = BtrfsTestImageFactory.CreateRaid1Copies(raid1C4Paths, copies: 4);
+    using (var fourth = DiskImageReaderFactory.Open(raid1C4Paths[3]))
+    {
+        var partition = PartitionTableReader.ReadPartitions(fourth).Single();
+        var fs = new BtrfsFileSystem([new PartitionSliceReader(fourth, partition)], partition);
+        Assert(fs.IsDegraded, "Btrfs RAID1C4 degraded state");
+        Assert(fs.MissingDeviceIds.SequenceEqual([1UL, 2UL, 3UL]), "Btrfs RAID1C4 missing devids");
+        var regular = fs.ListDirectory(fs.Root).Single(node => node.Name == "regular.bin");
+        Assert(
+            fs.ReadFile(regular, 0, checked((int)regular.Size))
+                .SequenceEqual(BtrfsTestImageFactory.RegularData),
+            "Btrfs RAID1C4 three-device degraded read");
     }
 }
 

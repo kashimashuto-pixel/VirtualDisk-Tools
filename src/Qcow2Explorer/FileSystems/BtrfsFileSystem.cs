@@ -46,6 +46,8 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
     private const ulong ChunkTypeSystem = 1UL << 1;
     private const ulong ChunkTypeMetadata = 1UL << 2;
     private const ulong ChunkProfileRaid1 = 1UL << 4;
+    private const ulong ChunkProfileRaid1C3 = 1UL << 9;
+    private const ulong ChunkProfileRaid1C4 = 1UL << 10;
     private const ulong ChunkProfileMask = 0x7f8;
 
     private const uint DirectoryMode = 0x4000;
@@ -61,7 +63,8 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
         | (1UL << 5) // BIG_METADATA
         | (1UL << 6) // EXTENDED_IREF
         | (1UL << 8) // SKINNY_METADATA
-        | (1UL << 9); // NO_HOLES
+        | (1UL << 9) // NO_HOLES
+        | (1UL << 11); // RAID1C34
 
     private static readonly UTF8Encoding StrictUtf8 = new(false, true);
 
@@ -671,6 +674,8 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
         {
             0 => 1,
             ChunkProfileRaid1 => 2,
+            ChunkProfileRaid1C3 => 3,
+            ChunkProfileRaid1C4 => 4,
             _ => 0,
         };
         if (expectedStripeCount == 0)
@@ -680,12 +685,10 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
                 + $"type=0x{type:X}, stripes={stripeCount}, sub_stripes={subStripeCount}");
         }
 
-        var validSubStripeCount = profile == ChunkProfileRaid1
-            ? subStripeCount == 1
-            : subStripeCount is 0 or 1;
+        var validSubStripeCount = subStripeCount is 0 or 1;
         if (stripeCount != expectedStripeCount || !validSubStripeCount)
         {
-            var profileName = profile == ChunkProfileRaid1 ? "RAID1" : "single";
+            var profileName = GetProfileName(profile);
             throw new InvalidDataException(
                 $"Btrfs {profileName} chunkのstripe数が不正です: "
                 + $"stripes={stripeCount}, sub_stripes={subStripeCount}");
@@ -739,10 +742,11 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
                 Convert.ToHexString(stripeUuid));
         }
 
-        if (profile == ChunkProfileRaid1
+        if (IsMirroredProfile(profile)
             && stripes.Select(stripe => stripe.DeviceId).Distinct().Count() != stripes.Length)
         {
-            throw new InvalidDataException("Btrfs RAID1 chunkのstripeが異なるdeviceを参照していません。");
+            throw new InvalidDataException(
+                $"Btrfs {GetProfileName(profile)} chunkのstripeが異なるdeviceを参照していません。");
         }
 
         return new BtrfsChunk(logicalStart, length, type, stripes);
@@ -908,7 +912,7 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
 
             var profile = chunk.Type & ChunkProfileMask;
             if (availableStripeCount == 0
-                || (availableStripeCount < chunk.Stripes.Count && profile != ChunkProfileRaid1))
+                || (availableStripeCount < chunk.Stripes.Count && !IsMirroredProfile(profile)))
             {
                 var missing = chunk.Stripes
                     .Where(stripe => !_devices.ContainsKey(stripe.DeviceId))
@@ -2232,6 +2236,22 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
     }
 
     private static bool IsPowerOfTwo(uint value) => value != 0 && (value & (value - 1)) == 0;
+
+    private static bool IsMirroredProfile(ulong profile)
+    {
+        return profile is ChunkProfileRaid1 or ChunkProfileRaid1C3 or ChunkProfileRaid1C4;
+    }
+
+    private static string GetProfileName(ulong profile)
+    {
+        return profile switch
+        {
+            ChunkProfileRaid1 => "RAID1",
+            ChunkProfileRaid1C3 => "RAID1C3",
+            ChunkProfileRaid1C4 => "RAID1C4",
+            _ => "single",
+        };
+    }
 
     private static long ToLongSize(ulong value) => value > long.MaxValue ? long.MaxValue : (long)value;
 
