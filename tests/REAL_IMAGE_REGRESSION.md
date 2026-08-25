@@ -140,6 +140,16 @@ wsl --distribution Ubuntu-24.04 --user root -- sh -lc `
 
 スクリプトは各PVへ128 MiBずつ配置した256 MiBのlinear LVを作り、PV境界をまたぐ160 MiBファイルを書き込みます。`e2fsck -fn`、PV/VG/LV UUID、segmentと各ファイル・RAWのSHA-256を表示します。manifestでは`"deviceSet": "LVM2"`を指定し、2台目を`companionImages`へ登録してください。ランナーはLVを組み立て、内部ファイルのSHA-256まで検証します。
 
+### LVM2 striped LV
+
+同じWSL環境で、2個のPVに64 KiB単位でstripingする384 MiBのLVとext4を生成します。
+
+```powershell
+.\tools\New-LvmStripedRegressionFixture.ps1
+```
+
+スクリプトは2台のPVへ交互に配置される300 MiBファイルを作成し、`e2fsck -fn`、PV/VG/LV UUID、stripe数・stripe size・device割り当て、各ファイル・RAWのSHA-256を表示します。manifestでは`"deviceSet": "LVM2"`を指定し、2台目を`companionImages`へ登録してください。ランナーはmetadata header/text CRC、PV UUID、extent範囲を検証してLVを組み立て、内部ファイルのSHA-256まで確認します。
+
 ### BitLocker XTS-AES
 
 BitLocker fixtureの生成は管理者PowerShellで実行します。

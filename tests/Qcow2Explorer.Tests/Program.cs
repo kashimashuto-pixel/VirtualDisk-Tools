@@ -94,6 +94,7 @@ static void RunGeneratedImageTests()
     TestLvmMetadataDiagnostics();
     TestGeneratedLvm2Image();
     TestGeneratedLvm2MultiPvImage();
+    TestGeneratedLvm2StripedImage();
     TestGeneratedLzopExt4Image();
     TestGeneratedBtrfsImage();
     TestGeneratedBtrfsMultiDeviceImage();
@@ -1351,6 +1352,8 @@ static void TestRealImageRegressionRunner()
     var regularSha256 = Convert.ToHexString(SHA256.HashData(BtrfsTestImageFactory.RegularData));
     var lvmFirstPath = Path.Combine(AppContext.BaseDirectory, "sample-lvm2-multipv-1.img");
     var lvmSecondPath = Path.Combine(AppContext.BaseDirectory, "sample-lvm2-multipv-2.img");
+    var lvmStripedFirstPath = Path.Combine(AppContext.BaseDirectory, "sample-lvm2-striped-1.img");
+    var lvmStripedSecondPath = Path.Combine(AppContext.BaseDirectory, "sample-lvm2-striped-2.img");
     var mdRaid0FirstPath = Path.Combine(AppContext.BaseDirectory, "synthetic-md-raid0-1.raw");
     var mdRaid0SecondPath = Path.Combine(AppContext.BaseDirectory, "synthetic-md-raid0-2.raw");
     var mdRaid10Paths = Enumerable.Range(0, 4)
@@ -1467,6 +1470,34 @@ static void TestRealImageRegressionRunner()
               ]
             },
             {
+              "name": "generated LVM2 striped runner",
+              "path": "{{Path.GetFileName(lvmStripedFirstPath)}}",
+              "sha256": "{{Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(lvmStripedFirstPath)))}}",
+              "companionImages": [
+                {
+                  "path": "{{Path.GetFileName(lvmStripedSecondPath)}}",
+                  "sha256": "{{Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(lvmStripedSecondPath)))}}"
+                }
+              ],
+              "deviceSet": "LVM2",
+              "expectedDiskLength": {{4 * 1024 * 1024}},
+              "expectedPartitionCount": 1,
+              "partitions": [
+                {
+                  "number": 1,
+                  "expectedFileSystem": "FAT16",
+                  "files": [
+                    {
+                      "path": "/HELLO.TXT",
+                      "expectedDirectory": false,
+                      "expectedLength": {{Encoding.ASCII.GetByteCount(TestImageFactory.HelloText)}},
+                      "sha256": "{{helloSha256}}"
+                    }
+                  ]
+                }
+              ]
+            },
+            {
               "name": "generated Linux md RAID10 runner",
               "path": "{{Path.GetFileName(mdRaid10Paths[0])}}",
               "sha256": "{{Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(mdRaid10Paths[0])))}}",
@@ -1498,7 +1529,7 @@ static void TestRealImageRegressionRunner()
         """;
     File.WriteAllText(manifestPath, manifest, new UTF8Encoding(false));
     var summary = RealImageRegressionRunner.Run(manifestPath);
-    Assert(summary.CaseCount == 5, "real-image regression runner case count");
+    Assert(summary.CaseCount == 6, "real-image regression runner case count");
 }
 
 static void TestBitLockerRecoveryPasswordUnlock()
@@ -3451,6 +3482,232 @@ static void TestGeneratedLvm2MultiPvImage()
         foreach (var disposable in ownedReaders)
         {
             disposable.Dispose();
+        }
+    }
+}
+
+static void TestGeneratedLvm2StripedImage()
+{
+    var firstPath = Path.Combine(AppContext.BaseDirectory, "sample-lvm2-striped-1.img");
+    var secondPath = Path.Combine(AppContext.BaseDirectory, "sample-lvm2-striped-2.img");
+    var expected = TestImageFactory.CreateLvm2StripedFat16Disks(firstPath, secondPath);
+
+    using var first = DiskImageReaderFactory.Open(firstPath);
+    using var second = DiskImageReaderFactory.Open(secondPath);
+    var firstPartition = PartitionTableReader.ReadPartitions(first).Single();
+    var secondOriginal = PartitionTableReader.ReadPartitions(second).Single();
+    var secondSlice = new PartitionSliceReader(second, secondOriginal);
+    var secondPartition = new PartitionInfo
+    {
+        Number = 2,
+        Scheme = "Companion MBR",
+        Name = secondOriginal.Name,
+        Type = secondOriginal.Type,
+        TypeId = secondOriginal.TypeId,
+        StartLba = 0,
+        SectorCount = checked((ulong)(secondSlice.Length / 512)),
+        ReaderOverride = secondSlice,
+        LengthOverrideBytes = secondSlice.Length,
+        FileSystem = "LVM2 PV (検出のみ)"
+    };
+    firstPartition.FileSystem = FileSystemDetector.Detect(first, firstPartition);
+
+    var missingReaders = new List<IDisposable>();
+    try
+    {
+        var missing = LogicalVolumeDiscoverer.Discover(
+            [first],
+            [firstPartition],
+            2,
+            missingReaders);
+        Assert(missing.Volumes.Count == 0, "striped LVM2 rejects a missing PV");
+        Assert(
+            missing.Diagnostics.Any(item =>
+                item.IsError
+                && item.Message.Contains("必要なPV", StringComparison.Ordinal)),
+            "striped LVM2 missing-PV diagnostic");
+    }
+    finally
+    {
+        foreach (var disposable in missingReaders)
+        {
+            disposable.Dispose();
+        }
+    }
+
+    var ownedReaders = new List<IDisposable>();
+    try
+    {
+        var result = LogicalVolumeDiscoverer.Discover(
+            [first, second],
+            [secondPartition, firstPartition],
+            3,
+            ownedReaders);
+        Assert(result.Volumes.Count == 1, string.Join(Environment.NewLine, result.Diagnostics.Select(item => item.Message)));
+        Assert(!result.Diagnostics.Any(item => item.IsError), string.Join(Environment.NewLine, result.Diagnostics.Select(item => item.Message)));
+        var volume = result.Volumes[0];
+        Assert(volume.Type.Contains("2 stripes", StringComparison.Ordinal), "striped LVM2 volume description");
+        Assert(volume.LengthBytes == expected.Length, "striped LVM2 volume length");
+        Assert(
+            Qcow2Explorer.Core.EndianUtilities.ReadBytes(volume.ReaderOverride!, 0, expected.Length)
+                .SequenceEqual(expected),
+            "striped LVM2 full mapping");
+        Assert(
+            Qcow2Explorer.Core.EndianUtilities.ReadBytes(volume.ReaderOverride!, 64 * 1024 - 31, 128)
+                .SequenceEqual(expected.AsSpan(64 * 1024 - 31, 128)),
+            "striped LVM2 stripe-boundary mapping");
+
+        volume.FileSystem = FileSystemDetector.Detect(first, volume);
+        Assert(volume.FileSystem == "FAT16", "FAT16 inside generated striped LVM2 LV");
+        var fs = FileSystemDetector.TryOpen(first, volume, out var error);
+        Assert(fs is not null, error);
+        var hello = fs!.ListDirectory(fs.Root).Single(node => node.Name == "HELLO.TXT");
+        Assert(
+            Encoding.ASCII.GetString(fs.ReadFile(hello, 0, (int)hello.Size)) == TestImageFactory.HelloText,
+            "generated striped LVM2 HELLO.TXT content");
+    }
+    finally
+    {
+        foreach (var disposable in ownedReaders)
+        {
+            disposable.Dispose();
+        }
+    }
+
+    var recoveredFirstPath = Path.Combine(AppContext.BaseDirectory, "sample-lvm2-striped-metadata-recovery-1.img");
+    var recoveredSecondPath = Path.Combine(AppContext.BaseDirectory, "sample-lvm2-striped-metadata-recovery-2.img");
+    _ = TestImageFactory.CreateLvm2StripedFat16Disks(recoveredFirstPath, recoveredSecondPath);
+    TestImageFactory.CorruptLvmMetadataText(recoveredFirstPath);
+    using (var recoveredFirst = DiskImageReaderFactory.Open(recoveredFirstPath))
+    using (var recoveredSecond = DiskImageReaderFactory.Open(recoveredSecondPath))
+    {
+        var recoveredFirstPartition = PartitionTableReader.ReadPartitions(recoveredFirst).Single();
+        var recoveredSecondOriginal = PartitionTableReader.ReadPartitions(recoveredSecond).Single();
+        var recoveredSecondSlice = new PartitionSliceReader(recoveredSecond, recoveredSecondOriginal);
+        var recoveredSecondPartition = new PartitionInfo
+        {
+            Number = 2,
+            StartLba = 0,
+            SectorCount = checked((ulong)(recoveredSecondSlice.Length / 512)),
+            ReaderOverride = recoveredSecondSlice,
+            LengthOverrideBytes = recoveredSecondSlice.Length,
+            FileSystem = "LVM2 PV (検出のみ)"
+        };
+        recoveredFirstPartition.FileSystem = FileSystemDetector.Detect(recoveredFirst, recoveredFirstPartition);
+        var recoveredReaders = new List<IDisposable>();
+        try
+        {
+            var recovered = LogicalVolumeDiscoverer.Discover(
+                [recoveredFirst, recoveredSecond],
+                [recoveredFirstPartition, recoveredSecondPartition],
+                3,
+                recoveredReaders);
+            Assert(recovered.Volumes.Count == 1, string.Join(Environment.NewLine, recovered.Diagnostics.Select(item => item.Message)));
+            Assert(
+                recovered.Diagnostics.Any(item => item.Message.Contains("metadata text CRC", StringComparison.Ordinal)),
+                "striped LVM2 reports a corrupt redundant metadata copy");
+            Assert(
+                Qcow2Explorer.Core.EndianUtilities.ReadBytes(recovered.Volumes[0].ReaderOverride!, 0, expected.Length)
+                    .SequenceEqual(expected),
+                "striped LVM2 recovers through another PV metadata copy");
+        }
+        finally
+        {
+            foreach (var disposable in recoveredReaders)
+            {
+                disposable.Dispose();
+            }
+        }
+    }
+
+    var corruptFirstPath = Path.Combine(AppContext.BaseDirectory, "sample-lvm2-striped-corrupt-1.img");
+    var corruptSecondPath = Path.Combine(AppContext.BaseDirectory, "sample-lvm2-striped-corrupt-2.img");
+    _ = TestImageFactory.CreateLvm2StripedFat16Disks(corruptFirstPath, corruptSecondPath);
+    TestImageFactory.CorruptLvmMetadataText(corruptFirstPath);
+    TestImageFactory.CorruptLvmMetadataText(corruptSecondPath);
+    using (var corruptFirst = DiskImageReaderFactory.Open(corruptFirstPath))
+    using (var corruptSecond = DiskImageReaderFactory.Open(corruptSecondPath))
+    {
+        var corruptFirstPartition = PartitionTableReader.ReadPartitions(corruptFirst).Single();
+        var corruptSecondOriginal = PartitionTableReader.ReadPartitions(corruptSecond).Single();
+        var corruptSecondSlice = new PartitionSliceReader(corruptSecond, corruptSecondOriginal);
+        var corruptSecondPartition = new PartitionInfo
+        {
+            Number = 2,
+            StartLba = 0,
+            SectorCount = checked((ulong)(corruptSecondSlice.Length / 512)),
+            ReaderOverride = corruptSecondSlice,
+            LengthOverrideBytes = corruptSecondSlice.Length,
+            FileSystem = "LVM2 PV (検出のみ)"
+        };
+        corruptFirstPartition.FileSystem = FileSystemDetector.Detect(corruptFirst, corruptFirstPartition);
+        var corruptReaders = new List<IDisposable>();
+        try
+        {
+            var corrupt = LogicalVolumeDiscoverer.Discover(
+                [corruptFirst, corruptSecond],
+                [corruptFirstPartition, corruptSecondPartition],
+                3,
+                corruptReaders);
+            Assert(corrupt.Volumes.Count == 0, "striped LVM2 rejects all corrupt metadata copies");
+            Assert(
+                corrupt.Diagnostics.Any(item =>
+                    item.Message.Contains("checksum", StringComparison.OrdinalIgnoreCase)
+                    || item.Message.Contains("CRC", StringComparison.Ordinal)),
+                "striped LVM2 corrupt-metadata diagnostic");
+        }
+        finally
+        {
+            foreach (var disposable in corruptReaders)
+            {
+                disposable.Dispose();
+            }
+        }
+    }
+
+    var conflictFirstPath = Path.Combine(AppContext.BaseDirectory, "sample-lvm2-striped-conflict-1.img");
+    var conflictSecondPath = Path.Combine(AppContext.BaseDirectory, "sample-lvm2-striped-conflict-2.img");
+    _ = TestImageFactory.CreateLvm2StripedFat16Disks(
+        conflictFirstPath,
+        conflictSecondPath,
+        conflictingSecondMetadata: true);
+    using (var conflictFirst = DiskImageReaderFactory.Open(conflictFirstPath))
+    using (var conflictSecond = DiskImageReaderFactory.Open(conflictSecondPath))
+    {
+        var conflictFirstPartition = PartitionTableReader.ReadPartitions(conflictFirst).Single();
+        var conflictSecondOriginal = PartitionTableReader.ReadPartitions(conflictSecond).Single();
+        var conflictSecondSlice = new PartitionSliceReader(conflictSecond, conflictSecondOriginal);
+        var conflictSecondPartition = new PartitionInfo
+        {
+            Number = 2,
+            StartLba = 0,
+            SectorCount = checked((ulong)(conflictSecondSlice.Length / 512)),
+            ReaderOverride = conflictSecondSlice,
+            LengthOverrideBytes = conflictSecondSlice.Length,
+            FileSystem = "LVM2 PV (検出のみ)"
+        };
+        conflictFirstPartition.FileSystem = FileSystemDetector.Detect(conflictFirst, conflictFirstPartition);
+        var conflictReaders = new List<IDisposable>();
+        try
+        {
+            var conflict = LogicalVolumeDiscoverer.Discover(
+                [conflictFirst, conflictSecond],
+                [conflictFirstPartition, conflictSecondPartition],
+                3,
+                conflictReaders);
+            Assert(conflict.Volumes.Count == 0, "striped LVM2 rejects conflicting current metadata copies");
+            Assert(
+                conflict.Diagnostics.Any(item =>
+                    item.IsError
+                    && item.Message.Contains("同一seqno", StringComparison.Ordinal)),
+                "striped LVM2 conflicting metadata diagnostic");
+        }
+        finally
+        {
+            foreach (var disposable in conflictReaders)
+            {
+                disposable.Dispose();
+            }
         }
     }
 }
@@ -5437,6 +5694,138 @@ internal static class TestImageFactory
             secondPvId.Replace("-", "", StringComparison.Ordinal),
             metadata,
             fatPartition.AsSpan(halfLength));
+    }
+
+    public static byte[] CreateLvm2StripedFat16Disks(
+        string firstPath,
+        string secondPath,
+        bool conflictingSecondMetadata = false)
+    {
+        const int extentSizeSectors = 8;
+        const int stripeSizeSectors = 128;
+        const int stripeSizeBytes = stripeSizeSectors * BytesPerSector;
+        const string firstPvId = "abcdef-1234-5678-90ab-cdef-1234-567890";
+        const string secondPvId = "112233-4455-6677-8899-aabb-ccdd-eeff00";
+        const string lvId = "323456-7890-abcd-efgh-ijkl-mnop-qrstuv";
+        const int lvmPartitionSectors = VirtualSize / BytesPerSector - PartitionStartLba;
+        const int dataAreaOffset = 1024 * 1024;
+        var partitionLength = lvmPartitionSectors * BytesPerSector;
+        var fatDisk = CreateVirtualDisk();
+        var logicalVolumeData = fatDisk.AsSpan(
+            PartitionStartLba * BytesPerSector,
+            PartitionSectors * BytesPerSector).ToArray();
+        var logicalVolumeExtents = logicalVolumeData.Length / (extentSizeSectors * BytesPerSector);
+        if (logicalVolumeData.Length % (stripeSizeBytes * 2) != 0 || logicalVolumeExtents % 2 != 0)
+        {
+            throw new InvalidOperationException("Generated LVM2 striped data does not fill complete stripe rows.");
+        }
+
+        var metadata = $$"""
+            contents = "Text Format Volume Group"
+            version = 1
+            description = "Qcow2Explorer generated striped LVM2 test"
+            creation_host = "Qcow2Explorer"
+            creation_time = 1
+            vg_striped {
+                id = "dedcba-9876-5432-10fe-dcba-9876-543210"
+                seqno = 7
+                format = "lvm2"
+                status = ["RESIZEABLE", "READ", "WRITE"]
+                flags = []
+                extent_size = {{extentSizeSectors}}
+                max_lv = 0
+                max_pv = 0
+                metadata_copies = 0
+                physical_volumes {
+                    pv0 {
+                        id = "{{firstPvId}}"
+                        device = "/dev/test0"
+                        status = ["ALLOCATABLE"]
+                        flags = []
+                        dev_size = {{lvmPartitionSectors}}
+                        pe_start = {{dataAreaOffset / BytesPerSector}}
+                        pe_count = {{(partitionLength - dataAreaOffset) / (extentSizeSectors * BytesPerSector)}}
+                    }
+                    pv1 {
+                        id = "{{secondPvId}}"
+                        device = "/dev/test1"
+                        status = ["ALLOCATABLE"]
+                        flags = []
+                        dev_size = {{lvmPartitionSectors}}
+                        pe_start = {{dataAreaOffset / BytesPerSector}}
+                        pe_count = {{(partitionLength - dataAreaOffset) / (extentSizeSectors * BytesPerSector)}}
+                    }
+                }
+                logical_volumes {
+                    root {
+                        id = "{{lvId}}"
+                        status = ["READ", "WRITE", "VISIBLE"]
+                        flags = []
+                        creation_host = "Qcow2Explorer"
+                        creation_time = 1
+                        segment_count = 1
+                        segment1 {
+                            start_extent = 0
+                            extent_count = {{logicalVolumeExtents}}
+                            type = "striped"
+                            stripe_count = 2
+                            stripe_size = {{stripeSizeSectors}}
+                            stripes = [ "pv0", 0, "pv1", 0 ]
+                        }
+                    }
+                }
+            }
+            """;
+
+        var componentData = new[]
+        {
+            new byte[logicalVolumeData.Length / 2],
+            new byte[logicalVolumeData.Length / 2]
+        };
+        for (var logicalOffset = 0; logicalOffset < logicalVolumeData.Length; logicalOffset += stripeSizeBytes)
+        {
+            var stripeNumber = logicalOffset / stripeSizeBytes;
+            var target = stripeNumber % componentData.Length;
+            var targetOffset = stripeNumber / componentData.Length * stripeSizeBytes;
+            Array.Copy(
+                logicalVolumeData,
+                logicalOffset,
+                componentData[target],
+                targetOffset,
+                stripeSizeBytes);
+        }
+
+        CreateLvm2MultiPvDisk(
+            firstPath,
+            firstPvId.Replace("-", "", StringComparison.Ordinal),
+            metadata,
+            componentData[0]);
+        CreateLvm2MultiPvDisk(
+            secondPath,
+            secondPvId.Replace("-", "", StringComparison.Ordinal),
+            conflictingSecondMetadata
+                ? metadata.Replace(
+                    "Qcow2Explorer generated striped LVM2 test",
+                    "Qcow2Explorer conflicting striped LVM2 test",
+                    StringComparison.Ordinal)
+                : metadata,
+            componentData[1]);
+        return logicalVolumeData;
+    }
+
+    public static void CorruptLvmMetadataText(string path)
+    {
+        const int metadataTextByte = PartitionStartLba * BytesPerSector + 4096 + 512 + 96;
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
+        stream.Position = metadataTextByte;
+        var value = stream.ReadByte();
+        if (value < 0)
+        {
+            throw new EndOfStreamException("Generated LVM2 metadata text is truncated.");
+        }
+
+        stream.Position = metadataTextByte;
+        stream.WriteByte((byte)(value ^ 1));
     }
 
     private static void CreateLvm2MultiPvDisk(

@@ -25,9 +25,10 @@ C# / Windows Forms で作成した、読み取り専用の仮想ディスク解�
   - LUKS1 はAES-XTS/plain64、PBKDF2（SHA-1/SHA-256/SHA-512）、標準4000 AF stripesのパスフレーズ解除に対応
   - LUKS2 は冗長headerとJSON metadataを検証し、PBKDF2/Argon2id keyslot、単一crypt segment、AES-XTS/plain64のパスフレーズ解除に対応
 - LVM2 論理ボリュームの検出と読み取り
-  - 単一PV、および複数ディスクのPVにまたがるlinear構成（LVMメタデータ上は`striped`、`stripe_count = 1`）を読み取り
+  - 単一PV、複数PVにまたがるlinear構成、および`stripe_count > 1`のstriped LVを読み取り
+  - striped LVは`stripe_size`単位でPVを切り替え、PV UUID、extent割り当て、data area、metadata header/text CRCを検証
   - 「複数ディスク」入力からPVをVG UUIDで束ね、必要なPVが揃ったLVを組み立て
-  - 読めない場合は不足PV、未対応segment type、複数stripe、メタデータ未検出、または内部例外を警告欄と解析レポートへ表示
+  - 読めない場合は不足PV、未対応segment type、メタデータ破損、メタデータ未検出、または内部例外を警告欄と解析レポートへ表示
 - Linux md RAID0／RAID1／RAID10の検出・読み取り（metadata 1.x、RAID0 multi-zone、RAID1／RAID10 degraded対応）
 - Windows Explorer風の左ツリー・右詳細一覧画面
   - `Alt + ↑`で親フォルダー、`Alt + ←`で戻る、`Alt + →`で進む
@@ -200,8 +201,8 @@ ProjFS マウントは Windows の Client-ProjFS 機能を使い、選択した�
 - E01はEWF1/EVFのEnCase 6形式、deflateまたは非圧縮chunk、連続したsegmentに対応します。安全なメモリ使用のためchunk数上限は4,194,304です。EWF2/Ex01、bzip2、論理証拠ファイル（L01）、暗号化EWF、旧形式など異なるtable配置は未対応です。
 - NTFSの主 `$MFT` 先頭レコードが破損している場合は `$MFTMirr` から復旧を試みます。ルートレコードなど主MFTの必須データ自体が欠落しているイメージは、元ディスクまたはバックアップからの再取得が必要です。
 - NTFS削除済みファイルはMFTに残っている情報を表示します。削除後に再利用されたクラスタの内容は復旧できません。
-- LVM2 は、単一または複数の入力ディスク内に必要なPVがすべてあり、LVが単一stripeのlinear相当である構成を読み取ります。複数PVにまたがるLVも、各PVを「複数ディスク」で同時に指定すると組み立てます。
-- 一部PVが入力されていないVG、複数stripe、thin/snapshot/cache/mirror/RAID segmentは未対応です。検出できたメタデータから該当理由を表示します。
+- LVM2 は、単一または複数の入力ディスク内に必要なPVがすべてあるlinear／striped LVを読み取ります。複数PVは各PVを「複数ディスク」で同時に指定すると組み立て、`stripe_size`境界とsegment境界をまたぐ読み取りに対応します。label、PV UUID、data/metadata area、metadata header/text CRC、最新seqno、extent範囲を検証し、1個のmetadata copyが壊れていても別PVの検証済み同世代copyから復旧します。
+- 一部PVが入力されていないVG、thin/snapshot/cache/mirror/RAID segmentは未対応です。検出できたメタデータから該当理由を表示します。
 - Parallels HDD は単一 Storage の Plain / Compressed image を読み取ります。split image、未知の image type、仕様外の拡張は未対応です。
 - OVAは読み取り中に内容を一時フォルダへ展開するため、アーカイブ内のファイル容量と同程度の空き容量が必要です。一時ファイルはイメージを閉じると削除します。
 - ProjFS マウントはフォルダ投影型です。Windows のドライブ文字としての実マウントではありません。
@@ -399,6 +400,7 @@ SOFTWARE.
 - Linux md metadata 1.x: https://github.com/torvalds/linux/blob/master/include/uapi/linux/raid/md_p.h
 - Linux md RAID0 mapping: https://github.com/torvalds/linux/blob/master/drivers/md/raid0.c
 - Linux md RAID10 mapping: https://github.com/torvalds/linux/blob/master/drivers/md/raid10.c
+- LVM2 striped segment implementation: https://github.com/lvmteam/lvm2/blob/main/lib/striped/striped.c
 - Zstandard compression format: https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md
 - Argon2 reference implementation: https://github.com/P-H-C/phc-winner-argon2
 - Konscious Argon2 for .NET: https://github.com/kmaragon/Konscious.Security.Cryptography
