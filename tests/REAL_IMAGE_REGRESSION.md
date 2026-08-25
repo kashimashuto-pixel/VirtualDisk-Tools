@@ -77,6 +77,15 @@ RAID1C3／RAID1C4は専用スクリプトで3個／4個のRAWを生成します�
 
 各生成処理は`btrfs check --readonly`とSHA-256を表示します。完全なdevice setは2個目以降を`companionImages`へ並べます。C3では1個、C4では1個だけを`path`へ登録して残りを省略すると、最大device欠損時のdegraded読み取りも確認できます。
 
+RAID10は専用スクリプトで4個のRAWを生成します。
+
+```powershell
+.\tools\New-BtrfsRaid10RegressionFixture.ps1 `
+  -OutputDirectory .\.tmp\real-images\raid10
+```
+
+完全構成では残り3個を`companionImages`へ並べます。degraded回帰では、すべてのchunkに対して各mirror組から1台以上残る組み合わせを使用してください。stripeの組み合わせはchunkごとに異なる場合があるため、単純にdevidだけから耐障害性を判断せず、ランナーのchunk検証を通過する構成を登録します。
+
 ### BitLocker XTS-AES
 
 BitLocker fixtureの生成は管理者PowerShellで実行します。
