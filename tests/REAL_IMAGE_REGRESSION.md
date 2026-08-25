@@ -114,6 +114,17 @@ wsl --distribution Ubuntu-24.04 --user root -- sh -lc `
 
 スクリプトはstripeを横断する300 MiBファイルを作成し、`e2fsck -fn`、`mdadm --detail`／`--examine`、各RAWと内部ファイルのSHA-256を表示します。manifestでは`"deviceSet": "Linux md RAID0"`を指定し、2台目を`companionImages`へ登録します。RAID0は全memberが必要なため、欠損構成は成功caseとして登録できません。
 
+### Linux md RAID10
+
+metadata 1.2、64 KiB chunk、4台のnear-2 RAID10とext4を生成します。
+
+```powershell
+.\tools\New-MdRaid10RegressionFixture.ps1 `
+  -OutputDirectory .\.tmp\real-images\mdraid10
+```
+
+スクリプトはstripeとmirror groupを横断する300 MiBファイルを作成し、`e2fsck -fn`、`mdadm --detail`／`--examine`、各RAWと内部ファイルのSHA-256を表示します。完全構成は`"deviceSet": "Linux md RAID10"`と残り3台の`companionImages`を指定します。near-2の4台構成ではrole 1と3のように各mirror groupから1台ずつ登録するとdegraded回帰も確認できます。同じmirror groupの2台だけでは組み立てを拒否します。
+
 ### LVM2 multiple PV
 
 WSL 2のUbuntu 24.04へ`lvm2`と`e2fsprogs`をインストールし、2個のPVにまたがるlinear LVとext4を生成します。

@@ -90,6 +90,7 @@ static void RunGeneratedImageTests()
     Test4KnGptParsing();
     TestGeneratedMdRaid1Image();
     TestGeneratedMdRaid0Image();
+    TestGeneratedMdRaid10Image();
     TestLvmMetadataDiagnostics();
     TestGeneratedLvm2Image();
     TestGeneratedLvm2MultiPvImage();
@@ -1352,6 +1353,9 @@ static void TestRealImageRegressionRunner()
     var lvmSecondPath = Path.Combine(AppContext.BaseDirectory, "sample-lvm2-multipv-2.img");
     var mdRaid0FirstPath = Path.Combine(AppContext.BaseDirectory, "synthetic-md-raid0-1.raw");
     var mdRaid0SecondPath = Path.Combine(AppContext.BaseDirectory, "synthetic-md-raid0-2.raw");
+    var mdRaid10Paths = Enumerable.Range(0, 4)
+        .Select(index => Path.Combine(AppContext.BaseDirectory, $"synthetic-md-raid10-{index}.raw"))
+        .ToArray();
     var manifestPath = Path.Combine(AppContext.BaseDirectory, "real-image-regression.generated.json");
     var manifest = $$"""
         {
@@ -1461,13 +1465,40 @@ static void TestRealImageRegressionRunner()
                   ]
                 }
               ]
+            },
+            {
+              "name": "generated Linux md RAID10 runner",
+              "path": "{{Path.GetFileName(mdRaid10Paths[0])}}",
+              "sha256": "{{Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(mdRaid10Paths[0])))}}",
+              "companionImages": [
+                { "path": "{{Path.GetFileName(mdRaid10Paths[1])}}", "sha256": "{{Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(mdRaid10Paths[1])))}}" },
+                { "path": "{{Path.GetFileName(mdRaid10Paths[2])}}", "sha256": "{{Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(mdRaid10Paths[2])))}}" },
+                { "path": "{{Path.GetFileName(mdRaid10Paths[3])}}", "sha256": "{{Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(mdRaid10Paths[3])))}}" }
+              ],
+              "deviceSet": "Linux md RAID10",
+              "expectedDiskLength": {{TestImageFactory.VirtualSize}},
+              "expectedPartitionCount": 1,
+              "partitions": [
+                {
+                  "number": 1,
+                  "expectedFileSystem": "FAT16",
+                  "files": [
+                    {
+                      "path": "/HELLO.TXT",
+                      "expectedDirectory": false,
+                      "expectedLength": {{Encoding.ASCII.GetByteCount(TestImageFactory.HelloText)}},
+                      "sha256": "{{helloSha256}}"
+                    }
+                  ]
+                }
+              ]
             }
           ]
         }
         """;
     File.WriteAllText(manifestPath, manifest, new UTF8Encoding(false));
     var summary = RealImageRegressionRunner.Run(manifestPath);
-    Assert(summary.CaseCount == 4, "real-image regression runner case count");
+    Assert(summary.CaseCount == 5, "real-image regression runner case count");
 }
 
 static void TestBitLockerRecoveryPasswordUnlock()
@@ -3156,6 +3187,124 @@ static void TestGeneratedMdRaid0Image()
     }
 }
 
+static void TestGeneratedMdRaid10Image()
+{
+    var paths = Enumerable.Range(0, 4)
+        .Select(index => Path.Combine(AppContext.BaseDirectory, $"synthetic-md-raid10-{index}.raw"))
+        .ToArray();
+    var expected = TestImageFactory.CreateMdRaid10Fat16(paths);
+    using (var first = DiskImageReaderFactory.Open(paths[0]))
+    using (var second = DiskImageReaderFactory.Open(paths[1]))
+    using (var third = DiskImageReaderFactory.Open(paths[2]))
+    using (var fourth = DiskImageReaderFactory.Open(paths[3]))
+    {
+        var discovery = MdRaidDeviceSet.Discover([fourth, second, first, third]);
+        Assert(discovery.Components.Count == 4, "Linux md RAID10 component discovery");
+        Assert(discovery.Arrays.Count == 1, string.Join(Environment.NewLine, discovery.Diagnostics));
+        var array = discovery.Arrays[0];
+        Assert(array.Level == 10 && array.LevelName == "RAID10", "Linux md RAID10 level");
+        Assert(!array.Reader.IsDegraded, "Linux md RAID10 complete array");
+        Assert(
+            array.Reader.AvailableRoles.SequenceEqual(new ushort[] { 0, 1, 2, 3 }),
+            "Linux md RAID10 role ordering");
+        Assert(array.Reader.Length == expected.Length, "Linux md RAID10 length");
+        Assert(
+            Qcow2Explorer.Core.EndianUtilities.ReadBytes(array.Reader, 0, expected.Length)
+                .SequenceEqual(expected),
+            "Linux md RAID10 full near-layout mapping");
+        Assert(
+            Qcow2Explorer.Core.EndianUtilities.ReadBytes(array.Reader, 64 * 1024 - 23, 128)
+                .SequenceEqual(expected.AsSpan(64 * 1024 - 23, 128)),
+            "Linux md RAID10 chunk-boundary mapping");
+
+        var partitions = PartitionTableReader.ReadPartitions(array.Reader);
+        Assert(partitions.Count == 1, "partition table inside Linux md RAID10");
+        var partition = partitions[0];
+        partition.FileSystem = FileSystemDetector.Detect(array.Reader, partition);
+        Assert(partition.FileSystem == "FAT16", "FAT16 inside Linux md RAID10");
+        var fs = FileSystemDetector.TryOpen(array.Reader, partition, out var error);
+        Assert(fs is not null, error);
+        var hello = fs!.ListDirectory(fs.Root).Single(node => node.Name == "HELLO.TXT");
+        Assert(
+            Encoding.ASCII.GetString(fs.ReadFile(hello, 0, (int)hello.Size)) == TestImageFactory.HelloText,
+            "Linux md RAID10 file read");
+    }
+
+    using (var second = DiskImageReaderFactory.Open(paths[1]))
+    using (var fourth = DiskImageReaderFactory.Open(paths[3]))
+    {
+        var discovery = MdRaidDeviceSet.Discover([fourth, second]);
+        Assert(discovery.Arrays.Count == 1, string.Join(Environment.NewLine, discovery.Diagnostics));
+        Assert(discovery.Arrays[0].Reader.IsDegraded, "Linux md RAID10 degraded assembly");
+        Assert(
+            Qcow2Explorer.Core.EndianUtilities.ReadBytes(discovery.Arrays[0].Reader, 0, expected.Length)
+                .SequenceEqual(expected),
+            "Linux md RAID10 one-member-per-group degraded read");
+    }
+
+    using (var first = DiskImageReaderFactory.Open(paths[0]))
+    using (var second = DiskImageReaderFactory.Open(paths[1]))
+    {
+        var discovery = MdRaidDeviceSet.Discover([first, second]);
+        Assert(discovery.Arrays.Count == 0, "Linux md RAID10 rejects a missing mirror group");
+        Assert(
+            discovery.Diagnostics.Any(message => message.Contains("mirror group", StringComparison.Ordinal)),
+            "Linux md RAID10 missing-group diagnostic");
+    }
+
+    var mismatchPaths = Enumerable.Range(0, 4)
+        .Select(index => Path.Combine(AppContext.BaseDirectory, $"synthetic-md-raid10-mismatch-{index}.raw"))
+        .ToArray();
+    _ = TestImageFactory.CreateMdRaid10Fat16(mismatchPaths, corruptRole: 1);
+    using (var first = DiskImageReaderFactory.Open(mismatchPaths[0]))
+    using (var second = DiskImageReaderFactory.Open(mismatchPaths[1]))
+    using (var third = DiskImageReaderFactory.Open(mismatchPaths[2]))
+    using (var fourth = DiskImageReaderFactory.Open(mismatchPaths[3]))
+    {
+        var array = MdRaidDeviceSet.Discover([first, second, third, fourth]).Arrays.Single();
+        try
+        {
+            _ = Qcow2Explorer.Core.EndianUtilities.ReadBytes(array.Reader, 0, 512);
+            Assert(false, "Linux md RAID10 rejects mismatching mirrors");
+        }
+        catch (InvalidDataException ex)
+        {
+            Assert(ex.Message.Contains("mirror内容", StringComparison.Ordinal), "Linux md RAID10 mirror mismatch diagnostic");
+        }
+    }
+
+    var threeDiskPaths = Enumerable.Range(0, 3)
+        .Select(index => Path.Combine(AppContext.BaseDirectory, $"synthetic-md-raid10-three-{index}.raw"))
+        .ToArray();
+    var threeDiskExpected = TestImageFactory.CreateMdRaid10Fat16(threeDiskPaths);
+    using (var first = DiskImageReaderFactory.Open(threeDiskPaths[0]))
+    using (var second = DiskImageReaderFactory.Open(threeDiskPaths[1]))
+    using (var third = DiskImageReaderFactory.Open(threeDiskPaths[2]))
+    {
+        var array = MdRaidDeviceSet.Discover([third, first, second]).Arrays.Single();
+        Assert(
+            Qcow2Explorer.Core.EndianUtilities.ReadBytes(array.Reader, 0, threeDiskExpected.Length)
+                .SequenceEqual(threeDiskExpected),
+            "Linux md RAID10 three-device wrapping near layout");
+    }
+
+    var farPaths = Enumerable.Range(0, 4)
+        .Select(index => Path.Combine(AppContext.BaseDirectory, $"synthetic-md-raid10-far-{index}.raw"))
+        .ToArray();
+    _ = TestImageFactory.CreateMdRaid10Fat16(farPaths, layout: 0x0201);
+    using (var first = DiskImageReaderFactory.Open(farPaths[0]))
+    using (var second = DiskImageReaderFactory.Open(farPaths[1]))
+    using (var third = DiskImageReaderFactory.Open(farPaths[2]))
+    using (var fourth = DiskImageReaderFactory.Open(farPaths[3]))
+    {
+        var discovery = MdRaidDeviceSet.Discover([first, second, third, fourth]);
+        Assert(discovery.Arrays.Count == 0, "Linux md RAID10 rejects unsupported far layout");
+        Assert(
+            discovery.Diagnostics.Any(message => message.Contains("near copies", StringComparison.Ordinal)),
+            "Linux md RAID10 unsupported-layout diagnostic");
+    }
+}
+
 static void TestLvmMetadataDiagnostics()
 {
     const string metadata = """
@@ -4661,6 +4810,97 @@ internal static class TestImageFactory
         }
 
         return expected;
+    }
+
+    public static byte[] CreateMdRaid10Fat16(
+        IReadOnlyList<string> paths,
+        uint layout = 0x0102,
+        int? corruptRole = null)
+    {
+        if (paths.Count is < 3 or > 4)
+        {
+            throw new ArgumentException("Synthetic RAID10 requires three or four paths.", nameof(paths));
+        }
+
+        const int dataOffset = 1024 * 1024;
+        const uint chunkSectors = 128;
+        const int chunkBytes = checked((int)chunkSectors * BytesPerSector);
+        const int memberDataLength = 8 * 1024 * 1024;
+        var nearCopies = layout & 0xff;
+        var farCopies = (layout >> 8) & 0xff;
+        if (nearCopies == 0 || farCopies == 0)
+        {
+            throw new ArgumentException("Synthetic RAID10 layout requires near and far copies.", nameof(layout));
+        }
+
+        var arrayLength = checked((int)((long)memberDataLength * paths.Count / (nearCopies * farCopies)));
+        var source = CreateVirtualDisk();
+        if (arrayLength > source.Length || arrayLength % chunkBytes != 0)
+        {
+            throw new InvalidOperationException("Synthetic RAID10 array length is invalid.");
+        }
+
+        var arrayData = source.AsSpan(0, arrayLength).ToArray();
+        var componentLength = checked(dataOffset + memberDataLength + 1024 * 1024);
+        var components = Enumerable.Range(0, paths.Count)
+            .Select(_ => new byte[componentLength])
+            .ToArray();
+        for (var logicalOffset = 0; logicalOffset < arrayData.Length; logicalOffset += chunkBytes)
+        {
+            var logicalChunk = checked((ulong)(logicalOffset / chunkBytes));
+            var scaledChunk = logicalChunk * nearCopies;
+            var stripe = scaledChunk / checked((uint)paths.Count);
+            var role = checked((int)(scaledChunk % checked((uint)paths.Count)));
+            var memberChunk = stripe;
+            for (var copy = 0U; copy < nearCopies; copy++)
+            {
+                Array.Copy(
+                    arrayData,
+                    logicalOffset,
+                    components[role],
+                    checked(dataOffset + (int)memberChunk * chunkBytes),
+                    chunkBytes);
+                role++;
+                if (role == paths.Count)
+                {
+                    role = 0;
+                    memberChunk++;
+                }
+            }
+        }
+
+        if (corruptRole is int roleToCorrupt)
+        {
+            components[roleToCorrupt][dataOffset + 17] ^= 1;
+        }
+
+        var setUuid = Guid.Parse("150bab2c-2903-4bb6-a1a0-4baf77f108da").ToByteArray();
+        byte[][] deviceUuids =
+        [
+            Guid.Parse("1473b99d-9c2c-49e6-9b4d-e8fe91681a7c").ToByteArray(),
+            Guid.Parse("eebcfddd-4fc9-4898-b1fc-2124310a2504").ToByteArray(),
+            Guid.Parse("117e0b7d-44ab-43b4-8694-f98923393258").ToByteArray(),
+            Guid.Parse("02ad415d-6150-47e1-9287-0b76072cba40").ToByteArray(),
+        ];
+        var memberSizeSectors = checked((ulong)(memberDataLength / BytesPerSector));
+        for (var index = 0; index < components.Length; index++)
+        {
+            var superblock = CreateMdSuperblock(
+                setUuid,
+                deviceUuids[index],
+                checked((uint)index),
+                checked((ushort)index),
+                memberSizeSectors,
+                events: 71,
+                level: 10,
+                layout: layout,
+                chunkSectors: chunkSectors,
+                raidDisks: checked((uint)paths.Count));
+            superblock.CopyTo(components[index], 4096);
+            File.WriteAllBytes(paths[index], components[index]);
+        }
+
+        return arrayData;
     }
 
     private static byte[] CreateMdSuperblock(
