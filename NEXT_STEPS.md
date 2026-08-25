@@ -135,12 +135,15 @@
 - RAID1C3／RAID1C4の3・4コピーを異なるdeviceとして検証し、CRC32C／data checksumに基づくmirror選択を一般化
 - C3で2台欠損、C4で3台欠損したdegraded読み取りと、C3の残存metadata破損拒否を合成fixtureで確認
 - 実`mkfs.btrfs -m/-d raid1c3`／`raid1c4`生成スクリプトを追加し、全device入力と最大device欠損のmanifest回帰を実行
+- RAID10の`stripe_length`単位のstripingと`sub_stripes`単位のmirror選択を実装し、chunkごとに異なるstripe組を読み取り
+- 各mirror組に少なくとも1台が残る場合だけdegraded読み取りを許可し、片側破損時はCRC32C／data checksumで代替mirrorへ切替
+- 4台の合成fixtureと実`mkfs.btrfs -m/-d raid10` fixtureで完全構成・2台欠損構成・LZO／zstd／subvolumeを回帰確認
 
 ## 次回の推奨作業
 
-### 1. Btrfs対応の第2段階
+### 1. Btrfs対応の第3段階
 
-- RAID10を検討する
+- RAID0を検討する
 
 ## 保守・品質改善
 

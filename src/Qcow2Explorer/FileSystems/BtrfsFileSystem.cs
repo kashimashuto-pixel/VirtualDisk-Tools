@@ -46,6 +46,7 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
     private const ulong ChunkTypeSystem = 1UL << 1;
     private const ulong ChunkTypeMetadata = 1UL << 2;
     private const ulong ChunkProfileRaid1 = 1UL << 4;
+    private const ulong ChunkProfileRaid10 = 1UL << 6;
     private const ulong ChunkProfileRaid1C3 = 1UL << 9;
     private const ulong ChunkProfileRaid1C4 = 1UL << 10;
     private const ulong ChunkProfileMask = 0x7f8;
@@ -674,6 +675,7 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
         {
             0 => 1,
             ChunkProfileRaid1 => 2,
+            ChunkProfileRaid10 => stripeCount,
             ChunkProfileRaid1C3 => 3,
             ChunkProfileRaid1C4 => 4,
             _ => 0,
@@ -685,8 +687,10 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
                 + $"type=0x{type:X}, stripes={stripeCount}, sub_stripes={subStripeCount}");
         }
 
-        var validSubStripeCount = subStripeCount is 0 or 1;
-        if (stripeCount != expectedStripeCount || !validSubStripeCount)
+        var validStripeLayout = profile == ChunkProfileRaid10
+            ? stripeCount >= 2 && stripeCount % 2 == 0 && subStripeCount == 2
+            : stripeCount == expectedStripeCount && subStripeCount is 0 or 1;
+        if (!validStripeLayout)
         {
             var profileName = GetProfileName(profile);
             throw new InvalidDataException(
@@ -749,7 +753,7 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
                 $"Btrfs {GetProfileName(profile)} chunkのstripeが異なるdeviceを参照していません。");
         }
 
-        return new BtrfsChunk(logicalStart, length, type, stripes);
+        return new BtrfsChunk(logicalStart, length, stripeLength, type, subStripeCount, stripes);
     }
 
     private BtrfsDeviceItem ParseDeviceItem(BtrfsLeafItem item)
@@ -866,7 +870,9 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
     {
         return left.LogicalStart == right.LogicalStart
             && left.Length == right.Length
+            && left.StripeLength == right.StripeLength
             && left.Type == right.Type
+            && left.SubStripeCount == right.SubStripeCount
             && left.Stripes.SequenceEqual(right.Stripes);
     }
 
@@ -877,9 +883,9 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
         {
             var chunk = _chunks[index];
             var logicalEnd = checked(chunk.LogicalStart + chunk.Length);
-            var availableStripeCount = 0;
-            foreach (var stripe in chunk.Stripes)
+            for (var stripeIndex = 0; stripeIndex < chunk.Stripes.Count; stripeIndex++)
             {
+                var stripe = chunk.Stripes[stripeIndex];
                 if (!_deviceItems.TryGetValue(stripe.DeviceId, out var deviceItem))
                 {
                     throw new InvalidDataException(
@@ -900,8 +906,8 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
                     continue;
                 }
 
-                availableStripeCount++;
-                var physicalEnd = checked(stripe.PhysicalStart + chunk.Length);
+                var physicalEnd = checked(
+                    stripe.PhysicalStart + GetStripePhysicalLength(chunk, stripeIndex));
                 if (physicalEnd > (ulong)device.Reader.Length || physicalEnd > device.TotalBytes)
                 {
                     throw new InvalidDataException(
@@ -911,8 +917,16 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
             }
 
             var profile = chunk.Type & ChunkProfileMask;
-            if (availableStripeCount == 0
-                || (availableStripeCount < chunk.Stripes.Count && !IsMirroredProfile(profile)))
+            var hasEnoughDevices = profile == ChunkProfileRaid10
+                ? Enumerable.Range(0, chunk.Stripes.Count / chunk.SubStripeCount)
+                    .All(groupIndex => chunk.Stripes
+                        .Skip(groupIndex * chunk.SubStripeCount)
+                        .Take(chunk.SubStripeCount)
+                        .Any(stripe => _devices.ContainsKey(stripe.DeviceId)))
+                : IsMirroredProfile(profile)
+                    ? chunk.Stripes.Any(stripe => _devices.ContainsKey(stripe.DeviceId))
+                    : chunk.Stripes.All(stripe => _devices.ContainsKey(stripe.DeviceId));
+            if (!hasEnoughDevices)
             {
                 var missing = chunk.Stripes
                     .Where(stripe => !_devices.ContainsKey(stripe.DeviceId))
@@ -1024,9 +1038,10 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
                 $"Btrfs tree blockがchunk境界をまたいでいます: {pointer.Bytenr:N0}");
         }
 
-        var errors = new List<string>(chunk.Stripes.Count);
+        var mirrorCount = GetMirrorCount(chunk);
+        var errors = new List<string>(mirrorCount);
         Exception? lastError = null;
-        for (var mirrorIndex = 0; mirrorIndex < chunk.Stripes.Count; mirrorIndex++)
+        for (var mirrorIndex = 0; mirrorIndex < mirrorCount; mirrorIndex++)
         {
             var block = new byte[_nodeSize];
             try
@@ -1372,11 +1387,12 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
                     $"Btrfs data sectorがchunk境界をまたいでいます: logical={sectorStart:N0}");
             }
 
-            var errors = new List<string>(chunk.Stripes.Count);
+            var mirrorCount = GetMirrorCount(chunk);
+            var errors = new List<string>(mirrorCount);
             Exception? lastError = null;
             byte[]? verifiedSector = null;
             var hasChecksum = _dataChecksums.TryGetValue(sectorStart, out var expectedChecksum);
-            for (var mirrorIndex = 0; mirrorIndex < chunk.Stripes.Count; mirrorIndex++)
+            for (var mirrorIndex = 0; mirrorIndex < mirrorCount; mirrorIndex++)
             {
                 var candidate = new byte[_sectorSize];
                 try
@@ -1859,7 +1875,8 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
         while (remaining > 0)
         {
             var chunk = FindChunk(logical);
-            if (mirrorIndex >= chunk.Stripes.Count)
+            var mirrorCount = GetMirrorCount(chunk);
+            if (mirrorIndex >= mirrorCount)
             {
                 throw new InvalidDataException(
                     $"Btrfs chunkに要求されたmirrorがありません: "
@@ -1868,9 +1885,12 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
 
             var withinChunk = logical - chunk.LogicalStart;
             var available = chunk.Length - withinChunk;
-            var readLength = checked((int)Math.Min((ulong)remaining, available));
-            var stripe = chunk.Stripes[mirrorIndex];
-            var physical = checked(stripe.PhysicalStart + withinChunk);
+            var mapping = MapStripe(chunk, withinChunk, mirrorIndex);
+            var readLength = checked((int)Math.Min(
+                (ulong)remaining,
+                Math.Min(available, mapping.AvailableLength)));
+            var stripe = mapping.Stripe;
+            var physical = mapping.Physical;
             if (!_devices.TryGetValue(stripe.DeviceId, out var device))
             {
                 throw new IOException($"Btrfs deviceがありません: devid={stripe.DeviceId}");
@@ -1889,6 +1909,72 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
             destinationOffset += readLength;
             remaining -= readLength;
         }
+    }
+
+    private static BtrfsStripeMapping MapStripe(
+        BtrfsChunk chunk,
+        ulong withinChunk,
+        int mirrorIndex)
+    {
+        var profile = chunk.Type & ChunkProfileMask;
+        if (profile != ChunkProfileRaid10)
+        {
+            return new BtrfsStripeMapping(
+                chunk.Stripes[mirrorIndex],
+                checked(chunk.Stripes[mirrorIndex].PhysicalStart + withinChunk),
+                chunk.Length - withinChunk);
+        }
+
+        var dataStripeCount = chunk.Stripes.Count / chunk.SubStripeCount;
+        var logicalStripeNumber = withinChunk / chunk.StripeLength;
+        var withinStripe = withinChunk % chunk.StripeLength;
+        var groupIndex = checked((int)(logicalStripeNumber % (ulong)dataStripeCount));
+        var stripeIndex = groupIndex * chunk.SubStripeCount + mirrorIndex;
+        var physicalStripeNumber = logicalStripeNumber / (ulong)dataStripeCount;
+        var stripe = chunk.Stripes[stripeIndex];
+        var physical = checked(
+            stripe.PhysicalStart
+            + physicalStripeNumber * chunk.StripeLength
+            + withinStripe);
+        return new BtrfsStripeMapping(
+            stripe,
+            physical,
+            chunk.StripeLength - withinStripe);
+    }
+
+    private static ulong GetStripePhysicalLength(BtrfsChunk chunk, int stripeIndex)
+    {
+        if ((chunk.Type & ChunkProfileMask) != ChunkProfileRaid10)
+        {
+            return chunk.Length;
+        }
+
+        var dataStripeCount = chunk.Stripes.Count / chunk.SubStripeCount;
+        var groupIndex = stripeIndex / chunk.SubStripeCount;
+        var logicalStripeCount = checked(
+            (chunk.Length + chunk.StripeLength - 1) / chunk.StripeLength);
+        if ((ulong)groupIndex >= logicalStripeCount)
+        {
+            return 0;
+        }
+
+        var assignedStripeCount = checked(
+            (logicalStripeCount - 1 - (ulong)groupIndex) / (ulong)dataStripeCount + 1);
+        var lastLogicalStripe = checked(
+            (ulong)groupIndex + (assignedStripeCount - 1) * (ulong)dataStripeCount);
+        var lastStripeLength = lastLogicalStripe == logicalStripeCount - 1
+            ? chunk.Length - lastLogicalStripe * chunk.StripeLength
+            : chunk.StripeLength;
+        return checked((assignedStripeCount - 1) * chunk.StripeLength + lastStripeLength);
+    }
+
+    private static int GetMirrorCount(BtrfsChunk chunk)
+    {
+        return (chunk.Type & ChunkProfileMask) == ChunkProfileRaid10
+            ? chunk.SubStripeCount
+            : IsMirroredProfile(chunk.Type & ChunkProfileMask)
+                ? chunk.Stripes.Count
+                : 1;
     }
 
     private BtrfsChunk FindChunk(ulong logical)
@@ -2239,7 +2325,7 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
 
     private static bool IsMirroredProfile(ulong profile)
     {
-        return profile is ChunkProfileRaid1 or ChunkProfileRaid1C3 or ChunkProfileRaid1C4;
+        return profile is ChunkProfileRaid1 or ChunkProfileRaid10 or ChunkProfileRaid1C3 or ChunkProfileRaid1C4;
     }
 
     private static string GetProfileName(ulong profile)
@@ -2247,6 +2333,7 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
         return profile switch
         {
             ChunkProfileRaid1 => "RAID1",
+            ChunkProfileRaid10 => "RAID10",
             ChunkProfileRaid1C3 => "RAID1C3",
             ChunkProfileRaid1C4 => "RAID1C4",
             _ => "single",
@@ -2270,10 +2357,16 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
         ulong DeviceId,
         ulong PhysicalStart,
         string DeviceUuid);
+    private readonly record struct BtrfsStripeMapping(
+        BtrfsStripe Stripe,
+        ulong Physical,
+        ulong AvailableLength);
     private sealed record BtrfsChunk(
         ulong LogicalStart,
         ulong Length,
+        ulong StripeLength,
         ulong Type,
+        ushort SubStripeCount,
         IReadOnlyList<BtrfsStripe> Stripes);
     private readonly record struct BtrfsObjectReference(ulong TreeId, ulong InodeNumber);
     private sealed record BtrfsNodeReference(BtrfsObjectReference Object);

@@ -95,6 +95,7 @@ static void RunGeneratedImageTests()
     TestGeneratedBtrfsMultiDeviceImage();
     TestGeneratedBtrfsRaid1Image();
     TestGeneratedBtrfsRaid1C34Image();
+    TestGeneratedBtrfsRaid10Image();
     TestGeneratedEwfE01Image();
     TestRealImageRegressionRunner();
     TestGeneratedVmaLzopImage();
@@ -1112,6 +1113,83 @@ static void TestGeneratedBtrfsRaid1C34Image()
             fs.ReadFile(regular, 0, checked((int)regular.Size))
                 .SequenceEqual(BtrfsTestImageFactory.RegularData),
             "Btrfs RAID1C4 three-device degraded read");
+    }
+}
+
+static void TestGeneratedBtrfsRaid10Image()
+{
+    var paths = Enumerable.Range(1, 4)
+        .Select(index => Path.Combine(AppContext.BaseDirectory, $"synthetic-btrfs-raid10-{index}.raw"))
+        .ToArray();
+    _ = BtrfsTestImageFactory.CreateRaid10(
+        paths,
+        corruptDataDeviceIds: new HashSet<int> { 1, 3 },
+        corruptMetadataDeviceIds: new HashSet<int> { 1 });
+
+    using (var first = DiskImageReaderFactory.Open(paths[0]))
+    using (var second = DiskImageReaderFactory.Open(paths[1]))
+    using (var third = DiskImageReaderFactory.Open(paths[2]))
+    using (var fourth = DiskImageReaderFactory.Open(paths[3]))
+    {
+        var partition = PartitionTableReader.ReadPartitions(first).Single();
+        var fs = new BtrfsFileSystem(
+            [
+                new PartitionSliceReader(first, partition),
+                new PartitionSliceReader(second, PartitionTableReader.ReadPartitions(second).Single()),
+                new PartitionSliceReader(third, PartitionTableReader.ReadPartitions(third).Single()),
+                new PartitionSliceReader(fourth, PartitionTableReader.ReadPartitions(fourth).Single()),
+            ],
+            partition);
+        var regular = fs.ListDirectory(fs.Root).Single(node => node.Name == "regular.bin");
+        Assert(
+            fs.ReadFile(regular, 0, checked((int)regular.Size))
+                .SequenceEqual(BtrfsTestImageFactory.RegularData),
+            "Btrfs RAID10 striped mirror fallback across stripe boundary");
+        Assert(!fs.IsDegraded, "Btrfs RAID10 complete device set");
+    }
+
+    using (var second = DiskImageReaderFactory.Open(paths[1]))
+    using (var fourth = DiskImageReaderFactory.Open(paths[3]))
+    {
+        var partition = PartitionTableReader.ReadPartitions(second).Single();
+        var fs = new BtrfsFileSystem(
+            [
+                new PartitionSliceReader(second, partition),
+                new PartitionSliceReader(fourth, PartitionTableReader.ReadPartitions(fourth).Single()),
+            ],
+            partition);
+        Assert(fs.IsDegraded, "Btrfs RAID10 degraded state");
+        Assert(fs.MissingDeviceIds.SequenceEqual([1UL, 3UL]), "Btrfs RAID10 missing devids");
+        var regular = fs.ListDirectory(fs.Root).Single(node => node.Name == "regular.bin");
+        Assert(
+            fs.ReadFile(regular, 0, checked((int)regular.Size))
+                .SequenceEqual(BtrfsTestImageFactory.RegularData),
+            "Btrfs RAID10 degraded read with one device per mirror group");
+    }
+
+    using (var third = DiskImageReaderFactory.Open(paths[2]))
+    using (var fourth = DiskImageReaderFactory.Open(paths[3]))
+    {
+        var partition = PartitionTableReader.ReadPartitions(third).Single();
+        try
+        {
+            _ = new BtrfsFileSystem(
+                [
+                    new PartitionSliceReader(third, partition),
+                    new PartitionSliceReader(fourth, PartitionTableReader.ReadPartitions(fourth).Single()),
+                ],
+                partition);
+            Assert(false, "Btrfs RAID10 rejects a missing mirror group");
+        }
+        catch (InvalidDataException ex)
+        {
+            Assert(
+                (ex.Message.Contains("deviceが不足", StringComparison.Ordinal)
+                    || ex.Message.Contains("全mirror", StringComparison.Ordinal))
+                    && ex.Message.Contains("devid=1", StringComparison.Ordinal)
+                    && ex.Message.Contains("devid=2", StringComparison.Ordinal),
+                "Btrfs RAID10 missing mirror group diagnostic");
+        }
     }
 }
 
