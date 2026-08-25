@@ -170,6 +170,14 @@
 - 3台near-2構成でrole wrap時にcopy側のdevice sectorが進む写像を合成回帰
 - 実`mdadm 4.3 --metadata=1.2 --level=10 --layout=n2 --chunk=64` + ext4を生成し、完全／2台degraded構成と300 MiBファイルをmanifest回帰で確認
 
+### Linux md RAID10 far／offset layout読み取り対応
+
+- Linux kernelの`__raid10_find_phys`と同じfar copy stride、offset配置、far-set wrapを実装
+- original／legacy／fixed far-set modeを解釈し、near×far copy数、component size、全物理mapping範囲を検証
+- 論理chunkごとのcopy roleを使ってdegraded可否を判定し、入力された複数copyの内容が一致しなければ停止
+- far、offset、legacy／fixed far-set、無効なfar-set modeを合成fixtureで検証
+- 実`mdadm 4.3 --layout=f2`／`o2`の2台構成を生成し、完全／1台degraded構成と160 MiBファイルをmanifest回帰で確認
+
 ### LVM2複数PV対応
 
 - 「複数ディスク」で指定した全入力をDiscUtilsのVolumeManagerへ登録し、VGに必要なPVを横断して検出
@@ -191,20 +199,20 @@
 
 ## 次回の推奨作業
 
-### 1. Linux md RAID10 far／offset layout
-
-- near layoutの基盤を使い、far copyのstride、far set、offset mappingを段階的に追加する
-- 実`mdadm --layout=f2`／`o2` fixtureとdegraded組み合わせを基準に安全条件を検証する
-
-### 2. LVM2 thin volume
+### 1. LVM2 thin volume
 
 - thin-pool metadata LVのsuperblock、space map、mapping btreeを読み取り専用で検証する
 - 最初に通常thin volume、その後snapshotと外部originを段階的に追加する
 
-### 3. Linux md RAID5
+### 2. Linux md RAID5
 
 - 全memberが揃った正常arrayの主要parity layoutから開始し、その後1台欠損のXOR復元を追加する
 - dirtyかつdegradedなarrayなど、parityを安全に信頼できない状態は拒否する
+
+### 3. LVM2 snapshot／cache／mirror segment
+
+- thin volumeの基盤を再利用してthin snapshotと外部originを段階的に追加する
+- 通常snapshot、cache、mirror、RAID segmentは個別にmappingと欠損device条件を検証する
 
 ## 保守・品質改善
 
@@ -219,7 +227,7 @@
 利用目的に応じ、次の順で検討します。
 
 1. Linux md RAIDの拡張
-   - RAID0／RAID1／RAID10 near対応を基盤に、RAID10 far/offset、その後RAID5/6を検討する
+   - RAID0／RAID1／RAID10 near/far/offset対応を基盤に、RAID5/6を検討する
 2. LVM2の拡張
    - striped対応を基盤に、thin、snapshot、cache、mirror、RAID segmentを段階的に対応する
 3. 証拠・暗号化形式の拡張

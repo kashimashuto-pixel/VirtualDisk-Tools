@@ -29,7 +29,7 @@ C# / Windows Forms で作成した、読み取り専用の仮想ディスク解�
   - striped LVは`stripe_size`単位でPVを切り替え、PV UUID、extent割り当て、data area、metadata header/text CRCを検証
   - 「複数ディスク」入力からPVをVG UUIDで束ね、必要なPVが揃ったLVを組み立て
   - 読めない場合は不足PV、未対応segment type、メタデータ破損、メタデータ未検出、または内部例外を警告欄と解析レポートへ表示
-- Linux md RAID0／RAID1／RAID10の検出・読み取り（metadata 1.x、RAID0 multi-zone、RAID1／RAID10 degraded対応）
+- Linux md RAID0／RAID1／RAID10の検出・読み取り（metadata 1.x、RAID0 multi-zone、RAID10 near／far／offset、RAID1／RAID10 degraded対応）
 - Windows Explorer風の左ツリー・右詳細一覧画面
   - `Alt + ↑`で親フォルダー、`Alt + ←`で戻る、`Alt + →`で進む
   - 画面上の「戻る」「進む」「上へ」ボタンでも同じ操作が可能
@@ -192,7 +192,7 @@ ProjFS マウントは Windows の Client-ProjFS 機能を使い、選択した�
 - Btrfsは単一／複数デバイスのsingle profile、RAID0、2-copy RAID1、3-copy RAID1C3、4-copy RAID1C4、striped mirrorのRAID10を読み取り専用で扱い、DEVICE_ITEM、devid、FSID、device UUIDとstripeを相互検証します。mirror profileではmetadata tree blockのCRC32Cまたはdata checksumが一致するコピーだけを採用し、破損時は検証済みの代替コピーへ切り替えます。RAID0／RAID10はchunkごとの`stripe_length`に従ってdeviceを切り替え、RAID10はさらに`sub_stripes`単位でmirrorを選択します。複数RAWはツールバーから一組として指定でき、実イメージ回帰manifestでも各companionのSHA-256を検証します。RAID0は全stripe deviceが必要です。mirror profileはchunk単位ですべてのmirror組に利用可能なstripeが残る場合だけdegraded読み取りで開き、欠損devidを警告へ表示します。subvolume、snapshot、default subvolumeとzlib・LZO・zstd圧縮extentを読み取れ、snapshot内に残る入れ子subvolume境界は元subvolumeへ誤接続せず空ディレクトリとして表示します。RAID5／6、暗号化extent、書き込みは未対応です。
 - Btrfsのsuperblock、metadata tree block、checksum treeに記録されたdata sectorのCRC32Cを検証し、不一致は読み取りを中止します。primary superblockが壊れている場合だけ、公式mirror位置（64 MiB／256 GiB）の検証済みbackupへ復旧し、primaryが有効なら常にprimaryを優先します。
 - SquashFS はライブラリが対応する圧縮形式のみ読み取れます。
-- Linux mdはmetadata 1.0／1.1／1.2のRAID0／RAID1／RAID10を読み取り専用で組み立てます。superblock checksum、array/device UUID、role、event counter、data/super offset、device範囲を検証し、同一eventのactive memberだけを使用します。RAID0はchunk単位のstriping、サイズが異なるmemberのmulti-zone original／alternate layoutに対応し、全active roleが揃わない場合は拒否します。RAID1は1台欠損、RAID10はnear copies 2以上／far copies 1で各mirror groupに1台以上残る構成のdegraded読み取りに対応します。複数mirrorの内容が一致しなければ停止します。RAID4／5／6、RAID10 far／offset layout、reshape・recovery中、replacement、bad-block log付きarray、metadata 0.90は未対応です。
+- Linux mdはmetadata 1.0／1.1／1.2のRAID0／RAID1／RAID10を読み取り専用で組み立てます。superblock checksum、array/device UUID、role、event counter、data/super offset、device範囲を検証し、同一eventのactive memberだけを使用します。RAID0はchunk単位のstriping、サイズが異なるmemberのmulti-zone original／alternate layoutに対応し、全active roleが揃わない場合は拒否します。RAID1は1台欠損、RAID10はnear／far／offset layoutとkernelのoriginal／legacy／fixed far-set配置を扱い、各mirror groupに1台以上残る構成をdegraded読み取りします。legacy far-setはLinux kernelと同じ配置を再現しますが、構成によって冗長性が低下するため、実際の論理chunkごとに利用可能なcopyを検証します。複数mirrorの内容が一致しなければ停止します。RAID4／5／6、reshape・recovery中、replacement、bad-block log付きarray、metadata 0.90は未対応です。
 - BitLockerはAES-XTS（128/256）に対応します。TPM単独保護、TPMとの複合保護、AES-CBC/Elephant Diffuserは未対応です。
 - BitLocker回復パスワード、通常パスワード、スタートアップキー、VMK、FVEKは設定・ログ・解析レポートへ保存しません。不要になったキー配列は可能な範囲で消去します。
 - LUKS1はAES-XTS/plain64の256/512-bit合成キーに対応します。detached header、AES-CBC、ESSIV、plain/plain64以外のIV方式は未対応です。

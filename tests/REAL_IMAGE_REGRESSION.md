@@ -125,6 +125,20 @@ metadata 1.2、64 KiB chunk、4台のnear-2 RAID10とext4を生成します。
 
 スクリプトはstripeとmirror groupを横断する300 MiBファイルを作成し、`e2fsck -fn`、`mdadm --detail`／`--examine`、各RAWと内部ファイルのSHA-256を表示します。完全構成は`"deviceSet": "Linux md RAID10"`と残り3台の`companionImages`を指定します。near-2の4台構成ではrole 1と3のように各mirror groupから1台ずつ登録するとdegraded回帰も確認できます。同じmirror groupの2台だけでは組み立てを拒否します。
 
+far-2／offset-2 layoutは、2台構成の専用fixtureで検証します。
+
+```powershell
+.\tools\New-MdRaid10ExtendedRegressionFixture.ps1 `
+  -Layout Far `
+  -OutputDirectory .\.tmp\real-images\mdraid10-far
+
+.\tools\New-MdRaid10ExtendedRegressionFixture.ps1 `
+  -Layout Offset `
+  -OutputDirectory .\.tmp\real-images\mdraid10-offset
+```
+
+各スクリプトはstripe境界を横断する160 MiBファイルを作成し、`e2fsck -fn`、`mdadm --detail`／`--examine`、各RAWと内部ファイルのSHA-256を表示します。完全構成では2台目を`companionImages`へ指定し、1台だけのcaseも登録するとfar／offsetそれぞれのdegraded読み取りを確認できます。
+
 ### LVM2 multiple PV
 
 WSL 2のUbuntu 24.04へ`lvm2`と`e2fsprogs`をインストールし、2個のPVにまたがるlinear LVとext4を生成します。
