@@ -48,73 +48,115 @@ public static class LogicalVolumeDiscoverer
         {
             var metadataInspection = LvmMetadataInspector.Inspect(disks[0], lvmPartitions, cancellationToken);
             var metadataSummaries = metadataInspection.Summaries;
-            diagnostics.AddRange(metadataInspection.Errors.Select(error => new LvmDiagnostic(error, true)));
-            AppendMetadataDiagnostics(metadataSummaries, lvmPartitions.Count, diagnostics);
-
-            var manager = new VolumeManager();
-            foreach (var diskStream in diskStreams)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                manager.AddDisk(diskStream);
-            }
-
-            cancellationToken.ThrowIfCancellationRequested();
-            var physicalVolumes = manager.GetPhysicalVolumes();
-            var lvmPhysicalVolumes = physicalVolumes
-                .Where(LogicalVolumeManager.HandlesPhysicalVolume)
-                .ToList();
-            diagnostics.Add(new LvmDiagnostic(
-                $"LVM2: {disks.Count:N0}個の入力deviceから"
-                + $"{lvmPhysicalVolumes.Count:N0}個のPhysical VolumeをDiscUtilsが認識しました。",
-                false));
-
-            var logicalVolumes = manager.GetLogicalVolumes()
-                .Where(volume => volume.PhysicalVolume is null)
-                .ToList();
-            cancellationToken.ThrowIfCancellationRequested();
 
             var number = firstNumber;
-            foreach (var volume in logicalVolumes)
+            var stripedDiscovery = LvmStripedVolumeDiscoverer.Discover(
+                disks[0],
+                lvmPartitions,
+                cancellationToken);
+            var requiresStripedReader = stripedDiscovery.RequiresStripedReader
+                || metadataSummaries.Any(summary => summary.MaximumStripeCount > 1);
+            if (requiresStripedReader)
             {
-                cancellationToken.ThrowIfCancellationRequested();
-                try
+                diagnostics.AddRange(stripedDiscovery.Diagnostics);
+                foreach (var volume in stripedDiscovery.Volumes)
                 {
-                    var stream = volume.Open();
-                    var reader = new StreamBlockReader(stream);
-                    ownedReaders.Add(reader);
-                    keepDiskStreams = true;
-
-                    var identity = volume.Identity ?? "";
                     volumes.Add(new PartitionInfo
                     {
                         Number = number++,
                         Scheme = "LVM2",
-                        Name = ShortenIdentity(identity),
-                        Type = "LVM2 logical volume",
-                        TypeId = identity,
+                        Name = ShortenIdentity(volume.Name),
+                        Type = volume.StripeCount > 1
+                            ? $"LVM2 striped logical volume ({volume.StripeCount:N0} stripes)"
+                            : "LVM2 logical volume (linear)",
+                        TypeId = volume.LvmId,
                         StartLba = 0,
-                        SectorCount = checked((ulong)Math.Max(0, volume.Length / 512)),
-                        ReaderOverride = reader,
-                        LengthOverrideBytes = volume.Length
+                        SectorCount = checked((ulong)(volume.Reader.Length / 512)),
+                        ReaderOverride = volume.Reader,
+                        LengthOverrideBytes = volume.Reader.Length
                     });
                 }
-                catch (OperationCanceledException)
+
+                diagnostics.Add(new LvmDiagnostic(
+                    $"LVM2: 検証済みmetadataから{stripedDiscovery.Volumes.Count:N0}個のstriped/linear LVを組み立てました。",
+                    false));
+            }
+            else
+            {
+                diagnostics.AddRange(metadataInspection.Errors.Select(error => new LvmDiagnostic(error, true)));
+                AppendMetadataDiagnostics(metadataSummaries, lvmPartitions.Count, diagnostics);
+                var manager = new VolumeManager();
+                foreach (var diskStream in diskStreams)
                 {
-                    throw;
+                    cancellationToken.ThrowIfCancellationRequested();
+                    manager.AddDisk(diskStream);
                 }
-                catch (Exception ex)
+
+                cancellationToken.ThrowIfCancellationRequested();
+                var physicalVolumes = manager.GetPhysicalVolumes();
+                var lvmPhysicalVolumes = physicalVolumes
+                    .Where(LogicalVolumeManager.HandlesPhysicalVolume)
+                    .ToList();
+                diagnostics.Add(new LvmDiagnostic(
+                    $"LVM2: {disks.Count:N0}個の入力deviceから"
+                    + $"{lvmPhysicalVolumes.Count:N0}個のPhysical VolumeをDiscUtilsが認識しました。",
+                    false));
+
+                var logicalVolumes = manager.GetLogicalVolumes()
+                    .Where(volume => volume.PhysicalVolume is null)
+                    .ToList();
+                cancellationToken.ThrowIfCancellationRequested();
+
+                foreach (var volume in logicalVolumes)
                 {
-                    diagnostics.Add(new LvmDiagnostic(
-                        $"LVM2 LV {volume.Identity}: 論理ボリュームを開けませんでした: {FormatException(ex)}",
-                        true));
+                    cancellationToken.ThrowIfCancellationRequested();
+
+                    try
+                    {
+                        var stream = volume.Open();
+                        var reader = new StreamBlockReader(stream);
+                        ownedReaders.Add(reader);
+                        keepDiskStreams = true;
+
+                        var identity = volume.Identity ?? "";
+                        volumes.Add(new PartitionInfo
+                        {
+                            Number = number++,
+                            Scheme = "LVM2",
+                            Name = ShortenIdentity(identity),
+                            Type = "LVM2 logical volume",
+                            TypeId = identity,
+                            StartLba = 0,
+                            SectorCount = checked((ulong)Math.Max(0, volume.Length / 512)),
+                            ReaderOverride = reader,
+                            LengthOverrideBytes = volume.Length
+                        });
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        throw;
+                    }
+                    catch (Exception ex)
+                    {
+                        diagnostics.Add(new LvmDiagnostic(
+                            $"LVM2 LV {volume.Identity}: 論理ボリュームを開けませんでした: {FormatException(ex)}",
+                            true));
+                    }
                 }
             }
 
             if (volumes.Count == 0)
             {
-                var metadataLvCount = metadataSummaries.Count == 0
-                    ? 0
-                    : metadataSummaries.Max(summary => summary.LogicalVolumeCount);
+                if (!requiresStripedReader)
+                {
+                    diagnostics.AddRange(stripedDiscovery.Diagnostics);
+                }
+
+                var metadataLvCount = requiresStripedReader
+                    ? stripedDiscovery.LogicalVolumeDefinitionCount
+                    : metadataSummaries.Count == 0
+                        ? 0
+                        : metadataSummaries.Max(summary => summary.LogicalVolumeCount);
                 var reason = metadataLvCount == 0
                     ? "LVMメタデータ内にLogical Volume定義がありません。"
                     : "Logical Volume定義はありますが、利用可能なPVと対応セグメントだけでは再構築できませんでした。";
@@ -195,8 +237,8 @@ public static class LogicalVolumeDiscoverer
             if (summary.MaximumStripeCount > 1)
             {
                 diagnostics.Add(new LvmDiagnostic(
-                    $"LVM2 PV #{summary.PartitionNumber}: 最大stripe_count={summary.MaximumStripeCount:N0}です。現在のDiscUtilsは単一stripeのlinear相当のみを開けます。",
-                    true));
+                    $"LVM2 PV #{summary.PartitionNumber}: 最大stripe_count={summary.MaximumStripeCount:N0}です。組み込みのstriped LV readerで検証します。",
+                    false));
             }
         }
     }

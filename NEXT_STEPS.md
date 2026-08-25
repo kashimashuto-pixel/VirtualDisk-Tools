@@ -179,17 +179,32 @@
 - 2個の合成PVに分割したFAT16 LVで、PV境界をまたぐ読み取りと欠損PVを回帰確認
 - 実`lvm2 2.03.16`で2個のPVにまたがるext4 LVを生成し、`e2fsck -fn`と160 MiBの境界横断ファイルをmanifest回帰で確認
 
+### LVM2 striped LV対応
+
+- LVM2 label、PV header、data/metadata area、metadata header CRC、active metadata text CRCを検証する組み込みreaderを追加
+- 最新seqnoのVG metadataを選択し、同一seqnoのmetadata copyが不一致なら安全に拒否
+- `stripe_count > 1`と`stripe_size`から論理offsetをPV・physical extentへ写像し、segment／stripe境界をまたぐ読み取りに対応
+- PV UUID、`pe_start`、`pe_count`、segment連続性、stripe数、物理data area範囲を相互検証
+- 片方のmetadata textが破損していても、別PVのCRC検証済みcopyを使ってLVを組み立て
+- 2台64 KiB stripeの合成FAT16 fixtureで全体写像、境界、入力順、PV欠損、metadata copy破損、同一seqno不一致を回帰確認
+- 実`lvm2 2.03.16`で2台・64 KiB stripe・384 MiB ext4 LVを生成し、300 MiBファイルをmanifest回帰で確認
+
 ## 次回の推奨作業
 
-### 1. LVM2 striped LV
-
-- `stripe_count > 1`のsegmentを複数PVへ写像し、stripe境界をまたぐ読み取りを追加する
-- その後にthin、snapshot、cache、mirror／RAID segmentを段階的に検討する
-
-### 2. Linux md RAID10 far／offset layout
+### 1. Linux md RAID10 far／offset layout
 
 - near layoutの基盤を使い、far copyのstride、far set、offset mappingを段階的に追加する
 - 実`mdadm --layout=f2`／`o2` fixtureとdegraded組み合わせを基準に安全条件を検証する
+
+### 2. LVM2 thin volume
+
+- thin-pool metadata LVのsuperblock、space map、mapping btreeを読み取り専用で検証する
+- 最初に通常thin volume、その後snapshotと外部originを段階的に追加する
+
+### 3. Linux md RAID5
+
+- 全memberが揃った正常arrayの主要parity layoutから開始し、その後1台欠損のXOR復元を追加する
+- dirtyかつdegradedなarrayなど、parityを安全に信頼できない状態は拒否する
 
 ## 保守・品質改善
 
@@ -206,7 +221,7 @@
 1. Linux md RAIDの拡張
    - RAID0／RAID1／RAID10 near対応を基盤に、RAID10 far/offset、その後RAID5/6を検討する
 2. LVM2の拡張
-   - striped、thin、snapshot、cache、mirror、RAID segmentを段階的に対応する
+   - striped対応を基盤に、thin、snapshot、cache、mirror、RAID segmentを段階的に対応する
 3. 証拠・暗号化形式の拡張
    - EWF2/Ex01、LUKS detached header／複数segmentを検討する
 
