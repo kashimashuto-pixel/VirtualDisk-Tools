@@ -11,6 +11,7 @@ using Qcow2Explorer.FileSystems;
 using Qcow2Explorer.Mounting;
 using Qcow2Explorer.Partitions;
 using Qcow2Explorer.Previewing;
+using Qcow2Explorer.Shell;
 using DiscUtils.Streams;
 using DiscXfsFileSystem = DiscUtils.Xfs.XfsFileSystem;
 using VdiDisk = DiscUtils.Vdi.Disk;
@@ -111,6 +112,7 @@ static void RunGeneratedImageTests()
     TestFilePreviews();
     TestNavigationHistory();
     TestVirtualPaths();
+    TestFileAssociationDefinitions();
     TestNtfsMftMirrorFallback();
 
     var imagePath = Path.Combine(AppContext.BaseDirectory, "sample-fat16.qcow2");
@@ -4667,6 +4669,35 @@ static void TestVirtualPaths()
     Assert(VirtualPath.GetParent("/disk.qcow2") == "/", "virtual path root parent");
     Assert(VirtualPath.GetParent("/backup/images/disk.qcow2") == "/backup/images", "virtual path nested parent");
     Assert(VirtualPath.Split("/backup/images").SequenceEqual(["backup", "images"]), "virtual path split");
+}
+
+static void TestFileAssociationDefinitions()
+{
+    var definitions = FileAssociationManager.SupportedExtensions;
+    Assert(definitions.Count > 0, "file association definitions are available");
+    Assert(
+        definitions.All(item => item.Extension.StartsWith('.') && item.Extension.Length > 1),
+        "file association extensions are valid");
+    Assert(
+        definitions.Select(item => item.Extension).Distinct(StringComparer.OrdinalIgnoreCase).Count() == definitions.Count,
+        "file association extensions are unique");
+    Assert(
+        definitions.All(item => DiskImageReaderFactory.DialogFilter.Contains(
+            $"*{item.Extension}",
+            StringComparison.OrdinalIgnoreCase)),
+        "file association extensions are present in the open dialog");
+
+    var normalized = FileAssociationManager.NormalizeExtensions([".VHDX", ".qcow2", ".vhdx"]);
+    Assert(normalized.SequenceEqual([".qcow2", ".vhdx"]), "file association normalization and ordering");
+
+    try
+    {
+        _ = FileAssociationManager.NormalizeExtensions([".unsupported"]);
+        throw new InvalidOperationException("Test failed: unsupported file association extension was accepted");
+    }
+    catch (ArgumentException)
+    {
+    }
 }
 
 static void TestNtfsMftMirrorFallback()

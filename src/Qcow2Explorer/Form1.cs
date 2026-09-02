@@ -9,6 +9,7 @@ using Qcow2Explorer.Mounting;
 using Qcow2Explorer.Partitions;
 using Qcow2Explorer.Previewing;
 using Qcow2Explorer.Reporting;
+using Qcow2Explorer.Shell;
 
 namespace Qcow2Explorer;
 
@@ -126,6 +127,12 @@ public partial class Form1 : Form
         openFolderButton.Click += async (_, _) => await OpenImageFolderDialogAsync();
         var openPhysicalDiskButton = new ToolStripButton("物理ディスク");
         openPhysicalDiskButton.Click += async (_, _) => await OpenPhysicalDiskDialogAsync();
+        var associationButton = new ToolStripButton("関連付け");
+        associationButton.Click += (_, _) =>
+        {
+            using var dialog = new FileAssociationDialog();
+            dialog.ShowDialog(this);
+        };
         var reportButton = new ToolStripButton("解析レポート");
         reportButton.Click += (_, _) => SaveAnalysisReport();
         var snapshotButton = new ToolStripButton("スナップショット");
@@ -138,6 +145,7 @@ public partial class Form1 : Form
         toolStrip.Items.Add(openDeviceSetButton);
         toolStrip.Items.Add(openFolderButton);
         toolStrip.Items.Add(openPhysicalDiskButton);
+        toolStrip.Items.Add(associationButton);
         toolStrip.Items.Add(new ToolStripSeparator());
         toolStrip.Items.Add(new ToolStripLabel("ファイル"));
         toolStrip.Items.Add(_pathBox);
