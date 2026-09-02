@@ -10,6 +10,7 @@ C# / Windows Forms で作成した、通常は原本を変更しない仮想デ�
 - 仮想ディスクの概要表示
 - RAW／内製sparse QCOW2、MBR／GPT、XFS／ext4／NTFSを混在できる複数パーティション、初期ファイルを指定した仮想ディスクの新規作成
 - Windows物理ディスク (`\\.\PhysicalDriveN`) の通常時読み取り専用解析と、明示確認・復旧ジャーナル付きの実験的な直接編集
+- 対応ディスク拡張子ごとに選択できるWindowsファイル関連付け（現在のユーザー／PC全体）
 - ext4／XFS／FAT16／FAT32／NTFS／exFAT内のファイル内容変更（拡大・縮小を含む）／追加／削除、ディレクトリ作成／空ディレクトリ削除、ファイル・ディレクトリの移動／名前変更、属性・更新日時変更を行い、新しいRAW／QCOW2／VDIへ保存（実験的）
 - 仮想ディスクデータの Hex 表示
 - MBR / GPT パーティション一覧の表示
@@ -242,6 +243,17 @@ dotnet run --project src/VirtualDisk.Cli/VirtualDisk.Cli.csproj -- edit disk.qco
 OS非依存のreader、filesystem、partition、作成処理は`VirtualDisk.Core`（`net10.0`）に分離されています。WinForms版は物理ディスク、ProjFSなどWindows固有機能をadapter側に残しつつ、同じ共通コアを利用します。
 
 Visual Studio で開く場合は `Qcow2Explorer.sln` を使ってください。
+
+## Windowsファイル関連付け
+
+WinForms版の［ファイル］→［ファイルの関連付け...］から、Virtual Disk ExplorerをWindowsの「プログラムから開く」と既定アプリ候補へ登録できます。
+
+- 対応拡張子を個別に選択できます。「すべて解除」の状態で適用すると、このアプリが作成した登録を解除します。
+- 「現在のユーザーのみ」は管理者権限なしで登録します。
+- 「このPCのすべてのユーザー」はUACで管理者権限を要求し、PC全体へ候補登録します。
+- Windowsの仕様上、既定アプリの最終選択はユーザーがWindows設定で行います。
+- 登録には現在の実行ファイルの絶対パスを使うため、アプリを移動した場合は移動後に再登録してください。
+- `.hdd`フォルダーはWindowsではフォルダーとして扱われるため、関連付けの対象は`.hdd`ファイルだけです。
 
 ## Windows配布パッケージ
 
