@@ -4,7 +4,7 @@ using DiscXfsFileSystem = DiscUtils.Xfs.XfsFileSystem;
 
 namespace Qcow2Explorer.FileSystems;
 
-public sealed class XfsFileSystem : IReadOnlyFileSystem, IDisposable
+public sealed class XfsFileSystem : IReadOnlyFileSystem, IFileContentWriter, IDisposable
 {
     private readonly BlockReaderStream _stream;
     private readonly DiscXfsFileSystem _reader;
@@ -100,6 +100,31 @@ public sealed class XfsFileSystem : IReadOnlyFileSystem, IDisposable
         }
 
         return node.Metadata?.ToString() ?? "";
+    }
+
+    public bool CanReplaceFile(VfsNode file, long replacementLength, out string reason)
+    {
+        if (_rawReader is null || file.Metadata is not XfsNodeRef nodeRef)
+        {
+            reason = "このXFSレイアウトは書き込み解析に対応していません。";
+            return false;
+        }
+
+        return _rawReader.CanReplaceFile(nodeRef, replacementLength, out reason);
+    }
+
+    public void ReplaceFileContent(
+        VfsNode file,
+        Stream replacement,
+        long replacementLength,
+        CancellationToken cancellationToken = default)
+    {
+        if (_rawReader is null || file.Metadata is not XfsNodeRef nodeRef)
+        {
+            throw new NotSupportedException("このXFSレイアウトは書き込み解析に対応していません。");
+        }
+
+        _rawReader.ReplaceFileContent(nodeRef, replacement, replacementLength, cancellationToken);
     }
 
     public void Dispose()

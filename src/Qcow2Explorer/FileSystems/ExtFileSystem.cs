@@ -4,12 +4,17 @@ using Qcow2Explorer.Partitions;
 
 namespace Qcow2Explorer.FileSystems;
 
-public sealed class ExtFileSystem : IReadOnlyFileSystem
+public sealed class ExtFileSystem : IReadOnlyFileSystem, IFileContentWriter
 {
     private const uint ExtentsFlag = 0x00080000;
+    private const uint CompressionIncompatFlag = 0x00000001;
+    private const uint InlineDataIncompatFlag = 0x00008000;
+    private const uint EncryptionIncompatFlag = 0x00010000;
+    private const uint VerityReadOnlyCompatibleFlag = 0x00008000;
     private const int MaxDirectoryBytes = 64 * 1024 * 1024;
 
     private readonly IBlockReader _reader;
+    private readonly IBlockWriter? _writer;
     private readonly uint _inodeCount;
     private readonly ulong _blockCount;
     private readonly uint _firstDataBlock;
@@ -19,10 +24,13 @@ public sealed class ExtFileSystem : IReadOnlyFileSystem
     private readonly int _inodeSize;
     private readonly int _groupDescriptorSize;
     private readonly long _groupDescriptorOffset;
+    private readonly uint _incompatibleFeatures;
+    private readonly uint _readOnlyCompatibleFeatures;
 
     public ExtFileSystem(IBlockReader reader, PartitionInfo partition)
     {
         _reader = reader;
+        _writer = reader as IBlockWriter;
         Partition = partition;
         var super = EndianUtilities.ReadBytes(reader, 1024, 1024);
         if (EndianUtilities.ReadUInt16Little(super, 0x38) != 0xef53)
@@ -45,8 +53,9 @@ public sealed class ExtFileSystem : IReadOnlyFileSystem
         _groupDescriptorSize = Math.Max(32, descSize == 0 ? 32 : descSize);
         _groupDescriptorOffset = (long)(_firstDataBlock + 1) * _blockSize;
 
-        var incompat = EndianUtilities.ReadUInt32Little(super, 0x60);
-        Name = (incompat & 0x40) != 0 ? "ext4" : "ext2/ext3";
+        _incompatibleFeatures = EndianUtilities.ReadUInt32Little(super, 0x60);
+        _readOnlyCompatibleFeatures = EndianUtilities.ReadUInt32Little(super, 0x64);
+        Name = (_incompatibleFeatures & 0x40) != 0 ? "ext4" : "ext2/ext3";
         Root = new VfsNode { Name = "", IsDirectory = true, Metadata = 2U };
     }
 
@@ -91,6 +100,122 @@ public sealed class ExtFileSystem : IReadOnlyFileSystem
 
         var available = checked((int)Math.Min((ulong)count, inode.Size - (ulong)offset));
         return ReadInodeData(inode, offset, available);
+    }
+
+    public bool CanReplaceFile(VfsNode file, long replacementLength, out string reason)
+    {
+        if (_writer is null)
+        {
+            reason = "変更を保持する書き込みオーバーレイがありません。";
+            return false;
+        }
+
+        if (file.IsDirectory || file.Metadata is not uint inodeNumber)
+        {
+            reason = "通常ファイルだけを置換できます。";
+            return false;
+        }
+
+        if (replacementLength < 0)
+        {
+            reason = "置換ファイルのサイズが不正です。";
+            return false;
+        }
+
+        ExtInode inode;
+        try
+        {
+            inode = ReadInode(inodeNumber);
+        }
+        catch (Exception ex)
+        {
+            reason = $"inodeを読み取れません: {ex.Message}";
+            return false;
+        }
+
+        if (!inode.IsRegularFile)
+        {
+            reason = "通常ファイルだけを置換できます。";
+            return false;
+        }
+
+        if (inode.Size > long.MaxValue || replacementLength != (long)inode.Size)
+        {
+            reason = $"現在は元ファイルと同じサイズ（{inode.Size:N0} bytes）の置換だけに対応しています。";
+            return false;
+        }
+
+        var unsafeIncompat = CompressionIncompatFlag | InlineDataIncompatFlag | EncryptionIncompatFlag;
+        if ((_incompatibleFeatures & unsafeIncompat) != 0
+            || (_readOnlyCompatibleFeatures & VerityReadOnlyCompatibleFlag) != 0)
+        {
+            reason = "圧縮、inline data、暗号化、fs-verityを使うextファイルシステムはまだ書き込めません。";
+            return false;
+        }
+
+        try
+        {
+            ValidateFullyAllocated(inode);
+        }
+        catch (Exception ex) when (ex is InvalidDataException or NotSupportedException or OverflowException)
+        {
+            reason = ex.Message;
+            return false;
+        }
+
+        reason = string.Empty;
+        return true;
+    }
+
+    public void ReplaceFileContent(
+        VfsNode file,
+        Stream replacement,
+        long replacementLength,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(replacement);
+        if (!replacement.CanRead)
+        {
+            throw new ArgumentException("置換元ストリームを読み取れません。", nameof(replacement));
+        }
+
+        if (!CanReplaceFile(file, replacementLength, out var reason))
+        {
+            throw new NotSupportedException(reason);
+        }
+
+        var inode = ReadInode((uint)file.Metadata!);
+        var extents = ValidateFullyAllocated(inode);
+        var remaining = replacementLength;
+        var buffer = new byte[1024 * 1024];
+        foreach (var extent in extents)
+        {
+            var extentBytes = checked((long)extent.BlockCount * _blockSize);
+            var bytesToWrite = Math.Min(remaining, extentBytes);
+            var physicalOffset = checked((long)extent.PhysicalBlock * _blockSize);
+            long writtenToExtent = 0;
+            while (writtenToExtent < bytesToWrite)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var count = checked((int)Math.Min(buffer.Length, bytesToWrite - writtenToExtent));
+                replacement.ReadExactly(buffer.AsSpan(0, count));
+                _writer!.WriteAt(physicalOffset + writtenToExtent, buffer, 0, count);
+                writtenToExtent += count;
+                remaining -= count;
+            }
+
+            if (remaining == 0)
+            {
+                break;
+            }
+        }
+
+        if (remaining != 0 || replacement.ReadByte() != -1)
+        {
+            throw new InvalidDataException("置換元ファイルのサイズが指定値と一致しません。変更は破棄してください。");
+        }
+
+        _writer!.Flush();
     }
 
     private IReadOnlyList<VfsNode> ParseDirectory(byte[] data)
@@ -270,8 +395,8 @@ public sealed class ExtFileSystem : IReadOnlyFileSystem
                 var lengthRaw = EndianUtilities.ReadUInt16Little(node, entryOffset + 4);
                 var startHi = EndianUtilities.ReadUInt16Little(node, entryOffset + 6);
                 var startLo = EndianUtilities.ReadUInt32Little(node, entryOffset + 8);
-                var initialized = (lengthRaw & 0x8000) == 0;
-                var length = (uint)(lengthRaw & 0x7fff);
+                var initialized = lengthRaw <= 0x8000;
+                var length = initialized ? (uint)lengthRaw : (uint)(lengthRaw - 0x8000);
                 var physical = startLo | ((ulong)startHi << 32);
                 extents.Add(new ExtExtent(logical, length, physical, initialized));
             }
@@ -345,10 +470,58 @@ public sealed class ExtFileSystem : IReadOnlyFileSystem
         return value > long.MaxValue ? long.MaxValue : (long)value;
     }
 
+    private IReadOnlyList<ExtExtent> ValidateFullyAllocated(ExtInode inode)
+    {
+        var extents = GetDataExtents(inode)
+            .OrderBy(extent => extent.LogicalBlock)
+            .ToArray();
+        var requiredBlocks = inode.Size == 0
+            ? 0UL
+            : checked((inode.Size + (ulong)_blockSize - 1) / (ulong)_blockSize);
+        ulong nextLogicalBlock = 0;
+        foreach (var extent in extents)
+        {
+            if (extent.BlockCount == 0)
+            {
+                throw new InvalidDataException("長さ0のext extentが含まれています。");
+            }
+
+            if (!extent.Initialized)
+            {
+                throw new NotSupportedException("未初期化extentを含むファイルはまだ置換できません。");
+            }
+
+            if (extent.LogicalBlock != nextLogicalBlock)
+            {
+                throw new NotSupportedException("スパースファイルはまだ置換できません。");
+            }
+
+            var extentEnd = checked(extent.PhysicalBlock + extent.BlockCount);
+            if (extent.PhysicalBlock < _firstDataBlock || extentEnd > _blockCount)
+            {
+                throw new InvalidDataException("ext extentがファイルシステム範囲外です。");
+            }
+
+            nextLogicalBlock = checked(nextLogicalBlock + extent.BlockCount);
+            if (nextLogicalBlock >= requiredBlocks)
+            {
+                break;
+            }
+        }
+
+        if (nextLogicalBlock < requiredBlocks)
+        {
+            throw new NotSupportedException("未割り当て領域を含むファイルはまだ置換できません。");
+        }
+
+        return extents;
+    }
+
     private sealed record ExtExtent(uint LogicalBlock, uint BlockCount, ulong PhysicalBlock, bool Initialized);
 
     private sealed record ExtInode(uint Number, ushort Mode, ulong Size, uint Flags, DateTime? ModifiedUtc, byte[] BlockBytes)
     {
         public bool IsDirectory => (Mode & 0xf000) == 0x4000;
+        public bool IsRegularFile => (Mode & 0xf000) == 0x8000;
     }
 }

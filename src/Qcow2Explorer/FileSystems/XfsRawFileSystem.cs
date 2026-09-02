@@ -18,6 +18,7 @@ internal sealed class XfsRawFileSystem
     private const int MaxSymlinkDepth = 12;
 
     private readonly IBlockReader _reader;
+    private readonly IBlockWriter? _writer;
     private readonly XfsSuperBlock _superBlock;
     private readonly Dictionary<ulong, XfsInode> _inodeCache = new();
     private readonly Dictionary<ulong, IReadOnlyList<XfsDirectoryEntry>> _directoryCache = new();
@@ -26,6 +27,7 @@ internal sealed class XfsRawFileSystem
     private XfsRawFileSystem(IBlockReader reader)
     {
         _reader = reader;
+        _writer = reader as IBlockWriter;
         _superBlock = ReadSuperBlock(reader);
         _fileNameEncoding = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: false);
     }
@@ -143,6 +145,120 @@ internal sealed class XfsRawFileSystem
         return builder.ToString();
     }
 
+    public bool CanReplaceFile(XfsNodeRef file, long replacementLength, out string reason)
+    {
+        if (_writer is null)
+        {
+            reason = "変更を保持する書き込みオーバーレイがありません。";
+            return false;
+        }
+
+        if (file.Kind != XfsRawNodeKind.RegularFile || replacementLength < 0)
+        {
+            reason = "通常ファイルだけを置換できます。";
+            return false;
+        }
+
+        XfsInode inode;
+        try
+        {
+            inode = ReadInode(file.Inode);
+        }
+        catch (Exception ex)
+        {
+            reason = $"inodeを読み取れません: {ex.Message}";
+            return false;
+        }
+
+        if (inode.Length > long.MaxValue || replacementLength != (long)inode.Length)
+        {
+            reason = $"現在は元ファイルと同じサイズ（{inode.Length:N0} bytes）の置換だけに対応しています。";
+            return false;
+        }
+
+        if ((inode.Flags & 0x0001) != 0)
+        {
+            reason = "realtime device上のXFSファイルはまだ書き込めません。";
+            return false;
+        }
+
+        if ((inode.Flags2 & 0x0002) != 0)
+        {
+            reason = "共有reflink extentを持つXFSファイルはまだ書き込めません。";
+            return false;
+        }
+
+        if (inode.Format is not (2 or 3))
+        {
+            reason = "local形式のXFSファイルはまだ書き込めません。";
+            return false;
+        }
+
+        try
+        {
+            ValidateFullyAllocated(inode);
+        }
+        catch (Exception ex) when (ex is InvalidDataException or NotSupportedException or OverflowException)
+        {
+            reason = ex.Message;
+            return false;
+        }
+
+        reason = string.Empty;
+        return true;
+    }
+
+    public void ReplaceFileContent(
+        XfsNodeRef file,
+        Stream replacement,
+        long replacementLength,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(replacement);
+        if (!replacement.CanRead)
+        {
+            throw new ArgumentException("置換元ストリームを読み取れません。", nameof(replacement));
+        }
+
+        if (!CanReplaceFile(file, replacementLength, out var reason))
+        {
+            throw new NotSupportedException(reason);
+        }
+
+        var inode = ReadInode(file.Inode);
+        var extents = ValidateFullyAllocated(inode);
+        var remaining = replacementLength;
+        var buffer = new byte[1024 * 1024];
+        foreach (var extent in extents)
+        {
+            var extentBytes = checked((long)extent.BlockCount * _superBlock.BlockSize);
+            var bytesToWrite = Math.Min(remaining, extentBytes);
+            var physicalOffset = ExtentToDiskOffset(extent.StartBlock);
+            long writtenToExtent = 0;
+            while (writtenToExtent < bytesToWrite)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var count = checked((int)Math.Min(buffer.Length, bytesToWrite - writtenToExtent));
+                replacement.ReadExactly(buffer.AsSpan(0, count));
+                _writer!.WriteAt(physicalOffset + writtenToExtent, buffer, 0, count);
+                writtenToExtent += count;
+                remaining -= count;
+            }
+
+            if (remaining == 0)
+            {
+                break;
+            }
+        }
+
+        if (remaining != 0 || replacement.ReadByte() != -1)
+        {
+            throw new InvalidDataException("置換元ファイルのサイズが指定値と一致しません。変更は破棄してください。");
+        }
+
+        _writer!.Flush();
+    }
+
     private static XfsSuperBlock ReadSuperBlock(IBlockReader reader)
     {
         if (reader.Length < 512)
@@ -241,6 +357,8 @@ internal sealed class XfsRawFileSystem
             _superBlock.HasLargeExtentCounts
                 ? EndianUtilities.ReadUInt64Big(buffer, 0x18)
                 : EndianUtilities.ReadUInt32Big(buffer, 0x4c),
+            ReadUInt16Big(buffer, 0x5a),
+            flags2,
             forkOffset,
             dataFork);
         _inodeCache[number] = inode;
@@ -518,7 +636,8 @@ internal sealed class XfsRawFileSystem
         return new XfsExtent(
             (uint)(lower & 0x001fffff),
             (middle >> 5) & 0x000fffffffffffff,
-            (upper >> 9) & 0x003fffffffffffff);
+            (upper >> 9) & 0x003fffffffffffff,
+            (upper & 0x8000000000000000UL) != 0);
     }
 
     private byte[] ReadContent(XfsInode inode, long offset, int count)
@@ -666,6 +785,54 @@ internal sealed class XfsRawFileSystem
         return checked((long)((allocationGroup * _superBlock.AgBlocks + relativeBlock) * _superBlock.BlockSize));
     }
 
+    private IReadOnlyList<XfsExtent> ValidateFullyAllocated(XfsInode inode)
+    {
+        var extents = GetExtents(inode)
+            .OrderBy(extent => extent.StartOffset)
+            .ToArray();
+        var requiredBlocks = inode.Length == 0
+            ? 0UL
+            : checked((inode.Length + _superBlock.BlockSize - 1) / _superBlock.BlockSize);
+        ulong nextLogicalBlock = 0;
+        foreach (var extent in extents)
+        {
+            if (extent.BlockCount == 0)
+            {
+                throw new InvalidDataException("長さ0のXFS extentが含まれています。");
+            }
+
+            if (extent.IsUnwritten)
+            {
+                throw new NotSupportedException("未書き込みextentを含むXFSファイルはまだ置換できません。");
+            }
+
+            if (extent.StartOffset != nextLogicalBlock)
+            {
+                throw new NotSupportedException("スパースXFSファイルはまだ置換できません。");
+            }
+
+            var physicalOffset = ExtentToDiskOffset(extent.StartBlock);
+            var extentBytes = checked((long)extent.BlockCount * _superBlock.BlockSize);
+            if (physicalOffset < 0 || physicalOffset > _reader.Length - extentBytes)
+            {
+                throw new InvalidDataException("XFS extentがファイルシステム範囲外です。");
+            }
+
+            nextLogicalBlock = checked(nextLogicalBlock + extent.BlockCount);
+            if (nextLogicalBlock >= requiredBlocks)
+            {
+                break;
+            }
+        }
+
+        if (nextLogicalBlock < requiredBlocks)
+        {
+            throw new NotSupportedException("未割り当て領域を含むXFSファイルはまだ置換できません。");
+        }
+
+        return extents;
+    }
+
     private static XfsRawNodeKind GetNodeKind(XfsInode inode)
     {
         return inode.FileType switch
@@ -793,6 +960,8 @@ internal sealed class XfsRawFileSystem
         ulong Length,
         ulong BlockCount,
         ulong ExtentCount,
+        ushort Flags,
+        ulong Flags2,
         byte ForkOffset,
         byte[] DataFork)
     {
@@ -803,7 +972,7 @@ internal sealed class XfsRawFileSystem
 
     private sealed record XfsDirectoryEntry(string Name, ulong Inode, byte FileType);
 
-    private sealed record XfsExtent(uint BlockCount, ulong StartBlock, ulong StartOffset);
+    private sealed record XfsExtent(uint BlockCount, ulong StartBlock, ulong StartOffset, bool IsUnwritten);
 }
 
 internal sealed record XfsNodeRef(string Path, ulong Inode, XfsRawNodeKind Kind);

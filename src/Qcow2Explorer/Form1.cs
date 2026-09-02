@@ -22,6 +22,8 @@ public partial class Form1 : Form
     private readonly ToolStripButton _cancelSearchButton = new("検索キャンセル") { Enabled = false };
     private readonly ToolStripButton _cancelCopyButton = new("コピーキャンセル") { Enabled = false };
     private readonly ToolStripProgressBar _copyProgressBar = new() { AutoSize = false, Width = 120, Visible = false };
+    private readonly ToolStripProgressBar _writeProgressBar = new() { AutoSize = false, Width = 120, Visible = false };
+    private readonly ToolStripButton _cancelWriteButton = new("保存キャンセル") { Enabled = false };
     private readonly ToolStripButton _backNavigationButton = new("戻る") { Enabled = false, ToolTipText = "戻る (Alt+←)" };
     private readonly ToolStripButton _forwardNavigationButton = new("進む") { Enabled = false, ToolTipText = "進む (Alt+→)" };
     private readonly ToolStripButton _upNavigationButton = new("上へ") { Enabled = false, ToolTipText = "親フォルダーへ (Alt+↑)" };
@@ -58,10 +60,13 @@ public partial class Form1 : Form
     private readonly HashSet<CancellationTokenSource> _copyCancellations = [];
     private readonly SemaphoreSlim _copyExecutionGate = new(1, 1);
     private CancellationTokenSource? _copyProgressOwner;
+    private CancellationTokenSource? _writeCancellation;
     private readonly NavigationHistory<TreeNode> _navigationHistory = new();
     private bool _isHistoryNavigation;
     private bool _isLoadingImage;
+    private bool _isWritingImage;
     private bool _closeAfterLoadCancellation;
+    private bool _closeAfterWriteCancellation;
     private UefiVariableStore? _currentUefiVariableStore;
     private SwtpmStateStore? _currentTpmStateStore;
 
@@ -79,6 +84,7 @@ public partial class Form1 : Form
             _loadCancellation?.Cancel();
             _searchCancellation?.Cancel();
             CancelCopyOperations();
+            _writeCancellation?.Cancel();
             DisposeMounts();
             DisposeFileSystems();
             DisposePartitionReaders();
@@ -345,6 +351,8 @@ public partial class Form1 : Form
         copyButton.Click += async (_, _) => await CopySelectedItemsAsync();
         var copyFolderButton = new ToolStripButton("表示フォルダをコピー");
         copyFolderButton.Click += async (_, _) => await CopyCurrentDirectoryAsync();
+        var replaceFileButton = new ToolStripButton("同サイズ置換→RAW保存");
+        replaceFileButton.Click += async (_, _) => await ReplaceSelectedFileToRawAsync();
         var mountButton = new ToolStripButton("マウント");
         mountButton.Click += (_, _) => MountSelectedPartition();
         var deletedButton = new ToolStripButton("削除済みNTFS");
@@ -371,6 +379,7 @@ public partial class Form1 : Form
         };
         _cancelSearchButton.Click += (_, _) => _searchCancellation?.Cancel();
         _cancelCopyButton.Click += (_, _) => CancelCopyOperations();
+        _cancelWriteButton.Click += (_, _) => _writeCancellation?.Cancel();
         _backNavigationButton.Click += (_, _) => NavigateBack();
         _forwardNavigationButton.Click += (_, _) => NavigateForward();
         _upNavigationButton.Click += (_, _) => NavigateUp();
@@ -391,6 +400,10 @@ public partial class Form1 : Form
         explorerStrip.Items.Add(copyFolderButton);
         explorerStrip.Items.Add(_copyProgressBar);
         explorerStrip.Items.Add(_cancelCopyButton);
+        explorerStrip.Items.Add(new ToolStripSeparator());
+        explorerStrip.Items.Add(replaceFileButton);
+        explorerStrip.Items.Add(_writeProgressBar);
+        explorerStrip.Items.Add(_cancelWriteButton);
         explorerStrip.Items.Add(deletedButton);
         explorerStrip.Items.Add(new ToolStripSeparator());
         explorerStrip.Items.Add(mountButton);
@@ -953,6 +966,12 @@ public partial class Form1 : Form
 
     private async Task LoadImageAsync(string path, IReadOnlyList<string>? companionPaths = null)
     {
+        if (_isWritingImage)
+        {
+            _statusLabel.Text = "変更済みRAWの保存中は別のイメージを開けません";
+            return;
+        }
+
         if (_isLoadingImage)
         {
             _statusLabel.Text = "別のディスクイメージを読み込み中です";
@@ -3208,6 +3227,159 @@ public partial class Form1 : Form
         }
     }
 
+    private async Task ReplaceSelectedFileToRawAsync()
+    {
+        if (_isWritingImage)
+        {
+            _statusLabel.Text = "別の変更済みRAWを保存中です";
+            return;
+        }
+
+        if (_reader is null || _currentFileSystem is null
+            || _fileList.SelectedItems.Count != 1
+            || _fileList.SelectedItems[0].Tag is not VfsNode file
+            || file.IsDirectory)
+        {
+            MessageBox.Show(
+                this,
+                "ext4またはXFSの通常ファイルを1個選択してください。",
+                "ファイル置換",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+            return;
+        }
+
+        using var replacementDialog = new OpenFileDialog
+        {
+            Title = $"{file.Name} と同じサイズの置換元ファイルを選択",
+            Filter = "すべてのファイル (*.*)|*.*",
+        };
+        if (replacementDialog.ShowDialog(this) != DialogResult.OK)
+        {
+            return;
+        }
+
+        var replacementLength = new FileInfo(replacementDialog.FileName).Length;
+        if (!FileReplacementService.CanReplaceToRaw(
+                _reader,
+                _currentFileSystem.Partition,
+                _currentFileSystem,
+                file,
+                replacementLength,
+                out var reason))
+        {
+            MessageBox.Show(this, reason, "このファイルはまだ置換できません", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        using var outputDialog = new SaveFileDialog
+        {
+            Title = "変更済みディスクを新しいRAWイメージとして保存",
+            Filter = "RAW disk image (*.raw)|*.raw|Disk image (*.img)|*.img|All files (*.*)|*.*",
+            DefaultExt = "raw",
+            AddExtension = true,
+            OverwritePrompt = false,
+            FileName = $"{Path.GetFileNameWithoutExtension(_reader.Path)}-modified.raw",
+        };
+        if (outputDialog.ShowDialog(this) != DialogResult.OK)
+        {
+            return;
+        }
+
+        if (File.Exists(outputDialog.FileName) || Directory.Exists(outputDialog.FileName))
+        {
+            MessageBox.Show(
+                this,
+                "安全のため既存ファイルは上書きしません。存在しない新しい名前を指定してください。",
+                "出力先が既に存在します",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+            return;
+        }
+
+        var confirmation = MessageBox.Show(
+            this,
+            $"実験的な書き込み機能です。\r\n\r\n"
+                + $"仮想ファイル: {file.Name} ({file.Size:N0} bytes)\r\n"
+                + $"出力: {outputDialog.FileName}\r\n\r\n"
+                + "原本は変更せず、変更後の論理ディスク全体を新しいRAWイメージへ保存します。続行しますか？",
+            "ファイル置換の確認",
+            MessageBoxButtons.YesNo,
+            MessageBoxIcon.Warning,
+            MessageBoxDefaultButton.Button2);
+        if (confirmation != DialogResult.Yes)
+        {
+            return;
+        }
+
+        using var cancellation = new CancellationTokenSource();
+        _writeCancellation = cancellation;
+        _isWritingImage = true;
+        _cancelWriteButton.Enabled = true;
+        _writeProgressBar.Visible = true;
+        _writeProgressBar.Style = ProgressBarStyle.Marquee;
+        var progress = new Progress<DiskImageProgress>(update =>
+        {
+            _statusLabel.Text = update.Message;
+            if (update.Percentage is int percentage)
+            {
+                _writeProgressBar.Style = ProgressBarStyle.Blocks;
+                _writeProgressBar.Value = Math.Clamp(percentage, 0, 100);
+                _statusLabel.Text = $"{update.Message}: {percentage}%";
+            }
+            else
+            {
+                _writeProgressBar.Style = ProgressBarStyle.Marquee;
+            }
+        });
+
+        try
+        {
+            var source = _reader;
+            var fileSystem = _currentFileSystem;
+            var result = await Task.Run(() => FileReplacementService.ReplaceToRawAsync(
+                source,
+                fileSystem.Partition,
+                fileSystem,
+                file,
+                replacementDialog.FileName,
+                outputDialog.FileName,
+                progress,
+                cancellation.Token), cancellation.Token);
+            _statusLabel.Text = $"変更済みRAWを保存しました: {result.DestinationPath}";
+            MessageBox.Show(
+                this,
+                $"変更済みRAWを保存しました。\r\n\r\n{result.DestinationPath}\r\n"
+                    + $"置換: {result.BytesReplaced:N0} bytes\r\n"
+                    + $"SHA-256: {Convert.ToHexString(result.Sha256).ToLowerInvariant()}",
+                "ファイル置換完了",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+        }
+        catch (OperationCanceledException)
+        {
+            _statusLabel.Text = "変更済みRAWの保存をキャンセルしました";
+        }
+        catch (Exception ex)
+        {
+            _statusLabel.Text = "変更済みRAWの保存に失敗しました";
+            MessageBox.Show(this, ex.Message, "ファイル置換エラー", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+        finally
+        {
+            _writeCancellation = null;
+            _isWritingImage = false;
+            _cancelWriteButton.Enabled = false;
+            _writeProgressBar.Visible = false;
+            _writeProgressBar.Value = 0;
+            if (_closeAfterWriteCancellation && !IsDisposed)
+            {
+                _closeAfterWriteCancellation = false;
+                BeginInvoke(new Action(Close));
+            }
+        }
+    }
+
     private void MountSelectedPartition()
     {
         var partition = GetSelectedPartitionForMount();
@@ -3392,6 +3564,14 @@ public partial class Form1 : Form
         {
             _closeAfterLoadCancellation = true;
             CancelImageLoad();
+            e.Cancel = true;
+            return;
+        }
+
+        if (_isWritingImage)
+        {
+            _closeAfterWriteCancellation = true;
+            _writeCancellation?.Cancel();
             e.Cancel = true;
             return;
         }

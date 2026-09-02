@@ -17,6 +17,12 @@ using VdiDisk = DiscUtils.Vdi.Disk;
 using VmdkDisk = DiscUtils.Vmdk.Disk;
 using VmdkDiskCreateType = DiscUtils.Vmdk.DiskCreateType;
 
+if (args.Length == 5 && string.Equals(args[0], "--replace-file", StringComparison.OrdinalIgnoreCase))
+{
+    ReplaceFileInRawImage(args[1], args[2], args[3], args[4]);
+    return;
+}
+
 if (args.Length > 0 && string.Equals(args[0], "--list-physical", StringComparison.OrdinalIgnoreCase))
 {
     foreach (var disk in PhysicalDiskReader.Enumerate())
@@ -77,6 +83,64 @@ if (args.Length > 0)
 
 RunGeneratedImageTests();
 
+static void ReplaceFileInRawImage(
+    string imagePath,
+    string virtualPath,
+    string replacementPath,
+    string outputPath)
+{
+    using var source = new RawDiskImageReader(imagePath);
+    var partition = new PartitionInfo
+    {
+        Number = 1,
+        Scheme = "raw-filesystem",
+        StartLba = 0,
+        SectorCount = checked((ulong)(source.Length / 512)),
+        LengthOverrideBytes = source.Length,
+    };
+    partition.FileSystem = FileSystemDetector.Detect(source, partition);
+    var fileSystem = FileSystemDetector.TryOpen(source, partition, out var error)
+        ?? throw new InvalidDataException(error);
+    try
+    {
+        var file = ResolveVirtualPath(fileSystem, virtualPath);
+        var progress = new Progress<DiskImageProgress>(update =>
+        {
+            var suffix = update.Percentage is int percentage ? $" {percentage}%" : string.Empty;
+            Console.WriteLine($"{update.Message}{suffix}");
+        });
+        var result = FileReplacementService.ReplaceToRawAsync(
+            source,
+            partition,
+            fileSystem,
+            file,
+            replacementPath,
+            outputPath,
+            progress).GetAwaiter().GetResult();
+        Console.WriteLine(
+            $"Replacement passed: fs={partition.FileSystem}, bytes={result.BytesReplaced:N0}, "
+            + $"pages={result.ModifiedPageCount:N0}, sha256={Convert.ToHexString(result.Sha256).ToLowerInvariant()}, "
+            + $"output={result.DestinationPath}");
+    }
+    finally
+    {
+        (fileSystem as IDisposable)?.Dispose();
+    }
+
+    static VfsNode ResolveVirtualPath(IReadOnlyFileSystem fileSystem, string path)
+    {
+        var current = fileSystem.Root;
+        foreach (var part in path.Replace('\\', '/').Split('/', StringSplitOptions.RemoveEmptyEntries))
+        {
+            current = fileSystem.ListDirectory(current)
+                .SingleOrDefault(node => string.Equals(node.Name, part, StringComparison.Ordinal))
+                ?? throw new FileNotFoundException($"仮想パスが見つかりません: {path}");
+        }
+
+        return current;
+    }
+}
+
 static void RunGeneratedImageTests()
 {
     Assert(PhysicalDiskReader.IsPhysicalDiskPath(@"\\.\PhysicalDrive0"), "physical disk path detection");
@@ -111,6 +175,8 @@ static void RunGeneratedImageTests()
     TestFilePreviews();
     TestNavigationHistory();
     TestVirtualPaths();
+    TestCopyOnWriteBlockDevice();
+    TestExt4SameLengthReplacement();
     TestNtfsMftMirrorFallback();
 
     var imagePath = Path.Combine(AppContext.BaseDirectory, "sample-fat16.qcow2");
@@ -4669,6 +4735,118 @@ static void TestVirtualPaths()
     Assert(VirtualPath.Split("/backup/images").SequenceEqual(["backup", "images"]), "virtual path split");
 }
 
+static void TestCopyOnWriteBlockDevice()
+{
+    var sourceData = Enumerable.Range(0, 200_000).Select(index => (byte)(index * 31)).ToArray();
+    var source = new MemorySectorReader(sourceData, 512);
+    var overlay = new CopyOnWriteBlockDevice(source, 4096);
+    var replacement = Enumerable.Range(0, 7000).Select(index => (byte)(255 - index)).ToArray();
+    overlay.WriteAt(3500, replacement, 0, replacement.Length);
+
+    var actual = new byte[12_000];
+    overlay.ReadAt(0, actual, 0, actual.Length);
+    Assert(actual.AsSpan(0, 3500).SequenceEqual(sourceData.AsSpan(0, 3500)), "copy-on-write prefix");
+    Assert(actual.AsSpan(3500, replacement.Length).SequenceEqual(replacement), "copy-on-write replacement");
+    Assert(
+        actual.AsSpan(3500 + replacement.Length).SequenceEqual(
+            sourceData.AsSpan(3500 + replacement.Length, actual.Length - 3500 - replacement.Length)),
+        "copy-on-write suffix");
+    Assert(sourceData[3500] != replacement[0], "copy-on-write source remains unchanged");
+    Assert(overlay.ModifiedPageCount == 3, "copy-on-write changed page count");
+
+    var partition = new PartitionInfo
+    {
+        StartLba = 40,
+        SectorCount = 64,
+        LengthOverrideBytes = 32 * 1024,
+    };
+    var slice = new WritablePartitionSlice(overlay, partition);
+    var partitionReplacement = new byte[] { 0xde, 0xad, 0xbe, 0xef };
+    slice.WriteAt(100, partitionReplacement, 0, partitionReplacement.Length);
+    var partitionActual = new byte[partitionReplacement.Length];
+    overlay.ReadAt(partition.StartOffset + 100, partitionActual, 0, partitionActual.Length);
+    Assert(partitionActual.SequenceEqual(partitionReplacement), "writable partition offset translation");
+
+    var outputPath = Path.Combine(AppContext.BaseDirectory, "sample-copy-on-write.raw");
+    File.Delete(outputPath);
+    overlay.ExportRawAsync(outputPath).GetAwaiter().GetResult();
+    var exported = File.ReadAllBytes(outputPath);
+    Assert(exported.Length == sourceData.Length, "copy-on-write export length");
+    Assert(exported.AsSpan(3500, replacement.Length).SequenceEqual(replacement), "copy-on-write export data");
+    Assert(
+        exported.AsSpan((int)partition.StartOffset + 100, partitionReplacement.Length).SequenceEqual(partitionReplacement),
+        "copy-on-write partition export data");
+}
+
+static void TestExt4SameLengthReplacement()
+{
+    var sourcePath = Path.Combine(AppContext.BaseDirectory, "sample-ext4-write-source.raw");
+    var outputPath = Path.Combine(AppContext.BaseDirectory, "sample-ext4-write-output.raw");
+    var serviceOutputPath = Path.Combine(AppContext.BaseDirectory, "sample-ext4-write-service-output.raw");
+    var replacementPath = Path.Combine(AppContext.BaseDirectory, "sample-ext4-write-replacement.bin");
+    File.Delete(sourcePath);
+    File.Delete(outputPath);
+    File.Delete(serviceOutputPath);
+    File.Delete(replacementPath);
+    TestImageFactory.CreateExt4RawDisk(sourcePath);
+
+    using var source = new RawDiskImageReader(sourcePath);
+    var overlay = new CopyOnWriteBlockDevice(source, 4096);
+    var partition = new PartitionInfo
+    {
+        Number = 1,
+        Scheme = "test",
+        StartLba = 0,
+        SectorCount = checked((ulong)(source.Length / 512)),
+        LengthOverrideBytes = source.Length,
+        FileSystem = "ext4",
+    };
+    var slice = new WritablePartitionSlice(overlay, partition);
+    var fileSystem = new ExtFileSystem(slice, partition);
+    var hello = fileSystem.ListDirectory(fileSystem.Root).Single(node => node.Name == "HELLO.TXT");
+    var replacement = Encoding.ASCII.GetBytes("Writable ext4 content!!!\n");
+    Assert(replacement.Length == hello.Size, "ext4 replacement fixture length");
+    Assert(fileSystem.CanReplaceFile(hello, replacement.Length, out var reason), $"ext4 replacement support: {reason}");
+    Assert(!fileSystem.CanReplaceFile(hello, replacement.Length + 1, out _), "ext4 size change rejection");
+
+    using (var replacementStream = new MemoryStream(replacement, writable: false))
+    {
+        fileSystem.ReplaceFileContent(hello, replacementStream, replacement.Length);
+    }
+
+    Assert(fileSystem.ReadFile(hello, 0, replacement.Length).SequenceEqual(replacement), "ext4 overlay replacement read");
+    var unchanged = new ExtFileSystem(new PartitionSliceReader(source, partition), partition);
+    Assert(
+        Encoding.ASCII.GetString(unchanged.ReadFile(hello, 0, (int)hello.Size)) == TestImageFactory.Ext4HelloText,
+        "ext4 source image remains unchanged");
+
+    overlay.ExportRawAsync(outputPath).GetAwaiter().GetResult();
+    using var exported = new RawDiskImageReader(outputPath);
+    var exportedFileSystem = new ExtFileSystem(new PartitionSliceReader(exported, partition), partition);
+    var exportedHello = exportedFileSystem.ListDirectory(exportedFileSystem.Root).Single(node => node.Name == "HELLO.TXT");
+    Assert(
+        exportedFileSystem.ReadFile(exportedHello, 0, replacement.Length).SequenceEqual(replacement),
+        "ext4 exported replacement read");
+
+    File.WriteAllBytes(replacementPath, replacement);
+    var serviceResult = FileReplacementService.ReplaceToRawAsync(
+        source,
+        partition,
+        unchanged,
+        hello,
+        replacementPath,
+        serviceOutputPath).GetAwaiter().GetResult();
+    Assert(serviceResult.BytesReplaced == replacement.Length, "ext4 replacement service byte count");
+    Assert(serviceResult.ModifiedPageCount > 0, "ext4 replacement service overlay pages");
+    Assert(serviceResult.Sha256.SequenceEqual(SHA256.HashData(replacement)), "ext4 replacement service hash");
+    using var serviceExported = new RawDiskImageReader(serviceOutputPath);
+    var serviceFileSystem = new ExtFileSystem(new PartitionSliceReader(serviceExported, partition), partition);
+    var serviceHello = serviceFileSystem.ListDirectory(serviceFileSystem.Root).Single(node => node.Name == "HELLO.TXT");
+    Assert(
+        serviceFileSystem.ReadFile(serviceHello, 0, replacement.Length).SequenceEqual(replacement),
+        "ext4 replacement service exported data");
+}
+
 static void TestNtfsMftMirrorFallback()
 {
     const int bytesPerSector = 512;
@@ -5595,6 +5773,11 @@ internal static class TestImageFactory
         string originalName = "sample-ext4.dd")
     {
         WriteLzop(path, CreateMinimalExt4Disk(), originalName, corruptHeaderChecksum);
+    }
+
+    public static void CreateExt4RawDisk(string path)
+    {
+        File.WriteAllBytes(path, CreateMinimalExt4Disk());
     }
 
     public static void CreateFat16VmaLzop(string path)
