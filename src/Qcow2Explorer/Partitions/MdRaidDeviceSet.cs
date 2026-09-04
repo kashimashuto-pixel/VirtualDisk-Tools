@@ -123,9 +123,9 @@ public static class MdRaidDeviceSet
                 $"reshape・recovery・bad-block等の未対応featureがあります: 0x{unsupportedFeatures:X8}");
         }
 
-        if (level is not 0 and not 1 and not 10)
+        if (level is not 0 and not 1 and not 5 and not 10)
         {
-            throw new NotSupportedException($"RAID level {level}は未対応です（現在はRAID0／RAID1／RAID10のみ）。");
+            throw new NotSupportedException($"RAID level {level}は未対応です（現在はRAID0／RAID1／RAID5／RAID10のみ）。");
         }
 
         var sizeSectors = EndianUtilities.ReadUInt64Little(data, 80);
@@ -141,7 +141,7 @@ public static class MdRaidDeviceSet
         var maximumDevices = EndianUtilities.ReadUInt32Little(data, 220);
         var recordedLogicalBlockSize = EndianUtilities.ReadUInt32Little(data, 224);
         var logicalBlockSize = recordedLogicalBlockSize == 0 ? 512U : recordedLogicalBlockSize;
-        if ((level is 1 or 10 && sizeSectors == 0)
+        if ((level is 1 or 5 or 10 && sizeSectors == 0)
             || (level == 0 && dataSizeSectors == 0)
             || raidDisks < 2
             || raidDisks > 1024)
@@ -171,13 +171,13 @@ public static class MdRaidDeviceSet
                 $"superblock checksumが一致しません: expected=0x{expectedChecksum:X8}, actual=0x{actualChecksum:X8}");
         }
 
-        if (level is 1 or 10 && dataSizeSectors < sizeSectors)
+        if (level is 1 or 5 or 10 && dataSizeSectors < sizeSectors)
         {
             throw new InvalidDataException(
                 $"component data sizeがarray sizeより小さいです: data={dataSizeSectors}, array={sizeSectors}");
         }
 
-        if (level is 1 or 10 && resyncOffsetSectors < sizeSectors)
+        if (level is 1 or 5 or 10 && resyncOffsetSectors < sizeSectors)
         {
             throw new NotSupportedException(
                 $"resync未完了のmemberは使用できません: resync={resyncOffsetSectors}, size={sizeSectors}");
@@ -188,6 +188,20 @@ public static class MdRaidDeviceSet
         {
             throw new InvalidDataException(
                 $"RAID0 chunk sizeが不正です: chunk={chunkSectors}, logical_block={logicalBlockSize}");
+        }
+
+        if (level == 5 && raidDisks < 3)
+        {
+            throw new InvalidDataException($"RAID5には3台以上のmemberが必要です: raid_disks={raidDisks}");
+        }
+
+        if (level == 5
+            && (chunkSectors < 8
+                || (chunkSectors & (chunkSectors - 1)) != 0
+                || chunkSectors % (logicalBlockSize / 512) != 0))
+        {
+            throw new InvalidDataException(
+                $"RAID5 chunk sizeが不正です: chunk={chunkSectors}, logical_block={logicalBlockSize}");
         }
 
         if (level == 10
@@ -353,6 +367,15 @@ public static class MdRaidDeviceSet
         else if (reference.Level == 1)
         {
             reader = new MdRaid1Reader(current, reference.SizeSectors, reference.LogicalBlockSize);
+        }
+        else if (reference.Level == 5)
+        {
+            reader = new MdRaid5Reader(
+                current,
+                reference.SizeSectors,
+                reference.ChunkSectors,
+                reference.Layout,
+                reference.LogicalBlockSize);
         }
         else
         {
@@ -583,6 +606,176 @@ public sealed class MdRaid1Reader : IMdRaidReader
 
         verified.CopyTo(buffer, bufferOffset);
     }
+}
+
+public sealed class MdRaid5Reader : IMdRaidReader
+{
+    private const uint LeftAsymmetric = 0;
+    private const uint RightAsymmetric = 1;
+    private const uint LeftSymmetric = 2;
+    private const uint RightSymmetric = 3;
+    private const uint Parity0 = 4;
+    private const uint ParityN = 5;
+    private readonly IReadOnlyDictionary<ushort, MdRaidComponent> _membersByRole;
+    private readonly uint _raidDisks;
+    private readonly uint _dataDisks;
+    private readonly uint _chunkSectors;
+    private readonly uint _layout;
+
+    internal MdRaid5Reader(
+        IReadOnlyList<MdRaidComponent> members,
+        ulong sizeSectors,
+        uint chunkSectors,
+        uint layout,
+        uint logicalSectorSize)
+    {
+        _raidDisks = members[0].Metadata.RaidDisks;
+        _dataDisks = _raidDisks - 1;
+        _chunkSectors = chunkSectors;
+        _layout = layout;
+        if (layout is not (LeftAsymmetric or RightAsymmetric or LeftSymmetric or RightSymmetric or Parity0 or ParityN))
+        {
+            throw new NotSupportedException($"RAID5 layout {layout}は未対応です（0～5のみ対応）。");
+        }
+
+        _membersByRole = members.ToDictionary(member => member.Metadata.Role);
+        AvailableRoles = members.Select(member => member.Metadata.Role).Order().ToArray();
+        if (_membersByRole.Count < _dataDisks)
+        {
+            throw new InvalidDataException(
+                $"RAID5には最低{_dataDisks:N0}台のactive memberが必要です: available={_membersByRole.Count:N0}/{_raidDisks:N0}");
+        }
+
+        var memberChunks = sizeSectors / chunkSectors;
+        if (memberChunks == 0)
+        {
+            throw new InvalidDataException("RAID5 component sizeがchunk sizeより小さいです。");
+        }
+
+        Length = checked((long)(memberChunks * _dataDisks * chunkSectors * 512UL));
+        LogicalSectorSize = logicalSectorSize;
+    }
+
+    public long Length { get; }
+    public uint LogicalSectorSize { get; }
+    public bool IsDegraded => _membersByRole.Count < _raidDisks;
+    public IReadOnlyList<ushort> AvailableRoles { get; }
+
+    public void ReadAt(long offset, byte[] buffer, int bufferOffset, int count)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(offset);
+        ArgumentOutOfRangeException.ThrowIfNegative(bufferOffset);
+        ArgumentOutOfRangeException.ThrowIfNegative(count);
+        if (offset > Length - count || bufferOffset > buffer.Length - count)
+        {
+            throw new ArgumentOutOfRangeException(nameof(count));
+        }
+
+        var remaining = count;
+        while (remaining > 0)
+        {
+            var logicalSector = checked((ulong)(offset / 512));
+            var byteInSector = checked((int)(offset % 512));
+            var chunkOffset = logicalSector % _chunkSectors;
+            var chunkRemaining = checked((long)((_chunkSectors - chunkOffset) * 512UL) - byteInSector);
+            var toRead = checked((int)Math.Min(remaining, chunkRemaining));
+            var mapping = MapData(logicalSector);
+            if (_membersByRole.TryGetValue(mapping.Role, out var member))
+            {
+                var physicalOffset = checked(
+                    (long)((member.Metadata.DataOffsetSectors + mapping.DeviceSector) * 512UL)
+                    + byteInSector);
+                member.Reader.ReadAt(physicalOffset, buffer, bufferOffset, toRead);
+            }
+            else
+            {
+                ReconstructMissingData(mapping.DeviceSector, byteInSector, buffer, bufferOffset, toRead);
+            }
+
+            offset += toRead;
+            bufferOffset += toRead;
+            remaining -= toRead;
+        }
+    }
+
+    private MdRaid5Mapping MapData(ulong logicalSector)
+    {
+        var dataChunk = logicalSector / _chunkSectors;
+        var dataIndex = checked((uint)(dataChunk % _dataDisks));
+        var stripe = dataChunk / _dataDisks;
+        var parityRole = GetParityRole(stripe);
+        var role = _layout switch
+        {
+            LeftAsymmetric or RightAsymmetric => dataIndex >= parityRole ? dataIndex + 1 : dataIndex,
+            LeftSymmetric or RightSymmetric => (parityRole + 1 + dataIndex) % _raidDisks,
+            Parity0 => dataIndex + 1,
+            ParityN => dataIndex,
+            _ => throw new InvalidOperationException("Unsupported RAID5 layout.")
+        };
+        var deviceSector = checked(stripe * _chunkSectors + logicalSector % _chunkSectors);
+        return new MdRaid5Mapping(checked((ushort)role), deviceSector);
+    }
+
+    private void ReconstructMissingData(
+        ulong deviceSector,
+        int byteInSector,
+        byte[] buffer,
+        int bufferOffset,
+        int count)
+    {
+        var reconstructed = new byte[count];
+        Exception? lastError = null;
+        var readCount = 0;
+        foreach (var role in Enumerable.Range(0, checked((int)_raidDisks)).Select(index => checked((ushort)index)))
+        {
+            if (!_membersByRole.TryGetValue(role, out var member))
+            {
+                continue;
+            }
+
+            var candidate = new byte[count];
+            try
+            {
+                var physicalOffset = checked(
+                    (long)((member.Metadata.DataOffsetSectors + deviceSector) * 512UL)
+                    + byteInSector);
+                member.Reader.ReadAt(physicalOffset, candidate, 0, count);
+                for (var index = 0; index < reconstructed.Length; index++)
+                {
+                    reconstructed[index] ^= candidate[index];
+                }
+
+                readCount++;
+            }
+            catch (IOException ex)
+            {
+                lastError = ex;
+            }
+        }
+
+        if (readCount != _dataDisks)
+        {
+            throw new IOException(
+                $"Linux md RAID5のXOR復元に必要なmemberを読み取れません: read={readCount:N0}/{_dataDisks:N0}",
+                lastError);
+        }
+
+        reconstructed.CopyTo(buffer, bufferOffset);
+    }
+
+    private uint GetParityRole(ulong stripe)
+    {
+        return _layout switch
+        {
+            LeftAsymmetric or LeftSymmetric => checked(_dataDisks - (uint)(stripe % _raidDisks)),
+            RightAsymmetric or RightSymmetric => checked((uint)(stripe % _raidDisks)),
+            Parity0 => 0,
+            ParityN => _dataDisks,
+            _ => throw new InvalidOperationException("Unsupported RAID5 layout.")
+        };
+    }
+
+    private sealed record MdRaid5Mapping(ushort Role, ulong DeviceSector);
 }
 
 public sealed class MdRaid10Reader : IMdRaidReader

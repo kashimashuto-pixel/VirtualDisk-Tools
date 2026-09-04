@@ -30,7 +30,7 @@ public sealed class BitLockerDecryptingReader : IBlockReader, IDisposable
         ObjectDisposedException.ThrowIf(_disposed, this);
         ArgumentOutOfRangeException.ThrowIfNegative(offset);
         ArgumentNullException.ThrowIfNull(buffer);
-        if (bufferOffset < 0 || count < 0 || bufferOffset + count > buffer.Length)
+        if (bufferOffset < 0 || count < 0 || bufferOffset > buffer.Length - count)
         {
             throw new ArgumentOutOfRangeException(nameof(bufferOffset));
         }

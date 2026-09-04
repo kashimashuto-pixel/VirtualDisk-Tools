@@ -19,7 +19,13 @@ public sealed class PartitionSliceReader : IBlockReader
     public void ReadAt(long offset, byte[] buffer, int bufferOffset, int count)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(offset);
-        if (offset + count > Length)
+        ArgumentNullException.ThrowIfNull(buffer);
+        if (bufferOffset < 0 || count < 0 || bufferOffset > buffer.Length - count)
+        {
+            throw new ArgumentOutOfRangeException(nameof(bufferOffset));
+        }
+
+        if (offset > Length - count)
         {
             var available = Math.Max(0, Length - offset);
             if (available > 0)
