@@ -92,6 +92,7 @@ static void RunGeneratedImageTests()
     Test4KnGptParsing();
     TestGeneratedMdRaid1Image();
     TestGeneratedMdRaid0Image();
+    TestGeneratedMdRaid5Image();
     TestGeneratedMdRaid10Image();
     TestLvmMetadataDiagnostics();
     TestGeneratedLvm2Image();
@@ -3357,6 +3358,90 @@ static void TestGeneratedMdRaid0Image()
     }
 }
 
+static void TestGeneratedMdRaid5Image()
+{
+    var paths = Enumerable.Range(0, 3)
+        .Select(index => Path.Combine(AppContext.BaseDirectory, $"synthetic-md-raid5-{index}.raw"))
+        .ToArray();
+    var expected = TestImageFactory.CreateMdRaid5Fat16(paths);
+    using (var first = DiskImageReaderFactory.Open(paths[0]))
+    using (var second = DiskImageReaderFactory.Open(paths[1]))
+    using (var third = DiskImageReaderFactory.Open(paths[2]))
+    {
+        var discovery = MdRaidDeviceSet.Discover([third, first, second]);
+        Assert(discovery.Components.Count == 3, "Linux md RAID5 component discovery");
+        Assert(discovery.Arrays.Count == 1, string.Join(Environment.NewLine, discovery.Diagnostics));
+        var array = discovery.Arrays[0];
+        Assert(array.Level == 5 && array.LevelName == "RAID5", "Linux md RAID5 level");
+        Assert(!array.Reader.IsDegraded, "Linux md RAID5 complete array");
+        Assert(array.Reader.AvailableRoles.SequenceEqual(new ushort[] { 0, 1, 2 }), "Linux md RAID5 role ordering");
+        Assert(array.Reader.Length == expected.Length, "Linux md RAID5 length");
+        Assert(
+            Qcow2Explorer.Core.EndianUtilities.ReadBytes(array.Reader, 0, expected.Length)
+                .SequenceEqual(expected),
+            "Linux md RAID5 full left-symmetric mapping");
+        Assert(
+            Qcow2Explorer.Core.EndianUtilities.ReadBytes(array.Reader, 64 * 1024 - 31, 160)
+                .SequenceEqual(expected.AsSpan(64 * 1024 - 31, 160)),
+            "Linux md RAID5 chunk-boundary mapping");
+
+        var partitions = PartitionTableReader.ReadPartitions(array.Reader);
+        Assert(partitions.Count == 1, "partition table inside Linux md RAID5");
+        var partition = partitions[0];
+        partition.FileSystem = FileSystemDetector.Detect(array.Reader, partition);
+        Assert(partition.FileSystem == "FAT16", "FAT16 inside Linux md RAID5");
+        var fs = FileSystemDetector.TryOpen(array.Reader, partition, out var error);
+        Assert(fs is not null, error);
+        var hello = fs!.ListDirectory(fs.Root).Single(node => node.Name == "HELLO.TXT");
+        Assert(
+            Encoding.ASCII.GetString(fs.ReadFile(hello, 0, (int)hello.Size)) == TestImageFactory.HelloText,
+            "Linux md RAID5 file read");
+    }
+
+    using (var first = DiskImageReaderFactory.Open(paths[0]))
+    using (var third = DiskImageReaderFactory.Open(paths[2]))
+    {
+        var discovery = MdRaidDeviceSet.Discover([third, first]);
+        Assert(discovery.Arrays.Count == 1, string.Join(Environment.NewLine, discovery.Diagnostics));
+        Assert(discovery.Arrays[0].Reader.IsDegraded, "Linux md RAID5 degraded assembly");
+        Assert(discovery.Arrays[0].Reader.AvailableRoles.SequenceEqual(new ushort[] { 0, 2 }), "Linux md RAID5 degraded roles");
+        Assert(
+            Qcow2Explorer.Core.EndianUtilities.ReadBytes(discovery.Arrays[0].Reader, 0, expected.Length)
+                .SequenceEqual(expected),
+            "Linux md RAID5 degraded XOR reconstruction");
+    }
+
+    using (var first = DiskImageReaderFactory.Open(paths[0]))
+    {
+        var discovery = MdRaidDeviceSet.Discover([first]);
+        Assert(discovery.Arrays.Count == 0, "Linux md RAID5 rejects two missing members");
+        Assert(
+            discovery.Diagnostics.Any(message => message.Contains("active member", StringComparison.Ordinal)),
+            "Linux md RAID5 missing-member diagnostic");
+    }
+
+    var unsupportedPaths = Enumerable.Range(0, 3)
+        .Select(index => Path.Combine(AppContext.BaseDirectory, $"synthetic-md-raid5-unsupported-{index}.raw"))
+        .ToArray();
+    _ = TestImageFactory.CreateMdRaid5Fat16(unsupportedPaths, layout: 6);
+    var readers = unsupportedPaths.Select(path => DiskImageReaderFactory.Open(path)).ToList();
+    try
+    {
+        var discovery = MdRaidDeviceSet.Discover(readers.Cast<IBlockReader>().ToList());
+        Assert(discovery.Arrays.Count == 0, "Linux md RAID5 rejects unsupported layout");
+        Assert(
+            discovery.Diagnostics.Any(message => message.Contains("layout", StringComparison.Ordinal)),
+            "Linux md RAID5 unsupported-layout diagnostic");
+    }
+    finally
+    {
+        foreach (var reader in readers)
+        {
+            reader.Dispose();
+        }
+    }
+}
+
 static void TestGeneratedMdRaid10Image()
 {
     var paths = Enumerable.Range(0, 4)
@@ -5437,6 +5522,83 @@ internal static class TestImageFactory
         return expected;
     }
 
+    public static byte[] CreateMdRaid5Fat16(
+        IReadOnlyList<string> paths,
+        uint layout = 2)
+    {
+        if (paths.Count < 3)
+        {
+            throw new ArgumentException("Synthetic RAID5 requires at least three paths.", nameof(paths));
+        }
+
+        const int dataOffset = 1024 * 1024;
+        const uint chunkSectors = 128;
+        const int chunkBytes = checked((int)chunkSectors * BytesPerSector);
+        var arrayData = CreateVirtualDisk();
+        var dataDisks = paths.Count - 1;
+        if (arrayData.Length % checked(chunkBytes * dataDisks) != 0)
+        {
+            throw new InvalidOperationException("Synthetic RAID5 data must fill complete stripes.");
+        }
+
+        var memberDataLength = arrayData.Length / dataDisks;
+        var componentLength = checked(dataOffset + memberDataLength + 1024 * 1024);
+        var components = Enumerable.Range(0, paths.Count)
+            .Select(_ => new byte[componentLength])
+            .ToArray();
+        var stripeCount = arrayData.Length / checked(chunkBytes * dataDisks);
+        for (var stripe = 0; stripe < stripeCount; stripe++)
+        {
+            var parityRole = GetMdRaid5ParityRole(stripe, paths.Count, layout);
+            var parity = new byte[chunkBytes];
+            for (var dataIndex = 0; dataIndex < dataDisks; dataIndex++)
+            {
+                var logicalOffset = checked((stripe * dataDisks + dataIndex) * chunkBytes);
+                var role = GetMdRaid5DataRole(dataIndex, paths.Count, layout, parityRole);
+                Array.Copy(
+                    arrayData,
+                    logicalOffset,
+                    components[role],
+                    checked(dataOffset + stripe * chunkBytes),
+                    chunkBytes);
+                for (var index = 0; index < parity.Length; index++)
+                {
+                    parity[index] ^= arrayData[logicalOffset + index];
+                }
+            }
+
+            parity.CopyTo(components[parityRole], checked(dataOffset + stripe * chunkBytes));
+        }
+
+        var setUuid = Guid.Parse("c870c7bd-c438-461b-a050-90ae7d5f20b2").ToByteArray();
+        byte[][] deviceUuids =
+        [
+            Guid.Parse("34fe833a-0016-4f8e-a5d7-f7dbcc7ff69c").ToByteArray(),
+            Guid.Parse("dc678af8-440c-4140-a59d-4ce8aaf73f68").ToByteArray(),
+            Guid.Parse("3d1066ee-c604-4046-b6a1-dd749b6726e8").ToByteArray(),
+            Guid.Parse("9d30332c-0808-45f3-92c8-9fb856bd7ad8").ToByteArray(),
+        ];
+        var memberSizeSectors = checked((ulong)(memberDataLength / BytesPerSector));
+        for (var index = 0; index < components.Length; index++)
+        {
+            var superblock = CreateMdSuperblock(
+                setUuid,
+                deviceUuids[index],
+                checked((uint)index),
+                checked((ushort)index),
+                memberSizeSectors,
+                events: 81,
+                level: 5,
+                layout: layout,
+                chunkSectors: chunkSectors,
+                raidDisks: checked((uint)paths.Count));
+            superblock.CopyTo(components[index], 4096);
+            File.WriteAllBytes(paths[index], components[index]);
+        }
+
+        return arrayData;
+    }
+
     public static byte[] CreateMdRaid10Fat16(
         IReadOnlyList<string> paths,
         uint layout = 0x0102,
@@ -5585,6 +5747,30 @@ internal static class TestImageFactory
         }
 
         return arrayData;
+    }
+
+    private static int GetMdRaid5ParityRole(int stripe, int raidDisks, uint layout)
+    {
+        return layout switch
+        {
+            0 or 2 => checked(raidDisks - 1 - stripe % raidDisks),
+            1 or 3 => stripe % raidDisks,
+            4 => 0,
+            5 => raidDisks - 1,
+            _ => 0
+        };
+    }
+
+    private static int GetMdRaid5DataRole(int dataIndex, int raidDisks, uint layout, int parityRole)
+    {
+        return layout switch
+        {
+            0 or 1 => dataIndex >= parityRole ? dataIndex + 1 : dataIndex,
+            2 or 3 => (parityRole + 1 + dataIndex) % raidDisks,
+            4 => dataIndex + 1,
+            5 => dataIndex,
+            _ => dataIndex >= parityRole ? dataIndex + 1 : dataIndex
+        };
     }
 
     private static byte[] CreateMdSuperblock(

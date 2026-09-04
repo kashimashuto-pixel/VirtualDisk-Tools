@@ -178,6 +178,13 @@
 - far、offset、legacy／fixed far-set、無効なfar-set modeを合成fixtureで検証
 - 実`mdadm 4.3 --layout=f2`／`o2`の2台構成を生成し、完全／1台degraded構成と160 MiBファイルをmanifest回帰で確認
 
+### Linux md RAID5読み取り対応（第1段階）
+
+- metadata 1.xのRAID5 level、3台以上のmember、chunk size、resync完了状態、物理data範囲を検証
+- left/right asymmetric、left/right symmetric、parity-first、parity-last layoutの正常arrayを読み取り専用で写像
+- 1台欠損時はXORで欠損data chunkを復元し、2台以上欠損または未対応layoutは安全に拒否
+- 合成FAT16 fixtureで完全構成、1台欠損、2台欠損、未対応layoutを自動テスト定義に追加
+
 ### LVM2複数PV対応
 
 - 「複数ディスク」で指定した全入力をDiscUtilsのVolumeManagerへ登録し、VGに必要なPVを横断して検出
@@ -210,8 +217,8 @@
 
 ### 1. Linux md RAID5
 
-- 全memberが揃った正常arrayの主要parity layoutから開始し、その後1台欠損のXOR復元を追加する
-- dirtyかつdegradedなarrayなど、parityを安全に信頼できない状態は拒否する
+- 実`mdadm 4.3 --level=5` fixtureを生成し、主要parity layout、完全構成、1台degraded構成をmanifest回帰で確認する
+- dirtyかつdegradedなarrayなど、parityを安全に信頼できない状態の実metadata表現を確認し、明示的に拒否する
 
 ### 2. LVM2 thin snapshot／external origin
 
