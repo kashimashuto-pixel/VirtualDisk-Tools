@@ -1,6 +1,6 @@
 # 次回対応予定
 
-- 最終更新: 2026-08-25
+- 最終更新: 2026-09-04
 - 基準ブランチ: `main`
 
 この文書は、次回の開発作業へ引き継ぐための優先順位付きロードマップです。
@@ -223,6 +223,19 @@
 - thin volumeの基盤を再利用してthin snapshotと外部originを段階的に追加する
 - 通常snapshot、cache、mirror、RAID segmentは個別にmappingと欠損device条件を検証する
 
+### 4. XFS Raw Readerの回帰強化
+
+- format-3 inodeのbmap B+treeを含む合成XFS fixtureを追加し、inline extent、B+tree、sparse/unwritten extent、複数回・範囲横断読み取りを自動テストする
+- 30 GiB級、2 GiB超の単一extent、`int.MaxValue`超のファイルoffsetを含むfixtureで、block countとbyte offsetの計算が64-bitで行われることを回帰確認する
+- 実XFSイメージでRaw ReaderとLinuxの読み取り結果をファイル単位SHA-256で比較する任意回帰手順を追加する
+- DiscUtils XFS fallbackは、Raw Readerが解決済みのnodeを読み直さない経路を優先し、fallback失敗時もRaw Readerの読み取りを妨げないようにする
+
+### 5. LZO省容量モードのindex cache管理
+
+- 圧縮LZO block index sidecarの使用容量、作成日時、元ファイル検証状態を一覧表示し、選択削除できるUIを追加する
+- sidecar cacheのヒット、破棄、再構築、元ファイル変更、破損を自動テストで確認する
+- LZO検証用の単一block書き出しを公式`lzop`で復号して、指定logical offsetのSHA-256が一致するテストを追加する
+
 ## 保守・品質改善
 
 機能追加と並行して、次を独立したコミットで行います。
@@ -230,6 +243,10 @@
 - 破損・途中切れ・異常サイズの入力テストを増やす
 - XFS bigtime、BitLockerなどの実イメージ回帰テストを追加する
 - 外部由来の実イメージは、再配布条件と機密情報を確認してからテスト資産へ追加する
+- ディスクoffset、filesystem block番号、論理ファイル長は`long`/`ulong`で保持し、配列長と一回のI/Oサイズは`int`に限定する。乗算・加算は縮小変換より前に64-bitへ昇格し、`checked`で検証する
+- 巨大なQCOW2 L1 tableや圧縮clusterなど、`byte[]`の上限を超える入力は不透明なoverflowではなく理由付きで拒否する。対応時は一括確保ではなくchunked readを設計する
+- 診断ログは読み取り処理を停止させない。GUI購読者の例外を分離し、高頻度イベントは集約・抑制してコピー性能とUI応答性を維持する
+- ビルド・テスト用の`artifacts`と配布用の`publish`はGit管理外とし、大型fixtureがローカル容量を圧迫しないよう実行後に清掃する
 
 ## 将来の対応形式候補
 
@@ -241,6 +258,11 @@
    - striped／通常thin対応を基盤に、thin snapshot、external origin、通常snapshot、cache、mirror、RAID segmentを段階的に対応する
 3. 証拠・暗号化形式の拡張
    - EWF2/Ex01、LUKS detached header／複数segmentを検討する
+4. Linux・クロスプラットフォーム対応
+   - filesystem/image readerのCore層をWindows UIから分離し、`net10.0`のcross-platform libraryとしてLinux上のCLI・自動回帰から利用可能にする
+   - WinForms/ProjFS/物理ディスク列挙はWindows固有adapterとして維持し、LinuxではFUSE、mount helper、またはCLI exportを別実装として検討する
+   - CIへLinux runnerを追加し、RAW、QCOW2、LZO、EWF、LUKS、ext、XFS、Btrfs、md RAID、LVMの読み取り回帰を実行する
+   - 実イメージ検証では`xfs_repair -n`、`btrfs check --readonly`、`e2fsck -fn`、`cryptsetup`、`mdadm`、`lvm`などLinux標準ツールとの相互検証を継続する
 
 ## 維持する既存仕様
 
