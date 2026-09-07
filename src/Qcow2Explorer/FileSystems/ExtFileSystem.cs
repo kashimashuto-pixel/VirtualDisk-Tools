@@ -10,7 +10,9 @@ public sealed class ExtFileSystem : IReadOnlyFileSystem, IFileContentWriter
     private const uint CompressionIncompatFlag = 0x00000001;
     private const uint InlineDataIncompatFlag = 0x00008000;
     private const uint EncryptionIncompatFlag = 0x00010000;
+    private const uint NeedsRecoveryIncompatFlag = 0x00000004;
     private const uint VerityReadOnlyCompatibleFlag = 0x00008000;
+    private const ushort ValidFileSystemState = 0x0001;
     private const int MaxDirectoryBytes = 64 * 1024 * 1024;
 
     private readonly IBlockReader _reader;
@@ -26,6 +28,7 @@ public sealed class ExtFileSystem : IReadOnlyFileSystem, IFileContentWriter
     private readonly long _groupDescriptorOffset;
     private readonly uint _incompatibleFeatures;
     private readonly uint _readOnlyCompatibleFeatures;
+    private readonly ushort _fileSystemState;
 
     public ExtFileSystem(IBlockReader reader, PartitionInfo partition)
     {
@@ -55,6 +58,7 @@ public sealed class ExtFileSystem : IReadOnlyFileSystem, IFileContentWriter
 
         _incompatibleFeatures = EndianUtilities.ReadUInt32Little(super, 0x60);
         _readOnlyCompatibleFeatures = EndianUtilities.ReadUInt32Little(super, 0x64);
+        _fileSystemState = EndianUtilities.ReadUInt16Little(super, 0x3a);
         Name = (_incompatibleFeatures & 0x40) != 0 ? "ext4" : "ext2/ext3";
         Root = new VfsNode { Name = "", IsDirectory = true, Metadata = 2U };
     }
@@ -142,6 +146,13 @@ public sealed class ExtFileSystem : IReadOnlyFileSystem, IFileContentWriter
         if (inode.Size > long.MaxValue || replacementLength != (long)inode.Size)
         {
             reason = $"現在は元ファイルと同じサイズ（{inode.Size:N0} bytes）の置換だけに対応しています。";
+            return false;
+        }
+
+        if ((_fileSystemState & ValidFileSystemState) == 0
+            || (_incompatibleFeatures & NeedsRecoveryIncompatFlag) != 0)
+        {
+            reason = "journal replayが必要なdirty状態のextファイルシステムは書き込めません。先にe2fsckで検査してください。";
             return false;
         }
 

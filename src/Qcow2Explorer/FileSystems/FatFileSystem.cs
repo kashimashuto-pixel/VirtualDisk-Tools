@@ -4,9 +4,10 @@ using Qcow2Explorer.Partitions;
 
 namespace Qcow2Explorer.FileSystems;
 
-public sealed class FatFileSystem : IReadOnlyFileSystem
+public sealed class FatFileSystem : IReadOnlyFileSystem, IFileContentWriter
 {
     private readonly IBlockReader _reader;
+    private readonly IBlockWriter? _writer;
     private readonly int _bytesPerSector;
     private readonly int _sectorsPerCluster;
     private readonly int _reservedSectors;
@@ -18,10 +19,12 @@ public sealed class FatFileSystem : IReadOnlyFileSystem
     private readonly uint _firstDataSector;
     private readonly uint _rootCluster;
     private readonly int _fatBits;
+    private readonly uint _clusterCount;
 
     public FatFileSystem(IBlockReader reader, PartitionInfo partition)
     {
         _reader = reader;
+        _writer = reader as IBlockWriter;
         Partition = partition;
         var boot = EndianUtilities.ReadBytes(reader, 0, 512);
 
@@ -34,16 +37,39 @@ public sealed class FatFileSystem : IReadOnlyFileSystem
         _totalSectors = total16 != 0 ? total16 : EndianUtilities.ReadUInt32Little(boot, 32);
         var fat16 = EndianUtilities.ReadUInt16Little(boot, 22);
         _fatSizeSectors = fat16 != 0 ? fat16 : EndianUtilities.ReadUInt32Little(boot, 36);
-        _rootDirSectors = (uint)((_rootEntryCount * 32 + _bytesPerSector - 1) / _bytesPerSector);
+        if (_bytesPerSector is not (512 or 1024 or 2048 or 4096)
+            || _sectorsPerCluster <= 0
+            || (_sectorsPerCluster & (_sectorsPerCluster - 1)) != 0
+            || _reservedSectors <= 0
+            || _fatCount is < 1 or > 2
+            || _fatSizeSectors == 0)
+        {
+            throw new InvalidDataException("FAT BPB geometryが不正です。");
+        }
+
+        _rootDirSectors = checked((uint)((_rootEntryCount * 32 + _bytesPerSector - 1) / _bytesPerSector));
         _firstDataSector = (uint)(_reservedSectors + _fatCount * _fatSizeSectors + _rootDirSectors);
         _rootCluster = EndianUtilities.ReadUInt32Little(boot, 44);
 
+        if (_totalSectors <= _firstDataSector
+            || checked((ulong)_totalSectors * (ulong)_bytesPerSector) > (ulong)reader.Length)
+        {
+            throw new InvalidDataException("FAT data領域が入力範囲外です。");
+        }
+
         var dataSectors = _totalSectors - _firstDataSector;
-        var clusterCount = dataSectors / (uint)_sectorsPerCluster;
-        _fatBits = clusterCount < 4085 ? 12 : clusterCount < 65525 ? 16 : 32;
+        _clusterCount = dataSectors / (uint)_sectorsPerCluster;
+        _fatBits = _clusterCount < 4085 ? 12 : _clusterCount < 65525 ? 16 : 32;
         if (_fatBits == 12)
         {
             throw new NotSupportedException("FAT12 は検出のみ対応です。");
+        }
+
+        var fatEntryCapacity = checked((ulong)_fatSizeSectors * (ulong)_bytesPerSector * 8UL / (ulong)_fatBits);
+        if (fatEntryCapacity < (ulong)_clusterCount + 2
+            || (_fatBits == 32 && (_rootCluster < 2 || _rootCluster > _clusterCount + 1)))
+        {
+            throw new InvalidDataException("FAT tableまたはroot clusterのgeometryが不正です。");
         }
 
         Root = new VfsNode
@@ -122,6 +148,86 @@ public sealed class FatFileSystem : IReadOnlyFileSystem
         return output.Length == written ? output : output[..written];
     }
 
+    public bool CanReplaceFile(VfsNode file, long replacementLength, out string reason)
+    {
+        if (_writer is null)
+        {
+            reason = "変更を保持する書き込みオーバーレイがありません。";
+            return false;
+        }
+
+        if (file.IsDirectory || file.Metadata is not FatNodeMeta metadata)
+        {
+            reason = "通常ファイルだけを置換できます。";
+            return false;
+        }
+
+        if (replacementLength < 0 || replacementLength != file.Size)
+        {
+            reason = $"現在は元ファイルと同じサイズ（{file.Size:N0} bytes）の置換だけに対応しています。";
+            return false;
+        }
+
+        try
+        {
+            ValidateWritableState();
+            _ = GetValidatedFileClusters(metadata, file.Size);
+        }
+        catch (Exception ex) when (ex is InvalidDataException or NotSupportedException or OverflowException)
+        {
+            reason = ex.Message;
+            return false;
+        }
+
+        reason = string.Empty;
+        return true;
+    }
+
+    public void ReplaceFileContent(
+        VfsNode file,
+        Stream replacement,
+        long replacementLength,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(replacement);
+        if (!replacement.CanRead)
+        {
+            throw new ArgumentException("置換元ストリームを読み取れません。", nameof(replacement));
+        }
+
+        if (!CanReplaceFile(file, replacementLength, out var reason))
+        {
+            throw new NotSupportedException(reason);
+        }
+
+        var clusters = GetValidatedFileClusters((FatNodeMeta)file.Metadata!, file.Size);
+        var clusterBytes = checked(_bytesPerSector * _sectorsPerCluster);
+        var buffer = new byte[Math.Min(1024 * 1024, clusterBytes)];
+        var remaining = replacementLength;
+        foreach (var cluster in clusters)
+        {
+            var clusterRemaining = Math.Min(remaining, clusterBytes);
+            var physicalOffset = ClusterToOffset(cluster);
+            long written = 0;
+            while (written < clusterRemaining)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var count = checked((int)Math.Min(buffer.Length, clusterRemaining - written));
+                replacement.ReadExactly(buffer.AsSpan(0, count));
+                _writer!.WriteAt(physicalOffset + written, buffer, 0, count);
+                written += count;
+                remaining -= count;
+            }
+        }
+
+        if (remaining != 0 || replacement.ReadByte() != -1)
+        {
+            throw new InvalidDataException("置換元ファイルのサイズが指定値と一致しません。変更は破棄してください。");
+        }
+
+        _writer!.Flush();
+    }
+
     private byte[] ReadClusterChain(uint firstCluster, int? maxBytes)
     {
         var clusterBytes = _bytesPerSector * _sectorsPerCluster;
@@ -165,12 +271,35 @@ public sealed class FatFileSystem : IReadOnlyFileSystem
 
     private uint ReadFatEntry(uint cluster)
     {
+        return ReadFatEntryFromCopy(cluster, 0);
+    }
+
+    private uint ReadFatEntryFromCopy(uint cluster, int fatIndex)
+    {
         var fatOffset = _fatBits == 32 ? cluster * 4 : cluster * 2;
-        var offset = (long)_reservedSectors * _bytesPerSector + fatOffset;
+        var offset = checked(
+            ((long)_reservedSectors + (long)fatIndex * _fatSizeSectors) * _bytesPerSector
+            + fatOffset);
         var buffer = EndianUtilities.ReadBytes(_reader, offset, _fatBits == 32 ? 4 : 2);
         return _fatBits == 32
             ? EndianUtilities.ReadUInt32Little(buffer, 0) & 0x0fffffff
             : EndianUtilities.ReadUInt16Little(buffer, 0);
+    }
+
+    private uint ReadFatEntryVerified(uint cluster)
+    {
+        var expected = ReadFatEntryFromCopy(cluster, 0);
+        for (var fatIndex = 1; fatIndex < _fatCount; fatIndex++)
+        {
+            var candidate = ReadFatEntryFromCopy(cluster, fatIndex);
+            if (candidate != expected)
+            {
+                throw new InvalidDataException(
+                    $"FAT copy間でcluster {cluster:N0}の値が一致しません。");
+            }
+        }
+
+        return expected;
     }
 
     private bool IsEndOfChain(uint value)
@@ -180,8 +309,94 @@ public sealed class FatFileSystem : IReadOnlyFileSystem
 
     private long ClusterToOffset(uint cluster)
     {
+        if (cluster < 2 || cluster > _clusterCount + 1)
+        {
+            throw new InvalidDataException($"FAT cluster番号が範囲外です: {cluster:N0}");
+        }
+
         var sector = _firstDataSector + (cluster - 2) * (uint)_sectorsPerCluster;
         return checked((long)sector * _bytesPerSector);
+    }
+
+    private void ValidateWritableState()
+    {
+        var status = ReadFatEntryVerified(1);
+        var cleanMask = _fatBits == 32 ? 0x08000000U : 0x8000U;
+        var hardErrorMask = _fatBits == 32 ? 0x04000000U : 0x4000U;
+        if ((status & cleanMask) == 0)
+        {
+            throw new NotSupportedException("dirty状態のFAT volumeは書き込めません。先に標準ツールで検査してください。");
+        }
+
+        if ((status & hardErrorMask) == 0)
+        {
+            throw new NotSupportedException("I/O error状態が記録されたFAT volumeは書き込めません。");
+        }
+    }
+
+    private IReadOnlyList<uint> GetValidatedFileClusters(FatNodeMeta metadata, long fileSize)
+    {
+        var clusterBytes = checked(_bytesPerSector * _sectorsPerCluster);
+        var requiredClusters = fileSize == 0
+            ? 0L
+            : checked((fileSize + clusterBytes - 1) / clusterBytes);
+        if (requiredClusters == 0)
+        {
+            if (metadata.FirstCluster >= 2)
+            {
+                throw new NotSupportedException("長さ0ですがclusterが割り当てられたFATファイルは書き込めません。");
+            }
+
+            return Array.Empty<uint>();
+        }
+
+        if (metadata.FirstCluster < 2 || metadata.FirstCluster > _clusterCount + 1)
+        {
+            throw new InvalidDataException("FATファイルの先頭clusterが不正です。");
+        }
+
+        var result = new List<uint>(checked((int)Math.Min(requiredClusters, int.MaxValue)));
+        var visited = new HashSet<uint>();
+        var current = metadata.FirstCluster;
+        for (long index = 0; index < requiredClusters; index++)
+        {
+            if (current < 2 || current > _clusterCount + 1)
+            {
+                throw new InvalidDataException("FAT cluster chainがdata領域外を参照しています。");
+            }
+
+            if (!visited.Add(current))
+            {
+                throw new InvalidDataException("FAT cluster chainにloopがあります。");
+            }
+
+            result.Add(current);
+            var next = ReadFatEntryVerified(current);
+            if (index + 1 == requiredClusters)
+            {
+                if (!IsEndOfChain(next))
+                {
+                    throw new NotSupportedException("ファイルサイズを超えるcluster chainは安全のため書き込めません。");
+                }
+            }
+            else
+            {
+                if (next == 0 || IsEndOfChain(next))
+                {
+                    throw new InvalidDataException("FAT cluster chainがファイルサイズより短いです。");
+                }
+
+                var badCluster = _fatBits == 32 ? 0x0ffffff7U : 0xfff7U;
+                if (next == badCluster)
+                {
+                    throw new InvalidDataException("FAT cluster chainがbad clusterを参照しています。");
+                }
+            }
+
+            current = next;
+        }
+
+        return result;
     }
 
     private IReadOnlyList<VfsNode> ParseDirectory(byte[] data)

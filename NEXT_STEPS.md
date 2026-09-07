@@ -8,7 +8,7 @@
 
 ## 書き込み対応ロードマップ
 
-### 対応済み: ext4／XFSの同サイズファイル置換
+### 対応済み: ext4／XFS／FAT16／FAT32の同サイズファイル置換
 
 - 原本を変更しない64 KiBページ単位のコピーオンライトブロックデバイス
 - ext4 extent／legacy block pointerとXFS inline／B+tree extentの物理位置へ内容を書き込み
@@ -17,14 +17,18 @@
 - 物理ディスク、RAID、LVM、復号パーティション、既存出力の上書きを拒否
 - C#生成ext4 fixtureの原本不変・保存後再読込テスト
 - Linux生成ext4／XFSで`e2fsck -fn`、`xfs_repair -n`、読み取り専用マウント後の内容一致を検証
+- FAT16／FAT32はclean状態、複数FAT copyの一致、cluster chainの範囲・loop・長さを検証して割り当て済みdataだけを置換
+- C#合成FAT16／FAT32とLinux生成fixtureを`fsck.fat -vn`、読み取り専用マウント、内容一致で検証
 
 ### 次段階
 
-1. ext4の空きblock／inode bitmap、group descriptor、superblock checksumを更新し、新規ファイル作成とサイズ変更へ対応
-2. ext4 directory entry、link count、extent tree、journalを安全に更新し、削除／移動へ対応
-3. XFS allocation groupのfree-space／inode btree、rmap／refcount、directory、inode CRC、log更新へ対応
-4. XFSの新規作成、サイズ変更、削除、reflink CoWへ段階的に対応
-5. RAW以外のコンテナーを同形式で保存するwriterを追加
+1. NTFSの非resident・非圧縮・非スパース通常ファイルを、完全なrunlist検証後に同サイズ置換
+2. exFATの割り当て済みcluster chain／contiguous fileを検証して同サイズ置換
+3. ext4の空きblock／inode bitmap、group descriptor、superblock checksumを更新し、新規ファイル作成とサイズ変更へ対応
+4. ext4 directory entry、link count、extent tree、journalを安全に更新し、削除／移動へ対応
+5. XFS allocation groupのfree-space／inode btree、rmap／refcount、directory、inode CRC、log更新へ対応
+6. XFSの新規作成、サイズ変更、削除、reflink CoWへ段階的に対応
+7. RAW以外のコンテナーを同形式で保存するwriterを追加
 
 ## 対応済み
 

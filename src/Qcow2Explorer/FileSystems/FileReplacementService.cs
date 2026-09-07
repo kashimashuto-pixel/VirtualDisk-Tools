@@ -182,6 +182,12 @@ public static class FileReplacementService
             return new WritableFileSystemHandle(fileSystem, fileSystem, fileSystem);
         }
 
+        if (fileSystemName is "FAT16" or "FAT32")
+        {
+            var fileSystem = new FatFileSystem(slice, partition);
+            return new WritableFileSystemHandle(fileSystem, fileSystem, disposable: null);
+        }
+
         throw new NotSupportedException($"{fileSystemName}の書き込みにはまだ対応していません。");
     }
 

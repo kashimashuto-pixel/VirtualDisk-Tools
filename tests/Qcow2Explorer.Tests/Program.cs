@@ -179,6 +179,7 @@ static void RunGeneratedImageTests()
     TestNavigationHistory();
     TestVirtualPaths();
     TestCopyOnWriteBlockDevice();
+    TestFatSameLengthReplacement();
     TestExt4SameLengthReplacement();
     TestNtfsMftMirrorFallback();
 
@@ -4985,6 +4986,143 @@ static void TestExt4SameLengthReplacement()
     Assert(
         serviceFileSystem.ReadFile(serviceHello, 0, replacement.Length).SequenceEqual(replacement),
         "ext4 replacement service exported data");
+
+    var dirtyBytes = File.ReadAllBytes(sourcePath);
+    dirtyBytes[1024 + 0x3a] = 0;
+    var dirtyOverlay = new CopyOnWriteBlockDevice(new MemorySectorReader(dirtyBytes, 512), 4096);
+    var dirtySlice = new WritablePartitionSlice(dirtyOverlay, partition);
+    var dirtyFileSystem = new ExtFileSystem(dirtySlice, partition);
+    var dirtyHello = dirtyFileSystem.ListDirectory(dirtyFileSystem.Root).Single(node => node.Name == "HELLO.TXT");
+    Assert(
+        !dirtyFileSystem.CanReplaceFile(dirtyHello, dirtyHello.Size, out var dirtyReason)
+        && dirtyReason.Contains("dirty", StringComparison.OrdinalIgnoreCase),
+        "ext4 dirty journal rejection");
+}
+
+static void TestFatSameLengthReplacement()
+{
+    TestFatReplacement(
+        "FAT16",
+        "sample-fat16-write-source.raw",
+        TestImageFactory.CreateRawFat16Disk,
+        usePartitionTable: true);
+    TestFatReplacement(
+        "FAT32",
+        "sample-fat32-write-source.raw",
+        TestImageFactory.CreateFat32RawFileSystem,
+        usePartitionTable: false);
+
+    static void TestFatReplacement(
+        string expectedFileSystem,
+        string sourceName,
+        Action<string> createImage,
+        bool usePartitionTable)
+    {
+        var sourcePath = Path.Combine(AppContext.BaseDirectory, sourceName);
+        var outputPath = Path.Combine(AppContext.BaseDirectory, $"sample-{expectedFileSystem.ToLowerInvariant()}-write-output.raw");
+        var replacementPath = Path.Combine(AppContext.BaseDirectory, $"sample-{expectedFileSystem.ToLowerInvariant()}-write-replacement.bin");
+        File.Delete(sourcePath);
+        File.Delete(outputPath);
+        File.Delete(replacementPath);
+        createImage(sourcePath);
+        var originalHash = SHA256.HashData(File.ReadAllBytes(sourcePath));
+
+        using var source = new RawDiskImageReader(sourcePath);
+        var partition = usePartitionTable
+            ? PartitionTableReader.ReadPartitions(source).Single()
+            : new PartitionInfo
+            {
+                Number = 1,
+                Scheme = "raw-filesystem",
+                StartLba = 0,
+                SectorCount = checked((ulong)(source.Length / 512)),
+                LengthOverrideBytes = source.Length,
+            };
+        partition.FileSystem = FileSystemDetector.Detect(source, partition);
+        Assert(partition.FileSystem == expectedFileSystem, $"{expectedFileSystem} write fixture detection");
+        var fileSystem = FileSystemDetector.TryOpen(source, partition, out var error);
+        Assert(fileSystem is not null, error);
+        var hello = fileSystem!.ListDirectory(fileSystem.Root).Single(node => node.Name == "HELLO.TXT");
+        var replacement = Enumerable.Range(0, checked((int)hello.Size))
+            .Select(index => (byte)(index * 37 + 11))
+            .ToArray();
+        File.WriteAllBytes(replacementPath, replacement);
+
+        Assert(
+            FileReplacementService.CanReplaceToRaw(
+                source,
+                partition,
+                fileSystem,
+                hello,
+                replacement.Length,
+                out var reason),
+            $"{expectedFileSystem} replacement support: {reason}");
+        Assert(
+            !FileReplacementService.CanReplaceToRaw(
+                source,
+                partition,
+                fileSystem,
+                hello,
+                replacement.Length + 1,
+                out _),
+            $"{expectedFileSystem} size change rejection");
+
+        var result = FileReplacementService.ReplaceToRawAsync(
+            source,
+            partition,
+            fileSystem,
+            hello,
+            replacementPath,
+            outputPath).GetAwaiter().GetResult();
+        Assert(result.Sha256.SequenceEqual(SHA256.HashData(replacement)), $"{expectedFileSystem} replacement hash");
+        Assert(SHA256.HashData(File.ReadAllBytes(sourcePath)).SequenceEqual(originalHash), $"{expectedFileSystem} source unchanged");
+
+        using var output = new RawDiskImageReader(outputPath);
+        var outputPartition = usePartitionTable
+            ? PartitionTableReader.ReadPartitions(output).Single()
+            : new PartitionInfo
+            {
+                Number = 1,
+                Scheme = "raw-filesystem",
+                StartLba = 0,
+                SectorCount = checked((ulong)(output.Length / 512)),
+                LengthOverrideBytes = output.Length,
+                FileSystem = expectedFileSystem,
+            };
+        outputPartition.FileSystem = expectedFileSystem;
+        var outputFileSystem = FileSystemDetector.TryOpen(output, outputPartition, out error);
+        Assert(outputFileSystem is not null, error);
+        var outputHello = outputFileSystem!.ListDirectory(outputFileSystem.Root).Single(node => node.Name == "HELLO.TXT");
+        Assert(
+            outputFileSystem.ReadFile(outputHello, 0, replacement.Length).SequenceEqual(replacement),
+            $"{expectedFileSystem} exported replacement read");
+
+        var dirtyBytes = File.ReadAllBytes(sourcePath);
+        var partitionStart = checked((int)partition.StartOffset);
+        var bytesPerSector = BinaryPrimitives.ReadUInt16LittleEndian(dirtyBytes.AsSpan(partitionStart + 11, 2));
+        var reservedSectors = BinaryPrimitives.ReadUInt16LittleEndian(dirtyBytes.AsSpan(partitionStart + 14, 2));
+        var fatCount = dirtyBytes[partitionStart + 16];
+        var fatSectors = expectedFileSystem == "FAT32"
+            ? BinaryPrimitives.ReadUInt32LittleEndian(dirtyBytes.AsSpan(partitionStart + 36, 4))
+            : BinaryPrimitives.ReadUInt16LittleEndian(dirtyBytes.AsSpan(partitionStart + 22, 2));
+        for (var fatIndex = 0; fatIndex < fatCount; fatIndex++)
+        {
+            var fatStatusOffset = checked(
+                partitionStart
+                + (int)(reservedSectors + fatIndex * fatSectors) * bytesPerSector
+                + (expectedFileSystem == "FAT32" ? 4 : 2));
+            dirtyBytes[fatStatusOffset + (expectedFileSystem == "FAT32" ? 3 : 1)] &=
+                expectedFileSystem == "FAT32" ? (byte)0xf7 : (byte)0x7f;
+        }
+        var dirtyOverlay = new CopyOnWriteBlockDevice(new MemorySectorReader(dirtyBytes, 512), 4096);
+        var dirtySlice = new WritablePartitionSlice(dirtyOverlay, partition);
+        var dirtyFileSystem = new FatFileSystem(dirtySlice, partition);
+        var dirtyHello = dirtyFileSystem.ListDirectory(dirtyFileSystem.Root).Single(node => node.Name == "HELLO.TXT");
+        Assert(
+            !dirtyFileSystem.CanReplaceFile(dirtyHello, dirtyHello.Size, out var dirtyReason)
+            && dirtyReason.Contains("dirty", StringComparison.OrdinalIgnoreCase),
+            $"{expectedFileSystem} dirty volume rejection");
+    }
 }
 
 static void TestNtfsMftMirrorFallback()
@@ -5513,6 +5651,55 @@ internal static class TestImageFactory
     public static void CreateRawFat16Disk(string path)
     {
         File.WriteAllBytes(path, CreateVirtualDisk());
+    }
+
+    public static void CreateFat32RawFileSystem(string path)
+    {
+        const int sectorSize = 512;
+        const uint totalSectors = 81_920;
+        const ushort reservedSectors = 32;
+        const byte fatCount = 2;
+        const uint fatSectors = 640;
+        const uint firstDataSector = reservedSectors + fatCount * fatSectors;
+        const uint rootCluster = 2;
+        const uint fileCluster = 3;
+        var image = new byte[checked((int)totalSectors * sectorSize)];
+
+        image[0] = 0xeb;
+        image[1] = 0x58;
+        image[2] = 0x90;
+        WriteAscii(image, 3, "MSWIN4.1", 8);
+        WriteU16Le(image, 11, sectorSize);
+        image[13] = 1;
+        WriteU16Le(image, 14, reservedSectors);
+        image[16] = fatCount;
+        WriteU32Le(image, 32, totalSectors);
+        WriteU32Le(image, 36, fatSectors);
+        WriteU32Le(image, 44, rootCluster);
+        WriteU16Le(image, 48, 1);
+        WriteU16Le(image, 50, 6);
+        image[64] = 0x80;
+        image[66] = 0x29;
+        WriteU32Le(image, 67, 0x89abcdef);
+        WriteAscii(image, 71, "VDT FAT32  ", 11);
+        WriteAscii(image, 82, "FAT32   ", 8);
+        image[510] = 0x55;
+        image[511] = 0xaa;
+
+        for (var fatIndex = 0; fatIndex < fatCount; fatIndex++)
+        {
+            var fatOffset = checked((int)((reservedSectors + fatIndex * fatSectors) * sectorSize));
+            WriteU32Le(image, fatOffset, 0x0ffffff8);
+            WriteU32Le(image, fatOffset + 4, 0x0fffffff);
+            WriteU32Le(image, fatOffset + 8, 0x0fffffff);
+            WriteU32Le(image, fatOffset + 12, 0x0fffffff);
+        }
+
+        var rootOffset = checked((int)firstDataSector * sectorSize);
+        WriteDirectoryEntry(image, rootOffset, "HELLO   TXT", 0x20, checked((int)fileCluster), HelloText.Length);
+        var fileOffset = checked((int)(firstDataSector + fileCluster - 2) * sectorSize);
+        WriteAscii(image, fileOffset, HelloText, HelloText.Length);
+        File.WriteAllBytes(path, image);
     }
 
     public static void CreateMdRaid1Fat16(
@@ -7314,6 +7501,7 @@ internal static class TestImageFactory
         WriteU32Le(disk, super + 0x20, 8192);
         WriteU32Le(disk, super + 0x28, 32);
         WriteU16Le(disk, super + 0x38, 0xef53);
+        WriteU16Le(disk, super + 0x3a, 0x0001);
         WriteU16Le(disk, super + 0x58, inodeSize);
         WriteU32Le(disk, super + 0x60, 0x40);
         WriteU16Le(disk, super + 0xfe, 32);

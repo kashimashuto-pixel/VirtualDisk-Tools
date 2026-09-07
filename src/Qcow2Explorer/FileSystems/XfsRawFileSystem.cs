@@ -190,6 +190,12 @@ internal sealed class XfsRawFileSystem
             return false;
         }
 
+        if (_superBlock.InProgress)
+        {
+            reason = "mkfsまたはgrowfsが完了していないXFSファイルシステムは書き込めません。";
+            return false;
+        }
+
         if ((inode.Flags & 0x0001) != 0)
         {
             reason = "realtime device上のXFSファイルはまだ書き込めません。";
@@ -322,7 +328,8 @@ internal sealed class XfsRawFileSystem
             blockSize << dirBlockLog2,
             sbVersion == 5 && (incompatibleFeatures & 0x1) != 0 || (version & 0x8000) != 0 && (features2 & 0x0200) != 0,
             sbVersion == 5 && (incompatibleFeatures & 0x08) != 0,
-            sbVersion == 5 && (incompatibleFeatures & 0x20) != 0);
+            sbVersion == 5 && (incompatibleFeatures & 0x20) != 0,
+            buffer[0x7e] != 0);
     }
 
     private XfsInode ReadInode(ulong number)
@@ -1054,7 +1061,8 @@ internal sealed class XfsRawFileSystem
         uint DirectoryBlockSize,
         bool HasFType,
         bool HasBigTime,
-        bool HasLargeExtentCounts);
+        bool HasLargeExtentCounts,
+        bool InProgress);
 
     private sealed record XfsInode(
         ulong Number,
