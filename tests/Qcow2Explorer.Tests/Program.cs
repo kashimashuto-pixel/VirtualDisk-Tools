@@ -4917,6 +4917,14 @@ static void TestCopyOnWriteBlockDevice()
     Assert(
         exported.AsSpan((int)partition.StartOffset + 100, partitionReplacement.Length).SequenceEqual(partitionReplacement),
         "copy-on-write partition export data");
+
+    using var writableStream = new BlockReaderStream(overlay);
+    Assert(writableStream.CanWrite, "block reader stream exposes overlay writes");
+    writableStream.Position = 12345;
+    writableStream.Write(partitionReplacement, 0, partitionReplacement.Length);
+    var streamWritten = new byte[partitionReplacement.Length];
+    overlay.ReadAt(12345, streamWritten, 0, streamWritten.Length);
+    Assert(streamWritten.SequenceEqual(partitionReplacement), "block reader stream write forwarding");
 }
 
 static void TestExt4SameLengthReplacement()

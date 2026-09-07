@@ -3358,7 +3358,7 @@ public partial class Form1 : Form
         {
             MessageBox.Show(
                 this,
-                "ext4、XFS、FAT16、FAT32、NTFSの通常ファイルを1個選択してください。",
+                "ext4、XFS、FAT16、FAT32、NTFS、exFATの通常ファイルを1個選択してください。",
                 "ファイル置換",
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Information);

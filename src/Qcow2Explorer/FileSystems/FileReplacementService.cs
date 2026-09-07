@@ -1,6 +1,7 @@
 using System.Security.Cryptography;
 using Qcow2Explorer.Core;
 using Qcow2Explorer.Partitions;
+using DiscExFatFileSystem = DiscUtils.ExFat.ExFatFileSystem;
 
 namespace Qcow2Explorer.FileSystems;
 
@@ -198,6 +199,16 @@ public static class FileReplacementService
                 fileSystem,
                 disposable: null,
                 original => MapNtfsFile(fileSystem, original));
+        }
+
+        if (fileSystemName.Equals("exFAT", StringComparison.OrdinalIgnoreCase))
+        {
+            var fileSystem = new DiscUtilsFileSystem(
+                slice,
+                partition,
+                stream => new DiscExFatFileSystem(stream, ['\\', '/']),
+                "exFAT");
+            return new WritableFileSystemHandle(fileSystem, fileSystem, fileSystem);
         }
 
         throw new NotSupportedException($"{fileSystemName}の書き込みにはまだ対応していません。");

@@ -17,28 +17,30 @@ xfs_image="$fixture_dir/xfs-modified.raw"
 fat16_image="$fixture_dir/fat16-modified.raw"
 fat32_image="$fixture_dir/fat32-modified.raw"
 ntfs_image="$fixture_dir/ntfs-modified.raw"
+exfat_image="$fixture_dir/exfat-modified.raw"
 replacement="$fixture_dir/replacement.bin"
 ext_mount="$fixture_dir/ext-verify-mount"
 xfs_mount="$fixture_dir/xfs-verify-mount"
 fat16_mount="$fixture_dir/fat16-verify-mount"
 fat32_mount="$fixture_dir/fat32-verify-mount"
 ntfs_mount="$fixture_dir/ntfs-verify-mount"
+exfat_mount="$fixture_dir/exfat-verify-mount"
 
-for path in "$ext_image" "$xfs_image" "$fat16_image" "$fat32_image" "$ntfs_image" "$replacement" "$fixture_dir/source.sha256"; do
+for path in "$ext_image" "$xfs_image" "$fat16_image" "$fat32_image" "$ntfs_image" "$exfat_image" "$replacement" "$fixture_dir/source.sha256"; do
     if [[ ! -f "$path" ]]; then
         echo "Required validation input not found: $path" >&2
         exit 1
     fi
 done
 
-for command_name in e2fsck xfs_repair fsck.fat ntfsfix mount mountpoint umount cmp sha256sum; do
+for command_name in e2fsck xfs_repair fsck.fat ntfsfix fsck.exfat mount mountpoint umount cmp sha256sum; do
     if ! command -v "$command_name" >/dev/null 2>&1; then
         echo "Required command not found: $command_name" >&2
         exit 1
     fi
 done
 
-mkdir -p "$ext_mount" "$xfs_mount" "$fat16_mount" "$fat32_mount" "$ntfs_mount"
+mkdir -p "$ext_mount" "$xfs_mount" "$fat16_mount" "$fat32_mount" "$ntfs_mount" "$exfat_mount"
 cleanup() {
     if mountpoint -q "$ext_mount"; then
         umount "$ext_mount"
@@ -55,6 +57,9 @@ cleanup() {
     if mountpoint -q "$ntfs_mount"; then
         umount "$ntfs_mount"
     fi
+    if mountpoint -q "$exfat_mount"; then
+        umount "$exfat_mount"
+    fi
 }
 trap cleanup EXIT
 
@@ -64,6 +69,7 @@ xfs_repair -n "$xfs_image"
 fsck.fat -vn "$fat16_image"
 fsck.fat -vn "$fat32_image"
 ntfsfix -n "$ntfs_image"
+fsck.exfat -n "$exfat_image"
 
 mount -o loop,ro "$ext_image" "$ext_mount"
 cmp "$replacement" "$ext_mount/payload.bin"
@@ -85,4 +91,8 @@ mount -o loop,ro "$ntfs_image" "$ntfs_mount"
 cmp "$replacement" "$ntfs_mount/payload.bin"
 umount "$ntfs_mount"
 
-echo "ext4, XFS, FAT16, FAT32, and NTFS write regression validation passed."
+mount -o loop,ro "$exfat_image" "$exfat_mount"
+cmp "$replacement" "$exfat_mount/payload.bin"
+umount "$exfat_mount"
+
+echo "ext4, XFS, FAT16, FAT32, NTFS, and exFAT write regression validation passed."
