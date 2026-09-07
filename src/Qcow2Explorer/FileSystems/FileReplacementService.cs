@@ -50,7 +50,8 @@ public static class FileReplacementService
             var overlay = new CopyOnWriteBlockDevice(source);
             var slice = new WritablePartitionSlice(overlay, partition);
             using var writableFileSystem = CreateWritableFileSystem(originalFileSystem.Name, slice, partition);
-            return writableFileSystem.Writer.CanReplaceFile(file, replacementLength, out reason);
+            var writableFile = writableFileSystem.MapFile(file);
+            return writableFileSystem.Writer.CanReplaceFile(writableFile, replacementLength, out reason);
         }
         catch (Exception ex) when (ex is IOException or InvalidDataException or ArgumentException or NotSupportedException or OverflowException)
         {
@@ -100,6 +101,7 @@ public static class FileReplacementService
         var overlay = new CopyOnWriteBlockDevice(source);
         var slice = new WritablePartitionSlice(overlay, partition);
         using var writableFileSystem = CreateWritableFileSystem(originalFileSystem.Name, slice, partition);
+        var writableFile = writableFileSystem.MapFile(file);
         byte[] sourceHash;
         await using (var replacement = new FileStream(
             replacementPath,
@@ -111,7 +113,7 @@ public static class FileReplacementService
         {
             progress?.Report(new DiskImageProgress("ファイル内容をオーバーレイへ反映", 0, replacementInfo.Length));
             writableFileSystem.Writer.ReplaceFileContent(
-                file,
+                writableFile,
                 replacement,
                 replacementInfo.Length,
                 cancellationToken);
@@ -121,7 +123,7 @@ public static class FileReplacementService
 
         var writtenHash = ComputeVirtualFileHash(
             writableFileSystem.FileSystem,
-            file,
+            writableFile,
             replacementInfo.Length,
             progress,
             cancellationToken);
@@ -188,16 +190,44 @@ public static class FileReplacementService
             return new WritableFileSystemHandle(fileSystem, fileSystem, disposable: null);
         }
 
+        if (fileSystemName.Equals("NTFS", StringComparison.OrdinalIgnoreCase))
+        {
+            var fileSystem = new NtfsFileSystem(slice, partition);
+            return new WritableFileSystemHandle(
+                fileSystem,
+                fileSystem,
+                disposable: null,
+                original => MapNtfsFile(fileSystem, original));
+        }
+
         throw new NotSupportedException($"{fileSystemName}の書き込みにはまだ対応していません。");
+    }
+
+    private static VfsNode MapNtfsFile(NtfsFileSystem fileSystem, VfsNode original)
+    {
+        if (original.Metadata is long)
+        {
+            return original;
+        }
+
+        if (original.Metadata is string path && fileSystem.TryResolvePath(path, out var mapped))
+        {
+            return mapped;
+        }
+
+        throw new FileNotFoundException($"NTFS上で置換対象を再解決できません: {original.Name}");
     }
 
     private sealed class WritableFileSystemHandle(
         IReadOnlyFileSystem fileSystem,
         IFileContentWriter writer,
-        IDisposable? disposable) : IDisposable
+        IDisposable? disposable,
+        Func<VfsNode, VfsNode>? mapFile = null) : IDisposable
     {
         public IReadOnlyFileSystem FileSystem { get; } = fileSystem;
         public IFileContentWriter Writer { get; } = writer;
+
+        public VfsNode MapFile(VfsNode original) => mapFile?.Invoke(original) ?? original;
 
         public void Dispose() => disposable?.Dispose();
     }

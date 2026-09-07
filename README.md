@@ -9,7 +9,7 @@ C# / Windows Forms で作成した、原本を変更しない仮想ディスク�
 
 - 仮想ディスクの概要表示
 - Windows物理ディスク (`\\.\PhysicalDriveN`) の読み取り専用解析
-- ext4／XFS／FAT16／FAT32内の既存ファイルを同サイズの内容で置換し、変更済み論理ディスクを新しいRAWへ保存（実験的）
+- ext4／XFS／FAT16／FAT32／NTFS内の既存ファイルを同サイズの内容で置換し、変更済み論理ディスクを新しいRAWへ保存（実験的）
 - 仮想ディスクデータの Hex 表示
 - MBR / GPT パーティション一覧の表示
 - ファイルシステム検出と読み取り
@@ -108,22 +108,22 @@ C# / Windows Forms で作成した、原本を変更しない仮想ディスク�
 - 512バイトおよび4Kn論理セクターのLBA計算に対応します。
 - OSや別アプリが使用中のディスクは解析中にも内容が変化するため、表示が一時的に整合しない場合があります。
 
-## 実験的なext4／XFS／FAT16／FAT32書き込み
+## 実験的なext4／XFS／FAT16／FAT32／NTFS書き込み
 
-エクスプローラーでext4、XFS、FAT16、FAT32内の通常ファイルを1個選択し、「同サイズ置換→RAW保存」から置換元ファイルと出力先を指定します。
+エクスプローラーでext4、XFS、FAT16、FAT32、NTFS内の通常ファイルを1個選択し、「同サイズ置換→RAW保存」から置換元ファイルと出力先を指定します。
 
 - 原本、物理ディスク、既存の出力ファイルへは書き込みません。変更はメモリ上のコピーオンライト領域へ保持し、最後に新しいRAWイメージとして保存します。
 - 置換直後に仮想ファイルを読み戻し、置換元とSHA-256が一致した場合だけRAW保存へ進みます。
-- 現在はファイルサイズを変更しない内容置換に限定しています。FATはclean volumeかつ全FAT copyが一致する完全なcluster chainだけを扱います。ファイルの新規作成、削除、拡大・縮小、スパース／未初期化extent、XFSの共有reflink extentは未対応です。
+- 現在はファイルサイズを変更しない内容置換に限定しています。FATはclean volumeかつ全FAT copyが一致する完全なcluster chainだけを扱います。NTFSはclean volume上の単一MFT recordに収まる、非resident・非圧縮・非暗号化・非sparseの無名data streamだけを扱い、runlistと`$Bitmap`の割り当てを検証します。ファイルの新規作成、削除、拡大・縮小、スパース／未初期化extent、XFSの共有reflink extentは未対応です。
 - RAID、LVM、BitLocker／LUKSなどの合成・復号パーティションと物理ディスクは書き込み対象外です。
 - qcow2、VHDXなどを開いた場合も、出力はコンテナー形式ではなく展開済みの論理ディスク全体を格納するRAWです。出力先には元の仮想ディスクと同程度の空き容量が必要です。
 - 実験的機能のため、重要なイメージでは使用せず、出力RAWもLinux標準ツールで検査してから利用してください。
 
-Linux／WSLで実ext4・XFS・FAT16・FAT32イメージを生成し、置換後に`e2fsck -fn`、`xfs_repair -n`、`fsck.fat -vn`、読み取り専用マウントと内容比較を行う検証スクリプトも用意しています。
+Linux／WSLで実ext4・XFS・FAT16・FAT32・NTFSイメージを生成し、置換後に`e2fsck -fn`、`xfs_repair -n`、`fsck.fat -vn`、`ntfsfix -n`、読み取り専用マウントと内容比較を行う検証スクリプトも用意しています。
 
 ```bash
 sudo ./tools/new-write-regression-fixtures.sh /path/to/fixtures
-# テストプロジェクトの --replace-file で ext4/xfs/fat16/fat32-modified.raw を生成
+# テストプロジェクトの --replace-file で ext4/xfs/fat16/fat32/ntfs-modified.raw を生成
 sudo ./tools/validate-write-regression-output.sh /path/to/fixtures
 ```
 
@@ -194,7 +194,7 @@ ProjFS マウントは Windows の Client-ProjFS 機能を使い、選択した�
 
 ## 現在の制限
 
-- 通常の解析・コピー・マウントは読み取り専用です。実験的なext4／XFS／FAT16／FAT32置換だけが、原本とは別の新規RAWイメージを生成します。
+- 通常の解析・コピー・マウントは読み取り専用です。実験的なext4／XFS／FAT16／FAT32／NTFS置換だけが、原本とは別の新規RAWイメージを生成します。
 - 物理ディスクを開くには管理者権限が必要です。使用中ディスクの一貫したスナップショットは作成しません。
 - qcow2コンテナー自体の暗号化機能は未対応です。パーティションとして格納された対応形式のLUKS1/LUKS2は読み取れます。
 - qcow2 external data fileは、ヘッダー拡張にファイル名があり、同じPCから参照できる場合に読み取ります。

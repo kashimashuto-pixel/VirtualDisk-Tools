@@ -17,27 +17,29 @@ ext_image="$output_dir/ext4-source.raw"
 xfs_image="$output_dir/xfs-source.raw"
 fat16_image="$output_dir/fat16-source.raw"
 fat32_image="$output_dir/fat32-source.raw"
+ntfs_image="$output_dir/ntfs-source.raw"
 replacement="$output_dir/replacement.bin"
 ext_mount="$output_dir/ext-mount"
 xfs_mount="$output_dir/xfs-mount"
 fat16_mount="$output_dir/fat16-mount"
 fat32_mount="$output_dir/fat32-mount"
+ntfs_mount="$output_dir/ntfs-mount"
 
-for command_name in truncate mkfs.ext4 e2fsck mkfs.xfs xfs_repair mkfs.fat fsck.fat mount mountpoint umount dd sha256sum; do
+for command_name in truncate mkfs.ext4 e2fsck mkfs.xfs xfs_repair mkfs.fat fsck.fat mkfs.ntfs ntfsfix mount mountpoint umount dd sha256sum; do
     if ! command -v "$command_name" >/dev/null 2>&1; then
         echo "Required command not found: $command_name" >&2
         exit 1
     fi
 done
 
-for path in "$ext_image" "$xfs_image" "$fat16_image" "$fat32_image" "$replacement"; do
+for path in "$ext_image" "$xfs_image" "$fat16_image" "$fat32_image" "$ntfs_image" "$replacement"; do
     if [[ -e "$path" ]]; then
         echo "Refusing to overwrite existing fixture: $path" >&2
         exit 1
     fi
 done
 
-mkdir -p "$ext_mount" "$xfs_mount" "$fat16_mount" "$fat32_mount"
+mkdir -p "$ext_mount" "$xfs_mount" "$fat16_mount" "$fat32_mount" "$ntfs_mount"
 cleanup() {
     if mountpoint -q "$ext_mount"; then
         umount "$ext_mount"
@@ -50,6 +52,9 @@ cleanup() {
     fi
     if mountpoint -q "$fat32_mount"; then
         umount "$fat32_mount"
+    fi
+    if mountpoint -q "$ntfs_mount"; then
+        umount "$ntfs_mount"
     fi
 }
 trap cleanup EXIT
@@ -84,5 +89,12 @@ dd if=/dev/zero of="$fat32_mount/payload.bin" bs=1M count=1 conv=fsync status=no
 umount "$fat32_mount"
 fsck.fat -vn "$fat32_image"
 
-sha256sum "$ext_image" "$xfs_image" "$fat16_image" "$fat32_image" "$replacement" > "$output_dir/source.sha256"
+truncate -s 256M "$ntfs_image"
+mkfs.ntfs -F -Q -L VDT_NTFS "$ntfs_image"
+mount -o loop "$ntfs_image" "$ntfs_mount"
+dd if=/dev/zero of="$ntfs_mount/payload.bin" bs=1M count=1 conv=fsync status=none
+umount "$ntfs_mount"
+ntfsfix -n "$ntfs_image"
+
+sha256sum "$ext_image" "$xfs_image" "$fat16_image" "$fat32_image" "$ntfs_image" "$replacement" > "$output_dir/source.sha256"
 echo "Write regression fixtures created in $output_dir"

@@ -5136,6 +5136,7 @@ static void TestNtfsMftMirrorFallback()
     Encoding.ASCII.GetBytes("NTFS    ").CopyTo(volume, 3);
     BinaryPrimitives.WriteUInt16LittleEndian(volume.AsSpan(11, 2), bytesPerSector);
     volume[13] = clusterSize / bytesPerSector;
+    BinaryPrimitives.WriteInt64LittleEndian(volume.AsSpan(40, 8), volume.Length / bytesPerSector);
     BinaryPrimitives.WriteInt64LittleEndian(volume.AsSpan(48, 8), mftLcn);
     BinaryPrimitives.WriteInt64LittleEndian(volume.AsSpan(56, 8), mftMirrorLcn);
     volume[64] = unchecked((byte)-10);
@@ -5144,13 +5145,34 @@ static void TestNtfsMftMirrorFallback()
 
     var mftRecord = CreateFileRecord(0, 5, "$MFT", isDirectory: false, data: null, includeMftRuns: true);
     mftRecord.CopyTo(volume, mftMirrorLcn * clusterSize);
+    CreateFileRecord(3, 5, "$Volume", isDirectory: false, data: null, includeMftRuns: false, volumeFlags: 0)
+        .CopyTo(volume, mftLcn * clusterSize + 3 * recordSize);
     CreateFileRecord(5, 5, ".", isDirectory: true, data: null, includeMftRuns: false)
         .CopyTo(volume, mftLcn * clusterSize + 5 * recordSize);
-    CreateFileRecord(6, 5, "hello.txt", isDirectory: false, data: Encoding.ASCII.GetBytes("mirror recovery"), includeMftRuns: false)
+    CreateFileRecord(
+            6,
+            5,
+            "$Bitmap",
+            isDirectory: false,
+            data: Enumerable.Repeat((byte)0xff, volume.Length / clusterSize / 8).ToArray(),
+            includeMftRuns: false)
         .CopyTo(volume, mftLcn * clusterSize + 6 * recordSize);
-    var deletedRecord = CreateFileRecord(7, 5, "deleted.txt", isDirectory: false, data: Encoding.ASCII.GetBytes("deleted content"), includeMftRuns: false);
+    var nonResidentContent = new byte[clusterSize];
+    Encoding.ASCII.GetBytes("mirror recovery").CopyTo(nonResidentContent, 0);
+    const int helloLcn = 50;
+    CreateFileRecord(
+            8,
+            5,
+            "hello.txt",
+            isDirectory: false,
+            data: nonResidentContent,
+            includeMftRuns: false,
+            nonResidentLcn: helloLcn)
+        .CopyTo(volume, mftLcn * clusterSize + 8 * recordSize);
+    nonResidentContent.CopyTo(volume, helloLcn * clusterSize);
+    var deletedRecord = CreateFileRecord(9, 5, "deleted.txt", isDirectory: false, data: Encoding.ASCII.GetBytes("deleted content"), includeMftRuns: false);
     BinaryPrimitives.WriteUInt16LittleEndian(deletedRecord.AsSpan(22, 2), 0);
-    deletedRecord.CopyTo(volume, mftLcn * clusterSize + 7 * recordSize);
+    deletedRecord.CopyTo(volume, mftLcn * clusterSize + 9 * recordSize);
 
     var reader = new MemorySectorReader(volume, bytesPerSector);
     var partition = new PartitionInfo
@@ -5164,8 +5186,23 @@ static void TestNtfsMftMirrorFallback()
     var fileSystem = new NtfsFileSystem(reader, partition);
     var file = fileSystem.ListDirectory(fileSystem.Root).Single(node => node.Name == "hello.txt");
     Assert(
-        Encoding.ASCII.GetString(fileSystem.ReadFile(file, 0, (int)file.Size)) == "mirror recovery",
+        Encoding.ASCII.GetString(fileSystem.ReadFile(file, 0, "mirror recovery".Length)) == "mirror recovery",
         "NTFS $MFTMirr fallback");
+
+    var overlay = new CopyOnWriteBlockDevice(reader, 4096);
+    var writable = new NtfsFileSystem(overlay, partition);
+    var writableFile = writable.ListDirectory(writable.Root).Single(node => node.Name == "hello.txt");
+    var replacement = Enumerable.Range(0, clusterSize).Select(index => (byte)(index * 13 + 7)).ToArray();
+    Assert(writable.CanReplaceFile(writableFile, replacement.Length, out var writeReason), $"NTFS replacement support: {writeReason}");
+    using (var replacementStream = new MemoryStream(replacement, writable: false))
+    {
+        writable.ReplaceFileContent(writableFile, replacementStream, replacement.Length);
+    }
+
+    Assert(writable.ReadFile(writableFile, 0, replacement.Length).SequenceEqual(replacement), "NTFS overlay replacement read");
+    var unchangedContent = new byte[replacement.Length];
+    reader.ReadAt(helloLcn * clusterSize, unchangedContent, 0, unchangedContent.Length);
+    Assert(unchangedContent.SequenceEqual(nonResidentContent), "NTFS source unchanged");
 
     var deletedFileSystem = new NtfsFileSystem(reader, partition, deletedOnly: true);
     var deletedFile = deletedFileSystem.ListDirectory(deletedFileSystem.Root).Single(node => node.Name == "deleted.txt");
@@ -5173,7 +5210,15 @@ static void TestNtfsMftMirrorFallback()
         Encoding.ASCII.GetString(deletedFileSystem.ReadFile(deletedFile, 0, (int)deletedFile.Size)) == "deleted content",
         "NTFS deleted-only scan uses active $MFT record 0");
 
-    static byte[] CreateFileRecord(long recordNumber, long parentRecord, string name, bool isDirectory, byte[]? data, bool includeMftRuns)
+    static byte[] CreateFileRecord(
+        long recordNumber,
+        long parentRecord,
+        string name,
+        bool isDirectory,
+        byte[]? data,
+        bool includeMftRuns,
+        int? nonResidentLcn = null,
+        ushort? volumeFlags = null)
     {
         var record = new byte[recordSize];
         Encoding.ASCII.GetBytes("FILE").CopyTo(record, 0);
@@ -5201,20 +5246,49 @@ static void TestNtfsMftMirrorFallback()
         nameBytes.CopyTo(record, nameValue + 66);
         attributeOffset += nameAttributeLength;
 
+        if (volumeFlags is ushort flags)
+        {
+            const int volumeInformationLength = 40;
+            BinaryPrimitives.WriteUInt32LittleEndian(record.AsSpan(attributeOffset, 4), 0x70);
+            BinaryPrimitives.WriteUInt32LittleEndian(record.AsSpan(attributeOffset + 4, 4), volumeInformationLength);
+            BinaryPrimitives.WriteUInt32LittleEndian(record.AsSpan(attributeOffset + 16, 4), 12);
+            BinaryPrimitives.WriteUInt16LittleEndian(record.AsSpan(attributeOffset + 20, 2), 24);
+            record[attributeOffset + 32] = 3;
+            record[attributeOffset + 33] = 1;
+            BinaryPrimitives.WriteUInt16LittleEndian(record.AsSpan(attributeOffset + 34, 2), flags);
+            attributeOffset += volumeInformationLength;
+        }
+
         if (includeMftRuns)
         {
             const int dataAttributeLength = 72;
             BinaryPrimitives.WriteUInt32LittleEndian(record.AsSpan(attributeOffset, 4), 0x80);
             BinaryPrimitives.WriteUInt32LittleEndian(record.AsSpan(attributeOffset + 4, 4), dataAttributeLength);
             record[attributeOffset + 8] = 1;
-            BinaryPrimitives.WriteInt64LittleEndian(record.AsSpan(attributeOffset + 24, 8), 1);
+            BinaryPrimitives.WriteInt64LittleEndian(record.AsSpan(attributeOffset + 24, 8), 3);
             BinaryPrimitives.WriteUInt16LittleEndian(record.AsSpan(attributeOffset + 32, 2), 64);
-            BinaryPrimitives.WriteInt64LittleEndian(record.AsSpan(attributeOffset + 40, 8), 2 * clusterSize);
-            BinaryPrimitives.WriteInt64LittleEndian(record.AsSpan(attributeOffset + 48, 8), 2 * clusterSize);
-            BinaryPrimitives.WriteInt64LittleEndian(record.AsSpan(attributeOffset + 56, 8), 2 * clusterSize);
+            BinaryPrimitives.WriteInt64LittleEndian(record.AsSpan(attributeOffset + 40, 8), 4 * clusterSize);
+            BinaryPrimitives.WriteInt64LittleEndian(record.AsSpan(attributeOffset + 48, 8), 4 * clusterSize);
+            BinaryPrimitives.WriteInt64LittleEndian(record.AsSpan(attributeOffset + 56, 8), 4 * clusterSize);
             record[attributeOffset + 64] = 0x11;
-            record[attributeOffset + 65] = 2;
+            record[attributeOffset + 65] = 4;
             record[attributeOffset + 66] = mftLcn;
+            attributeOffset += dataAttributeLength;
+        }
+        else if (data is not null && nonResidentLcn is int dataLcn)
+        {
+            const int dataAttributeLength = 72;
+            BinaryPrimitives.WriteUInt32LittleEndian(record.AsSpan(attributeOffset, 4), 0x80);
+            BinaryPrimitives.WriteUInt32LittleEndian(record.AsSpan(attributeOffset + 4, 4), dataAttributeLength);
+            record[attributeOffset + 8] = 1;
+            BinaryPrimitives.WriteInt64LittleEndian(record.AsSpan(attributeOffset + 24, 8), 0);
+            BinaryPrimitives.WriteUInt16LittleEndian(record.AsSpan(attributeOffset + 32, 2), 64);
+            BinaryPrimitives.WriteInt64LittleEndian(record.AsSpan(attributeOffset + 40, 8), clusterSize);
+            BinaryPrimitives.WriteInt64LittleEndian(record.AsSpan(attributeOffset + 48, 8), data.Length);
+            BinaryPrimitives.WriteInt64LittleEndian(record.AsSpan(attributeOffset + 56, 8), data.Length);
+            record[attributeOffset + 64] = 0x11;
+            record[attributeOffset + 65] = 1;
+            record[attributeOffset + 66] = checked((byte)dataLcn);
             attributeOffset += dataAttributeLength;
         }
         else if (data is not null)

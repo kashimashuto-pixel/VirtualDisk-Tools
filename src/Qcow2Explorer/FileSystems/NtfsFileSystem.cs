@@ -4,12 +4,16 @@ using Qcow2Explorer.Partitions;
 
 namespace Qcow2Explorer.FileSystems;
 
-public sealed class NtfsFileSystem : IReadOnlyFileSystem
+public sealed class NtfsFileSystem : IReadOnlyFileSystem, IFileContentWriter
 {
     private const ulong FileReferenceMask = 0x0000ffffffffffffUL;
     private const int MaxMftRecordsToScan = 250_000;
+    private const ushort CompressedAttributeFlag = 0x0001;
+    private const ushort EncryptedAttributeFlag = 0x4000;
+    private const ushort SparseAttributeFlag = 0x8000;
 
     private readonly IBlockReader _reader;
+    private readonly IBlockWriter? _writer;
     private readonly int _bytesPerSector;
     private readonly int _clusterSize;
     private readonly int _fileRecordSize;
@@ -19,10 +23,13 @@ public sealed class NtfsFileSystem : IReadOnlyFileSystem
     private readonly Dictionary<long, NtfsFileEntry> _entries = new();
     private readonly Dictionary<long, List<NtfsFileEntry>> _children = new();
     private readonly bool _deletedOnly;
+    private readonly long _volumeClusterCount;
+    private readonly ushort? _volumeFlags;
 
     public NtfsFileSystem(IBlockReader reader, PartitionInfo partition, bool deletedOnly = false)
     {
         _reader = reader;
+        _writer = reader as IBlockWriter;
         _deletedOnly = deletedOnly;
         Partition = partition;
         var boot = EndianUtilities.ReadBytes(reader, 0, 512);
@@ -40,6 +47,20 @@ public sealed class NtfsFileSystem : IReadOnlyFileSystem
         _fileRecordSize = clustersPerRecord > 0
             ? clustersPerRecord * _clusterSize
             : 1 << -clustersPerRecord;
+        var totalSectors = EndianUtilities.ReadInt64Little(boot, 40);
+        if (_bytesPerSector is not (512 or 1024 or 2048 or 4096)
+            || sectorsPerCluster == 0
+            || (sectorsPerCluster & (sectorsPerCluster - 1)) != 0
+            || _clusterSize <= 0
+            || _fileRecordSize < _bytesPerSector
+            || _fileRecordSize > 64 * 1024
+            || totalSectors <= 0
+            || totalSectors > reader.Length / _bytesPerSector)
+        {
+            throw new InvalidDataException("NTFS boot geometryが不正です。");
+        }
+
+        _volumeClusterCount = totalSectors / sectorsPerCluster;
 
         var mft0 = ReadMftRecordZero(mftMirrorLcn, out var recoveredFromMirror);
         // Record 0 describes $MFT itself and is always an in-use record. Parse it
@@ -55,6 +76,7 @@ public sealed class NtfsFileSystem : IReadOnlyFileSystem
         _mftSize = mftEntry.Data.Size;
         Root = new VfsNode { Name = deletedOnly ? "Deleted files" : "", IsDirectory = true, Metadata = deletedOnly ? -1L : 5L };
         ScanMft();
+        _volumeFlags = TryReadVolumeFlags();
         if (!deletedOnly && !_entries.ContainsKey(5))
         {
             throw new InvalidDataException(recoveredFromMirror
@@ -148,6 +170,147 @@ public sealed class NtfsFileSystem : IReadOnlyFileSystem
         var output = new byte[available];
         ReadFromRuns(entry.Data.Runs, entry.Data.Size, offset, output, 0, available);
         return output;
+    }
+
+    public bool TryResolvePath(string path, out VfsNode node)
+    {
+        node = Root;
+        var parentId = 5L;
+        foreach (var part in path.Replace('/', '\\').Split('\\', StringSplitOptions.RemoveEmptyEntries))
+        {
+            if (!_children.TryGetValue(parentId, out var children))
+            {
+                return false;
+            }
+
+            var entry = children.SingleOrDefault(candidate =>
+                string.Equals(candidate.Name, part, StringComparison.OrdinalIgnoreCase));
+            if (entry is null)
+            {
+                return false;
+            }
+
+            node = ToNode(entry);
+            parentId = entry.Id;
+        }
+
+        return true;
+    }
+
+    public bool CanReplaceFile(VfsNode file, long replacementLength, out string reason)
+    {
+        if (_writer is null)
+        {
+            reason = "変更を保持する書き込みオーバーレイがありません。";
+            return false;
+        }
+
+        if (_deletedOnly || file.IsDirectory || file.Metadata is not long id
+            || !_entries.TryGetValue(id, out var entry) || entry.Data is null)
+        {
+            reason = "通常の使用中ファイルだけを置換できます。";
+            return false;
+        }
+
+        if (replacementLength < 0 || replacementLength != entry.Data.Size)
+        {
+            reason = $"現在は元ファイルと同じサイズ（{entry.Data.Size:N0} bytes）の置換だけに対応しています。";
+            return false;
+        }
+
+        if (_volumeFlags is null)
+        {
+            reason = "NTFS $Volumeの状態を確認できないため書き込めません。";
+            return false;
+        }
+
+        if (_volumeFlags != 0)
+        {
+            reason = $"dirtyまたは保守状態のNTFS volumeは書き込めません: flags=0x{_volumeFlags:X4}";
+            return false;
+        }
+
+        if (entry.HasAttributeList)
+        {
+            reason = "複数MFT recordにまたがるNTFS attribute listはまだ書き込めません。";
+            return false;
+        }
+
+        var data = entry.Data;
+        if (data.ResidentData is not null)
+        {
+            reason = "MFT内resident dataはまだ書き込めません。";
+            return false;
+        }
+
+        if ((data.Flags & (CompressedAttributeFlag | EncryptedAttributeFlag | SparseAttributeFlag)) != 0)
+        {
+            reason = "圧縮、暗号化、またはsparse属性のNTFS dataはまだ書き込めません。";
+            return false;
+        }
+
+        try
+        {
+            ValidateWritableRuns(data);
+        }
+        catch (Exception ex) when (ex is InvalidDataException or NotSupportedException or OverflowException)
+        {
+            reason = ex.Message;
+            return false;
+        }
+
+        reason = string.Empty;
+        return true;
+    }
+
+    public void ReplaceFileContent(
+        VfsNode file,
+        Stream replacement,
+        long replacementLength,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(replacement);
+        if (!replacement.CanRead)
+        {
+            throw new ArgumentException("置換元ストリームを読み取れません。", nameof(replacement));
+        }
+
+        if (!CanReplaceFile(file, replacementLength, out var reason))
+        {
+            throw new NotSupportedException(reason);
+        }
+
+        var data = _entries[(long)file.Metadata!].Data!;
+        var remaining = replacementLength;
+        var buffer = new byte[1024 * 1024];
+        foreach (var run in data.Runs)
+        {
+            var runBytes = checked(run.ClusterCount * _clusterSize);
+            var bytesToWrite = Math.Min(remaining, runBytes);
+            var physicalOffset = checked(run.Lcn * _clusterSize);
+            long written = 0;
+            while (written < bytesToWrite)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var count = checked((int)Math.Min(buffer.Length, bytesToWrite - written));
+                replacement.ReadExactly(buffer.AsSpan(0, count));
+                _writer!.WriteAt(physicalOffset + written, buffer, 0, count);
+                written += count;
+                remaining -= count;
+            }
+
+            if (remaining == 0)
+            {
+                break;
+            }
+        }
+
+        if (remaining != 0 || replacement.ReadByte() != -1)
+        {
+            throw new InvalidDataException("置換元ファイルのサイズが指定値と一致しません。変更は破棄してください。");
+        }
+
+        _writer!.Flush();
     }
 
     private void ScanMft()
@@ -262,9 +425,17 @@ public sealed class NtfsFileSystem : IReadOnlyFileSystem
             }
             else if (attrType == 0x80)
             {
-                entry.Data = nonResident
-                    ? ParseNonResidentData(record, attrOffset, (int)attrLength)
-                    : ParseResidentData(record, attrOffset, (int)attrLength);
+                var nameLength = record[attrOffset + 9];
+                if (nameLength == 0 && entry.Data is null)
+                {
+                    entry.Data = nonResident
+                        ? ParseNonResidentData(record, attrOffset, (int)attrLength)
+                        : ParseResidentData(record, attrOffset, (int)attrLength);
+                }
+            }
+            else if (attrType == 0x20)
+            {
+                entry.HasAttributeList = true;
             }
 
             attrOffset += (int)attrLength;
@@ -314,7 +485,7 @@ public sealed class NtfsFileSystem : IReadOnlyFileSystem
             return null;
         }
 
-        return new NtfsDataAttribute(value.Length, value, new List<NtfsDataRun>());
+        return new NtfsDataAttribute(value.Length, value.Length, 0, 0, value, new List<NtfsDataRun>());
     }
 
     private static NtfsDataAttribute? ParseNonResidentData(byte[] record, int attrOffset, int attrLength)
@@ -325,6 +496,9 @@ public sealed class NtfsFileSystem : IReadOnlyFileSystem
         }
 
         var runOffset = EndianUtilities.ReadUInt16Little(record, attrOffset + 32);
+        var lowestVcn = EndianUtilities.ReadInt64Little(record, attrOffset + 16);
+        var highestVcn = EndianUtilities.ReadInt64Little(record, attrOffset + 24);
+        var allocatedSize = EndianUtilities.ReadInt64Little(record, attrOffset + 40);
         var realSize = EndianUtilities.ReadInt64Little(record, attrOffset + 48);
         if (runOffset >= attrLength)
         {
@@ -333,10 +507,16 @@ public sealed class NtfsFileSystem : IReadOnlyFileSystem
 
         var runData = new byte[attrLength - runOffset];
         Array.Copy(record, attrOffset + runOffset, runData, 0, runData.Length);
-        return new NtfsDataAttribute(realSize, null, ParseDataRuns(runData));
+        return new NtfsDataAttribute(
+            realSize,
+            allocatedSize,
+            EndianUtilities.ReadUInt16Little(record, attrOffset + 12),
+            lowestVcn,
+            null,
+            ParseDataRuns(runData, highestVcn));
     }
 
-    private static List<NtfsDataRun> ParseDataRuns(byte[] runData)
+    private static List<NtfsDataRun> ParseDataRuns(byte[] runData, long expectedHighestVcn = -1)
     {
         var runs = new List<NtfsDataRun>();
         long currentLcn = 0;
@@ -348,7 +528,7 @@ public sealed class NtfsFileSystem : IReadOnlyFileSystem
             var offsetSize = (header >> 4) & 0x0f;
             if (lengthSize == 0 || offset + lengthSize + offsetSize > runData.Length)
             {
-                break;
+                throw new InvalidDataException("NTFS data run headerが不正です。");
             }
 
             var clusterCount = (long)ReadVariableUInt(runData, offset, lengthSize);
@@ -362,7 +542,23 @@ public sealed class NtfsFileSystem : IReadOnlyFileSystem
             }
 
             offset += offsetSize;
+            if (clusterCount <= 0)
+            {
+                throw new InvalidDataException("NTFS data runのcluster数が不正です。");
+            }
+
             runs.Add(new NtfsDataRun(lcn, clusterCount));
+        }
+
+        if (offset >= runData.Length || runData[offset] != 0)
+        {
+            throw new InvalidDataException("NTFS data run terminatorがありません。");
+        }
+
+        if (expectedHighestVcn >= 0
+            && runs.Sum(run => run.ClusterCount) != checked(expectedHighestVcn + 1))
+        {
+            throw new InvalidDataException("NTFS data runとVCN範囲が一致しません。");
         }
 
         return runs;
@@ -502,9 +698,151 @@ public sealed class NtfsFileSystem : IReadOnlyFileSystem
         };
     }
 
+    private ushort? TryReadVolumeFlags()
+    {
+        try
+        {
+            var record = ReadMftRecord(3);
+            var attrOffset = (int)EndianUtilities.ReadUInt16Little(record, 20);
+            while (attrOffset + 24 <= record.Length)
+            {
+                var attrType = EndianUtilities.ReadUInt32Little(record, attrOffset);
+                if (attrType == 0xffffffff)
+                {
+                    break;
+                }
+
+                var attrLength = EndianUtilities.ReadUInt32Little(record, attrOffset + 4);
+                if (attrLength < 24 || attrOffset + attrLength > record.Length)
+                {
+                    return null;
+                }
+
+                if (attrType == 0x70 && record[attrOffset + 8] == 0)
+                {
+                    var value = GetResidentValue(record, attrOffset, checked((int)attrLength));
+                    return value is { Length: >= 12 }
+                        ? EndianUtilities.ReadUInt16Little(value, 10)
+                        : null;
+                }
+
+                attrOffset += checked((int)attrLength);
+            }
+        }
+        catch (Exception ex) when (ex is IOException or InvalidDataException or OverflowException)
+        {
+        }
+
+        return null;
+    }
+
+    private void ValidateWritableRuns(NtfsDataAttribute data)
+    {
+        if (data.LowestVcn != 0 || data.Size < 0 || data.AllocatedSize < data.Size || data.Runs.Count == 0)
+        {
+            throw new InvalidDataException("NTFS data attributeのsizeまたはVCNが不正です。");
+        }
+
+        long coveredBytes = 0;
+        foreach (var run in data.Runs)
+        {
+            if (run.Lcn < 0)
+            {
+                throw new NotSupportedException("sparse data runを含むNTFSファイルはまだ書き込めません。");
+            }
+
+            var endLcn = checked(run.Lcn + run.ClusterCount);
+            if (endLcn > _volumeClusterCount)
+            {
+                throw new InvalidDataException("NTFS data runがvolume範囲外です。");
+            }
+
+            coveredBytes = checked(coveredBytes + checked(run.ClusterCount * _clusterSize));
+        }
+
+        if (coveredBytes < data.Size || data.AllocatedSize > coveredBytes)
+        {
+            throw new InvalidDataException("NTFS data runがfile sizeを完全にカバーしていません。");
+        }
+
+        if (!_entries.TryGetValue(6, out var bitmapEntry) || bitmapEntry.Data is null)
+        {
+            throw new InvalidDataException("NTFS $Bitmapを読み取れないためcluster割り当てを検証できません。");
+        }
+
+        var bitmap = bitmapEntry.Data;
+        var requiredBitmapBytes = checked((_volumeClusterCount + 7) / 8);
+        if (bitmap.Size < requiredBitmapBytes)
+        {
+            throw new InvalidDataException("NTFS $Bitmapがvolume cluster数より短いです。");
+        }
+
+        foreach (var run in data.Runs)
+        {
+            ValidateBitmapAllocation(bitmap, run.Lcn, run.ClusterCount);
+        }
+    }
+
+    private void ValidateBitmapAllocation(NtfsDataAttribute bitmap, long firstLcn, long clusterCount)
+    {
+        const int bitmapChunkBytes = 1024 * 1024;
+        var currentLcn = firstLcn;
+        var remainingClusters = clusterCount;
+        while (remainingClusters > 0)
+        {
+            var firstBit = checked((int)(currentLcn & 7));
+            var clustersInChunk = Math.Min(
+                remainingClusters,
+                checked((long)bitmapChunkBytes * 8 - firstBit));
+            var byteOffset = currentLcn / 8;
+            var byteCount = checked((int)((firstBit + clustersInChunk + 7) / 8));
+            var bytes = ReadDataAttribute(bitmap, byteOffset, byteCount);
+            if (bytes.Length != byteCount)
+            {
+                throw new InvalidDataException("NTFS $Bitmapの必要範囲を読み取れません。");
+            }
+
+            for (long index = 0; index < clustersInChunk; index++)
+            {
+                var bit = checked(firstBit + index);
+                if ((bytes[checked((int)(bit / 8))] & (1 << (int)(bit & 7))) == 0)
+                {
+                    throw new InvalidDataException(
+                        $"NTFS data runが未割り当てclusterを参照しています: LCN={currentLcn + index:N0}");
+                }
+            }
+
+            currentLcn += clustersInChunk;
+            remainingClusters -= clustersInChunk;
+        }
+    }
+
+    private byte[] ReadDataAttribute(NtfsDataAttribute data, long offset, int count)
+    {
+        if (data.ResidentData is not null)
+        {
+            if (offset < 0 || offset > data.ResidentData.Length - count)
+            {
+                return Array.Empty<byte>();
+            }
+
+            return data.ResidentData.AsSpan(checked((int)offset), count).ToArray();
+        }
+
+        var result = new byte[count];
+        ReadFromRuns(data.Runs, data.Size, offset, result, 0, count);
+        return result;
+    }
+
     private sealed record NtfsFileName(long ParentId, string Name, byte Namespace, long Size, DateTime? ModifiedUtc);
     private sealed record NtfsDataRun(long Lcn, long ClusterCount);
-    private sealed record NtfsDataAttribute(long Size, byte[]? ResidentData, List<NtfsDataRun> Runs);
+    private sealed record NtfsDataAttribute(
+        long Size,
+        long AllocatedSize,
+        ushort Flags,
+        long LowestVcn,
+        byte[]? ResidentData,
+        List<NtfsDataRun> Runs);
 
     private sealed class NtfsFileEntry
     {
@@ -517,5 +855,6 @@ public sealed class NtfsFileSystem : IReadOnlyFileSystem
         public DateTime? ModifiedUtc { get; set; }
         public FileAttributes Attributes { get; set; }
         public NtfsDataAttribute? Data { get; set; }
+        public bool HasAttributeList { get; set; }
     }
 }
