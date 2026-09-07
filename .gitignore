@@ -1,5 +1,7 @@
 bin/
 obj/
+artifacts/
+publish/
 .tmp/
 *.user
 *.qcow2

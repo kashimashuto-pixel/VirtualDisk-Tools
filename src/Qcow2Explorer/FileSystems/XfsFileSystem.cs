@@ -1,11 +1,15 @@
 using Qcow2Explorer.Core;
 using Qcow2Explorer.Partitions;
 using DiscXfsFileSystem = DiscUtils.Xfs.XfsFileSystem;
+using System.Diagnostics;
 
 namespace Qcow2Explorer.FileSystems;
 
 public sealed class XfsFileSystem : IReadOnlyFileSystem, IFileContentWriter, IDisposable
 {
+    /// <summary>Set to false to compare DiscUtils.Xfs behavior without the raw reader.</summary>
+    public static bool UseRawXfsReader { get; set; } = true;
+
     private readonly BlockReaderStream _stream;
     private readonly DiscXfsFileSystem _reader;
     private readonly XfsRawFileSystem? _rawReader;
@@ -15,7 +19,8 @@ public sealed class XfsFileSystem : IReadOnlyFileSystem, IFileContentWriter, IDi
         Partition = partition;
         _stream = new BlockReaderStream(reader);
         _reader = new DiscXfsFileSystem(_stream);
-        _rawReader = XfsRawFileSystem.TryOpen(reader);
+        _rawReader = UseRawXfsReader ? XfsRawFileSystem.TryOpen(reader) : null;
+        DiagnosticLog.Write($"XFS reader initialized: rawReaderEnabled={UseRawXfsReader}, rawReaderAvailable={_rawReader is not null}, partition={partition}");
         Root = new VfsNode
         {
             Name = "",
@@ -36,13 +41,13 @@ public sealed class XfsFileSystem : IReadOnlyFileSystem, IFileContentWriter, IDi
             {
                 return _rawReader.ListDirectory(nodeRef);
             }
-            catch
+            catch (Exception ex)
             {
-                // Fall back to DiscUtils for XFS layouts not covered by the raw reader.
+                WriteRawReadFailure(directory, nodeRef, 0, 0, ex);
             }
         }
 
-        if (!directory.IsDirectory || directory.Metadata is not string path)
+        if (!directory.IsDirectory || !TryGetPath(directory.Metadata, out var path))
         {
             return Array.Empty<VfsNode>();
         }
@@ -62,34 +67,43 @@ public sealed class XfsFileSystem : IReadOnlyFileSystem, IFileContentWriter, IDi
             {
                 return _rawReader.ReadFile(nodeRef, offset, count);
             }
-            catch
+            catch (Exception ex)
             {
-                // Fall back to DiscUtils for XFS layouts not covered by the raw reader.
+                WriteRawReadFailure(file, nodeRef, offset, count, ex);
             }
         }
 
-        if (file.IsDirectory || file.Metadata is not string path || offset >= file.Size || count <= 0)
+        if (file.IsDirectory || !TryGetPath(file.Metadata, out var path) || offset >= file.Size || count <= 0)
         {
             return Array.Empty<byte>();
         }
 
         var available = checked((int)Math.Min(count, file.Size - offset));
+        DiagnosticLog.Write($"XFS DiscUtils read: file={file.Name}, path={path}, offset={offset}, count={available}");
         var buffer = new byte[available];
-        using var stream = _reader.OpenFile(path, FileMode.Open, FileAccess.Read);
-        stream.Position = offset;
-        var total = 0;
-        while (total < buffer.Length)
+        try
         {
-            var read = stream.Read(buffer, total, buffer.Length - total);
-            if (read == 0)
+            using var stream = _reader.OpenFile(path, FileMode.Open, FileAccess.Read);
+            stream.Position = offset;
+            var total = 0;
+            while (total < buffer.Length)
             {
-                break;
+                var read = stream.Read(buffer, total, buffer.Length - total);
+                if (read == 0)
+                {
+                    break;
+                }
+
+                total += read;
             }
 
-            total += read;
+            return total == buffer.Length ? buffer : buffer[..total];
         }
-
-        return total == buffer.Length ? buffer : buffer[..total];
+        catch (Exception ex)
+        {
+            DiagnosticLog.Write($"XFS DiscUtils read failed: file={file.Name}, path={path}, offset={offset}, count={available}, error={ex}");
+            throw;
+        }
     }
 
     public string DescribeNode(VfsNode node)
@@ -205,5 +219,22 @@ public sealed class XfsFileSystem : IReadOnlyFileSystem, IFileContentWriter, IDi
         }
 
         return path.Replace('/', '\\');
+    }
+
+    private static bool TryGetPath(object? metadata, out string path)
+    {
+        path = metadata switch
+        {
+            string value => value,
+            XfsNodeRef nodeRef => nodeRef.Path,
+            _ => ""
+        };
+        return !string.IsNullOrWhiteSpace(path);
+    }
+
+    private static void WriteRawReadFailure(VfsNode file, XfsNodeRef nodeRef, long offset, int count, Exception exception)
+    {
+        var message = $"XFS raw read failed; falling back to DiscUtils: file={file.Name}, inode={nodeRef.Inode}, offset={offset}, count={count}, error={exception}";
+        DiagnosticLog.Write(message);
     }
 }

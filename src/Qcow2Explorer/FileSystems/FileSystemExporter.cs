@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
+using Qcow2Explorer.Core;
 
 namespace Qcow2Explorer.FileSystems;
 
@@ -161,7 +162,11 @@ public static class FileSystemExporter
                     var chunk = fileSystem.ReadFile(file, offset, chunkSize);
                     if (chunk.Length == 0)
                     {
-                        throw new EndOfStreamException($"ファイルの途中で読み込みが止まりました: {file.Name}");
+                        var exception = new EndOfStreamException(
+                            $"Unexpected EOF while reading '{file.Name}'. size={file.Size}, offset={offset}, requested={chunkSize}, " +
+                            $"fileSystem={fileSystem.Name}, node={file.Metadata}");
+                        DiagnosticLog.Write($"File export failed: {exception}");
+                        throw exception;
                     }
 
                     output.Write(chunk, 0, chunk.Length);

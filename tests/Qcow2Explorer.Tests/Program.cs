@@ -151,6 +151,8 @@ static void RunGeneratedImageTests()
     TestLuks1Unlock();
     TestLuks2Unlock();
     TestXfsTimestampDecoding();
+    TestXfsExtentDecoding();
+    TestFileSystemExporterUnexpectedEofDiagnostics();
     Test4KnGptParsing();
     TestGeneratedMdRaid1Image();
     TestGeneratedMdRaid0Image();
@@ -3154,6 +3156,59 @@ static void TestXfsTimestampDecoding()
         .AddTicks(legacyNanoseconds / 100)
         .UtcDateTime;
     Assert(decodedLegacy == expectedLegacy, "XFS signed legacy timestamp decoding");
+}
+
+static void TestXfsExtentDecoding()
+{
+    const ulong logicalBlock = (1UL << 40) + 7;
+    const ulong physicalBlock = (1UL << 51) + 123;
+    const uint blockCount = 37;
+    var record = new byte[16];
+    var high = (1UL << 63) | (logicalBlock << 9) | (physicalBlock >> 43);
+    var low = ((physicalBlock & ((1UL << 43) - 1)) << 21) | blockCount;
+    BinaryPrimitives.WriteUInt64BigEndian(record.AsSpan(0, 8), high);
+    BinaryPrimitives.WriteUInt64BigEndian(record.AsSpan(8, 8), low);
+
+    var extent = XfsRawFileSystem.ReadExtent(record, 0);
+    Assert(extent.StartOffset == logicalBlock, "XFS extent preserves 64bit logical offset");
+    Assert(extent.StartBlock == physicalBlock, "XFS extent preserves 53bit physical block");
+    Assert(extent.BlockCount == blockCount, "XFS extent block count decoding");
+    Assert(extent.IsUnwritten, "XFS extent unwritten flag decoding");
+
+    Assert(
+        XfsRawFileSystem.GetExtentByteLength(1_540_608, 4_096) == 6_310_330_368,
+        "XFS large extent byte length uses 64bit multiplication");
+}
+
+static void TestFileSystemExporterUnexpectedEofDiagnostics()
+{
+    var fileSystem = new UnexpectedEofFileSystem();
+    var destination = Path.Combine(AppContext.BaseDirectory, "unexpected-eof-copy");
+    if (Directory.Exists(destination))
+    {
+        Directory.Delete(destination, recursive: true);
+    }
+
+    try
+    {
+        FileSystemExporter.CopyNode(fileSystem, fileSystem.File, destination);
+        Assert(false, "unexpected EOF throws");
+    }
+    catch (EndOfStreamException ex)
+    {
+        Assert(ex.Message.Contains("size=1048577", StringComparison.Ordinal), "unexpected EOF includes size");
+        Assert(ex.Message.Contains("offset=1048576", StringComparison.Ordinal), "unexpected EOF includes offset");
+        Assert(ex.Message.Contains("requested=1", StringComparison.Ordinal), "unexpected EOF includes requested count");
+        Assert(ex.Message.Contains("fileSystem=Unexpected EOF test", StringComparison.Ordinal), "unexpected EOF includes filesystem");
+        Assert(ex.Message.Contains("inode=42", StringComparison.Ordinal), "unexpected EOF includes node reference");
+    }
+    finally
+    {
+        if (Directory.Exists(destination))
+        {
+            Directory.Delete(destination, recursive: true);
+        }
+    }
 }
 
 static void Test4KnGptParsing()
@@ -7648,4 +7703,21 @@ internal sealed class InterruptibleCopyFileSystem : IReadOnlyFileSystem
     public IReadOnlyList<VfsNode> ListDirectory(VfsNode directory) => Array.Empty<VfsNode>();
 
     public byte[] ReadFile(VfsNode file, long offset, int count) => new byte[count];
+}
+
+internal sealed class UnexpectedEofFileSystem : IReadOnlyFileSystem
+{
+    public string Name => "Unexpected EOF test";
+    public PartitionInfo Partition { get; } = new();
+    public VfsNode Root { get; } = new() { IsDirectory = true };
+    public VfsNode File { get; } = new()
+    {
+        Name = "disk.img",
+        Size = 1_048_577,
+        Metadata = "inode=42"
+    };
+
+    public IReadOnlyList<VfsNode> ListDirectory(VfsNode directory) => Array.Empty<VfsNode>();
+
+    public byte[] ReadFile(VfsNode file, long offset, int count) => offset == 0 ? new byte[count] : Array.Empty<byte>();
 }

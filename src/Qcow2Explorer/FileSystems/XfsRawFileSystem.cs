@@ -1,5 +1,6 @@
 using System.Text;
 using System.Globalization;
+using System.Diagnostics;
 using Qcow2Explorer.Core;
 
 namespace Qcow2Explorer.FileSystems;
@@ -21,7 +22,9 @@ internal sealed class XfsRawFileSystem
     private readonly IBlockWriter? _writer;
     private readonly XfsSuperBlock _superBlock;
     private readonly Dictionary<ulong, XfsInode> _inodeCache = new();
+    private readonly Dictionary<ulong, IReadOnlyList<XfsExtent>> _extentCache = new();
     private readonly Dictionary<ulong, IReadOnlyList<XfsDirectoryEntry>> _directoryCache = new();
+    private readonly HashSet<ulong> _diagnosedInodes = [];
     private readonly Encoding _fileNameEncoding;
 
     private XfsRawFileSystem(IBlockReader reader)
@@ -104,13 +107,24 @@ internal sealed class XfsRawFileSystem
             return result;
         }
 
-        var maxAvailable = Math.Min(count, inode.Length > long.MaxValue ? long.MaxValue : (long)inode.Length - offset);
-        if (maxAvailable <= 0)
+        try
         {
-            return Array.Empty<byte>();
-        }
+            WriteFileDiagnostics(file, inode);
 
-        return ReadContent(inode, offset, checked((int)maxAvailable));
+            var maxAvailable = Math.Min(count, inode.Length > long.MaxValue ? long.MaxValue : (long)inode.Length - offset);
+            if (maxAvailable <= 0)
+            {
+                return Array.Empty<byte>();
+            }
+
+            return ReadContent(inode, offset, checked((int)maxAvailable));
+        }
+        catch (Exception ex) when (ex is OverflowException or IOException or InvalidDataException or ArgumentOutOfRangeException)
+        {
+            throw new IOException(
+                $"XFS raw file read failed: path={file.Path}, inode={inode.Number}, offset={offset}, count={count}, format={inode.Format}, length={inode.Length}.",
+                ex);
+        }
     }
 
     public bool TryResolvePath(string path, out XfsNodeRef node)
@@ -322,9 +336,9 @@ internal sealed class XfsRawFileSystem
         var allocationGroup = number >> (_superBlock.AgBlocksLog2 + _superBlock.InodesPerBlockLog2);
         var agBlock = (number >> _superBlock.InodesPerBlockLog2) & ((1UL << _superBlock.AgBlocksLog2) - 1);
         var blockOffset = number & ((1UL << _superBlock.InodesPerBlockLog2) - 1);
-        var inodeOffset = checked((long)(allocationGroup * _superBlock.AgBlocks * _superBlock.BlockSize
-            + agBlock * _superBlock.BlockSize
-            + blockOffset * _superBlock.InodeSize));
+        var inodeOffset = checked((long)checked(
+            checked(checked(allocationGroup * _superBlock.AgBlocks) * _superBlock.BlockSize)
+            + checked(checked(agBlock * _superBlock.BlockSize) + checked(blockOffset * _superBlock.InodeSize))));
 
         var buffer = EndianUtilities.ReadBytes(_reader, inodeOffset, _superBlock.InodeSize);
         if (ReadUInt16Big(buffer, 0) != InodeMagic)
@@ -534,16 +548,28 @@ internal sealed class XfsRawFileSystem
 
     private IReadOnlyList<XfsExtent> GetExtents(XfsInode inode)
     {
-        return inode.Format switch
+        if (_extentCache.TryGetValue(inode.Number, out var cached))
         {
-            2 => ReadInlineExtents(inode.DataFork, inode.ExtentCount),
+            return cached;
+        }
+
+        var extents = inode.Format switch
+        {
+            2 => ReadInlineExtents(inode.Number, inode.DataFork, inode.ExtentCount),
             3 => ReadBtreeExtents(inode.DataFork),
             _ => Array.Empty<XfsExtent>()
         };
+        _extentCache[inode.Number] = extents;
+        return extents;
     }
 
-    private IReadOnlyList<XfsExtent> ReadInlineExtents(byte[] dataFork, ulong extentCount)
+    private IReadOnlyList<XfsExtent> ReadInlineExtents(ulong inodeNumber, byte[] dataFork, ulong extentCount)
     {
+        if (extentCount > (ulong)(dataFork.Length / 16))
+        {
+            throw new InvalidDataException($"XFS inode {inodeNumber} contains more inline extents than its data fork can hold.");
+        }
+
         var result = new List<XfsExtent>(checked((int)Math.Min(extentCount, (ulong)(dataFork.Length / 16))));
         var offset = 0;
         for (ulong i = 0; i < extentCount && offset + 16 <= dataFork.Length; i++, offset += 16)
@@ -569,6 +595,22 @@ internal sealed class XfsRawFileSystem
         }
 
         var maxRecords = Math.Max(0, (dataFork.Length - 4) / 16);
+        if (records > maxRecords)
+        {
+            throw new InvalidDataException("XFS extent B+tree root has more records than its data fork can hold.");
+        }
+
+        if (level == 0)
+        {
+            var inlineExtents = new List<XfsExtent>(records);
+            for (var index = 0; index < records; index++)
+            {
+                inlineExtents.Add(ReadExtent(dataFork, 4 + index * 16));
+            }
+
+            return inlineExtents;
+        }
+
         var pointerOffset = 4 + maxRecords * 8;
         var result = new List<XfsExtent>();
         for (var i = 0; i < records; i++)
@@ -580,6 +622,7 @@ internal sealed class XfsRawFileSystem
             }
 
             var pointer = EndianUtilities.ReadUInt64Big(dataFork, offset);
+            DiagnosticLog.Write($"XFS B+tree root child: index={i}, rootLevel={level}, rootRecords={records}, maxRecords={maxRecords}, pointerOffset={offset}, fsBlock={pointer}, partitionOffset={ExtentToDiskOffset(pointer)}");
             ReadBtreeBlock(pointer, level, result);
         }
 
@@ -592,12 +635,18 @@ internal sealed class XfsRawFileSystem
         var magic = EndianUtilities.ReadUInt32Big(block, 0);
         if (magic != (_superBlock.SbVersion == 5 ? BmapMagicV5 : BmapMagic))
         {
-            throw new InvalidDataException("Invalid XFS extent B+tree magic.");
+            throw new InvalidDataException(
+                $"Invalid XFS extent B+tree magic: fsBlock={fileSystemBlock}, partitionOffset={ExtentToDiskOffset(fileSystemBlock)}, actual=0x{magic:X8}, expected=0x{(_superBlock.SbVersion == 5 ? BmapMagicV5 : BmapMagic):X8}, parentLevel={parentLevel}, firstBytes={Convert.ToHexString(block.AsSpan(0, Math.Min(32, block.Length)))}.");
         }
 
         var level = ReadUInt16Big(block, 4);
         var records = ReadUInt16Big(block, 6);
         var headerSize = _superBlock.SbVersion == 5 ? 0x48 : 0x18;
+        var maxRecords = Math.Max(0, (block.Length - headerSize) / 16);
+        if (records > maxRecords)
+        {
+            throw new InvalidDataException("XFS extent B+tree block has more records than it can hold.");
+        }
         if (level == 0)
         {
             var offset = headerSize;
@@ -614,7 +663,6 @@ internal sealed class XfsRawFileSystem
             throw new InvalidDataException("Invalid XFS extent B+tree level.");
         }
 
-        var maxRecords = Math.Max(0, (block.Length - headerSize) / 16);
         var pointerOffset = headerSize + maxRecords * 8;
         for (var i = 0; i < records; i++)
         {
@@ -624,20 +672,21 @@ internal sealed class XfsRawFileSystem
                 break;
             }
 
-            ReadBtreeBlock(EndianUtilities.ReadUInt64Big(block, offset), level, result);
+            var pointer = EndianUtilities.ReadUInt64Big(block, offset);
+            DiagnosticLog.Write($"XFS B+tree internal child: parentFsBlock={fileSystemBlock}, index={i}, level={level}, records={records}, pointerOffset={offset}, fsBlock={pointer}, partitionOffset={ExtentToDiskOffset(pointer)}");
+            ReadBtreeBlock(pointer, level, result);
         }
     }
 
-    private XfsExtent ReadExtent(byte[] buffer, int offset)
+    internal static XfsExtent ReadExtent(byte[] buffer, int offset)
     {
-        var lower = EndianUtilities.ReadUInt64Big(buffer, offset + 8);
-        var middle = ReadUInt64BigFromOffset(buffer, offset + 6);
-        var upper = EndianUtilities.ReadUInt64Big(buffer, offset);
+        var high = EndianUtilities.ReadUInt64Big(buffer, offset);
+        var low = EndianUtilities.ReadUInt64Big(buffer, offset + 8);
         return new XfsExtent(
-            (uint)(lower & 0x001fffff),
-            (middle >> 5) & 0x000fffffffffffff,
-            (upper >> 9) & 0x003fffffffffffff,
-            (upper & 0x8000000000000000UL) != 0);
+            (uint)(low & 0x001fffff),
+            ((high & 0x1ff) << 43) | (low >> 21),
+            (high >> 9) & 0x003fffffffffffff,
+            (high & (1UL << 63)) != 0);
     }
 
     private byte[] ReadContent(XfsInode inode, long offset, int count)
@@ -655,26 +704,94 @@ internal sealed class XfsRawFileSystem
             return localResult;
         }
 
+        var extents = GetExtents(inode).OrderBy(extent => extent.StartOffset).ToList();
+        ValidateExtents(inode, extents);
         var result = new byte[count];
-        foreach (var extent in GetExtents(inode))
+        for (var extentIndex = 0; extentIndex < extents.Count; extentIndex++)
         {
-            var extentStart = checked((long)(extent.StartOffset * _superBlock.BlockSize));
-            var extentLength = checked((long)(extent.BlockCount * _superBlock.BlockSize));
-            var extentEnd = extentStart + extentLength;
-            var readStart = Math.Max(offset, extentStart);
-            var readEnd = Math.Min(offset + count, extentEnd);
-            if (readEnd <= readStart)
+            var extent = extents[extentIndex];
+            try
             {
-                continue;
-            }
+                var extentStart = checked((long)checked(extent.StartOffset * (ulong)_superBlock.BlockSize));
+                var extentLength = GetExtentByteLength(extent.BlockCount, _superBlock.BlockSize);
+                var extentEnd = checked(extentStart + extentLength);
+                var readStart = Math.Max(offset, extentStart);
+                var readEnd = Math.Min(checked(offset + count), extentEnd);
+                if (readEnd <= readStart || extent.IsUnwritten)
+                {
+                    continue;
+                }
 
-            var resultOffset = checked((int)(readStart - offset));
-            var physicalOffset = ExtentToDiskOffset(extent.StartBlock) + (readStart - extentStart);
-            var bytesToRead = checked((int)(readEnd - readStart));
-            _reader.ReadAt(physicalOffset, result, resultOffset, bytesToRead);
+                var resultOffset = checked((int)(readStart - offset));
+                var physicalOffset = checked(ExtentToDiskOffset(extent.StartBlock) + (readStart - extentStart));
+                var bytesToRead = checked((int)(readEnd - readStart));
+                DiagnosticLog.Write($"XFS raw extent read: inode={inode.Number}, fileOffset={readStart}, bytes={bytesToRead}, logicalBlock={extent.StartOffset}, physicalBlock={extent.StartBlock}, partitionOffset={physicalOffset}, unwritten={extent.IsUnwritten}");
+                _reader.ReadAt(physicalOffset, result, resultOffset, bytesToRead);
+            }
+            catch (Exception ex)
+            {
+                throw new IOException(
+                    $"XFS extent read failed: inode={inode.Number}, index={extentIndex}, logicalBlock={extent.StartOffset}, physicalBlock={extent.StartBlock}, blockCount={extent.BlockCount}.",
+                    ex);
+            }
         }
 
         return result;
+    }
+
+    internal static long GetExtentByteLength(uint blockCount, uint blockSize) =>
+        checked((long)checked((ulong)blockCount * blockSize));
+
+    private void ValidateExtents(XfsInode inode, IReadOnlyList<XfsExtent> extents)
+    {
+        ulong previousEnd = 0;
+        foreach (var extent in extents)
+        {
+            if (extent.BlockCount == 0)
+            {
+                throw new InvalidDataException($"XFS inode {inode.Number} contains a zero-length extent.");
+            }
+
+            if (extent.StartBlock >= _superBlock.DataBlocks || extent.BlockCount > _superBlock.DataBlocks - extent.StartBlock)
+            {
+                throw new InvalidDataException(
+                    $"XFS inode {inode.Number} extent is outside the data device: startBlock={extent.StartBlock}, blockCount={extent.BlockCount}, dataBlocks={_superBlock.DataBlocks}.");
+            }
+
+            var end = checked(extent.StartOffset + extent.BlockCount);
+            if (extent.StartOffset < previousEnd)
+            {
+                throw new InvalidDataException($"XFS inode {inode.Number} contains overlapping or unsorted extents.");
+            }
+
+            previousEnd = end;
+        }
+
+        var requiredBlocks = checked((inode.Length + _superBlock.BlockSize - 1) / _superBlock.BlockSize);
+        if (inode.Length > 0 && (extents.Count == 0 || previousEnd < requiredBlocks))
+        {
+            throw new InvalidDataException(
+                $"XFS inode {inode.Number} extents do not cover the file: length={inode.Length}, requiredBlocks={requiredBlocks}, coveredBlocks={previousEnd}, extents={extents.Count}.");
+        }
+    }
+
+    private void WriteFileDiagnostics(XfsNodeRef file, XfsInode inode)
+    {
+        if (!_diagnosedInodes.Add(inode.Number))
+        {
+            return;
+        }
+
+        if (inode.Format is not (2 or 3))
+        {
+            DiagnosticLog.Write($"XFS raw read: path={file.Path}, inode={inode.Number}, format={inode.Format}, size={inode.Length}, extents=0, blockSize={_superBlock.BlockSize}");
+            return;
+        }
+
+        var extents = GetExtents(inode).OrderBy(extent => extent.StartOffset).ToList();
+        var first = extents.FirstOrDefault();
+        var last = extents.LastOrDefault();
+        DiagnosticLog.Write($"XFS raw read: path={file.Path}, inode={inode.Number}, format={inode.Format}, size={inode.Length}, extents={extents.Count}, blockSize={_superBlock.BlockSize}, first={first}, last={last}");
     }
 
     private bool TryCreateNode(ulong inodeNumber, string name, string path, string parentPath, int symlinkDepth, out VfsNode node)
@@ -782,7 +899,8 @@ internal sealed class XfsRawFileSystem
     {
         var allocationGroup = fileSystemBlock >> _superBlock.AgBlocksLog2;
         var relativeBlock = fileSystemBlock & ((1UL << _superBlock.AgBlocksLog2) - 1);
-        return checked((long)((allocationGroup * _superBlock.AgBlocks + relativeBlock) * _superBlock.BlockSize));
+        var diskBlock = checked(checked(allocationGroup * _superBlock.AgBlocks) + relativeBlock);
+        return checked((long)checked(diskBlock * _superBlock.BlockSize));
     }
 
     private IReadOnlyList<XfsExtent> ValidateFullyAllocated(XfsInode inode)
@@ -918,18 +1036,6 @@ internal sealed class XfsRawFileSystem
         return EndianUtilities.ReadUInt32Big(buffer, offset);
     }
 
-    private static ulong ReadUInt64BigFromOffset(byte[] buffer, int offset)
-    {
-        return ((ulong)buffer[offset] << 56)
-            | ((ulong)buffer[offset + 1] << 48)
-            | ((ulong)buffer[offset + 2] << 40)
-            | ((ulong)buffer[offset + 3] << 32)
-            | ((ulong)buffer[offset + 4] << 24)
-            | ((ulong)buffer[offset + 5] << 16)
-            | ((ulong)buffer[offset + 6] << 8)
-            | buffer[offset + 7];
-    }
-
     private sealed record XfsSuperBlock(
         uint BlockSize,
         ulong DataBlocks,
@@ -972,7 +1078,7 @@ internal sealed class XfsRawFileSystem
 
     private sealed record XfsDirectoryEntry(string Name, ulong Inode, byte FileType);
 
-    private sealed record XfsExtent(uint BlockCount, ulong StartBlock, ulong StartOffset, bool IsUnwritten);
+    internal sealed record XfsExtent(uint BlockCount, ulong StartBlock, ulong StartOffset, bool IsUnwritten);
 }
 
 internal sealed record XfsNodeRef(string Path, ulong Inode, XfsRawNodeKind Kind);

@@ -30,7 +30,7 @@ public partial class Form1 : Form
     private readonly ListView _headerList = new() { Dock = DockStyle.Fill, View = View.Details, FullRowSelect = true, GridLines = true };
     private readonly TextBox _warningText = new() { Dock = DockStyle.Fill, Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical };
     private readonly TextBox _offsetBox = new() { Text = "0x0", Width = 140 };
-    private readonly NumericUpDown _lengthBox = new() { Minimum = 1, Maximum = 1024 * 1024, Value = 512, Increment = 512, Width = 110 };
+    private readonly NumericUpDown _lengthBox = new() { Minimum = 1, Maximum = 64 * 1024 * 1024, Value = 512, Increment = 512, Width = 110 };
     private readonly TextBox _hexText = new() { Dock = DockStyle.Fill, Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Both, WordWrap = false, Font = new Font("Consolas", 10) };
     private readonly DataGridView _partitionGrid = new() { Dock = DockStyle.Fill, ReadOnly = true, AllowUserToAddRows = false, AllowUserToDeleteRows = false, SelectionMode = DataGridViewSelectionMode.FullRowSelect, MultiSelect = false, AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill };
     private readonly DataGridView _uefiVariableGrid = new() { Dock = DockStyle.Fill, ReadOnly = true, AllowUserToAddRows = false, AllowUserToDeleteRows = false, SelectionMode = DataGridViewSelectionMode.FullRowSelect, MultiSelect = false, AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill };
@@ -191,8 +191,12 @@ public partial class Form1 : Form
         var top = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, WrapContents = false, Padding = new Padding(8) };
         var readButton = new Button { Text = "読込", Width = 80 };
         var clusterButton = new Button { Text = "クラスタ", Width = 90 };
+        var probeButton = new Button { Text = "Probe保存", Width = 90 };
+        var lzoVerifyButton = new Button { Text = "LZO検証保存", Width = 100 };
         readButton.Click += (_, _) => ReadRawData();
         clusterButton.Click += (_, _) => ShowClusterLookup();
+        probeButton.Click += async (_, _) => await SaveRawProbeAsync();
+        lzoVerifyButton.Click += (_, _) => SaveLzoVerificationBlock();
         top.Controls.AddRange(new Control[]
         {
             new Label { Text = "Offset", AutoSize = true, Padding = new Padding(0, 6, 0, 0) },
@@ -200,7 +204,9 @@ public partial class Form1 : Form
             new Label { Text = "Length", AutoSize = true, Padding = new Padding(12, 6, 0, 0) },
             _lengthBox,
             readButton,
-            clusterButton
+            clusterButton,
+            probeButton,
+            lzoVerifyButton
         });
 
         var layout = new TableLayoutPanel { Dock = DockStyle.Fill, RowCount = 2, ColumnCount = 1 };
@@ -1971,6 +1977,116 @@ public partial class Form1 : Form
         catch (Exception ex)
         {
             MessageBox.Show(this, ex.Message, "クラスタ参照エラー", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+    }
+
+    private async Task SaveRawProbeAsync()
+    {
+        if (_reader is null)
+        {
+            return;
+        }
+
+        long offset;
+        int length;
+        try
+        {
+            offset = ParseOffset(_offsetBox.Text);
+            length = (int)_lengthBox.Value;
+            if (offset < 0 || offset > _reader.Length - length)
+            {
+                throw new ArgumentOutOfRangeException(nameof(offset), "Probe 範囲がディスクイメージの範囲外です。");
+            }
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, ex.Message, "Probe保存エラー", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        using var dialog = new SaveFileDialog
+        {
+            Title = "LZO raw probe を保存",
+            FileName = $"raw-probe-{offset:X}-{length}.bin",
+            Filter = "Binary files (*.bin)|*.bin|All files (*.*)|*.*"
+        };
+        if (dialog.ShowDialog(this) != DialogResult.OK)
+        {
+            return;
+        }
+
+        var reader = _reader;
+        var description = reader.DescribeOffset(offset);
+        _statusLabel.Text = "Probe保存中...";
+        try
+        {
+            var hash = await Task.Run(() => SaveRawProbe(reader, offset, length, dialog.FileName));
+            var message = $"Probe保存完了: {dialog.FileName}{Environment.NewLine}offset=0x{offset:X}, length={length}, SHA-256={hash}{Environment.NewLine}{description}";
+            DiagnosticLog.Write(message);
+            _hexText.Text = message;
+            _statusLabel.Text = "Probe保存完了";
+        }
+        catch (Exception ex)
+        {
+            DiagnosticLog.Write($"Probe save failed: offset={offset}, length={length}, error={ex}");
+            MessageBox.Show(this, ex.Message, "Probe保存エラー", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            _statusLabel.Text = "Probe保存失敗";
+        }
+    }
+
+    private static string SaveRawProbe(IDiskImageReader reader, long offset, int length, string path)
+    {
+        const int bufferSize = 1024 * 1024;
+        var buffer = new byte[Math.Min(bufferSize, length)];
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        using var output = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None);
+        var remaining = length;
+        var currentOffset = offset;
+        while (remaining > 0)
+        {
+            var count = Math.Min(buffer.Length, remaining);
+            reader.ReadAt(currentOffset, buffer, 0, count);
+            output.Write(buffer, 0, count);
+            hash.AppendData(buffer, 0, count);
+            currentOffset = checked(currentOffset + count);
+            remaining -= count;
+        }
+
+        return Convert.ToHexString(hash.GetHashAndReset());
+    }
+
+    private void SaveLzoVerificationBlock()
+    {
+        if (_reader is not LzopDiskImageReader lzopReader)
+        {
+            MessageBox.Show(this, "LZO省容量モードで開いた .lzo イメージでのみ利用できます。", "LZO検証保存", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        try
+        {
+            var offset = ParseOffset(_offsetBox.Text);
+            using var dialog = new SaveFileDialog
+            {
+                Title = "LZO検証用 block を保存",
+                FileName = $"lzop-block-{offset:X}.lzo",
+                Filter = "LZOP files (*.lzo)|*.lzo|All files (*.*)|*.*"
+            };
+            if (dialog.ShowDialog(this) != DialogResult.OK)
+            {
+                return;
+            }
+
+            var block = lzopReader.ExportVerificationBlock(offset, dialog.FileName);
+            var message = $"LZO検証block保存完了: {block.OutputPath}{Environment.NewLine}block={block.BlockIndex}, blockRawOffset=0x{block.BlockRawOffset:X}, inBlockOffset={block.InBlockOffset}, blockRawSize={block.BlockRawSize}";
+            DiagnosticLog.Write(message);
+            _hexText.Text = message;
+            _statusLabel.Text = "LZO検証block保存完了";
+        }
+        catch (Exception ex)
+        {
+            DiagnosticLog.Write($"LZO verification block export failed: error={ex}");
+            MessageBox.Show(this, ex.Message, "LZO検証保存エラー", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
     }
 

@@ -1,7 +1,9 @@
 using System.Buffers.Binary;
+using System.IO.Compression;
+using System.Security.Cryptography;
 using System.Text;
 
-namespace Qcow2Explorer.Core;
+namespace                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               Qcow2Explorer.Core;
 
 public sealed class LzopDiskImageReader : IDiskImageReader
 {
@@ -17,6 +19,9 @@ public sealed class LzopDiskImageReader : IDiskImageReader
     private const uint FlagHeaderCrc32 = 0x00001000;
     private const uint KnownFlagMask = 0xfff03fff;
     private const uint MaximumBlockSize = 64 * 1024 * 1024;
+    private const int IndexCacheVersion = 2;
+    private const int FingerprintLength = 4096;
+    private static readonly byte[] IndexCacheMagic = "VDLZOIDX"u8.ToArray();
 
     private readonly FileStream _stream;
     private readonly IProgress<DiskImageProgress>? _progress;
@@ -24,6 +29,7 @@ public sealed class LzopDiskImageReader : IDiskImageReader
     private readonly object _sync = new();
     private readonly List<LzopBlock> _blocks = [];
     private readonly long _compressedLength;
+    private long _firstBlockOffset;
     private byte[]? _cachedData;
     private int _cachedBlockIndex = -1;
 
@@ -42,7 +48,11 @@ public sealed class LzopDiskImageReader : IDiskImageReader
         try
         {
             ReadHeader();
-            BuildBlockIndex();
+            if (!TryLoadBlockIndex())
+            {
+                BuildBlockIndex();
+                TrySaveBlockIndex();
+            }
         }
         catch
         {
@@ -59,6 +69,7 @@ public sealed class LzopDiskImageReader : IDiskImageReader
     public byte Level { get; private set; }
     public uint Flags { get; private set; }
     public string OriginalName { get; private set; } = "";
+    public bool UsedCachedIndex { get; private set; }
 
     public IReadOnlyList<KeyValuePair<string, string>> GetHeaderRows()
     {
@@ -71,7 +82,8 @@ public sealed class LzopDiskImageReader : IDiskImageReader
             Row("格納名", string.IsNullOrWhiteSpace(OriginalName) ? "(なし)" : OriginalName),
             Row("圧縮ファイルサイズ", $"{_compressedLength:N0} bytes"),
             Row("仮想ディスクサイズ", $"{Length:N0} bytes"),
-            Row("lzopブロック数", $"{_blocks.Count:N0}")
+            Row("lzopブロック数", $"{_blocks.Count:N0}"),
+            Row("lzop索引", UsedCachedIndex ? "キャッシュ再利用" : "今回作成")
         ];
 
         static KeyValuePair<string, string> Row(string key, string value) => new(key, value);
@@ -131,6 +143,38 @@ public sealed class LzopDiskImageReader : IDiskImageReader
     public void Dispose()
     {
         _stream.Dispose();
+    }
+
+    public LzopVerificationBlock ExportVerificationBlock(long rawOffset, string outputPath)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(rawOffset);
+        if (rawOffset >= Length)
+        {
+            throw new ArgumentOutOfRangeException(nameof(rawOffset));
+        }
+
+        lock (_sync)
+        {
+            var index = FindBlock(rawOffset);
+            var block = _blocks[index];
+            var recordStart = checked(block.DataOffset - GetBlockHeaderSize(block));
+            var recordLength = checked((block.DataOffset - recordStart) + block.CompressedSize);
+            var originalPosition = _stream.Position;
+            try
+            {
+                using var output = new FileStream(outputPath, FileMode.Create, FileAccess.Write, FileShare.None);
+                CopyRange(_stream, 0, _firstBlockOffset, output);
+                CopyRange(_stream, recordStart, recordLength, output);
+                output.Write([0, 0, 0, 0]);
+            }
+            finally
+            {
+                _stream.Position = originalPosition;
+            }
+
+            DiagnosticLog.Write($"LZO verification block exported: rawOffset={rawOffset}, block={index}, blockRawOffset={block.UncompressedOffset}, inBlockOffset={rawOffset - block.UncompressedOffset}, output={outputPath}");
+            return new LzopVerificationBlock(index, block.UncompressedOffset, block.UncompressedSize, rawOffset - block.UncompressedOffset, block.DataOffset, outputPath);
+        }
     }
 
     private void ReadHeader()
@@ -219,10 +263,13 @@ public sealed class LzopDiskImageReader : IDiskImageReader
                 throw new InvalidDataException("lzop追加ヘッダーのチェックサムが一致しません。");
             }
         }
+
+        _firstBlockOffset = _stream.Position;
     }
 
     private void BuildBlockIndex()
     {
+        DiagnosticLog.Write($"LZO index build started: source={Path}, compressedLength={_compressedLength}");
         long uncompressedOffset = 0;
         var lastPercentage = -1;
         ReportIndexProgress(force: true);
@@ -292,6 +339,7 @@ public sealed class LzopDiskImageReader : IDiskImageReader
             $"LZO索引作成完了: {_blocks.Count:N0}ブロック",
             _compressedLength,
             _compressedLength));
+        DiagnosticLog.Write($"LZO index build completed: source={Path}, blocks={_blocks.Count}, rawLength={Length}");
 
         void ReportIndexProgress(bool force)
         {
@@ -325,6 +373,10 @@ public sealed class LzopDiskImageReader : IDiskImageReader
         }
 
         var block = _blocks[index];
+        if (index == 0 || index == _blocks.Count - 1 || index % 10_000 == 0)
+        {
+            DiagnosticLog.Write($"LZO block decompression: index={index}, rawOffset={block.UncompressedOffset}, rawSize={block.UncompressedSize}, compressedOffset={block.DataOffset}, compressedSize={block.CompressedSize}");
+        }
         _progress?.Report(new DiskImageProgress(
             $"LZOブロック展開中: {index + 1:N0} / {_blocks.Count:N0}",
             index + 1,
@@ -404,7 +456,7 @@ public sealed class LzopDiskImageReader : IDiskImageReader
             {
                 high = middle - 1;
             }
-            else if (offset >= block.UncompressedOffset + block.UncompressedSize)
+            else if (offset >= checked(block.UncompressedOffset + block.UncompressedSize))
             {
                 low = middle + 1;
             }
@@ -415,6 +467,202 @@ public sealed class LzopDiskImageReader : IDiskImageReader
         }
 
         throw new ArgumentOutOfRangeException(nameof(offset));
+    }
+
+    private int GetBlockHeaderSize(LzopBlock block)
+    {
+        var size = sizeof(uint) * 2;
+        if ((Flags & FlagAdler32Data) != 0)
+        {
+            size += sizeof(uint);
+        }
+
+        if ((Flags & FlagCrc32Data) != 0)
+        {
+            size += sizeof(uint);
+        }
+
+        if (block.CompressedSize < block.UncompressedSize)
+        {
+            if ((Flags & FlagAdler32Compressed) != 0)
+            {
+                size += sizeof(uint);
+            }
+
+            if ((Flags & FlagCrc32Compressed) != 0)
+            {
+                size += sizeof(uint);
+            }
+        }
+
+        return size;
+    }
+
+    private static void CopyRange(Stream source, long offset, long length, Stream destination)
+    {
+        source.Position = offset;
+        var buffer = new byte[64 * 1024];
+        while (length > 0)
+        {
+            var count = (int)Math.Min(buffer.Length, length);
+            var read = source.Read(buffer, 0, count);
+            if (read == 0)
+            {
+                throw new EndOfStreamException("lzop verification block source ended unexpectedly.");
+            }
+
+            destination.Write(buffer, 0, read);
+            length -= read;
+        }
+    }
+
+    private bool TryLoadBlockIndex()
+    {
+        var cachePath = GetIndexCachePath();
+        if (!File.Exists(cachePath))
+        {
+            DiagnosticLog.Write($"LZO index cache miss: path={cachePath}, reason=not found");
+            return false;
+        }
+
+        try
+        {
+            var identity = GetSourceIdentity();
+            using var file = new FileStream(cachePath, FileMode.Open, FileAccess.Read, FileShare.Read);
+            using var compressed = new BrotliStream(file, CompressionMode.Decompress);
+            using var reader = new BinaryReader(compressed, Encoding.UTF8, leaveOpen: false);
+            if (!reader.ReadBytes(IndexCacheMagic.Length).SequenceEqual(IndexCacheMagic)
+                || reader.ReadInt32() != IndexCacheVersion
+                || reader.ReadInt64() != identity.Length
+                || reader.ReadInt64() != identity.LastWriteUtcTicks
+                || !reader.ReadBytes(identity.Fingerprint.Length).SequenceEqual(identity.Fingerprint))
+            {
+                DiagnosticLog.Write($"LZO index cache miss: path={cachePath}, reason=source identity mismatch");
+                return false;
+            }
+
+            var rawLength = reader.ReadInt64();
+            var blockCount = reader.ReadInt32();
+            if (rawLength <= 0 || blockCount <= 0)
+            {
+                throw new InvalidDataException("LZO index cache has an invalid length or block count.");
+            }
+
+            _blocks.Capacity = blockCount;
+            for (var index = 0; index < blockCount; index++)
+            {
+                _blocks.Add(new LzopBlock(
+                    reader.ReadInt64(), reader.ReadInt32(), reader.ReadInt32(), reader.ReadInt64(),
+                    ReadNullableUInt32(reader), ReadNullableUInt32(reader), ReadNullableUInt32(reader), ReadNullableUInt32(reader)));
+            }
+
+            if (_blocks[0].UncompressedOffset != 0
+                || checked(_blocks[^1].UncompressedOffset + _blocks[^1].UncompressedSize) != rawLength)
+            {
+                throw new InvalidDataException("LZO index cache does not cover the raw image.");
+            }
+
+            Length = rawLength;
+            UsedCachedIndex = true;
+            _progress?.Report(new DiskImageProgress(
+                $"LZO索引作成中: キャッシュ読み込み ({blockCount:N0}ブロック)",
+                _compressedLength,
+                _compressedLength));
+            _cancellationToken.ThrowIfCancellationRequested();
+            DiagnosticLog.Write($"LZO index cache hit: path={cachePath}, blocks={blockCount}, rawLength={rawLength}");
+            return true;
+        }
+        catch (Exception ex) when (ex is IOException or InvalidDataException or EndOfStreamException or OverflowException)
+        {
+            _blocks.Clear();
+            DiagnosticLog.Write($"LZO index cache rejected: path={cachePath}, error={ex}");
+            return false;
+        }
+    }
+
+    private void TrySaveBlockIndex()
+    {
+        var cachePath = GetIndexCachePath();
+        var temporaryPath = cachePath + ".partial";
+        try
+        {
+            Directory.CreateDirectory(System.IO.Path.GetDirectoryName(cachePath)!);
+            var identity = GetSourceIdentity();
+            using (var file = new FileStream(temporaryPath, FileMode.Create, FileAccess.Write, FileShare.None))
+            using (var compressed = new BrotliStream(file, CompressionLevel.Fastest))
+            using (var writer = new BinaryWriter(compressed, Encoding.UTF8, leaveOpen: false))
+            {
+                writer.Write(IndexCacheMagic);
+                writer.Write(IndexCacheVersion);
+                writer.Write(identity.Length);
+                writer.Write(identity.LastWriteUtcTicks);
+                writer.Write(identity.Fingerprint);
+                writer.Write(Length);
+                writer.Write(_blocks.Count);
+                foreach (var block in _blocks)
+                {
+                    writer.Write(block.UncompressedOffset);
+                    writer.Write(block.UncompressedSize);
+                    writer.Write(block.CompressedSize);
+                    writer.Write(block.DataOffset);
+                    WriteNullableUInt32(writer, block.DataAdler32);
+                    WriteNullableUInt32(writer, block.DataCrc32);
+                    WriteNullableUInt32(writer, block.CompressedAdler32);
+                    WriteNullableUInt32(writer, block.CompressedCrc32);
+                }
+            }
+
+            File.Move(temporaryPath, cachePath, overwrite: true);
+            DiagnosticLog.Write($"LZO index cache saved: path={cachePath}, blocks={_blocks.Count}");
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or NotSupportedException)
+        {
+            DiagnosticLog.Write($"LZO index cache save failed: source={Path}, error={ex}");
+        }
+    }
+
+    private string GetIndexCachePath()
+    {
+        var cacheId = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(System.IO.Path.GetFullPath(Path).ToUpperInvariant()))).ToLowerInvariant();
+        return System.IO.Path.Combine(LzopRawCacheManager.DefaultCacheRoot, "Index", cacheId + ".lzop-index.br");
+    }
+
+    private LzopIndexSourceIdentity GetSourceIdentity()
+    {
+        var info = new FileInfo(Path);
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        AppendFingerprint(hash, 0, Math.Min(FingerprintLength, _stream.Length));
+        if (_stream.Length > FingerprintLength)
+        {
+            AppendFingerprint(hash, _stream.Length - FingerprintLength, FingerprintLength);
+        }
+
+        return new LzopIndexSourceIdentity(info.Length, info.LastWriteTimeUtc.Ticks, hash.GetHashAndReset());
+    }
+
+    private void AppendFingerprint(IncrementalHash hash, long offset, long count)
+    {
+        var position = _stream.Position;
+        try
+        {
+            _stream.Position = offset;
+            hash.AppendData(ReadExact(checked((int)count)));
+        }
+        finally
+        {
+            _stream.Position = position;
+        }
+    }
+
+    private static uint? ReadNullableUInt32(BinaryReader reader) => reader.ReadBoolean() ? reader.ReadUInt32() : null;
+
+    private static void WriteNullableUInt32(BinaryWriter writer, uint? value)
+    {
+        writer.Write(value.HasValue);
+        if (value.HasValue)
+        {
+            writer.Write(value.Value);
+        }
     }
 
     private byte[] ReadRange(long offset, int count)
@@ -481,7 +729,17 @@ public sealed class LzopDiskImageReader : IDiskImageReader
         uint? DataCrc32,
         uint? CompressedAdler32,
         uint? CompressedCrc32);
+
+    private sealed record LzopIndexSourceIdentity(long Length, long LastWriteUtcTicks, byte[] Fingerprint);
 }
+
+public sealed record LzopVerificationBlock(
+    int BlockIndex,
+    long BlockRawOffset,
+    int BlockRawSize,
+    long InBlockOffset,
+    long CompressedDataOffset,
+    string OutputPath);
 
 internal static class LzopChecksums
 {
