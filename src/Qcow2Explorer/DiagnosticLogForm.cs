@@ -5,6 +5,7 @@ namespace Qcow2Explorer;
 
 public sealed class DiagnosticLogForm : Form
 {
+    private const int MaximumEntriesPerUpdate = 400;
     private readonly ConcurrentQueue<string> _pendingEntries = new();
     private int _updateScheduled;
 
@@ -48,21 +49,29 @@ public sealed class DiagnosticLogForm : Form
             return;
         }
 
-        BeginInvoke(() =>
+        BeginInvoke(DrainPendingEntries);
+    }
+
+    private void DrainPendingEntries()
+    {
+        var processed = 0;
+        while (processed < MaximumEntriesPerUpdate
+            && _pendingEntries.TryDequeue(out var pendingEntry))
         {
-            while (_pendingEntries.TryDequeue(out var pendingEntry))
-            {
-                _text.AppendText(pendingEntry + Environment.NewLine);
-            }
+            _text.AppendText(pendingEntry + Environment.NewLine);
+            processed++;
+        }
 
-            _text.SelectionStart = _text.TextLength;
-            _text.ScrollToCaret();
-            Volatile.Write(ref _updateScheduled, 0);
+        _text.SelectionStart = _text.TextLength;
+        _text.ScrollToCaret();
+        Volatile.Write(ref _updateScheduled, 0);
 
-            if (!_pendingEntries.IsEmpty)
-            {
-                OnEntryAdded(null, string.Empty);
-            }
-        });
+        if (!_pendingEntries.IsEmpty
+            && !IsDisposed
+            && IsHandleCreated
+            && Interlocked.Exchange(ref _updateScheduled, 1) == 0)
+        {
+            BeginInvoke(DrainPendingEntries);
+        }
     }
 }

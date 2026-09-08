@@ -3186,6 +3186,34 @@ static void TestXfsExtentDecoding()
     Assert(
         XfsRawFileSystem.GetExtentByteLength(1_540_608, 4_096) == 6_310_330_368,
         "XFS large extent byte length uses 64bit multiplication");
+
+    Assert(
+        XfsRawFileSystem.IsExtentWithinAllocationGroup(
+            (3UL << 10) | 999,
+            1,
+            agBlocks: 1_000,
+            agCount: 4,
+            dataBlocks: 4_000,
+            agBlockLog: 10),
+        "XFS extent accepts valid padded FSB in the final AG");
+    Assert(
+        !XfsRawFileSystem.IsExtentWithinAllocationGroup(
+            (3UL << 10) | 1_000,
+            1,
+            agBlocks: 1_000,
+            agCount: 4,
+            dataBlocks: 4_000,
+            agBlockLog: 10),
+        "XFS extent rejects block outside final AG");
+    Assert(
+        !XfsRawFileSystem.IsExtentWithinAllocationGroup(
+            (3UL << 10) | 999,
+            2,
+            agBlocks: 1_000,
+            agCount: 4,
+            dataBlocks: 4_000,
+            agBlockLog: 10),
+        "XFS extent rejects AG boundary crossing");
 }
 
 static void TestFileSystemExporterUnexpectedEofDiagnostics()
