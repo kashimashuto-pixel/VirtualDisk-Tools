@@ -14,6 +14,7 @@ using Qcow2Explorer.Previewing;
 using DiscUtils.Streams;
 using DiscXfsFileSystem = DiscUtils.Xfs.XfsFileSystem;
 using VdiDisk = DiscUtils.Vdi.Disk;
+using VhdxDisk = DiscUtils.Vhdx.Disk;
 using VmdkDisk = DiscUtils.Vmdk.Disk;
 using VmdkDiskCreateType = DiscUtils.Vmdk.DiskCreateType;
 
@@ -316,6 +317,7 @@ static void RunGeneratedImageTests()
     TestFatSameLengthReplacement();
     TestFatFileEditingOperations();
     TestExt4SameLengthReplacement();
+    TestAvhdxDifferencingDisk();
     TestNtfsMftMirrorFallback();
 
     var imagePath = Path.Combine(AppContext.BaseDirectory, "sample-fat16.qcow2");
@@ -1819,6 +1821,79 @@ static void TestRealImageRegressionRunner()
     File.WriteAllText(manifestPath, manifest, new UTF8Encoding(false));
     var summary = RealImageRegressionRunner.Run(manifestPath);
     Assert(summary.CaseCount == 9, "real-image regression runner case count");
+}
+
+static void TestAvhdxDifferencingDisk()
+{
+    const long capacity = 16L * 1024 * 1024;
+    const long dataOffset = 4L * 1024 * 1024;
+    var parentPath = Path.Combine(AppContext.BaseDirectory, "sample-avhdx-parent.vhdx");
+    var childPath = Path.Combine(AppContext.BaseDirectory, "sample-avhdx-child.avhdx");
+    var grandchildPath = Path.Combine(AppContext.BaseDirectory, "sample-avhdx-grandchild.avhdx");
+    var missingParentPath = parentPath + ".missing";
+    foreach (var path in new[] { grandchildPath, childPath, parentPath, missingParentPath })
+    {
+        File.Delete(path);
+    }
+
+    var parentData = Enumerable.Range(0, 8 * 1024).Select(index => (byte)(index * 17 + 3)).ToArray();
+    var childData = Enumerable.Range(0, 512).Select(index => (byte)(255 - index)).ToArray();
+    var grandchildData = Enumerable.Range(0, 512).Select(index => (byte)(index * 29 + 11)).ToArray();
+    using (var stream = new FileStream(parentPath, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None))
+    using (var parent = VhdxDisk.InitializeDynamic(stream, Ownership.Dispose, capacity))
+    {
+        parent.Content.Position = dataOffset;
+        parent.Content.Write(parentData);
+    }
+
+    using (var parent = new VhdxDisk(parentPath, FileAccess.Read))
+    using (var child = parent.CreateDifferencingDisk(childPath))
+    {
+        child.Content.Position = dataOffset + 1024;
+        child.Content.Write(childData);
+    }
+
+    using (var child = new VhdxDisk(childPath, FileAccess.Read))
+    using (var grandchild = child.CreateDifferencingDisk(grandchildPath))
+    {
+        grandchild.Content.Position = dataOffset + 2048;
+        grandchild.Content.Write(grandchildData);
+    }
+
+    using (var reader = DiskImageReaderFactory.Open(grandchildPath))
+    {
+        Assert(reader.FormatName == "AVHDX (VHDX differencing)", "AVHDX format name");
+        Assert(reader.Length == capacity, "AVHDX virtual capacity");
+        Assert(DiskImageReaderFactory.DialogFilter.Contains("*.avhdx", StringComparison.Ordinal), "AVHDX dialog filter");
+        var actual = new byte[parentData.Length];
+        reader.ReadAt(dataOffset, actual, 0, actual.Length);
+        var expected = parentData.ToArray();
+        childData.CopyTo(expected, 1024);
+        grandchildData.CopyTo(expected, 2048);
+        Assert(actual.SequenceEqual(expected), "AVHDX three-layer merged content");
+        Assert(
+            reader.GetHeaderRows().Any(row => row.Key == "VHDXレイヤー数" && row.Value == "3"),
+            "AVHDX layer count header");
+        Assert(reader.GetWarnings().Any(warning => warning.Contains("3層", StringComparison.Ordinal)), "AVHDX chain warning");
+    }
+
+    File.Move(parentPath, missingParentPath);
+    try
+    {
+        try
+        {
+            using var _ = DiskImageReaderFactory.Open(grandchildPath);
+            throw new InvalidOperationException("AVHDX missing parent was accepted");
+        }
+        catch (InvalidDataException ex)
+        {
+            Assert(ex.Message.Contains("親VHDX/AVHDX", StringComparison.Ordinal), "AVHDX missing parent diagnostics");
+        }
+    }
+    finally
+    {
+        File.Move(missingParentPath, parentPath);
+    }
 }
 
 static void TestBitLockerRecoveryPasswordUnlock()

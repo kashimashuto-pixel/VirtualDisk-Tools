@@ -3,7 +3,7 @@ using System.IO.Compression;
 using System.Security.Cryptography;
 using System.Text;
 
-namespace                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               Qcow2Explorer.Core;
+namespace Qcow2Explorer.Core;
 
 public sealed class LzopDiskImageReader : IDiskImageReader
 {
