@@ -184,7 +184,7 @@ public static class FileReplacementService
         if (fileSystemName.Equals("XFS", StringComparison.OrdinalIgnoreCase))
         {
             var fileSystem = new XfsFileSystem(slice, partition);
-            return new WritableFileSystemHandle(fileSystem, fileSystem, fileSystem);
+            return new WritableFileSystemHandle(fileSystem, fileSystem, fileSystem, fileSystem);
         }
 
         if (fileSystemName is "FAT16" or "FAT32")

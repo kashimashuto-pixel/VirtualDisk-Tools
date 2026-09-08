@@ -1,11 +1,12 @@
 using System.Text;
 using System.Globalization;
 using System.Diagnostics;
+using System.Buffers.Binary;
 using Qcow2Explorer.Core;
 
 namespace Qcow2Explorer.FileSystems;
 
-internal sealed class XfsRawFileSystem
+internal sealed partial class XfsRawFileSystem
 {
     private const uint SuperBlockMagic = 0x58465342;
     private const ushort InodeMagic = 0x494e;
@@ -310,7 +311,10 @@ internal sealed class XfsRawFileSystem
         var agBlocksLog2 = buffer[0x7c];
         var dirBlockLog2 = buffer[0xc0];
         var features2 = EndianUtilities.ReadUInt32Big(buffer, 0xc8);
+        var compatibleFeatures = sbVersion >= 5 ? EndianUtilities.ReadUInt32Big(buffer, 0xd0) : 0;
+        var readOnlyCompatibleFeatures = sbVersion >= 5 ? EndianUtilities.ReadUInt32Big(buffer, 0xd4) : 0;
         var incompatibleFeatures = sbVersion >= 5 ? EndianUtilities.ReadUInt32Big(buffer, 0xd8) : 0;
+        var logIncompatibleFeatures = sbVersion >= 5 ? EndianUtilities.ReadUInt32Big(buffer, 0xdc) : 0;
         var logStart = EndianUtilities.ReadUInt64Big(buffer, 0x30);
         var logBlocks = EndianUtilities.ReadUInt32Big(buffer, 0x60);
         var agOffsetBits = agBlocksLog2 + inodesPerBlockLog2;
@@ -322,6 +326,7 @@ internal sealed class XfsRawFileSystem
         return new XfsSuperBlock(
             blockSize,
             EndianUtilities.ReadUInt64Big(buffer, 0x08),
+            EndianUtilities.ReadUInt64Big(buffer, 0x10),
             EndianUtilities.ReadUInt64Big(buffer, 0x38),
             EndianUtilities.ReadUInt32Big(buffer, 0x54),
             EndianUtilities.ReadUInt32Big(buffer, 0x58),
@@ -341,7 +346,13 @@ internal sealed class XfsRawFileSystem
             buffer[0x7e] != 0,
             logStart,
             logBlocks,
-            buffer.AsSpan(0x20, 16).ToArray());
+            buffer.AsSpan(0x20, 16).ToArray(),
+            ReadUInt16Big(buffer, 0x66),
+            compatibleFeatures,
+            readOnlyCompatibleFeatures,
+            incompatibleFeatures,
+            logIncompatibleFeatures,
+            EndianUtilities.ReadUInt16Big(buffer, 0xb0));
     }
 
     private XfsInode ReadInode(ulong number)
@@ -366,6 +377,11 @@ internal sealed class XfsRawFileSystem
         }
 
         var version = buffer[0x04];
+        if (version >= 3)
+        {
+            ValidateChecksum(buffer, 0x64, $"XFS inode {number}");
+        }
+
         var dataForkOffset = version < 3 ? 0x64 : 0xb0;
         var flags2 = version >= 3 && buffer.Length >= 0x80
             ? EndianUtilities.ReadUInt64Big(buffer, 0x78)
@@ -374,7 +390,7 @@ internal sealed class XfsRawFileSystem
         var forkOffset = buffer[0x52];
         var dataForkLength = forkOffset == 0
             ? buffer.Length - dataForkOffset
-            : Math.Max(0, Math.Min(buffer.Length - dataForkOffset, forkOffset * 8));
+            : Math.Max(0, Math.Min(buffer.Length - dataForkOffset, forkOffset * 8 - dataForkOffset));
         var dataFork = new byte[dataForkLength];
         Array.Copy(buffer, dataForkOffset, dataFork, 0, dataFork.Length);
 
@@ -393,7 +409,10 @@ internal sealed class XfsRawFileSystem
             ReadUInt16Big(buffer, 0x5a),
             flags2,
             forkOffset,
-            dataFork);
+            dataFork,
+            version,
+            inodeOffset,
+            buffer);
         _inodeCache[number] = inode;
         return inode;
     }
@@ -842,6 +861,7 @@ internal sealed class XfsRawFileSystem
         node = new VfsNode
         {
             Name = name,
+            VirtualPath = path,
             IsDirectory = kind == XfsRawNodeKind.Directory,
             Size = kind == XfsRawNodeKind.Directory ? 0 : (long)Math.Min(inode.Length, long.MaxValue),
             ModifiedUtc = inode.ModifiedUtc,
@@ -1207,6 +1227,7 @@ internal sealed class XfsRawFileSystem
     private sealed record XfsSuperBlock(
         uint BlockSize,
         ulong DataBlocks,
+        ulong RealtimeBlocks,
         ulong RootInode,
         uint AgBlocks,
         uint AgCount,
@@ -1226,7 +1247,13 @@ internal sealed class XfsRawFileSystem
         bool InProgress,
         ulong LogStart,
         uint LogBlocks,
-        byte[] Uuid);
+        byte[] Uuid,
+        ushort SectorSize,
+        uint CompatibleFeatures,
+        uint ReadOnlyCompatibleFeatures,
+        uint IncompatibleFeatures,
+        uint LogIncompatibleFeatures,
+        ushort QuotaFlags);
 
     private sealed record XfsInode(
         ulong Number,
@@ -1241,7 +1268,10 @@ internal sealed class XfsRawFileSystem
         ushort Flags,
         ulong Flags2,
         byte ForkOffset,
-        byte[] DataFork)
+        byte[] DataFork,
+        byte Version,
+        long DiskOffset,
+        byte[] RawData)
     {
         public int FileType => (Mode >> 12) & 0x0f;
         public bool IsDirectory => FileType == 4;
