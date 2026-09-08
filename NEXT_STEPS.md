@@ -13,6 +13,7 @@
 - 原本を変更しない64 KiBページ単位のコピーオンライトブロックデバイス
 - ext4 extent／legacy block pointerとXFS inline／B+tree extentの物理位置へ内容を書き込み
 - スパース、未初期化extent、XFS realtime／共有reflink、暗号化などを事前に拒否
+- XFS logのcycleからheadを確認し、直前の正常unmount recordを認識できる単純なclean状態だけを許可（未回収logと複雑な循環状態は安全側で拒否）
 - 置換後の仮想ファイルをSHA-256で読み戻し検証してから、新規RAWへ原子的に保存
 - 物理ディスク、RAID、LVM、復号パーティション、既存出力の上書きを拒否
 - C#生成ext4 fixtureの原本不変・保存後再読込テスト

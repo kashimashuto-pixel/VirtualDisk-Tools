@@ -114,7 +114,7 @@ C# / Windows Forms で作成した、原本を変更しない仮想ディスク�
 
 - 原本、物理ディスク、既存の出力ファイルへは書き込みません。変更はメモリ上のコピーオンライト領域へ保持し、最後に新しいRAWイメージとして保存します。
 - 置換直後に仮想ファイルを読み戻し、置換元とSHA-256が一致した場合だけRAW保存へ進みます。
-- 現在はファイルサイズを変更しない内容置換に限定しています。FATはclean volumeかつ全FAT copyが一致する完全なcluster chainだけを扱います。NTFSはclean volume上の単一MFT recordに収まる、非resident・非圧縮・非暗号化・非sparseの無名data streamだけを扱い、runlistと`$Bitmap`の割り当てを検証します。exFATはdirty／media-failure状態を拒否し、DiscUtils上で既存ファイルとサイズを再確認してからコピーオンライトへ反映します。ファイルの新規作成、削除、拡大・縮小、スパース／未初期化extent、XFSの共有reflink extentは未対応です。
+- 現在はファイルサイズを変更しない内容置換に限定しています。FATはclean volumeかつ全FAT copyが一致する完全なcluster chainだけを扱います。NTFSはclean volume上の単一MFT recordに収まる、非resident・非圧縮・非暗号化・非sparseの無名data streamだけを扱い、runlistと`$Bitmap`の割り当てを検証します。exFATはdirty／media-failure状態を拒否し、DiscUtils上で既存ファイルとサイズを再確認してからコピーオンライトへ反映します。XFSはlogのhead直前に正常unmount recordがある単純なclean状態だけを許可し、未回収logや複雑な循環状態は拒否します。ファイルの新規作成、削除、拡大・縮小、スパース／未初期化extent、XFSの共有reflink extentは未対応です。
 - RAID、LVM、BitLocker／LUKSなどの合成・復号パーティションと物理ディスクは書き込み対象外です。
 - qcow2、VHDXなどを開いた場合も、出力はコンテナー形式ではなく展開済みの論理ディスク全体を格納するRAWです。出力先には元の仮想ディスクと同程度の空き容量が必要です。
 - 実験的機能のため、重要なイメージでは使用せず、出力RAWもLinux標準ツールで検査してから利用してください。

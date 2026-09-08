@@ -26,6 +26,7 @@ internal sealed class XfsRawFileSystem
     private readonly Dictionary<ulong, IReadOnlyList<XfsDirectoryEntry>> _directoryCache = new();
     private readonly HashSet<ulong> _diagnosedInodes = [];
     private readonly Encoding _fileNameEncoding;
+    private bool? _hasCleanLog;
 
     private XfsRawFileSystem(IBlockReader reader)
     {
@@ -196,6 +197,12 @@ internal sealed class XfsRawFileSystem
             return false;
         }
 
+        if (!HasCleanUnmountRecord())
+        {
+            reason = "clean unmount recordを確認できないXFS logは書き込めません。Linuxでlog replayと正常unmountを完了してください。";
+            return false;
+        }
+
         if ((inode.Flags & 0x0001) != 0)
         {
             reason = "realtime device上のXFSファイルはまだ書き込めません。";
@@ -304,6 +311,8 @@ internal sealed class XfsRawFileSystem
         var dirBlockLog2 = buffer[0xc0];
         var features2 = EndianUtilities.ReadUInt32Big(buffer, 0xc8);
         var incompatibleFeatures = sbVersion >= 5 ? EndianUtilities.ReadUInt32Big(buffer, 0xd8) : 0;
+        var logStart = EndianUtilities.ReadUInt64Big(buffer, 0x30);
+        var logBlocks = EndianUtilities.ReadUInt32Big(buffer, 0x60);
         var agOffsetBits = agBlocksLog2 + inodesPerBlockLog2;
         if (agOffsetBits <= 0 || agOffsetBits >= 63)
         {
@@ -329,7 +338,10 @@ internal sealed class XfsRawFileSystem
             sbVersion == 5 && (incompatibleFeatures & 0x1) != 0 || (version & 0x8000) != 0 && (features2 & 0x0200) != 0,
             sbVersion == 5 && (incompatibleFeatures & 0x08) != 0,
             sbVersion == 5 && (incompatibleFeatures & 0x20) != 0,
-            buffer[0x7e] != 0);
+            buffer[0x7e] != 0,
+            logStart,
+            logBlocks,
+            buffer.AsSpan(0x20, 16).ToArray());
     }
 
     private XfsInode ReadInode(ulong number)
@@ -910,6 +922,155 @@ internal sealed class XfsRawFileSystem
         return checked((long)checked(diskBlock * _superBlock.BlockSize));
     }
 
+    private bool HasCleanUnmountRecord()
+    {
+        if (_hasCleanLog is bool cached)
+        {
+            return cached;
+        }
+
+        const uint logHeaderMagic = 0xfeedbabe;
+        const int basicBlockSize = 512;
+        const int scanBufferSize = 4 * 1024 * 1024;
+        if (_superBlock.LogStart == 0 || _superBlock.LogBlocks == 0)
+        {
+            return (_hasCleanLog = false).Value;
+        }
+
+        var logOffset = checked((long)checked(_superBlock.LogStart * _superBlock.BlockSize));
+        var logLength = checked((long)checked((ulong)_superBlock.LogBlocks * _superBlock.BlockSize));
+        if (logOffset < 0 || logLength < basicBlockSize || logOffset > _reader.Length - logLength)
+        {
+            return (_hasCleanLog = false).Value;
+        }
+
+        if ((logLength % basicBlockSize) != 0 || logLength / basicBlockSize > int.MaxValue)
+        {
+            return (_hasCleanLog = false).Value;
+        }
+
+        var logBasicBlocks = checked((int)(logLength / basicBlockSize));
+        var cycles = new uint[logBasicBlocks];
+        var headers = new List<XfsLogRecordHeader>();
+        var buffer = new byte[scanBufferSize];
+        for (long chunkOffset = 0; chunkOffset < logLength; chunkOffset += buffer.Length)
+        {
+            var count = checked((int)Math.Min(buffer.Length, logLength - chunkOffset));
+            _reader.ReadAt(logOffset + chunkOffset, buffer, 0, count);
+            for (var offset = 0; offset + basicBlockSize <= count; offset += basicBlockSize)
+            {
+                var logBlock = checked((int)((chunkOffset + offset) / basicBlockSize));
+                var firstWord = EndianUtilities.ReadUInt32Big(buffer, offset);
+                cycles[logBlock] = firstWord == logHeaderMagic
+                    ? EndianUtilities.ReadUInt32Big(buffer, offset + 4)
+                    : firstWord;
+                if (firstWord != logHeaderMagic)
+                {
+                    continue;
+                }
+
+                var version = EndianUtilities.ReadUInt32Big(buffer, offset + 8);
+                var recordLength = EndianUtilities.ReadUInt32Big(buffer, offset + 12);
+                var lsn = EndianUtilities.ReadUInt64Big(buffer, offset + 16);
+                if (version is not (1U or 2U)
+                    || recordLength == 0
+                    || recordLength > 256 * 1024
+                    || (recordLength & 7) != 0
+                    || (uint)(lsn >> 32) != cycles[logBlock]
+                    || (uint)lsn != (uint)logBlock
+                    || !buffer.AsSpan(offset + 304, 16).SequenceEqual(_superBlock.Uuid))
+                {
+                    continue;
+                }
+
+                headers.Add(new XfsLogRecordHeader(
+                    logBlock,
+                    version,
+                    recordLength,
+                    EndianUtilities.ReadUInt32Big(buffer, offset + 320),
+                    EndianUtilities.ReadUInt32Big(buffer, offset + 40)));
+            }
+        }
+
+        var firstCycle = cycles[0];
+        var lastCycle = cycles[^1];
+        int head;
+        if (firstCycle == lastCycle)
+        {
+            if (cycles.Any(cycle => cycle != firstCycle))
+            {
+                return (_hasCleanLog = false).Value;
+            }
+
+            head = 0;
+        }
+        else
+        {
+            if (firstCycle != unchecked(lastCycle + 1))
+            {
+                return (_hasCleanLog = false).Value;
+            }
+
+            head = Array.FindIndex(cycles, cycle => cycle == lastCycle);
+            if (head <= 0
+                || cycles.AsSpan(0, head).ContainsAnyExcept(firstCycle)
+                || cycles.AsSpan(head).ContainsAnyExcept(lastCycle))
+            {
+                return (_hasCleanLog = false).Value;
+            }
+        }
+
+        var latest = head == 0
+            ? headers.MaxBy(header => header.Block)
+            : headers.Where(header => header.Block < head).MaxBy(header => header.Block);
+        if (latest is null)
+        {
+            return (_hasCleanLog = false).Value;
+        }
+
+        if (latest.Version == 2
+            && (latest.RecordSize < 32 * 1024
+                || latest.RecordSize > 256 * 1024
+                || (latest.RecordSize % (32 * 1024)) != 0))
+        {
+            return (_hasCleanLog = false).Value;
+        }
+
+        var headerBlocks = latest.Version == 2 ? latest.RecordSize / (32 * 1024) : 1L;
+        if (headerBlocks > 8)
+        {
+            return (_hasCleanLog = false).Value;
+        }
+
+        var dataBlocks = (latest.RecordLength + basicBlockSize - 1L) / basicBlockSize;
+        if ((latest.Block + headerBlocks + dataBlocks) % logBasicBlocks != head
+            || latest.NumLogOperations != 1)
+        {
+            return (_hasCleanLog = false).Value;
+        }
+
+        var operationBlock = (latest.Block + headerBlocks) % logBasicBlocks;
+        var operation = ReadWrappedLog(logOffset, logLength, operationBlock * basicBlockSize, 12);
+        var operationLength = EndianUtilities.ReadUInt32Big(operation, 4);
+        var client = operation[8];
+        var flags = operation[9];
+        _hasCleanLog = client == 0xaa && flags == 0x20 && operationLength == 0;
+        return _hasCleanLog.Value;
+    }
+
+    private byte[] ReadWrappedLog(long logOffset, long logLength, long relativeOffset, int count)
+    {
+        var result = new byte[count];
+        var firstCount = checked((int)Math.Min(count, logLength - relativeOffset));
+        _reader.ReadAt(logOffset + relativeOffset, result, 0, firstCount);
+        if (firstCount < count)
+        {
+            _reader.ReadAt(logOffset, result, firstCount, count - firstCount);
+        }
+
+        return result;
+    }
+
     private IReadOnlyList<XfsExtent> ValidateFullyAllocated(XfsInode inode)
     {
         var extents = GetExtents(inode)
@@ -1062,7 +1223,10 @@ internal sealed class XfsRawFileSystem
         bool HasFType,
         bool HasBigTime,
         bool HasLargeExtentCounts,
-        bool InProgress);
+        bool InProgress,
+        ulong LogStart,
+        uint LogBlocks,
+        byte[] Uuid);
 
     private sealed record XfsInode(
         ulong Number,
@@ -1085,6 +1249,13 @@ internal sealed class XfsRawFileSystem
     }
 
     private sealed record XfsDirectoryEntry(string Name, ulong Inode, byte FileType);
+
+    private sealed record XfsLogRecordHeader(
+        int Block,
+        uint Version,
+        uint RecordLength,
+        uint RecordSize,
+        uint NumLogOperations);
 
     internal sealed record XfsExtent(uint BlockCount, ulong StartBlock, ulong StartOffset, bool IsUnwritten);
 }
