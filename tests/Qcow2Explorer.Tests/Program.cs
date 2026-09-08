@@ -18,6 +18,49 @@ using VhdxDisk = DiscUtils.Vhdx.Disk;
 using VmdkDisk = DiscUtils.Vmdk.Disk;
 using VmdkDiskCreateType = DiscUtils.Vmdk.DiskCreateType;
 
+if (args.Length == 5 && string.Equals(args[0], "--replace-file", StringComparison.OrdinalIgnoreCase))
+{
+    ReplaceFileInRawImage(args[1], args[2], args[3], args[4]);
+    return;
+}
+
+if (args.Length == 5 && string.Equals(args[0], "--write-file", StringComparison.OrdinalIgnoreCase))
+{
+    WriteFileInRawImage(args[1], args[2], args[3], args[4]);
+    return;
+}
+
+if (args.Length == 6 && string.Equals(args[0], "--create-file", StringComparison.OrdinalIgnoreCase))
+{
+    CreateFileInRawImage(args[1], args[2], args[3], args[4], args[5]);
+    return;
+}
+
+if (args.Length == 4 && string.Equals(args[0], "--delete-file", StringComparison.OrdinalIgnoreCase))
+{
+    DeleteFileInRawImage(args[1], args[2], args[3]);
+    return;
+}
+
+if (args.Length == 5 && string.Equals(args[0], "--batch-edit-smoke", StringComparison.OrdinalIgnoreCase))
+{
+    BatchEditRawImage(args[1], args[2], args[3], args[4]);
+    return;
+}
+
+if (args.Length == 1 && string.Equals(args[0], "--generated-fat-editing", StringComparison.OrdinalIgnoreCase))
+{
+    TestFatFileEditingOperations();
+    Console.WriteLine("Generated FAT editing tests passed.");
+    return;
+}
+
+if (args.Length == 3 && string.Equals(args[0], "--metadata-edit-smoke", StringComparison.OrdinalIgnoreCase))
+{
+    MetadataEditRawImage(args[1], args[2]);
+    return;
+}
+
 if (args.Length > 0 && string.Equals(args[0], "--list-physical", StringComparison.OrdinalIgnoreCase))
 {
     foreach (var disk in PhysicalDiskReader.Enumerate())
@@ -78,6 +121,256 @@ if (args.Length > 0)
 
 RunGeneratedImageTests();
 
+static void ReplaceFileInRawImage(
+    string imagePath,
+    string virtualPath,
+    string replacementPath,
+    string outputPath)
+{
+    using var source = new RawDiskImageReader(imagePath);
+    var partition = new PartitionInfo
+    {
+        Number = 1,
+        Scheme = "raw-filesystem",
+        StartLba = 0,
+        SectorCount = checked((ulong)(source.Length / 512)),
+        LengthOverrideBytes = source.Length,
+    };
+    partition.FileSystem = FileSystemDetector.Detect(source, partition);
+    var fileSystem = FileSystemDetector.TryOpen(source, partition, out var error)
+        ?? throw new InvalidDataException(error);
+    try
+    {
+        var file = ResolveVirtualPath(fileSystem, virtualPath);
+        var progress = new Progress<DiskImageProgress>(update =>
+        {
+            var suffix = update.Percentage is int percentage ? $" {percentage}%" : string.Empty;
+            Console.WriteLine($"{update.Message}{suffix}");
+        });
+        var result = FileReplacementService.ReplaceToRawAsync(
+            source,
+            partition,
+            fileSystem,
+            file,
+            replacementPath,
+            outputPath,
+            progress).GetAwaiter().GetResult();
+        Console.WriteLine(
+            $"Replacement passed: fs={partition.FileSystem}, bytes={result.BytesReplaced:N0}, "
+            + $"pages={result.ModifiedPageCount:N0}, sha256={Convert.ToHexString(result.Sha256).ToLowerInvariant()}, "
+            + $"output={result.DestinationPath}");
+    }
+    finally
+    {
+        (fileSystem as IDisposable)?.Dispose();
+    }
+
+}
+
+static void WriteFileInRawImage(
+    string imagePath,
+    string virtualPath,
+    string contentPath,
+    string outputPath)
+{
+    using var source = new RawDiskImageReader(imagePath);
+    var partition = CreateRawFileSystemPartition(source);
+    var fileSystem = OpenDetectedFileSystem(source, partition);
+    try
+    {
+        var file = ResolveVirtualPath(fileSystem, virtualPath);
+        var result = FileEditService.WriteFileToRawAsync(
+            source,
+            partition,
+            fileSystem,
+            file,
+            contentPath,
+            outputPath).GetAwaiter().GetResult();
+        PrintEditResult(result);
+    }
+    finally
+    {
+        (fileSystem as IDisposable)?.Dispose();
+    }
+}
+
+static void CreateFileInRawImage(
+    string imagePath,
+    string directoryPath,
+    string name,
+    string contentPath,
+    string outputPath)
+{
+    using var source = new RawDiskImageReader(imagePath);
+    var partition = CreateRawFileSystemPartition(source);
+    var fileSystem = OpenDetectedFileSystem(source, partition);
+    try
+    {
+        var directory = ResolveVirtualPath(fileSystem, directoryPath);
+        var result = FileEditService.CreateFileToRawAsync(
+            source,
+            partition,
+            fileSystem,
+            directory,
+            name,
+            contentPath,
+            outputPath).GetAwaiter().GetResult();
+        PrintEditResult(result);
+    }
+    finally
+    {
+        (fileSystem as IDisposable)?.Dispose();
+    }
+}
+
+static void DeleteFileInRawImage(string imagePath, string virtualPath, string outputPath)
+{
+    using var source = new RawDiskImageReader(imagePath);
+    var partition = CreateRawFileSystemPartition(source);
+    var fileSystem = OpenDetectedFileSystem(source, partition);
+    try
+    {
+        var normalized = virtualPath.Replace('\\', '/').TrimEnd('/');
+        var separator = normalized.LastIndexOf('/');
+        var parentPath = separator <= 0 ? "/" : normalized[..separator];
+        var directory = ResolveVirtualPath(fileSystem, parentPath);
+        var file = ResolveVirtualPath(fileSystem, normalized);
+        var result = FileEditService.DeleteFileToRawAsync(
+            source,
+            partition,
+            fileSystem,
+            directory,
+            file,
+            outputPath).GetAwaiter().GetResult();
+        PrintEditResult(result);
+    }
+    finally
+    {
+        (fileSystem as IDisposable)?.Dispose();
+    }
+}
+
+static void BatchEditRawImage(
+    string imagePath,
+    string replacementPath,
+    string finalContentPath,
+    string outputPath)
+{
+    using var source = new RawDiskImageReader(imagePath);
+    var partition = CreateRawFileSystemPartition(source);
+    var fileSystem = OpenDetectedFileSystem(source, partition);
+    try
+    {
+        PendingFileEdit[] edits =
+        [
+            new(FileEditOperationKind.WriteContent, "/payload.bin", replacementPath),
+            new(FileEditOperationKind.CreateFile, "/Added batch.bin", replacementPath),
+            new(FileEditOperationKind.WriteContent, "/Added batch.bin", finalContentPath),
+            new(FileEditOperationKind.DeleteFile, "/payload.bin"),
+        ];
+        var progress = new Progress<DiskImageProgress>(update => Console.WriteLine(update.Message));
+        var result = FileEditBatchService.ApplyToRawAsync(
+            source,
+            partition,
+            fileSystem,
+            edits,
+            outputPath,
+            progress).GetAwaiter().GetResult();
+        Console.WriteLine(
+            $"Batch edit passed: fs={partition.FileSystem}, edits={result.EditCount:N0}, "
+            + $"pages={result.ModifiedPageCount:N0}, output={result.DestinationPath}");
+    }
+    finally
+    {
+        (fileSystem as IDisposable)?.Dispose();
+    }
+}
+
+static void MetadataEditRawImage(string imagePath, string outputPath)
+{
+    using var source = new RawDiskImageReader(imagePath);
+    var partition = CreateRawFileSystemPartition(source);
+    var fileSystem = OpenDetectedFileSystem(source, partition);
+    try
+    {
+        var timestamp = new DateTime(2024, 2, 3, 4, 5, 6, DateTimeKind.Utc);
+        var attributes = partition.FileSystem.StartsWith("ext", StringComparison.OrdinalIgnoreCase)
+            || partition.FileSystem.Equals("XFS", StringComparison.OrdinalIgnoreCase)
+            ? FileAttributes.ReadOnly
+            : FileAttributes.Hidden | FileAttributes.Archive;
+        PendingFileEdit[] edits =
+        [
+            new(FileEditOperationKind.CreateDirectory, "/Work"),
+            new(FileEditOperationKind.MoveEntry, "/payload.bin", DestinationVirtualPath: "/Work/Renamed.bin"),
+            new(FileEditOperationKind.SetAttributes, "/Work/Renamed.bin", Attributes: attributes),
+            new(FileEditOperationKind.SetLastWriteTimeUtc, "/Work/Renamed.bin", ModifiedUtc: timestamp),
+            new(FileEditOperationKind.CreateDirectory, "/Empty"),
+            new(FileEditOperationKind.DeleteDirectory, "/Empty"),
+            new(FileEditOperationKind.CreateDirectory, "/Target"),
+            new(FileEditOperationKind.MoveEntry, "/Work", DestinationVirtualPath: "/Target/Renamed folder"),
+        ];
+        var result = FileEditBatchService.ApplyToRawAsync(
+            source,
+            partition,
+            fileSystem,
+            edits,
+            outputPath,
+            new Progress<DiskImageProgress>(update => Console.WriteLine(update.Message))).GetAwaiter().GetResult();
+        Console.WriteLine(
+            $"Metadata edit passed: fs={partition.FileSystem}, edits={result.EditCount:N0}, "
+            + $"pages={result.ModifiedPageCount:N0}, output={result.DestinationPath}");
+    }
+    finally
+    {
+        (fileSystem as IDisposable)?.Dispose();
+    }
+}
+
+static PartitionInfo CreateRawFileSystemPartition(RawDiskImageReader source)
+{
+    var partition = new PartitionInfo
+    {
+        Number = 1,
+        Scheme = "raw-filesystem",
+        StartLba = 0,
+        SectorCount = checked((ulong)(source.Length / 512)),
+        LengthOverrideBytes = source.Length,
+    };
+    partition.FileSystem = FileSystemDetector.Detect(source, partition);
+    return partition;
+}
+
+static IReadOnlyFileSystem OpenDetectedFileSystem(RawDiskImageReader source, PartitionInfo partition)
+{
+    return FileSystemDetector.TryOpen(source, partition, out var error)
+        ?? throw new InvalidDataException(error);
+}
+
+static VfsNode ResolveVirtualPath(IReadOnlyFileSystem fileSystem, string path)
+{
+    var current = fileSystem.Root;
+    foreach (var part in path.Replace('\\', '/').Split('/', StringSplitOptions.RemoveEmptyEntries))
+    {
+        var comparison = fileSystem.Name is "FAT16" or "FAT32" or "exFAT" or "NTFS"
+            ? StringComparison.OrdinalIgnoreCase
+            : StringComparison.Ordinal;
+        current = fileSystem.ListDirectory(current)
+            .SingleOrDefault(node => string.Equals(node.Name, part, comparison))
+            ?? throw new FileNotFoundException($"仮想パスが見つかりません: {path}");
+    }
+
+    return current;
+}
+
+static void PrintEditResult(FileEditResult result)
+{
+    var hash = result.Sha256 is null ? "-" : Convert.ToHexString(result.Sha256).ToLowerInvariant();
+    Console.WriteLine(
+        $"Edit passed: operation={result.Operation}, path={result.VirtualPath}, "
+        + $"old={result.PreviousLength:N0}, new={result.NewLength:N0}, "
+        + $"pages={result.ModifiedPageCount:N0}, sha256={hash}, output={result.DestinationPath}");
+}
+
 static void RunGeneratedImageTests()
 {
     Assert(PhysicalDiskReader.IsPhysicalDiskPath(@"\\.\PhysicalDrive0"), "physical disk path detection");
@@ -93,6 +386,7 @@ static void RunGeneratedImageTests()
     Test4KnGptParsing();
     TestGeneratedMdRaid1Image();
     TestGeneratedMdRaid0Image();
+    TestGeneratedMdRaid5Image();
     TestGeneratedMdRaid10Image();
     TestLvmMetadataDiagnostics();
     TestGeneratedLvm2Image();
@@ -114,6 +408,12 @@ static void RunGeneratedImageTests()
     TestFilePreviews();
     TestNavigationHistory();
     TestVirtualPaths();
+    TestCopyOnWriteBlockDevice();
+    TestPhysicalDiskCommitEngine();
+    TestFatSameLengthReplacement();
+    TestFatFileEditingOperations();
+    TestLogicalLayerEditing();
+    TestExt4SameLengthReplacement();
     TestAvhdxDifferencingDisk();
     TestNtfsMftMirrorFallback();
 
@@ -3460,6 +3760,90 @@ static void TestGeneratedMdRaid0Image()
     }
 }
 
+static void TestGeneratedMdRaid5Image()
+{
+    var paths = Enumerable.Range(0, 3)
+        .Select(index => Path.Combine(AppContext.BaseDirectory, $"synthetic-md-raid5-{index}.raw"))
+        .ToArray();
+    var expected = TestImageFactory.CreateMdRaid5Fat16(paths);
+    using (var first = DiskImageReaderFactory.Open(paths[0]))
+    using (var second = DiskImageReaderFactory.Open(paths[1]))
+    using (var third = DiskImageReaderFactory.Open(paths[2]))
+    {
+        var discovery = MdRaidDeviceSet.Discover([third, first, second]);
+        Assert(discovery.Components.Count == 3, "Linux md RAID5 component discovery");
+        Assert(discovery.Arrays.Count == 1, string.Join(Environment.NewLine, discovery.Diagnostics));
+        var array = discovery.Arrays[0];
+        Assert(array.Level == 5 && array.LevelName == "RAID5", "Linux md RAID5 level");
+        Assert(!array.Reader.IsDegraded, "Linux md RAID5 complete array");
+        Assert(array.Reader.AvailableRoles.SequenceEqual(new ushort[] { 0, 1, 2 }), "Linux md RAID5 role ordering");
+        Assert(array.Reader.Length == expected.Length, "Linux md RAID5 length");
+        Assert(
+            Qcow2Explorer.Core.EndianUtilities.ReadBytes(array.Reader, 0, expected.Length)
+                .SequenceEqual(expected),
+            "Linux md RAID5 full left-symmetric mapping");
+        Assert(
+            Qcow2Explorer.Core.EndianUtilities.ReadBytes(array.Reader, 64 * 1024 - 31, 160)
+                .SequenceEqual(expected.AsSpan(64 * 1024 - 31, 160)),
+            "Linux md RAID5 chunk-boundary mapping");
+
+        var partitions = PartitionTableReader.ReadPartitions(array.Reader);
+        Assert(partitions.Count == 1, "partition table inside Linux md RAID5");
+        var partition = partitions[0];
+        partition.FileSystem = FileSystemDetector.Detect(array.Reader, partition);
+        Assert(partition.FileSystem == "FAT16", "FAT16 inside Linux md RAID5");
+        var fs = FileSystemDetector.TryOpen(array.Reader, partition, out var error);
+        Assert(fs is not null, error);
+        var hello = fs!.ListDirectory(fs.Root).Single(node => node.Name == "HELLO.TXT");
+        Assert(
+            Encoding.ASCII.GetString(fs.ReadFile(hello, 0, (int)hello.Size)) == TestImageFactory.HelloText,
+            "Linux md RAID5 file read");
+    }
+
+    using (var first = DiskImageReaderFactory.Open(paths[0]))
+    using (var third = DiskImageReaderFactory.Open(paths[2]))
+    {
+        var discovery = MdRaidDeviceSet.Discover([third, first]);
+        Assert(discovery.Arrays.Count == 1, string.Join(Environment.NewLine, discovery.Diagnostics));
+        Assert(discovery.Arrays[0].Reader.IsDegraded, "Linux md RAID5 degraded assembly");
+        Assert(discovery.Arrays[0].Reader.AvailableRoles.SequenceEqual(new ushort[] { 0, 2 }), "Linux md RAID5 degraded roles");
+        Assert(
+            Qcow2Explorer.Core.EndianUtilities.ReadBytes(discovery.Arrays[0].Reader, 0, expected.Length)
+                .SequenceEqual(expected),
+            "Linux md RAID5 degraded XOR reconstruction");
+    }
+
+    using (var first = DiskImageReaderFactory.Open(paths[0]))
+    {
+        var discovery = MdRaidDeviceSet.Discover([first]);
+        Assert(discovery.Arrays.Count == 0, "Linux md RAID5 rejects two missing members");
+        Assert(
+            discovery.Diagnostics.Any(message => message.Contains("active member", StringComparison.Ordinal)),
+            "Linux md RAID5 missing-member diagnostic");
+    }
+
+    var unsupportedPaths = Enumerable.Range(0, 3)
+        .Select(index => Path.Combine(AppContext.BaseDirectory, $"synthetic-md-raid5-unsupported-{index}.raw"))
+        .ToArray();
+    _ = TestImageFactory.CreateMdRaid5Fat16(unsupportedPaths, layout: 6);
+    var readers = unsupportedPaths.Select(path => DiskImageReaderFactory.Open(path)).ToList();
+    try
+    {
+        var discovery = MdRaidDeviceSet.Discover(readers.Cast<IBlockReader>().ToList());
+        Assert(discovery.Arrays.Count == 0, "Linux md RAID5 rejects unsupported layout");
+        Assert(
+            discovery.Diagnostics.Any(message => message.Contains("layout", StringComparison.Ordinal)),
+            "Linux md RAID5 unsupported-layout diagnostic");
+    }
+    finally
+    {
+        foreach (var reader in readers)
+        {
+            reader.Dispose();
+        }
+    }
+}
+
 static void TestGeneratedMdRaid10Image()
 {
     var paths = Enumerable.Range(0, 4)
@@ -4820,11 +5204,831 @@ static void TestVirtualPaths()
 {
     Assert(VirtualPath.Normalize("") == "/", "virtual path empty normalization");
     Assert(VirtualPath.Normalize("//backup//images/") == "/backup/images", "virtual path normalization");
+    Assert(VirtualPath.Normalize(@"\backup\images\") == "/backup/images", "virtual path backslash normalization");
     Assert(VirtualPath.Combine("/", "disk.qcow2") == "/disk.qcow2", "virtual path root combination");
     Assert(VirtualPath.Combine("/backup", "disk.qcow2") == "/backup/disk.qcow2", "virtual path nested combination");
     Assert(VirtualPath.GetParent("/disk.qcow2") == "/", "virtual path root parent");
     Assert(VirtualPath.GetParent("/backup/images/disk.qcow2") == "/backup/images", "virtual path nested parent");
     Assert(VirtualPath.Split("/backup/images").SequenceEqual(["backup", "images"]), "virtual path split");
+}
+
+static void TestCopyOnWriteBlockDevice()
+{
+    var sourceData = Enumerable.Range(0, 200_000).Select(index => (byte)(index * 31)).ToArray();
+    var source = new MemorySectorReader(sourceData, 512);
+    var overlay = new CopyOnWriteBlockDevice(source, 4096);
+    var replacement = Enumerable.Range(0, 7000).Select(index => (byte)(255 - index)).ToArray();
+    overlay.WriteAt(3500, replacement, 0, replacement.Length);
+
+    var actual = new byte[12_000];
+    overlay.ReadAt(0, actual, 0, actual.Length);
+    Assert(actual.AsSpan(0, 3500).SequenceEqual(sourceData.AsSpan(0, 3500)), "copy-on-write prefix");
+    Assert(actual.AsSpan(3500, replacement.Length).SequenceEqual(replacement), "copy-on-write replacement");
+    Assert(
+        actual.AsSpan(3500 + replacement.Length).SequenceEqual(
+            sourceData.AsSpan(3500 + replacement.Length, actual.Length - 3500 - replacement.Length)),
+        "copy-on-write suffix");
+    Assert(sourceData[3500] != replacement[0], "copy-on-write source remains unchanged");
+    Assert(overlay.ModifiedPageCount == 3, "copy-on-write changed page count");
+
+    var partition = new PartitionInfo
+    {
+        StartLba = 40,
+        SectorCount = 64,
+        LengthOverrideBytes = 32 * 1024,
+    };
+    var slice = new WritablePartitionSlice(overlay, partition);
+    var partitionReplacement = new byte[] { 0xde, 0xad, 0xbe, 0xef };
+    slice.WriteAt(100, partitionReplacement, 0, partitionReplacement.Length);
+    var partitionActual = new byte[partitionReplacement.Length];
+    overlay.ReadAt(partition.StartOffset + 100, partitionActual, 0, partitionActual.Length);
+    Assert(partitionActual.SequenceEqual(partitionReplacement), "writable partition offset translation");
+
+    var outputPath = Path.Combine(AppContext.BaseDirectory, "sample-copy-on-write.raw");
+    File.Delete(outputPath);
+    overlay.ExportRawAsync(outputPath).GetAwaiter().GetResult();
+    var exported = File.ReadAllBytes(outputPath);
+    Assert(exported.Length == sourceData.Length, "copy-on-write export length");
+    Assert(exported.AsSpan(3500, replacement.Length).SequenceEqual(replacement), "copy-on-write export data");
+    Assert(
+        exported.AsSpan((int)partition.StartOffset + 100, partitionReplacement.Length).SequenceEqual(partitionReplacement),
+        "copy-on-write partition export data");
+
+    using var writableStream = new BlockReaderStream(overlay);
+    Assert(writableStream.CanWrite, "block reader stream exposes overlay writes");
+    writableStream.Position = 12345;
+    writableStream.Write(partitionReplacement, 0, partitionReplacement.Length);
+    var streamWritten = new byte[partitionReplacement.Length];
+    overlay.ReadAt(12345, streamWritten, 0, streamWritten.Length);
+    Assert(streamWritten.SequenceEqual(partitionReplacement), "block reader stream write forwarding");
+
+    var noOpOverlay = new CopyOnWriteBlockDevice(new MemorySectorReader(sourceData, 512), 4096);
+    noOpOverlay.WriteAt(4096, sourceData, 4096, 4096);
+    Assert(noOpOverlay.GetModifiedPages().Count == 0, "copy-on-write no-op pages excluded from commit");
+}
+
+static void TestPhysicalDiskCommitEngine()
+{
+    var original = Enumerable.Range(0, 16 * 1024).Select(index => (byte)(index * 17 + 9)).ToArray();
+    var overlay = new CopyOnWriteBlockDevice(new MemorySectorReader(original, 512), 4096);
+    var firstChange = Enumerable.Repeat((byte)0xa5, 700).ToArray();
+    var secondChange = Enumerable.Repeat((byte)0x5a, 900).ToArray();
+    overlay.WriteAt(512, firstChange, 0, firstChange.Length);
+    overlay.WriteAt(8192, secondChange, 0, secondChange.Length);
+    var pages = overlay.GetModifiedPages();
+    Assert(pages.Count == 2, "physical commit changed-page snapshot count");
+    Assert(pages[0].OriginalData.AsSpan().SequenceEqual(original.AsSpan(0, 4096)), "physical commit original snapshot");
+
+    var targetInfo = new PhysicalDiskTargetInfo(
+        7,
+        @"\\.\PhysicalDrive7",
+        original.Length,
+        512,
+        IsRemovable: false,
+        IsSystemDisk: false,
+        "Test disk",
+        "TEST-0007",
+        "Test",
+        "identity-test-0007");
+    var journalPath = Path.Combine(AppContext.BaseDirectory, "physical-commit.vdt-recovery");
+    File.Delete(journalPath);
+    var target = new TestBlockDevice(original);
+    var verifierCalled = false;
+    PhysicalDiskCommitEngine.Apply(
+        target,
+        targetInfo,
+        pages,
+        journalPath,
+        finalVerifier: reader =>
+        {
+            verifierCalled = true;
+            var data = new byte[firstChange.Length];
+            reader.ReadAt(512, data, 0, data.Length);
+            Assert(data.SequenceEqual(firstChange), "physical commit final verifier data");
+        });
+    Assert(verifierCalled, "physical commit final verifier called");
+    Assert(
+        PhysicalDiskRecoveryJournal.Read(journalPath).State == PhysicalDiskRecoveryState.Committed,
+        "physical commit journal committed state");
+    Assert(target.Data.AsSpan(512, firstChange.Length).SequenceEqual(firstChange), "physical commit first page applied");
+    Assert(target.Data.AsSpan(8192, secondChange.Length).SequenceEqual(secondChange), "physical commit second page applied");
+
+    var mismatchedTargetInfo = targetInfo with { IdentityToken = "different-device" };
+    var identityRejected = false;
+    try
+    {
+        PhysicalDiskCommitEngine.Restore(target, mismatchedTargetInfo, journalPath);
+    }
+    catch (IOException)
+    {
+        identityRejected = true;
+    }
+
+    Assert(identityRejected, "physical recovery target identity mismatch rejection");
+    Assert(target.Data.AsSpan(512, firstChange.Length).SequenceEqual(firstChange), "identity rejection writes nothing");
+
+    PhysicalDiskCommitEngine.Restore(target, targetInfo, journalPath);
+    Assert(target.Data.SequenceEqual(original), "physical commit journal restore");
+    Assert(
+        PhysicalDiskRecoveryJournal.Read(journalPath).State == PhysicalDiskRecoveryState.RolledBack,
+        "physical commit journal rolled-back state");
+
+    var interruptedTarget = new TestBlockDevice(original);
+    Array.Copy(pages[0].ModifiedData, 0, interruptedTarget.Data, pages[0].Offset, 512);
+    PhysicalDiskCommitEngine.Restore(interruptedTarget, targetInfo, journalPath);
+    Assert(interruptedTarget.Data.SequenceEqual(original), "physical recovery accepts mixed old/new sectors");
+
+    var conflictJournalPath = Path.Combine(AppContext.BaseDirectory, "physical-conflict.vdt-recovery");
+    File.Delete(conflictJournalPath);
+    var conflictTarget = new TestBlockDevice(original);
+    conflictTarget.Data[checked((int)pages[0].Offset)] ^= 0xff;
+    var conflictRejected = false;
+    try
+    {
+        PhysicalDiskCommitEngine.Apply(conflictTarget, targetInfo, pages, conflictJournalPath);
+    }
+    catch (IOException)
+    {
+        conflictRejected = true;
+    }
+
+    Assert(conflictRejected, "physical commit stale-source conflict rejection");
+    Assert(!File.Exists(conflictJournalPath), "physical commit conflict does not create journal");
+
+    var failedJournalPath = Path.Combine(AppContext.BaseDirectory, "physical-failed.vdt-recovery");
+    File.Delete(failedJournalPath);
+    var failedTarget = new TestBlockDevice(original, failOnWriteCall: 2);
+    PhysicalDiskCommitException? commitFailure = null;
+    try
+    {
+        PhysicalDiskCommitEngine.Apply(failedTarget, targetInfo, pages, failedJournalPath);
+    }
+    catch (PhysicalDiskCommitException ex)
+    {
+        commitFailure = ex;
+    }
+
+    Assert(commitFailure?.RollbackSucceeded == true, "physical commit write failure automatic rollback status");
+    Assert(failedTarget.Data.SequenceEqual(original), "physical commit write failure automatic rollback data");
+    Assert(
+        PhysicalDiskRecoveryJournal.Read(failedJournalPath).State == PhysicalDiskRecoveryState.RolledBack,
+        "physical commit write failure journal state");
+
+    var verifyFailureJournalPath = Path.Combine(AppContext.BaseDirectory, "physical-verify-failed.vdt-recovery");
+    File.Delete(verifyFailureJournalPath);
+    var verifyFailureTarget = new TestBlockDevice(original);
+    try
+    {
+        PhysicalDiskCommitEngine.Apply(
+            verifyFailureTarget,
+            targetInfo,
+            pages,
+            verifyFailureJournalPath,
+            finalVerifier: _ => throw new InvalidDataException("injected final verification failure"));
+        Assert(false, "physical commit final verification failure must throw");
+    }
+    catch (PhysicalDiskCommitException ex)
+    {
+        Assert(ex.RollbackSucceeded, "physical commit verification failure rollback status");
+    }
+
+    Assert(verifyFailureTarget.Data.SequenceEqual(original), "physical commit verification failure rollback data");
+
+    var corruptedJournalPath = Path.Combine(AppContext.BaseDirectory, "physical-corrupt.vdt-recovery");
+    File.Copy(journalPath, corruptedJournalPath, overwrite: true);
+    using (var stream = new FileStream(corruptedJournalPath, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+    {
+        stream.Position = stream.Length - 1;
+        var value = stream.ReadByte();
+        stream.Position--;
+        stream.WriteByte((byte)(value ^ 0xff));
+    }
+
+    var corruptRejected = false;
+    try
+    {
+        _ = PhysicalDiskRecoveryJournal.Read(corruptedJournalPath);
+    }
+    catch (InvalidDataException)
+    {
+        corruptRejected = true;
+    }
+
+    Assert(corruptRejected, "physical commit corrupt journal rejection");
+
+    var corruptedMetadataPath = Path.Combine(AppContext.BaseDirectory, "physical-corrupt-metadata.vdt-recovery");
+    File.Copy(journalPath, corruptedMetadataPath, overwrite: true);
+    using (var stream = new FileStream(corruptedMetadataPath, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+    {
+        stream.Position = 16;
+        var value = stream.ReadByte();
+        stream.Position--;
+        stream.WriteByte((byte)(value ^ 0x01));
+    }
+
+    var corruptMetadataRejected = false;
+    try
+    {
+        _ = PhysicalDiskRecoveryJournal.Read(corruptedMetadataPath);
+    }
+    catch (InvalidDataException)
+    {
+        corruptMetadataRejected = true;
+    }
+
+    Assert(corruptMetadataRejected, "physical commit corrupt metadata rejection");
+}
+
+static void TestExt4SameLengthReplacement()
+{
+    var sourcePath = Path.Combine(AppContext.BaseDirectory, "sample-ext4-write-source.raw");
+    var outputPath = Path.Combine(AppContext.BaseDirectory, "sample-ext4-write-output.raw");
+    var serviceOutputPath = Path.Combine(AppContext.BaseDirectory, "sample-ext4-write-service-output.raw");
+    var resizedOutputPath = Path.Combine(AppContext.BaseDirectory, "sample-ext4-edit-resized.raw");
+    var replacementPath = Path.Combine(AppContext.BaseDirectory, "sample-ext4-write-replacement.bin");
+    var resizedContentPath = Path.Combine(AppContext.BaseDirectory, "sample-ext4-edit-resized.bin");
+    File.Delete(sourcePath);
+    File.Delete(outputPath);
+    File.Delete(serviceOutputPath);
+    File.Delete(resizedOutputPath);
+    File.Delete(replacementPath);
+    File.Delete(resizedContentPath);
+    TestImageFactory.CreateExt4RawDisk(sourcePath);
+
+    using var source = new RawDiskImageReader(sourcePath);
+    var overlay = new CopyOnWriteBlockDevice(source, 4096);
+    var partition = new PartitionInfo
+    {
+        Number = 1,
+        Scheme = "test",
+        StartLba = 0,
+        SectorCount = checked((ulong)(source.Length / 512)),
+        LengthOverrideBytes = source.Length,
+        FileSystem = "ext4",
+    };
+    var slice = new WritablePartitionSlice(overlay, partition);
+    var fileSystem = new ExtFileSystem(slice, partition);
+    var hello = fileSystem.ListDirectory(fileSystem.Root).Single(node => node.Name == "HELLO.TXT");
+    var replacement = Encoding.ASCII.GetBytes("Writable ext4 content!!!\n");
+    Assert(replacement.Length == hello.Size, "ext4 replacement fixture length");
+    Assert(fileSystem.CanReplaceFile(hello, replacement.Length, out var reason), $"ext4 replacement support: {reason}");
+    Assert(!fileSystem.CanReplaceFile(hello, replacement.Length + 1, out _), "ext4 size change rejection");
+    Assert(!fileSystem.CanWriteFile(hello, 4097, out _), "ext4 allocation-changing resize rejection");
+
+    using (var replacementStream = new MemoryStream(replacement, writable: false))
+    {
+        fileSystem.ReplaceFileContent(hello, replacementStream, replacement.Length);
+    }
+
+    Assert(fileSystem.ReadFile(hello, 0, replacement.Length).SequenceEqual(replacement), "ext4 overlay replacement read");
+    var unchanged = new ExtFileSystem(new PartitionSliceReader(source, partition), partition);
+    Assert(
+        Encoding.ASCII.GetString(unchanged.ReadFile(hello, 0, (int)hello.Size)) == TestImageFactory.Ext4HelloText,
+        "ext4 source image remains unchanged");
+
+    overlay.ExportRawAsync(outputPath).GetAwaiter().GetResult();
+    using var exported = new RawDiskImageReader(outputPath);
+    var exportedFileSystem = new ExtFileSystem(new PartitionSliceReader(exported, partition), partition);
+    var exportedHello = exportedFileSystem.ListDirectory(exportedFileSystem.Root).Single(node => node.Name == "HELLO.TXT");
+    Assert(
+        exportedFileSystem.ReadFile(exportedHello, 0, replacement.Length).SequenceEqual(replacement),
+        "ext4 exported replacement read");
+
+    File.WriteAllBytes(replacementPath, replacement);
+    var serviceResult = FileReplacementService.ReplaceToRawAsync(
+        source,
+        partition,
+        unchanged,
+        hello,
+        replacementPath,
+        serviceOutputPath).GetAwaiter().GetResult();
+    Assert(serviceResult.BytesReplaced == replacement.Length, "ext4 replacement service byte count");
+    Assert(serviceResult.ModifiedPageCount > 0, "ext4 replacement service overlay pages");
+    Assert(serviceResult.Sha256.SequenceEqual(SHA256.HashData(replacement)), "ext4 replacement service hash");
+    using var serviceExported = new RawDiskImageReader(serviceOutputPath);
+    var serviceFileSystem = new ExtFileSystem(new PartitionSliceReader(serviceExported, partition), partition);
+    var serviceHello = serviceFileSystem.ListDirectory(serviceFileSystem.Root).Single(node => node.Name == "HELLO.TXT");
+    Assert(
+        serviceFileSystem.ReadFile(serviceHello, 0, replacement.Length).SequenceEqual(replacement),
+        "ext4 replacement service exported data");
+
+    var resizedContent = Enumerable.Range(0, 17).Select(index => (byte)(index * 19 + 3)).ToArray();
+    File.WriteAllBytes(resizedContentPath, resizedContent);
+    var editResult = FileEditService.WriteFileToRawAsync(
+        source,
+        partition,
+        unchanged,
+        hello,
+        resizedContentPath,
+        resizedOutputPath).GetAwaiter().GetResult();
+    Assert(editResult.NewLength == resizedContent.Length, "ext4 same-allocation resize length");
+    using var resizedOutput = new RawDiskImageReader(resizedOutputPath);
+    var resizedFileSystem = new ExtFileSystem(new PartitionSliceReader(resizedOutput, partition), partition);
+    var resizedHello = resizedFileSystem.ListDirectory(resizedFileSystem.Root).Single(node => node.Name == "HELLO.TXT");
+    Assert(resizedHello.Size == resizedContent.Length, "ext4 resized output inode size");
+    Assert(
+        resizedFileSystem.ReadFile(resizedHello, 0, resizedContent.Length).SequenceEqual(resizedContent),
+        "ext4 resized output content");
+
+    var dirtyBytes = File.ReadAllBytes(sourcePath);
+    dirtyBytes[1024 + 0x3a] = 0;
+    var dirtyOverlay = new CopyOnWriteBlockDevice(new MemorySectorReader(dirtyBytes, 512), 4096);
+    var dirtySlice = new WritablePartitionSlice(dirtyOverlay, partition);
+    var dirtyFileSystem = new ExtFileSystem(dirtySlice, partition);
+    var dirtyHello = dirtyFileSystem.ListDirectory(dirtyFileSystem.Root).Single(node => node.Name == "HELLO.TXT");
+    Assert(
+        !dirtyFileSystem.CanReplaceFile(dirtyHello, dirtyHello.Size, out var dirtyReason)
+        && dirtyReason.Contains("dirty", StringComparison.OrdinalIgnoreCase),
+        "ext4 dirty journal rejection");
+}
+
+static void TestFatSameLengthReplacement()
+{
+    TestFatReplacement(
+        "FAT16",
+        "sample-fat16-write-source.raw",
+        TestImageFactory.CreateRawFat16Disk,
+        usePartitionTable: true);
+    TestFatReplacement(
+        "FAT32",
+        "sample-fat32-write-source.raw",
+        TestImageFactory.CreateFat32RawFileSystem,
+        usePartitionTable: false);
+
+    static void TestFatReplacement(
+        string expectedFileSystem,
+        string sourceName,
+        Action<string> createImage,
+        bool usePartitionTable)
+    {
+        var sourcePath = Path.Combine(AppContext.BaseDirectory, sourceName);
+        var outputPath = Path.Combine(AppContext.BaseDirectory, $"sample-{expectedFileSystem.ToLowerInvariant()}-write-output.raw");
+        var replacementPath = Path.Combine(AppContext.BaseDirectory, $"sample-{expectedFileSystem.ToLowerInvariant()}-write-replacement.bin");
+        File.Delete(sourcePath);
+        File.Delete(outputPath);
+        File.Delete(replacementPath);
+        createImage(sourcePath);
+        var originalHash = SHA256.HashData(File.ReadAllBytes(sourcePath));
+
+        using var source = new RawDiskImageReader(sourcePath);
+        var partition = usePartitionTable
+            ? PartitionTableReader.ReadPartitions(source).Single()
+            : new PartitionInfo
+            {
+                Number = 1,
+                Scheme = "raw-filesystem",
+                StartLba = 0,
+                SectorCount = checked((ulong)(source.Length / 512)),
+                LengthOverrideBytes = source.Length,
+            };
+        partition.FileSystem = FileSystemDetector.Detect(source, partition);
+        Assert(partition.FileSystem == expectedFileSystem, $"{expectedFileSystem} write fixture detection");
+        var fileSystem = FileSystemDetector.TryOpen(source, partition, out var error);
+        Assert(fileSystem is not null, error);
+        var hello = fileSystem!.ListDirectory(fileSystem.Root).Single(node => node.Name == "HELLO.TXT");
+        var replacement = Enumerable.Range(0, checked((int)hello.Size))
+            .Select(index => (byte)(index * 37 + 11))
+            .ToArray();
+        File.WriteAllBytes(replacementPath, replacement);
+
+        Assert(
+            FileReplacementService.CanReplaceToRaw(
+                source,
+                partition,
+                fileSystem,
+                hello,
+                replacement.Length,
+                out var reason),
+            $"{expectedFileSystem} replacement support: {reason}");
+        Assert(
+            !FileReplacementService.CanReplaceToRaw(
+                source,
+                partition,
+                fileSystem,
+                hello,
+                replacement.Length + 1,
+                out _),
+            $"{expectedFileSystem} size change rejection");
+
+        var result = FileReplacementService.ReplaceToRawAsync(
+            source,
+            partition,
+            fileSystem,
+            hello,
+            replacementPath,
+            outputPath).GetAwaiter().GetResult();
+        Assert(result.Sha256.SequenceEqual(SHA256.HashData(replacement)), $"{expectedFileSystem} replacement hash");
+        Assert(SHA256.HashData(File.ReadAllBytes(sourcePath)).SequenceEqual(originalHash), $"{expectedFileSystem} source unchanged");
+
+        using var output = new RawDiskImageReader(outputPath);
+        var outputPartition = usePartitionTable
+            ? PartitionTableReader.ReadPartitions(output).Single()
+            : new PartitionInfo
+            {
+                Number = 1,
+                Scheme = "raw-filesystem",
+                StartLba = 0,
+                SectorCount = checked((ulong)(output.Length / 512)),
+                LengthOverrideBytes = output.Length,
+                FileSystem = expectedFileSystem,
+            };
+        outputPartition.FileSystem = expectedFileSystem;
+        var outputFileSystem = FileSystemDetector.TryOpen(output, outputPartition, out error);
+        Assert(outputFileSystem is not null, error);
+        var outputHello = outputFileSystem!.ListDirectory(outputFileSystem.Root).Single(node => node.Name == "HELLO.TXT");
+        Assert(
+            outputFileSystem.ReadFile(outputHello, 0, replacement.Length).SequenceEqual(replacement),
+            $"{expectedFileSystem} exported replacement read");
+
+        var dirtyBytes = File.ReadAllBytes(sourcePath);
+        var partitionStart = checked((int)partition.StartOffset);
+        var bytesPerSector = BinaryPrimitives.ReadUInt16LittleEndian(dirtyBytes.AsSpan(partitionStart + 11, 2));
+        var reservedSectors = BinaryPrimitives.ReadUInt16LittleEndian(dirtyBytes.AsSpan(partitionStart + 14, 2));
+        var fatCount = dirtyBytes[partitionStart + 16];
+        var fatSectors = expectedFileSystem == "FAT32"
+            ? BinaryPrimitives.ReadUInt32LittleEndian(dirtyBytes.AsSpan(partitionStart + 36, 4))
+            : BinaryPrimitives.ReadUInt16LittleEndian(dirtyBytes.AsSpan(partitionStart + 22, 2));
+        for (var fatIndex = 0; fatIndex < fatCount; fatIndex++)
+        {
+            var fatStatusOffset = checked(
+                partitionStart
+                + (int)(reservedSectors + fatIndex * fatSectors) * bytesPerSector
+                + (expectedFileSystem == "FAT32" ? 4 : 2));
+            dirtyBytes[fatStatusOffset + (expectedFileSystem == "FAT32" ? 3 : 1)] &=
+                expectedFileSystem == "FAT32" ? (byte)0xf7 : (byte)0x7f;
+        }
+        var dirtyOverlay = new CopyOnWriteBlockDevice(new MemorySectorReader(dirtyBytes, 512), 4096);
+        var dirtySlice = new WritablePartitionSlice(dirtyOverlay, partition);
+        var dirtyFileSystem = new FatFileSystem(dirtySlice, partition);
+        var dirtyHello = dirtyFileSystem.ListDirectory(dirtyFileSystem.Root).Single(node => node.Name == "HELLO.TXT");
+        Assert(
+            !dirtyFileSystem.CanReplaceFile(dirtyHello, dirtyHello.Size, out var dirtyReason)
+            && dirtyReason.Contains("dirty", StringComparison.OrdinalIgnoreCase),
+            $"{expectedFileSystem} dirty volume rejection");
+    }
+}
+
+static void TestFatFileEditingOperations()
+{
+    RunFatEditingScenario(
+        "FAT16",
+        "sample-fat16-edit-source.raw",
+        TestImageFactory.CreateRawFat16Disk,
+        usePartitionTable: true);
+    RunFatEditingScenario(
+        "FAT32",
+        "sample-fat32-edit-source.raw",
+        TestImageFactory.CreateFat32RawFileSystem,
+        usePartitionTable: false);
+
+    static void RunFatEditingScenario(
+        string expectedFileSystem,
+        string sourceName,
+        Action<string> createImage,
+        bool usePartitionTable)
+    {
+        var prefix = expectedFileSystem.ToLowerInvariant();
+        var sourcePath = Path.Combine(AppContext.BaseDirectory, sourceName);
+        var grownPath = Path.Combine(AppContext.BaseDirectory, $"sample-{prefix}-edit-grown.raw");
+        var createdPath = Path.Combine(AppContext.BaseDirectory, $"sample-{prefix}-edit-created.raw");
+        var shrunkPath = Path.Combine(AppContext.BaseDirectory, $"sample-{prefix}-edit-shrunk.raw");
+        var finalPath = Path.Combine(AppContext.BaseDirectory, $"sample-{prefix}-edit-final.raw");
+        var batchPath = Path.Combine(AppContext.BaseDirectory, $"sample-{prefix}-edit-batch.raw");
+        var failedBatchPath = Path.Combine(AppContext.BaseDirectory, $"sample-{prefix}-edit-batch-failed.raw");
+        var nonEmptyFailedPath = Path.Combine(AppContext.BaseDirectory, $"sample-{prefix}-edit-nonempty-failed.raw");
+        var grownContentPath = Path.Combine(AppContext.BaseDirectory, $"sample-{prefix}-edit-grown.bin");
+        var addedContentPath = Path.Combine(AppContext.BaseDirectory, $"sample-{prefix}-edit-added.bin");
+        var shrunkContentPath = Path.Combine(AppContext.BaseDirectory, $"sample-{prefix}-edit-small.bin");
+        foreach (var path in new[]
+                 {
+                     sourcePath,
+                     grownPath,
+                     createdPath,
+                     shrunkPath,
+                     finalPath,
+                     batchPath,
+                     failedBatchPath,
+                     nonEmptyFailedPath,
+                     grownContentPath,
+                     addedContentPath,
+                     shrunkContentPath,
+                 })
+        {
+            File.Delete(path);
+        }
+
+        createImage(sourcePath);
+        var sourceHash = SHA256.HashData(File.ReadAllBytes(sourcePath));
+        var grownContent = Enumerable.Range(0, 9_137).Select(index => (byte)(index * 31 + 17)).ToArray();
+        var addedContent = Enumerable.Range(0, 8_192).Select(index => (byte)(index * 13 + 5)).ToArray();
+        var shrunkContent = Enumerable.Range(0, 73).Select(index => (byte)(255 - index)).ToArray();
+        File.WriteAllBytes(grownContentPath, grownContent);
+        File.WriteAllBytes(addedContentPath, addedContent);
+        File.WriteAllBytes(shrunkContentPath, shrunkContent);
+
+        using (var source = new RawDiskImageReader(sourcePath))
+        {
+            var partition = GetFatPartition(source, expectedFileSystem, usePartitionTable);
+            var fileSystem = OpenFileSystem(source, partition);
+            var hello = fileSystem.ListDirectory(fileSystem.Root).Single(node => node.Name == "HELLO.TXT");
+            var result = FileEditService.WriteFileToRawAsync(
+                source,
+                partition,
+                fileSystem,
+                hello,
+                grownContentPath,
+                grownPath).GetAwaiter().GetResult();
+            Assert(result.PreviousLength == hello.Size, $"{expectedFileSystem} edit original length");
+            Assert(result.NewLength == grownContent.Length, $"{expectedFileSystem} edit grown length");
+        }
+
+        using (var grown = new RawDiskImageReader(grownPath))
+        {
+            var partition = GetFatPartition(grown, expectedFileSystem, usePartitionTable);
+            var fileSystem = OpenFileSystem(grown, partition);
+            var result = FileEditService.CreateFileToRawAsync(
+                grown,
+                partition,
+                fileSystem,
+                fileSystem.Root,
+                "Added long file.bin",
+                addedContentPath,
+                createdPath).GetAwaiter().GetResult();
+            Assert(result.Operation == FileEditOperationKind.CreateFile, $"{expectedFileSystem} create operation");
+        }
+
+        using (var created = new RawDiskImageReader(createdPath))
+        {
+            var partition = GetFatPartition(created, expectedFileSystem, usePartitionTable);
+            var fileSystem = OpenFileSystem(created, partition);
+            var added = fileSystem.ListDirectory(fileSystem.Root)
+                .Single(node => node.Name == "Added long file.bin");
+            _ = FileEditService.WriteFileToRawAsync(
+                created,
+                partition,
+                fileSystem,
+                added,
+                shrunkContentPath,
+                shrunkPath).GetAwaiter().GetResult();
+        }
+
+        using (var shrunk = new RawDiskImageReader(shrunkPath))
+        {
+            var partition = GetFatPartition(shrunk, expectedFileSystem, usePartitionTable);
+            var fileSystem = OpenFileSystem(shrunk, partition);
+            var hello = fileSystem.ListDirectory(fileSystem.Root).Single(node => node.Name == "HELLO.TXT");
+            _ = FileEditService.DeleteFileToRawAsync(
+                shrunk,
+                partition,
+                fileSystem,
+                fileSystem.Root,
+                hello,
+                finalPath).GetAwaiter().GetResult();
+        }
+
+        using (var final = new RawDiskImageReader(finalPath))
+        {
+            var partition = GetFatPartition(final, expectedFileSystem, usePartitionTable);
+            var fileSystem = OpenFileSystem(final, partition);
+            var entries = fileSystem.ListDirectory(fileSystem.Root);
+            Assert(entries.All(node => node.Name != "HELLO.TXT"), $"{expectedFileSystem} deleted file absent");
+            var added = entries.Single(node => node.Name == "Added long file.bin");
+            Assert(added.Size == shrunkContent.Length, $"{expectedFileSystem} shrunk file length");
+            Assert(
+                fileSystem.ReadFile(added, 0, shrunkContent.Length).SequenceEqual(shrunkContent),
+                $"{expectedFileSystem} shrunk file content");
+            var validation = ((FatFileSystem)fileSystem).ValidateForEditing();
+            Assert(validation.IsValid, $"{expectedFileSystem} final allocation graph: {validation.Reason}");
+        }
+
+        using (var source = new RawDiskImageReader(sourcePath))
+        {
+            var partition = GetFatPartition(source, expectedFileSystem, usePartitionTable);
+            var fileSystem = OpenFileSystem(source, partition);
+            var edits = new[]
+            {
+                new PendingFileEdit(FileEditOperationKind.WriteContent, "/HELLO.TXT", grownContentPath),
+                new PendingFileEdit(FileEditOperationKind.CreateFile, "/Added batch.bin", addedContentPath),
+                new PendingFileEdit(FileEditOperationKind.WriteContent, "/Added batch.bin", shrunkContentPath),
+                new PendingFileEdit(FileEditOperationKind.DeleteFile, "/HELLO.TXT"),
+                new PendingFileEdit(FileEditOperationKind.CreateDirectory, "/Work"),
+                new PendingFileEdit(
+                    FileEditOperationKind.MoveEntry,
+                    "/Added batch.bin",
+                    DestinationVirtualPath: "/Work/Renamed.bin"),
+                new PendingFileEdit(
+                    FileEditOperationKind.SetAttributes,
+                    "/Work/Renamed.bin",
+                    Attributes: FileAttributes.Hidden | FileAttributes.Archive),
+                new PendingFileEdit(
+                    FileEditOperationKind.SetLastWriteTimeUtc,
+                    "/Work/Renamed.bin",
+                    ModifiedUtc: new DateTime(2024, 2, 3, 4, 5, 6, DateTimeKind.Utc)),
+                new PendingFileEdit(FileEditOperationKind.CreateDirectory, "/Empty"),
+                new PendingFileEdit(FileEditOperationKind.DeleteDirectory, "/Empty"),
+                new PendingFileEdit(FileEditOperationKind.CreateDirectory, "/Target"),
+                new PendingFileEdit(
+                    FileEditOperationKind.MoveEntry,
+                    "/Work",
+                    DestinationVirtualPath: "/Target/Renamed folder"),
+                new PendingFileEdit(
+                    FileEditOperationKind.SetAttributes,
+                    "/Target/Renamed folder",
+                    Attributes: FileAttributes.Directory | FileAttributes.Hidden),
+                new PendingFileEdit(
+                    FileEditOperationKind.SetLastWriteTimeUtc,
+                    "/Target/Renamed folder",
+                    ModifiedUtc: new DateTime(2023, 12, 30, 11, 22, 34, DateTimeKind.Utc)),
+            };
+            var batch = FileEditBatchService.ApplyToRawAsync(
+                source,
+                partition,
+                fileSystem,
+                edits,
+                batchPath).GetAwaiter().GetResult();
+            Assert(batch.EditCount == edits.Length, $"{expectedFileSystem} batch edit count");
+            Assert(batch.ModifiedPageCount > 0, $"{expectedFileSystem} batch modified pages");
+        }
+
+        using (var batch = new RawDiskImageReader(batchPath))
+        {
+            var partition = GetFatPartition(batch, expectedFileSystem, usePartitionTable);
+            var fileSystem = OpenFileSystem(batch, partition);
+            var entries = fileSystem.ListDirectory(fileSystem.Root);
+            Assert(entries.All(node => node.Name != "HELLO.TXT"), $"{expectedFileSystem} batch deleted file absent");
+            Assert(entries.All(node => node.Name != "Empty" && node.Name != "Work"), $"{expectedFileSystem} batch old directories absent");
+            var targetDirectory = entries.Single(node => node.Name == "Target" && node.IsDirectory);
+            var renamedDirectory = fileSystem.ListDirectory(targetDirectory)
+                .Single(node => node.Name == "Renamed folder" && node.IsDirectory);
+            Assert(
+                renamedDirectory.Attributes.HasFlag(FileAttributes.Hidden),
+                $"{expectedFileSystem} batch directory attributes");
+            Assert(
+                renamedDirectory.ModifiedUtc == new DateTime(2023, 12, 30, 11, 22, 34, DateTimeKind.Utc),
+                $"{expectedFileSystem} batch directory timestamp");
+            var added = fileSystem.ListDirectory(renamedDirectory).Single(node => node.Name == "Renamed.bin");
+            Assert(added.Size == shrunkContent.Length, $"{expectedFileSystem} batch final length");
+            Assert(
+                added.Attributes == (FileAttributes.Hidden | FileAttributes.Archive),
+                $"{expectedFileSystem} batch file attributes");
+            Assert(
+                added.ModifiedUtc == new DateTime(2024, 2, 3, 4, 5, 6, DateTimeKind.Utc),
+                $"{expectedFileSystem} batch file timestamp");
+            Assert(
+                fileSystem.ReadFile(added, 0, shrunkContent.Length).SequenceEqual(shrunkContent),
+                $"{expectedFileSystem} batch final content");
+        }
+
+        using (var source = new RawDiskImageReader(sourcePath))
+        {
+            var partition = GetFatPartition(source, expectedFileSystem, usePartitionTable);
+            var fileSystem = OpenFileSystem(source, partition);
+            var rejected = false;
+            try
+            {
+                _ = FileEditBatchService.ApplyToRawAsync(
+                    source,
+                    partition,
+                    fileSystem,
+                    [
+                        new PendingFileEdit(FileEditOperationKind.WriteContent, @"\HELLO.TXT", grownContentPath),
+                        new PendingFileEdit(FileEditOperationKind.DeleteFile, "/missing.bin"),
+                    ],
+                    failedBatchPath).GetAwaiter().GetResult();
+            }
+            catch (FileNotFoundException)
+            {
+                rejected = true;
+            }
+
+            Assert(rejected, $"{expectedFileSystem} batch invalid operation rejected");
+            Assert(!File.Exists(failedBatchPath), $"{expectedFileSystem} failed batch not published");
+        }
+
+        using (var source = new RawDiskImageReader(sourcePath))
+        {
+            var partition = GetFatPartition(source, expectedFileSystem, usePartitionTable);
+            var fileSystem = OpenFileSystem(source, partition);
+            var rejected = false;
+            try
+            {
+                _ = FileEditBatchService.ApplyToRawAsync(
+                    source,
+                    partition,
+                    fileSystem,
+                    [
+                        new PendingFileEdit(FileEditOperationKind.CreateDirectory, "/Nonempty"),
+                        new PendingFileEdit(
+                            FileEditOperationKind.MoveEntry,
+                            "/HELLO.TXT",
+                            DestinationVirtualPath: "/Nonempty/HELLO.TXT"),
+                        new PendingFileEdit(FileEditOperationKind.DeleteDirectory, "/Nonempty"),
+                    ],
+                    nonEmptyFailedPath).GetAwaiter().GetResult();
+            }
+            catch (NotSupportedException)
+            {
+                rejected = true;
+            }
+
+            Assert(rejected, $"{expectedFileSystem} non-empty directory deletion rejected");
+            Assert(!File.Exists(nonEmptyFailedPath), $"{expectedFileSystem} non-empty failure not published");
+        }
+
+        Assert(
+            SHA256.HashData(File.ReadAllBytes(sourcePath)).SequenceEqual(sourceHash),
+            $"{expectedFileSystem} edit source remains unchanged");
+    }
+
+    static PartitionInfo GetFatPartition(
+        RawDiskImageReader reader,
+        string expectedFileSystem,
+        bool usePartitionTable)
+    {
+        var partition = usePartitionTable
+            ? PartitionTableReader.ReadPartitions(reader).Single()
+            : new PartitionInfo
+            {
+                Number = 1,
+                Scheme = "raw-filesystem",
+                StartLba = 0,
+                SectorCount = checked((ulong)(reader.Length / 512)),
+                LengthOverrideBytes = reader.Length,
+            };
+        partition.FileSystem = FileSystemDetector.Detect(reader, partition);
+        Assert(partition.FileSystem == expectedFileSystem, $"{expectedFileSystem} edit fixture detection");
+        return partition;
+    }
+
+    static IReadOnlyFileSystem OpenFileSystem(RawDiskImageReader reader, PartitionInfo partition)
+    {
+        return FileSystemDetector.TryOpen(reader, partition, out var error)
+            ?? throw new InvalidDataException(error);
+    }
+}
+
+static void TestLogicalLayerEditing()
+{
+    var sourcePath = Path.Combine(AppContext.BaseDirectory, "sample-logical-edit-source.raw");
+    var outputPath = Path.Combine(AppContext.BaseDirectory, "sample-logical-edit-output.raw");
+    File.Delete(sourcePath);
+    File.Delete(outputPath);
+    TestImageFactory.CreateRawFat16Disk(sourcePath);
+    var sourceHash = SHA256.HashData(File.ReadAllBytes(sourcePath));
+
+    using var source = new RawDiskImageReader(sourcePath);
+    var physicalPartition = PartitionTableReader.ReadPartitions(source).Single();
+    physicalPartition.FileSystem = FileSystemDetector.Detect(source, physicalPartition);
+    var logicalReader = new PartitionSliceReader(source, physicalPartition);
+    var logicalPartition = new PartitionInfo
+    {
+        Number = physicalPartition.Number,
+        Scheme = "synthetic-logical-layer",
+        Name = "assembled/decrypted test volume",
+        SectorSize = physicalPartition.SectorSize,
+        SectorCount = checked((ulong)(logicalReader.Length / physicalPartition.SectorSize)),
+        LengthOverrideBytes = logicalReader.Length,
+        FileSystem = physicalPartition.FileSystem,
+        ReaderOverride = logicalReader,
+    };
+    var fileSystem = FileSystemDetector.TryOpen(source, logicalPartition, out var error)
+        ?? throw new InvalidDataException(error);
+    try
+    {
+        var result = FileEditBatchService.ApplyToRawAsync(
+            source,
+            logicalPartition,
+            fileSystem,
+            [new PendingFileEdit(FileEditOperationKind.CreateDirectory, "/Logical output")],
+            outputPath).GetAwaiter().GetResult();
+        Assert(result.IsLogicalVolumeOutput, "logical-layer edit result kind");
+        Assert(new FileInfo(outputPath).Length == logicalReader.Length, "logical-layer flat RAW length");
+    }
+    finally
+    {
+        (fileSystem as IDisposable)?.Dispose();
+    }
+
+    using (var output = new RawDiskImageReader(outputPath))
+    {
+        var partition = CreateRawFileSystemPartition(output);
+        var outputFileSystem = OpenDetectedFileSystem(output, partition);
+        try
+        {
+            Assert(
+                outputFileSystem.ListDirectory(outputFileSystem.Root)
+                    .Any(node => node.IsDirectory && node.Name == "Logical output"),
+                "logical-layer flat RAW directory");
+        }
+        finally
+        {
+            (outputFileSystem as IDisposable)?.Dispose();
+        }
+    }
+
+    Assert(
+        SHA256.HashData(File.ReadAllBytes(sourcePath)).SequenceEqual(sourceHash),
+        "logical-layer physical source remains unchanged");
 }
 
 static void TestNtfsMftMirrorFallback()
@@ -4838,6 +6042,7 @@ static void TestNtfsMftMirrorFallback()
     Encoding.ASCII.GetBytes("NTFS    ").CopyTo(volume, 3);
     BinaryPrimitives.WriteUInt16LittleEndian(volume.AsSpan(11, 2), bytesPerSector);
     volume[13] = clusterSize / bytesPerSector;
+    BinaryPrimitives.WriteInt64LittleEndian(volume.AsSpan(40, 8), volume.Length / bytesPerSector);
     BinaryPrimitives.WriteInt64LittleEndian(volume.AsSpan(48, 8), mftLcn);
     BinaryPrimitives.WriteInt64LittleEndian(volume.AsSpan(56, 8), mftMirrorLcn);
     volume[64] = unchecked((byte)-10);
@@ -4846,13 +6051,34 @@ static void TestNtfsMftMirrorFallback()
 
     var mftRecord = CreateFileRecord(0, 5, "$MFT", isDirectory: false, data: null, includeMftRuns: true);
     mftRecord.CopyTo(volume, mftMirrorLcn * clusterSize);
+    CreateFileRecord(3, 5, "$Volume", isDirectory: false, data: null, includeMftRuns: false, volumeFlags: 0)
+        .CopyTo(volume, mftLcn * clusterSize + 3 * recordSize);
     CreateFileRecord(5, 5, ".", isDirectory: true, data: null, includeMftRuns: false)
         .CopyTo(volume, mftLcn * clusterSize + 5 * recordSize);
-    CreateFileRecord(6, 5, "hello.txt", isDirectory: false, data: Encoding.ASCII.GetBytes("mirror recovery"), includeMftRuns: false)
+    CreateFileRecord(
+            6,
+            5,
+            "$Bitmap",
+            isDirectory: false,
+            data: Enumerable.Repeat((byte)0xff, volume.Length / clusterSize / 8).ToArray(),
+            includeMftRuns: false)
         .CopyTo(volume, mftLcn * clusterSize + 6 * recordSize);
-    var deletedRecord = CreateFileRecord(7, 5, "deleted.txt", isDirectory: false, data: Encoding.ASCII.GetBytes("deleted content"), includeMftRuns: false);
+    var nonResidentContent = new byte[clusterSize];
+    Encoding.ASCII.GetBytes("mirror recovery").CopyTo(nonResidentContent, 0);
+    const int helloLcn = 50;
+    CreateFileRecord(
+            8,
+            5,
+            "hello.txt",
+            isDirectory: false,
+            data: nonResidentContent,
+            includeMftRuns: false,
+            nonResidentLcn: helloLcn)
+        .CopyTo(volume, mftLcn * clusterSize + 8 * recordSize);
+    nonResidentContent.CopyTo(volume, helloLcn * clusterSize);
+    var deletedRecord = CreateFileRecord(9, 5, "deleted.txt", isDirectory: false, data: Encoding.ASCII.GetBytes("deleted content"), includeMftRuns: false);
     BinaryPrimitives.WriteUInt16LittleEndian(deletedRecord.AsSpan(22, 2), 0);
-    deletedRecord.CopyTo(volume, mftLcn * clusterSize + 7 * recordSize);
+    deletedRecord.CopyTo(volume, mftLcn * clusterSize + 9 * recordSize);
 
     var reader = new MemorySectorReader(volume, bytesPerSector);
     var partition = new PartitionInfo
@@ -4866,8 +6092,23 @@ static void TestNtfsMftMirrorFallback()
     var fileSystem = new NtfsFileSystem(reader, partition);
     var file = fileSystem.ListDirectory(fileSystem.Root).Single(node => node.Name == "hello.txt");
     Assert(
-        Encoding.ASCII.GetString(fileSystem.ReadFile(file, 0, (int)file.Size)) == "mirror recovery",
+        Encoding.ASCII.GetString(fileSystem.ReadFile(file, 0, "mirror recovery".Length)) == "mirror recovery",
         "NTFS $MFTMirr fallback");
+
+    var overlay = new CopyOnWriteBlockDevice(reader, 4096);
+    var writable = new NtfsFileSystem(overlay, partition);
+    var writableFile = writable.ListDirectory(writable.Root).Single(node => node.Name == "hello.txt");
+    var replacement = Enumerable.Range(0, clusterSize).Select(index => (byte)(index * 13 + 7)).ToArray();
+    Assert(writable.CanReplaceFile(writableFile, replacement.Length, out var writeReason), $"NTFS replacement support: {writeReason}");
+    using (var replacementStream = new MemoryStream(replacement, writable: false))
+    {
+        writable.ReplaceFileContent(writableFile, replacementStream, replacement.Length);
+    }
+
+    Assert(writable.ReadFile(writableFile, 0, replacement.Length).SequenceEqual(replacement), "NTFS overlay replacement read");
+    var unchangedContent = new byte[replacement.Length];
+    reader.ReadAt(helloLcn * clusterSize, unchangedContent, 0, unchangedContent.Length);
+    Assert(unchangedContent.SequenceEqual(nonResidentContent), "NTFS source unchanged");
 
     var deletedFileSystem = new NtfsFileSystem(reader, partition, deletedOnly: true);
     var deletedFile = deletedFileSystem.ListDirectory(deletedFileSystem.Root).Single(node => node.Name == "deleted.txt");
@@ -4875,7 +6116,15 @@ static void TestNtfsMftMirrorFallback()
         Encoding.ASCII.GetString(deletedFileSystem.ReadFile(deletedFile, 0, (int)deletedFile.Size)) == "deleted content",
         "NTFS deleted-only scan uses active $MFT record 0");
 
-    static byte[] CreateFileRecord(long recordNumber, long parentRecord, string name, bool isDirectory, byte[]? data, bool includeMftRuns)
+    static byte[] CreateFileRecord(
+        long recordNumber,
+        long parentRecord,
+        string name,
+        bool isDirectory,
+        byte[]? data,
+        bool includeMftRuns,
+        int? nonResidentLcn = null,
+        ushort? volumeFlags = null)
     {
         var record = new byte[recordSize];
         Encoding.ASCII.GetBytes("FILE").CopyTo(record, 0);
@@ -4903,20 +6152,49 @@ static void TestNtfsMftMirrorFallback()
         nameBytes.CopyTo(record, nameValue + 66);
         attributeOffset += nameAttributeLength;
 
+        if (volumeFlags is ushort flags)
+        {
+            const int volumeInformationLength = 40;
+            BinaryPrimitives.WriteUInt32LittleEndian(record.AsSpan(attributeOffset, 4), 0x70);
+            BinaryPrimitives.WriteUInt32LittleEndian(record.AsSpan(attributeOffset + 4, 4), volumeInformationLength);
+            BinaryPrimitives.WriteUInt32LittleEndian(record.AsSpan(attributeOffset + 16, 4), 12);
+            BinaryPrimitives.WriteUInt16LittleEndian(record.AsSpan(attributeOffset + 20, 2), 24);
+            record[attributeOffset + 32] = 3;
+            record[attributeOffset + 33] = 1;
+            BinaryPrimitives.WriteUInt16LittleEndian(record.AsSpan(attributeOffset + 34, 2), flags);
+            attributeOffset += volumeInformationLength;
+        }
+
         if (includeMftRuns)
         {
             const int dataAttributeLength = 72;
             BinaryPrimitives.WriteUInt32LittleEndian(record.AsSpan(attributeOffset, 4), 0x80);
             BinaryPrimitives.WriteUInt32LittleEndian(record.AsSpan(attributeOffset + 4, 4), dataAttributeLength);
             record[attributeOffset + 8] = 1;
-            BinaryPrimitives.WriteInt64LittleEndian(record.AsSpan(attributeOffset + 24, 8), 1);
+            BinaryPrimitives.WriteInt64LittleEndian(record.AsSpan(attributeOffset + 24, 8), 3);
             BinaryPrimitives.WriteUInt16LittleEndian(record.AsSpan(attributeOffset + 32, 2), 64);
-            BinaryPrimitives.WriteInt64LittleEndian(record.AsSpan(attributeOffset + 40, 8), 2 * clusterSize);
-            BinaryPrimitives.WriteInt64LittleEndian(record.AsSpan(attributeOffset + 48, 8), 2 * clusterSize);
-            BinaryPrimitives.WriteInt64LittleEndian(record.AsSpan(attributeOffset + 56, 8), 2 * clusterSize);
+            BinaryPrimitives.WriteInt64LittleEndian(record.AsSpan(attributeOffset + 40, 8), 4 * clusterSize);
+            BinaryPrimitives.WriteInt64LittleEndian(record.AsSpan(attributeOffset + 48, 8), 4 * clusterSize);
+            BinaryPrimitives.WriteInt64LittleEndian(record.AsSpan(attributeOffset + 56, 8), 4 * clusterSize);
             record[attributeOffset + 64] = 0x11;
-            record[attributeOffset + 65] = 2;
+            record[attributeOffset + 65] = 4;
             record[attributeOffset + 66] = mftLcn;
+            attributeOffset += dataAttributeLength;
+        }
+        else if (data is not null && nonResidentLcn is int dataLcn)
+        {
+            const int dataAttributeLength = 72;
+            BinaryPrimitives.WriteUInt32LittleEndian(record.AsSpan(attributeOffset, 4), 0x80);
+            BinaryPrimitives.WriteUInt32LittleEndian(record.AsSpan(attributeOffset + 4, 4), dataAttributeLength);
+            record[attributeOffset + 8] = 1;
+            BinaryPrimitives.WriteInt64LittleEndian(record.AsSpan(attributeOffset + 24, 8), 0);
+            BinaryPrimitives.WriteUInt16LittleEndian(record.AsSpan(attributeOffset + 32, 2), 64);
+            BinaryPrimitives.WriteInt64LittleEndian(record.AsSpan(attributeOffset + 40, 8), clusterSize);
+            BinaryPrimitives.WriteInt64LittleEndian(record.AsSpan(attributeOffset + 48, 8), data.Length);
+            BinaryPrimitives.WriteInt64LittleEndian(record.AsSpan(attributeOffset + 56, 8), data.Length);
+            record[attributeOffset + 64] = 0x11;
+            record[attributeOffset + 65] = 1;
+            record[attributeOffset + 66] = checked((byte)dataLcn);
             attributeOffset += dataAttributeLength;
         }
         else if (data is not null)
@@ -5355,6 +6633,67 @@ internal static class TestImageFactory
         File.WriteAllBytes(path, CreateVirtualDisk());
     }
 
+    public static void CreateFat32RawFileSystem(string path)
+    {
+        const int sectorSize = 512;
+        const uint totalSectors = 81_920;
+        const ushort reservedSectors = 32;
+        const byte fatCount = 2;
+        const uint fatSectors = 640;
+        const uint firstDataSector = reservedSectors + fatCount * fatSectors;
+        const uint rootCluster = 2;
+        const uint fileCluster = 3;
+        var image = new byte[checked((int)totalSectors * sectorSize)];
+
+        image[0] = 0xeb;
+        image[1] = 0x58;
+        image[2] = 0x90;
+        WriteAscii(image, 3, "MSWIN4.1", 8);
+        WriteU16Le(image, 11, sectorSize);
+        image[13] = 1;
+        WriteU16Le(image, 14, reservedSectors);
+        image[16] = fatCount;
+        WriteU32Le(image, 32, totalSectors);
+        WriteU32Le(image, 36, fatSectors);
+        WriteU32Le(image, 44, rootCluster);
+        WriteU16Le(image, 48, 1);
+        WriteU16Le(image, 50, 6);
+        image[64] = 0x80;
+        image[66] = 0x29;
+        WriteU32Le(image, 67, 0x89abcdef);
+        WriteAscii(image, 71, "VDT FAT32  ", 11);
+        WriteAscii(image, 82, "FAT32   ", 8);
+        image[510] = 0x55;
+        image[511] = 0xaa;
+        image.AsSpan(0, sectorSize).CopyTo(image.AsSpan(6 * sectorSize, sectorSize));
+
+        var clusterCount = (totalSectors - firstDataSector) / image[13];
+        foreach (var fsInfoSector in new[] { 1, 7 })
+        {
+            var fsInfoOffset = fsInfoSector * sectorSize;
+            WriteU32Le(image, fsInfoOffset, 0x41615252);
+            WriteU32Le(image, fsInfoOffset + 484, 0x61417272);
+            WriteU32Le(image, fsInfoOffset + 488, clusterCount - 2);
+            WriteU32Le(image, fsInfoOffset + 492, 4);
+            WriteU32Le(image, fsInfoOffset + 508, 0xaa550000);
+        }
+
+        for (var fatIndex = 0; fatIndex < fatCount; fatIndex++)
+        {
+            var fatOffset = checked((int)((reservedSectors + fatIndex * fatSectors) * sectorSize));
+            WriteU32Le(image, fatOffset, 0x0ffffff8);
+            WriteU32Le(image, fatOffset + 4, 0x0fffffff);
+            WriteU32Le(image, fatOffset + 8, 0x0fffffff);
+            WriteU32Le(image, fatOffset + 12, 0x0fffffff);
+        }
+
+        var rootOffset = checked((int)firstDataSector * sectorSize);
+        WriteDirectoryEntry(image, rootOffset, "HELLO   TXT", 0x20, checked((int)fileCluster), HelloText.Length);
+        var fileOffset = checked((int)(firstDataSector + fileCluster - 2) * sectorSize);
+        WriteAscii(image, fileOffset, HelloText, HelloText.Length);
+        File.WriteAllBytes(path, image);
+    }
+
     public static void CreateMdRaid1Fat16(
         string firstPath,
         string secondPath,
@@ -5540,6 +6879,83 @@ internal static class TestImageFactory
         return expected;
     }
 
+    public static byte[] CreateMdRaid5Fat16(
+        IReadOnlyList<string> paths,
+        uint layout = 2)
+    {
+        if (paths.Count < 3)
+        {
+            throw new ArgumentException("Synthetic RAID5 requires at least three paths.", nameof(paths));
+        }
+
+        const int dataOffset = 1024 * 1024;
+        const uint chunkSectors = 128;
+        const int chunkBytes = checked((int)chunkSectors * BytesPerSector);
+        var arrayData = CreateVirtualDisk();
+        var dataDisks = paths.Count - 1;
+        if (arrayData.Length % checked(chunkBytes * dataDisks) != 0)
+        {
+            throw new InvalidOperationException("Synthetic RAID5 data must fill complete stripes.");
+        }
+
+        var memberDataLength = arrayData.Length / dataDisks;
+        var componentLength = checked(dataOffset + memberDataLength + 1024 * 1024);
+        var components = Enumerable.Range(0, paths.Count)
+            .Select(_ => new byte[componentLength])
+            .ToArray();
+        var stripeCount = arrayData.Length / checked(chunkBytes * dataDisks);
+        for (var stripe = 0; stripe < stripeCount; stripe++)
+        {
+            var parityRole = GetMdRaid5ParityRole(stripe, paths.Count, layout);
+            var parity = new byte[chunkBytes];
+            for (var dataIndex = 0; dataIndex < dataDisks; dataIndex++)
+            {
+                var logicalOffset = checked((stripe * dataDisks + dataIndex) * chunkBytes);
+                var role = GetMdRaid5DataRole(dataIndex, paths.Count, layout, parityRole);
+                Array.Copy(
+                    arrayData,
+                    logicalOffset,
+                    components[role],
+                    checked(dataOffset + stripe * chunkBytes),
+                    chunkBytes);
+                for (var index = 0; index < parity.Length; index++)
+                {
+                    parity[index] ^= arrayData[logicalOffset + index];
+                }
+            }
+
+            parity.CopyTo(components[parityRole], checked(dataOffset + stripe * chunkBytes));
+        }
+
+        var setUuid = Guid.Parse("c870c7bd-c438-461b-a050-90ae7d5f20b2").ToByteArray();
+        byte[][] deviceUuids =
+        [
+            Guid.Parse("34fe833a-0016-4f8e-a5d7-f7dbcc7ff69c").ToByteArray(),
+            Guid.Parse("dc678af8-440c-4140-a59d-4ce8aaf73f68").ToByteArray(),
+            Guid.Parse("3d1066ee-c604-4046-b6a1-dd749b6726e8").ToByteArray(),
+            Guid.Parse("9d30332c-0808-45f3-92c8-9fb856bd7ad8").ToByteArray(),
+        ];
+        var memberSizeSectors = checked((ulong)(memberDataLength / BytesPerSector));
+        for (var index = 0; index < components.Length; index++)
+        {
+            var superblock = CreateMdSuperblock(
+                setUuid,
+                deviceUuids[index],
+                checked((uint)index),
+                checked((ushort)index),
+                memberSizeSectors,
+                events: 81,
+                level: 5,
+                layout: layout,
+                chunkSectors: chunkSectors,
+                raidDisks: checked((uint)paths.Count));
+            superblock.CopyTo(components[index], 4096);
+            File.WriteAllBytes(paths[index], components[index]);
+        }
+
+        return arrayData;
+    }
+
     public static byte[] CreateMdRaid10Fat16(
         IReadOnlyList<string> paths,
         uint layout = 0x0102,
@@ -5690,6 +7106,30 @@ internal static class TestImageFactory
         return arrayData;
     }
 
+    private static int GetMdRaid5ParityRole(int stripe, int raidDisks, uint layout)
+    {
+        return layout switch
+        {
+            0 or 2 => checked(raidDisks - 1 - stripe % raidDisks),
+            1 or 3 => stripe % raidDisks,
+            4 => 0,
+            5 => raidDisks - 1,
+            _ => 0
+        };
+    }
+
+    private static int GetMdRaid5DataRole(int dataIndex, int raidDisks, uint layout, int parityRole)
+    {
+        return layout switch
+        {
+            0 or 1 => dataIndex >= parityRole ? dataIndex + 1 : dataIndex,
+            2 or 3 => (parityRole + 1 + dataIndex) % raidDisks,
+            4 => dataIndex + 1,
+            5 => dataIndex,
+            _ => dataIndex >= parityRole ? dataIndex + 1 : dataIndex
+        };
+    }
+
     private static byte[] CreateMdSuperblock(
         byte[] setUuid,
         byte[] deviceUuid,
@@ -5753,6 +7193,11 @@ internal static class TestImageFactory
         string originalName = "sample-ext4.dd")
     {
         WriteLzop(path, CreateMinimalExt4Disk(), originalName, corruptHeaderChecksum);
+    }
+
+    public static void CreateExt4RawDisk(string path)
+    {
+        File.WriteAllBytes(path, CreateMinimalExt4Disk());
     }
 
     public static void CreateFat16VmaLzop(string path)
@@ -7048,6 +8493,7 @@ internal static class TestImageFactory
         WriteU32Le(disk, super + 0x20, 8192);
         WriteU32Le(disk, super + 0x28, 32);
         WriteU16Le(disk, super + 0x38, 0xef53);
+        WriteU16Le(disk, super + 0x3a, 0x0001);
         WriteU16Le(disk, super + 0x58, inodeSize);
         WriteU32Le(disk, super + 0x60, 0x40);
         WriteU16Le(disk, super + 0xfe, 32);
@@ -7080,6 +8526,7 @@ internal static class TestImageFactory
         int blockCount)
     {
         WriteU16Le(disk, offset, mode);
+        WriteU16Le(disk, offset + 26, (mode & 0xf000) == 0x4000 ? 2 : 1);
         WriteU32Le(disk, offset + 4, size);
         WriteU32Le(disk, offset + 32, 0x00080000);
         WriteU16Le(disk, offset + 40, 0xf30a);
@@ -7412,6 +8859,43 @@ internal sealed class MemorySectorReader : IBlockReader, ILogicalSectorReader
 
         var available = checked((int)Math.Min(count, Length - offset));
         Array.Copy(_data, offset, buffer, bufferOffset, available);
+    }
+}
+
+internal sealed class TestBlockDevice : IBlockDevice
+{
+    private readonly int? _failOnWriteCall;
+    private int _writeCount;
+    private bool _failureInjected;
+
+    public TestBlockDevice(byte[] data, int? failOnWriteCall = null)
+    {
+        Data = (byte[])data.Clone();
+        _failOnWriteCall = failOnWriteCall;
+    }
+
+    public byte[] Data { get; }
+    public long Length => Data.LongLength;
+
+    public void ReadAt(long offset, byte[] buffer, int bufferOffset, int count)
+    {
+        Array.Copy(Data, offset, buffer, bufferOffset, count);
+    }
+
+    public void WriteAt(long offset, byte[] buffer, int bufferOffset, int count)
+    {
+        _writeCount++;
+        if (!_failureInjected && _failOnWriteCall == _writeCount)
+        {
+            _failureInjected = true;
+            throw new IOException("injected physical write failure");
+        }
+
+        Array.Copy(buffer, bufferOffset, Data, offset, count);
+    }
+
+    public void Flush()
+    {
     }
 }
 

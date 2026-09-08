@@ -1,10 +1,41 @@
 # 次回対応予定
 
-- 最終更新: 2026-09-04
-- 基準ブランチ: `main`
+- 最終更新: 2026-09-08
+- 基準ブランチ: `experimental/fs-editing`
 
 この文書は、次回の開発作業へ引き継ぐための優先順位付きロードマップです。
-本ソフトは引き続き、ディスクイメージと内部ファイルシステムを変更しない読み取り専用ツールとして実装します。
+通常の解析は読み取り専用を維持し、書き込み機能は原本を変更しないコピーオンライト方式で段階的に実装します。
+
+## 書き込み対応ロードマップ
+
+### 対応済み: ext4／XFS／FAT16／FAT32／NTFS／exFATの実験的編集
+
+- 原本を変更しない64 KiBページ単位のコピーオンライトブロックデバイス
+- 既存ファイルの内容変更（拡大・縮小を含む）、新規ファイル作成、通常ファイル削除
+- ディレクトリ作成／空ディレクトリ削除、ファイル・ディレクトリの移動／名前変更、属性・更新日時編集
+- 複数操作を1つのコピーオンライト領域へ順番に適用し、操作ごとの再オープン検証と最終RAW検証を実施
+- UIの変更予定一覧、選択／直前／全操作の取り消し、別イメージ切替・終了時の未保存確認
+- スパース、未初期化extent、XFS realtime／共有reflink、暗号化などを事前に拒否
+- XFS logのcycleからheadを確認し、直前の正常unmount recordを認識できる単純なclean状態だけを許可（未回収logと複雑な循環状態は安全側で拒否）
+- 内容変更／追加後の仮想ファイルをSHA-256で読み戻し、削除後のパス消失を検証してから新規RAWへ原子的に保存
+- RAID、LVM、復号パーティションは構成元へ書き戻さず、編集済みの平坦な論理RAWとして保存
+- 物理ディスクはリムーバブル／固定データディスクへ直接差分を適用可能。実行中Windowsのシステムディスク、合成・復号レイヤー、既存出力の上書きは拒否
+- 物理ディスク直接適用は、シリアル番号またはStorage Device IDを必須とする対象再識別、全所属ボリュームの排他ロック／アンマウント、変更前ページの競合検出、別ディスク上の復旧ジャーナル、flush／読み戻し／最終FS検証、自動ロールバックを実施
+- C#生成ext4 fixtureの原本不変・保存後再読込テスト
+- Linux生成ext4／XFSで`e2fsck -fn`、`xfs_repair -n`、読み取り専用マウント後の内容一致を検証
+- FAT16／FAT32はclean状態、複数FAT copyの一致、cluster chainの範囲・loop・長さを検証して割り当て済みdataだけを置換
+- C#合成FAT16／FAT32とLinux生成fixtureを`fsck.fat -vn`、読み取り専用マウント、内容一致で検証
+- NTFSはclean volume、単一MFT recordの非resident通常data、runlist全体、`$Bitmap`割り当てを検証し、resident／圧縮／暗号化／sparse／attribute listを拒否
+- C#合成NTFSと`ntfs-3g 2022.10.3`生成fixtureを、`ntfsfix -n`、読み取り専用マウント、内容一致で検証
+- exFATはdirty／media-failure状態とサイズを事前検証し、書き込み可能streamをコピーオンライトだけへ公開
+- 実`exfatprogs 1.2.2`生成fixtureを`fsck.exfat -n`、読み取り専用マウント、内容一致で検証
+
+### 次段階
+
+1. 現在安全側で拒否する複雑なext4 extent tree／directory layoutの対応範囲を、実fixtureとfsck検証付きで拡張
+2. XFSのdirectory／extent btree、複数allocation group、reflink CoWを、rmap／refcount更新と実fixture検証付きで段階的に拡張
+3. 物理ディスク書き込みを実リムーバブル試験媒体とオフライン固定ディスクで検証し、電源断を模したジャーナル復旧手順を継続的に確認
+4. RAW以外のコンテナーを同形式で保存するwriterを追加
 
 ## 対応済み
 
@@ -178,6 +209,13 @@
 - far、offset、legacy／fixed far-set、無効なfar-set modeを合成fixtureで検証
 - 実`mdadm 4.3 --layout=f2`／`o2`の2台構成を生成し、完全／1台degraded構成と160 MiBファイルをmanifest回帰で確認
 
+### Linux md RAID5読み取り対応（第1段階）
+
+- metadata 1.xのRAID5 level、3台以上のmember、chunk size、resync完了状態、物理data範囲を検証
+- left/right asymmetric、left/right symmetric、parity-first、parity-last layoutの正常arrayを読み取り専用で写像
+- 1台欠損時はXORで欠損data chunkを復元し、2台以上欠損または未対応layoutは安全に拒否
+- 合成FAT16 fixtureで完全構成、1台欠損、2台欠損、未対応layoutを自動テスト定義に追加
+
 ### LVM2複数PV対応
 
 - 「複数ディスク」で指定した全入力をDiscUtilsのVolumeManagerへ登録し、VGに必要なPVを横断して検出
@@ -210,8 +248,8 @@
 
 ### 1. Linux md RAID5
 
-- 全memberが揃った正常arrayの主要parity layoutから開始し、その後1台欠損のXOR復元を追加する
-- dirtyかつdegradedなarrayなど、parityを安全に信頼できない状態は拒否する
+- 実`mdadm 4.3 --level=5` fixtureを生成し、主要parity layout、完全構成、1台degraded構成をmanifest回帰で確認する
+- dirtyかつdegradedなarrayなど、parityを安全に信頼できない状態の実metadata表現を確認し、明示的に拒否する
 
 ### 2. LVM2 thin snapshot／external origin
 
@@ -266,7 +304,8 @@
 
 ## 維持する既存仕様
 
-- ディスクイメージと内部ファイルシステムは読み取り専用
+- 通常の解析経路と物理ディスクは読み取り専用
+- 書き込みは原本と既存ファイルを変更せず、新規出力へのコピーオンライト確定だけを許可
 - 選択コピーと表示フォルダーコピーではハッシュ計算を行わない
 - コピーはバックグラウンドキューで処理し、追加コピーで既存コピーをキャンセルしない
 - 検索、コピー、読み込みには独立したキャンセルトークンを使用する

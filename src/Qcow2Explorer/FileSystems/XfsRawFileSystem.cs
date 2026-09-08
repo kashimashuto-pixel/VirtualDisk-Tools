@@ -1,11 +1,12 @@
 using System.Text;
 using System.Globalization;
 using System.Diagnostics;
+using System.Buffers.Binary;
 using Qcow2Explorer.Core;
 
 namespace Qcow2Explorer.FileSystems;
 
-internal sealed class XfsRawFileSystem
+internal sealed partial class XfsRawFileSystem
 {
     private const uint SuperBlockMagic = 0x58465342;
     private const ushort InodeMagic = 0x494e;
@@ -19,6 +20,7 @@ internal sealed class XfsRawFileSystem
     private const int MaxSymlinkDepth = 12;
 
     private readonly IBlockReader _reader;
+    private readonly IBlockWriter? _writer;
     private readonly XfsSuperBlock _superBlock;
     private readonly Dictionary<ulong, XfsInode> _inodeCache = new();
     private readonly Dictionary<ulong, IReadOnlyList<XfsExtent>> _extentCache = new();
@@ -26,10 +28,12 @@ internal sealed class XfsRawFileSystem
     private readonly HashSet<ulong> _diagnosedInodes = [];
     private readonly HashSet<ulong> _diagnosedOutOfDataDeviceInodes = [];
     private readonly Encoding _fileNameEncoding;
+    private bool? _hasCleanLog;
 
     private XfsRawFileSystem(IBlockReader reader)
     {
         _reader = reader;
+        _writer = reader as IBlockWriter;
         _superBlock = ReadSuperBlock(reader);
         _fileNameEncoding = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: false);
     }
@@ -158,6 +162,132 @@ internal sealed class XfsRawFileSystem
         return builder.ToString();
     }
 
+    public bool CanReplaceFile(XfsNodeRef file, long replacementLength, out string reason)
+    {
+        if (_writer is null)
+        {
+            reason = "変更を保持する書き込みオーバーレイがありません。";
+            return false;
+        }
+
+        if (file.Kind != XfsRawNodeKind.RegularFile || replacementLength < 0)
+        {
+            reason = "通常ファイルだけを置換できます。";
+            return false;
+        }
+
+        XfsInode inode;
+        try
+        {
+            inode = ReadInode(file.Inode);
+        }
+        catch (Exception ex)
+        {
+            reason = $"inodeを読み取れません: {ex.Message}";
+            return false;
+        }
+
+        if (inode.Length > long.MaxValue || replacementLength != (long)inode.Length)
+        {
+            reason = $"現在は元ファイルと同じサイズ（{inode.Length:N0} bytes）の置換だけに対応しています。";
+            return false;
+        }
+
+        if (_superBlock.InProgress)
+        {
+            reason = "mkfsまたはgrowfsが完了していないXFSファイルシステムは書き込めません。";
+            return false;
+        }
+
+        if (!HasCleanUnmountRecord())
+        {
+            reason = "clean unmount recordを確認できないXFS logは書き込めません。Linuxでlog replayと正常unmountを完了してください。";
+            return false;
+        }
+
+        if ((inode.Flags & 0x0001) != 0)
+        {
+            reason = "realtime device上のXFSファイルはまだ書き込めません。";
+            return false;
+        }
+
+        if ((inode.Flags2 & 0x0002) != 0)
+        {
+            reason = "共有reflink extentを持つXFSファイルはまだ書き込めません。";
+            return false;
+        }
+
+        if (inode.Format is not (2 or 3))
+        {
+            reason = "local形式のXFSファイルはまだ書き込めません。";
+            return false;
+        }
+
+        try
+        {
+            ValidateFullyAllocated(inode);
+        }
+        catch (Exception ex) when (ex is InvalidDataException or NotSupportedException or OverflowException)
+        {
+            reason = ex.Message;
+            return false;
+        }
+
+        reason = string.Empty;
+        return true;
+    }
+
+    public void ReplaceFileContent(
+        XfsNodeRef file,
+        Stream replacement,
+        long replacementLength,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(replacement);
+        if (!replacement.CanRead)
+        {
+            throw new ArgumentException("置換元ストリームを読み取れません。", nameof(replacement));
+        }
+
+        if (!CanReplaceFile(file, replacementLength, out var reason))
+        {
+            throw new NotSupportedException(reason);
+        }
+
+        var inode = ReadInode(file.Inode);
+        var extents = ValidateFullyAllocated(inode);
+        var remaining = replacementLength;
+        var buffer = new byte[1024 * 1024];
+        foreach (var extent in extents)
+        {
+            var extentBytes = checked((long)extent.BlockCount * _superBlock.BlockSize);
+            var bytesToWrite = Math.Min(remaining, extentBytes);
+            var physicalOffset = ExtentToDiskOffset(extent.StartBlock);
+            long writtenToExtent = 0;
+            while (writtenToExtent < bytesToWrite)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var count = checked((int)Math.Min(buffer.Length, bytesToWrite - writtenToExtent));
+                replacement.ReadExactly(buffer.AsSpan(0, count));
+                _writer!.WriteAt(physicalOffset + writtenToExtent, buffer, 0, count);
+                writtenToExtent += count;
+                remaining -= count;
+            }
+
+            if (remaining == 0)
+            {
+                break;
+            }
+        }
+
+        if (remaining != 0 || replacement.ReadByte() != -1)
+        {
+            throw new InvalidDataException("置換元ファイルのサイズが指定値と一致しません。変更は破棄してください。");
+        }
+
+        _writer!.Flush();
+    }
+
     private static XfsSuperBlock ReadSuperBlock(IBlockReader reader)
     {
         if (reader.Length < 512)
@@ -182,7 +312,12 @@ internal sealed class XfsRawFileSystem
         var agBlocksLog2 = buffer[0x7c];
         var dirBlockLog2 = buffer[0xc0];
         var features2 = EndianUtilities.ReadUInt32Big(buffer, 0xc8);
+        var compatibleFeatures = sbVersion >= 5 ? EndianUtilities.ReadUInt32Big(buffer, 0xd0) : 0;
+        var readOnlyCompatibleFeatures = sbVersion >= 5 ? EndianUtilities.ReadUInt32Big(buffer, 0xd4) : 0;
         var incompatibleFeatures = sbVersion >= 5 ? EndianUtilities.ReadUInt32Big(buffer, 0xd8) : 0;
+        var logIncompatibleFeatures = sbVersion >= 5 ? EndianUtilities.ReadUInt32Big(buffer, 0xdc) : 0;
+        var logStart = EndianUtilities.ReadUInt64Big(buffer, 0x30);
+        var logBlocks = EndianUtilities.ReadUInt32Big(buffer, 0x60);
         var agOffsetBits = agBlocksLog2 + inodesPerBlockLog2;
         if (agOffsetBits <= 0 || agOffsetBits >= 63)
         {
@@ -192,6 +327,7 @@ internal sealed class XfsRawFileSystem
         return new XfsSuperBlock(
             blockSize,
             EndianUtilities.ReadUInt64Big(buffer, 0x08),
+            EndianUtilities.ReadUInt64Big(buffer, 0x10),
             EndianUtilities.ReadUInt64Big(buffer, 0x38),
             EndianUtilities.ReadUInt32Big(buffer, 0x54),
             EndianUtilities.ReadUInt32Big(buffer, 0x58),
@@ -207,7 +343,17 @@ internal sealed class XfsRawFileSystem
             blockSize << dirBlockLog2,
             sbVersion == 5 && (incompatibleFeatures & 0x1) != 0 || (version & 0x8000) != 0 && (features2 & 0x0200) != 0,
             sbVersion == 5 && (incompatibleFeatures & 0x08) != 0,
-            sbVersion == 5 && (incompatibleFeatures & 0x20) != 0);
+            sbVersion == 5 && (incompatibleFeatures & 0x20) != 0,
+            buffer[0x7e] != 0,
+            logStart,
+            logBlocks,
+            buffer.AsSpan(0x20, 16).ToArray(),
+            ReadUInt16Big(buffer, 0x66),
+            compatibleFeatures,
+            readOnlyCompatibleFeatures,
+            incompatibleFeatures,
+            logIncompatibleFeatures,
+            EndianUtilities.ReadUInt16Big(buffer, 0xb0));
     }
 
     private XfsInode ReadInode(ulong number)
@@ -232,6 +378,11 @@ internal sealed class XfsRawFileSystem
         }
 
         var version = buffer[0x04];
+        if (version >= 3)
+        {
+            ValidateChecksum(buffer, 0x64, $"XFS inode {number}");
+        }
+
         var dataForkOffset = version < 3 ? 0x64 : 0xb0;
         var flags2 = version >= 3 && buffer.Length >= 0x80
             ? EndianUtilities.ReadUInt64Big(buffer, 0x78)
@@ -240,7 +391,7 @@ internal sealed class XfsRawFileSystem
         var forkOffset = buffer[0x52];
         var dataForkLength = forkOffset == 0
             ? buffer.Length - dataForkOffset
-            : Math.Max(0, Math.Min(buffer.Length - dataForkOffset, forkOffset * 8));
+            : Math.Max(0, Math.Min(buffer.Length - dataForkOffset, forkOffset * 8 - dataForkOffset));
         var dataFork = new byte[dataForkLength];
         Array.Copy(buffer, dataForkOffset, dataFork, 0, dataFork.Length);
 
@@ -256,8 +407,13 @@ internal sealed class XfsRawFileSystem
             _superBlock.HasLargeExtentCounts
                 ? EndianUtilities.ReadUInt64Big(buffer, 0x18)
                 : EndianUtilities.ReadUInt32Big(buffer, 0x4c),
+            ReadUInt16Big(buffer, 0x5a),
+            flags2,
             forkOffset,
-            dataFork);
+            dataFork,
+            version,
+            inodeOffset,
+            buffer);
         _inodeCache[number] = inode;
         return inode;
     }
@@ -761,9 +917,12 @@ internal sealed class XfsRawFileSystem
         node = new VfsNode
         {
             Name = name,
+            VirtualPath = path,
             IsDirectory = kind == XfsRawNodeKind.Directory,
             Size = kind == XfsRawNodeKind.Directory ? 0 : (long)Math.Min(inode.Length, long.MaxValue),
             ModifiedUtc = inode.ModifiedUtc,
+            Attributes = (kind == XfsRawNodeKind.Directory ? FileAttributes.Directory : (FileAttributes)0)
+                | ((inode.Mode & 0x92) == 0 ? FileAttributes.ReadOnly : (FileAttributes)0),
             Metadata = new XfsNodeRef(resolvedPath, inode.Number, kind)
         };
         return true;
@@ -839,6 +998,203 @@ internal sealed class XfsRawFileSystem
         var relativeBlock = fileSystemBlock & ((1UL << _superBlock.AgBlocksLog2) - 1);
         var diskBlock = checked(checked(allocationGroup * _superBlock.AgBlocks) + relativeBlock);
         return checked((long)checked(diskBlock * _superBlock.BlockSize));
+    }
+
+    private bool HasCleanUnmountRecord()
+    {
+        if (_hasCleanLog is bool cached)
+        {
+            return cached;
+        }
+
+        const uint logHeaderMagic = 0xfeedbabe;
+        const int basicBlockSize = 512;
+        const int scanBufferSize = 4 * 1024 * 1024;
+        if (_superBlock.LogStart == 0 || _superBlock.LogBlocks == 0)
+        {
+            return (_hasCleanLog = false).Value;
+        }
+
+        var logOffset = checked((long)checked(_superBlock.LogStart * _superBlock.BlockSize));
+        var logLength = checked((long)checked((ulong)_superBlock.LogBlocks * _superBlock.BlockSize));
+        if (logOffset < 0 || logLength < basicBlockSize || logOffset > _reader.Length - logLength)
+        {
+            return (_hasCleanLog = false).Value;
+        }
+
+        if ((logLength % basicBlockSize) != 0 || logLength / basicBlockSize > int.MaxValue)
+        {
+            return (_hasCleanLog = false).Value;
+        }
+
+        var logBasicBlocks = checked((int)(logLength / basicBlockSize));
+        var cycles = new uint[logBasicBlocks];
+        var headers = new List<XfsLogRecordHeader>();
+        var buffer = new byte[scanBufferSize];
+        for (long chunkOffset = 0; chunkOffset < logLength; chunkOffset += buffer.Length)
+        {
+            var count = checked((int)Math.Min(buffer.Length, logLength - chunkOffset));
+            _reader.ReadAt(logOffset + chunkOffset, buffer, 0, count);
+            for (var offset = 0; offset + basicBlockSize <= count; offset += basicBlockSize)
+            {
+                var logBlock = checked((int)((chunkOffset + offset) / basicBlockSize));
+                var firstWord = EndianUtilities.ReadUInt32Big(buffer, offset);
+                cycles[logBlock] = firstWord == logHeaderMagic
+                    ? EndianUtilities.ReadUInt32Big(buffer, offset + 4)
+                    : firstWord;
+                if (firstWord != logHeaderMagic)
+                {
+                    continue;
+                }
+
+                var version = EndianUtilities.ReadUInt32Big(buffer, offset + 8);
+                var recordLength = EndianUtilities.ReadUInt32Big(buffer, offset + 12);
+                var lsn = EndianUtilities.ReadUInt64Big(buffer, offset + 16);
+                if (version is not (1U or 2U)
+                    || recordLength == 0
+                    || recordLength > 256 * 1024
+                    || (recordLength & 7) != 0
+                    || (uint)(lsn >> 32) != cycles[logBlock]
+                    || (uint)lsn != (uint)logBlock
+                    || !buffer.AsSpan(offset + 304, 16).SequenceEqual(_superBlock.Uuid))
+                {
+                    continue;
+                }
+
+                headers.Add(new XfsLogRecordHeader(
+                    logBlock,
+                    version,
+                    recordLength,
+                    EndianUtilities.ReadUInt32Big(buffer, offset + 320),
+                    EndianUtilities.ReadUInt32Big(buffer, offset + 40)));
+            }
+        }
+
+        var firstCycle = cycles[0];
+        var lastCycle = cycles[^1];
+        int head;
+        if (firstCycle == lastCycle)
+        {
+            if (cycles.Any(cycle => cycle != firstCycle))
+            {
+                return (_hasCleanLog = false).Value;
+            }
+
+            head = 0;
+        }
+        else
+        {
+            if (firstCycle != unchecked(lastCycle + 1))
+            {
+                return (_hasCleanLog = false).Value;
+            }
+
+            head = Array.FindIndex(cycles, cycle => cycle == lastCycle);
+            if (head <= 0
+                || cycles.AsSpan(0, head).ContainsAnyExcept(firstCycle)
+                || cycles.AsSpan(head).ContainsAnyExcept(lastCycle))
+            {
+                return (_hasCleanLog = false).Value;
+            }
+        }
+
+        var latest = head == 0
+            ? headers.MaxBy(header => header.Block)
+            : headers.Where(header => header.Block < head).MaxBy(header => header.Block);
+        if (latest is null)
+        {
+            return (_hasCleanLog = false).Value;
+        }
+
+        if (latest.Version == 2
+            && (latest.RecordSize < 32 * 1024
+                || latest.RecordSize > 256 * 1024
+                || (latest.RecordSize % (32 * 1024)) != 0))
+        {
+            return (_hasCleanLog = false).Value;
+        }
+
+        var headerBlocks = latest.Version == 2 ? latest.RecordSize / (32 * 1024) : 1L;
+        if (headerBlocks > 8)
+        {
+            return (_hasCleanLog = false).Value;
+        }
+
+        var dataBlocks = (latest.RecordLength + basicBlockSize - 1L) / basicBlockSize;
+        if ((latest.Block + headerBlocks + dataBlocks) % logBasicBlocks != head
+            || latest.NumLogOperations != 1)
+        {
+            return (_hasCleanLog = false).Value;
+        }
+
+        var operationBlock = (latest.Block + headerBlocks) % logBasicBlocks;
+        var operation = ReadWrappedLog(logOffset, logLength, operationBlock * basicBlockSize, 12);
+        var operationLength = EndianUtilities.ReadUInt32Big(operation, 4);
+        var client = operation[8];
+        var flags = operation[9];
+        _hasCleanLog = client == 0xaa && flags == 0x20 && operationLength == 0;
+        return _hasCleanLog.Value;
+    }
+
+    private byte[] ReadWrappedLog(long logOffset, long logLength, long relativeOffset, int count)
+    {
+        var result = new byte[count];
+        var firstCount = checked((int)Math.Min(count, logLength - relativeOffset));
+        _reader.ReadAt(logOffset + relativeOffset, result, 0, firstCount);
+        if (firstCount < count)
+        {
+            _reader.ReadAt(logOffset, result, firstCount, count - firstCount);
+        }
+
+        return result;
+    }
+
+    private IReadOnlyList<XfsExtent> ValidateFullyAllocated(XfsInode inode)
+    {
+        var extents = GetExtents(inode)
+            .OrderBy(extent => extent.StartOffset)
+            .ToArray();
+        var requiredBlocks = inode.Length == 0
+            ? 0UL
+            : checked((inode.Length + _superBlock.BlockSize - 1) / _superBlock.BlockSize);
+        ulong nextLogicalBlock = 0;
+        foreach (var extent in extents)
+        {
+            if (extent.BlockCount == 0)
+            {
+                throw new InvalidDataException("長さ0のXFS extentが含まれています。");
+            }
+
+            if (extent.IsUnwritten)
+            {
+                throw new NotSupportedException("未書き込みextentを含むXFSファイルはまだ置換できません。");
+            }
+
+            if (extent.StartOffset != nextLogicalBlock)
+            {
+                throw new NotSupportedException("スパースXFSファイルはまだ置換できません。");
+            }
+
+            var physicalOffset = ExtentToDiskOffset(extent.StartBlock);
+            var extentBytes = checked((long)extent.BlockCount * _superBlock.BlockSize);
+            if (physicalOffset < 0 || physicalOffset > _reader.Length - extentBytes)
+            {
+                throw new InvalidDataException("XFS extentがファイルシステム範囲外です。");
+            }
+
+            nextLogicalBlock = checked(nextLogicalBlock + extent.BlockCount);
+            if (nextLogicalBlock >= requiredBlocks)
+            {
+                break;
+            }
+        }
+
+        if (nextLogicalBlock < requiredBlocks)
+        {
+            throw new NotSupportedException("未割り当て領域を含むXFSファイルはまだ置換できません。");
+        }
+
+        return extents;
     }
 
     private static XfsRawNodeKind GetNodeKind(XfsInode inode)
@@ -929,6 +1285,7 @@ internal sealed class XfsRawFileSystem
     private sealed record XfsSuperBlock(
         uint BlockSize,
         ulong DataBlocks,
+        ulong RealtimeBlocks,
         ulong RootInode,
         uint AgBlocks,
         uint AgCount,
@@ -944,7 +1301,17 @@ internal sealed class XfsRawFileSystem
         uint DirectoryBlockSize,
         bool HasFType,
         bool HasBigTime,
-        bool HasLargeExtentCounts);
+        bool HasLargeExtentCounts,
+        bool InProgress,
+        ulong LogStart,
+        uint LogBlocks,
+        byte[] Uuid,
+        ushort SectorSize,
+        uint CompatibleFeatures,
+        uint ReadOnlyCompatibleFeatures,
+        uint IncompatibleFeatures,
+        uint LogIncompatibleFeatures,
+        ushort QuotaFlags);
 
     private sealed record XfsInode(
         ulong Number,
@@ -956,8 +1323,13 @@ internal sealed class XfsRawFileSystem
         ulong Length,
         ulong BlockCount,
         ulong ExtentCount,
+        ushort Flags,
+        ulong Flags2,
         byte ForkOffset,
-        byte[] DataFork)
+        byte[] DataFork,
+        byte Version,
+        long DiskOffset,
+        byte[] RawData)
     {
         public int FileType => (Mode >> 12) & 0x0f;
         public bool IsDirectory => FileType == 4;
@@ -965,6 +1337,13 @@ internal sealed class XfsRawFileSystem
     }
 
     private sealed record XfsDirectoryEntry(string Name, ulong Inode, byte FileType);
+
+    private sealed record XfsLogRecordHeader(
+        int Block,
+        uint Version,
+        uint RecordLength,
+        uint RecordSize,
+        uint NumLogOperations);
 
     internal sealed record XfsExtent(uint BlockCount, ulong StartBlock, ulong StartOffset, bool IsUnwritten);
 }

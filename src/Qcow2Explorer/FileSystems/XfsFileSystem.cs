@@ -5,7 +5,7 @@ using System.Diagnostics;
 
 namespace Qcow2Explorer.FileSystems;
 
-public sealed class XfsFileSystem : IReadOnlyFileSystem, IDisposable
+public sealed class XfsFileSystem : IReadOnlyFileSystem, IFileContentWriter, IFileSystemEditor, IDisposable
 {
     /// <summary>Set to false to compare DiscUtils.Xfs behavior without the raw reader.</summary>
     public static bool UseRawXfsReader { get; set; } = true;
@@ -24,6 +24,7 @@ public sealed class XfsFileSystem : IReadOnlyFileSystem, IDisposable
         Root = new VfsNode
         {
             Name = "",
+            VirtualPath = @"\",
             IsDirectory = true,
             Metadata = _rawReader is null ? @"\" : _rawReader.RootRef
         };
@@ -116,6 +117,299 @@ public sealed class XfsFileSystem : IReadOnlyFileSystem, IDisposable
         return node.Metadata?.ToString() ?? "";
     }
 
+    public bool CanReplaceFile(VfsNode file, long replacementLength, out string reason)
+    {
+        if (_rawReader is null || file.Metadata is not XfsNodeRef nodeRef)
+        {
+            reason = "このXFSレイアウトは書き込み解析に対応していません。";
+            return false;
+        }
+
+        return _rawReader.CanReplaceFile(nodeRef, replacementLength, out reason);
+    }
+
+    public void ReplaceFileContent(
+        VfsNode file,
+        Stream replacement,
+        long replacementLength,
+        CancellationToken cancellationToken = default)
+    {
+        if (_rawReader is null || file.Metadata is not XfsNodeRef nodeRef)
+        {
+            throw new NotSupportedException("このXFSレイアウトは書き込み解析に対応していません。");
+        }
+
+        _rawReader.ReplaceFileContent(nodeRef, replacement, replacementLength, cancellationToken);
+    }
+
+    public bool ValidateFileSystem(out string reason)
+    {
+        if (_rawReader is null)
+        {
+            reason = "このXFSレイアウトは書き込み解析に対応していません。";
+            return false;
+        }
+
+        return _rawReader.ValidateForEditing(out reason);
+    }
+
+    public bool CanWriteFile(VfsNode file, long contentLength, out string reason)
+    {
+        if (_rawReader is null || file.Metadata is not XfsNodeRef nodeRef)
+        {
+            reason = "このXFSレイアウトは書き込み解析に対応していません。";
+            return false;
+        }
+
+        return _rawReader.CanWriteFile(nodeRef, contentLength, out reason);
+    }
+
+    public void WriteFileContent(
+        VfsNode file,
+        Stream content,
+        long contentLength,
+        CancellationToken cancellationToken = default)
+    {
+        if (_rawReader is null || file.Metadata is not XfsNodeRef nodeRef)
+        {
+            throw new NotSupportedException("このXFSレイアウトは書き込み解析に対応していません。");
+        }
+
+        _rawReader.WriteFileContent(nodeRef, content, contentLength, cancellationToken);
+    }
+
+    public bool CanCreateFile(VfsNode directory, string name, long contentLength, out string reason)
+    {
+        if (_rawReader is null || directory.Metadata is not XfsNodeRef nodeRef)
+        {
+            reason = "このXFSレイアウトは書き込み解析に対応していません。";
+            return false;
+        }
+
+        return _rawReader.CanCreateFile(nodeRef, name, contentLength, out reason);
+    }
+
+    public VfsNode CreateFile(
+        VfsNode directory,
+        string name,
+        Stream content,
+        long contentLength,
+        CancellationToken cancellationToken = default)
+    {
+        if (_rawReader is null || directory.Metadata is not XfsNodeRef nodeRef)
+        {
+            throw new NotSupportedException("このXFSレイアウトは書き込み解析に対応していません。");
+        }
+
+        var created = _rawReader.CreateFile(nodeRef, name, content, contentLength, cancellationToken);
+        return new VfsNode
+        {
+            Name = name,
+            VirtualPath = created.Path,
+            IsDirectory = false,
+            Size = contentLength,
+            ModifiedUtc = DateTime.UtcNow,
+            Metadata = created,
+        };
+    }
+
+    public bool CanDeleteFile(VfsNode directory, VfsNode file, out string reason)
+    {
+        if (_rawReader is null
+            || directory.Metadata is not XfsNodeRef directoryRef
+            || file.Metadata is not XfsNodeRef fileRef)
+        {
+            reason = "このXFSレイアウトは書き込み解析に対応していません。";
+            return false;
+        }
+
+        return _rawReader.CanDeleteFile(directoryRef, fileRef, file.Name, out reason);
+    }
+
+    public void DeleteFile(
+        VfsNode directory,
+        VfsNode file,
+        CancellationToken cancellationToken = default)
+    {
+        if (_rawReader is null
+            || directory.Metadata is not XfsNodeRef directoryRef
+            || file.Metadata is not XfsNodeRef fileRef)
+        {
+            throw new NotSupportedException("このXFSレイアウトは書き込み解析に対応していません。");
+        }
+
+        _rawReader.DeleteFile(directoryRef, fileRef, file.Name, cancellationToken);
+    }
+
+    public bool CanCreateDirectory(VfsNode directory, string name, out string reason)
+    {
+        if (_rawReader is null || directory.Metadata is not XfsNodeRef directoryRef)
+        {
+            reason = "このXFSレイアウトは書き込み解析に対応していません。";
+            return false;
+        }
+
+        return _rawReader.CanCreateDirectory(directoryRef, name, out reason);
+    }
+
+    public VfsNode CreateDirectory(
+        VfsNode directory,
+        string name,
+        CancellationToken cancellationToken = default)
+    {
+        if (_rawReader is null || directory.Metadata is not XfsNodeRef directoryRef)
+        {
+            throw new NotSupportedException("このXFSレイアウトは書き込み解析に対応していません。");
+        }
+
+        var created = _rawReader.CreateDirectory(directoryRef, name, cancellationToken);
+        return new VfsNode
+        {
+            Name = name,
+            VirtualPath = created.Path,
+            IsDirectory = true,
+            Size = 0,
+            ModifiedUtc = DateTime.UtcNow,
+            Attributes = FileAttributes.Directory,
+            Metadata = created,
+        };
+    }
+
+    public bool CanDeleteDirectory(VfsNode parentDirectory, VfsNode directory, out string reason)
+    {
+        if (_rawReader is null
+            || parentDirectory.Metadata is not XfsNodeRef parentRef
+            || directory.Metadata is not XfsNodeRef directoryRef)
+        {
+            reason = "このXFSレイアウトは書き込み解析に対応していません。";
+            return false;
+        }
+
+        return _rawReader.CanDeleteDirectory(parentRef, directoryRef, directory.Name, out reason);
+    }
+
+    public void DeleteDirectory(
+        VfsNode parentDirectory,
+        VfsNode directory,
+        CancellationToken cancellationToken = default)
+    {
+        if (_rawReader is null
+            || parentDirectory.Metadata is not XfsNodeRef parentRef
+            || directory.Metadata is not XfsNodeRef directoryRef)
+        {
+            throw new NotSupportedException("このXFSレイアウトは書き込み解析に対応していません。");
+        }
+
+        _rawReader.DeleteDirectory(parentRef, directoryRef, directory.Name, cancellationToken);
+    }
+
+    public bool CanMoveEntry(
+        VfsNode sourceDirectory,
+        VfsNode entry,
+        VfsNode destinationDirectory,
+        string destinationName,
+        out string reason)
+    {
+        if (_rawReader is null
+            || sourceDirectory.Metadata is not XfsNodeRef sourceRef
+            || entry.Metadata is not XfsNodeRef entryRef
+            || destinationDirectory.Metadata is not XfsNodeRef destinationRef)
+        {
+            reason = "このXFSレイアウトは書き込み解析に対応していません。";
+            return false;
+        }
+
+        return _rawReader.CanMoveEntry(
+            sourceRef,
+            entryRef,
+            destinationRef,
+            entry.Name,
+            destinationName,
+            out reason);
+    }
+
+    public VfsNode MoveEntry(
+        VfsNode sourceDirectory,
+        VfsNode entry,
+        VfsNode destinationDirectory,
+        string destinationName,
+        CancellationToken cancellationToken = default)
+    {
+        if (_rawReader is null
+            || sourceDirectory.Metadata is not XfsNodeRef sourceRef
+            || entry.Metadata is not XfsNodeRef entryRef
+            || destinationDirectory.Metadata is not XfsNodeRef destinationRef)
+        {
+            throw new NotSupportedException("このXFSレイアウトは書き込み解析に対応していません。");
+        }
+
+        var moved = _rawReader.MoveEntry(
+            sourceRef,
+            entryRef,
+            destinationRef,
+            entry.Name,
+            destinationName,
+            cancellationToken);
+        return new VfsNode
+        {
+            Name = destinationName,
+            VirtualPath = moved.Path,
+            IsDirectory = entry.IsDirectory,
+            Size = entry.Size,
+            ModifiedUtc = entry.ModifiedUtc,
+            Attributes = entry.Attributes,
+            Metadata = moved,
+        };
+    }
+
+    public bool CanSetAttributes(VfsNode entry, FileAttributes attributes, out string reason)
+    {
+        if (_rawReader is null || entry.Metadata is not XfsNodeRef entryRef)
+        {
+            reason = "このXFSレイアウトは書き込み解析に対応していません。";
+            return false;
+        }
+
+        return _rawReader.CanSetAttributes(entryRef, attributes, out reason);
+    }
+
+    public void SetAttributes(
+        VfsNode entry,
+        FileAttributes attributes,
+        CancellationToken cancellationToken = default)
+    {
+        if (_rawReader is null || entry.Metadata is not XfsNodeRef entryRef)
+        {
+            throw new NotSupportedException("このXFSレイアウトは書き込み解析に対応していません。");
+        }
+
+        _rawReader.SetAttributes(entryRef, attributes, cancellationToken);
+    }
+
+    public bool CanSetLastWriteTimeUtc(VfsNode entry, DateTime modifiedUtc, out string reason)
+    {
+        if (_rawReader is null || entry.Metadata is not XfsNodeRef entryRef)
+        {
+            reason = "このXFSレイアウトは書き込み解析に対応していません。";
+            return false;
+        }
+
+        return _rawReader.CanSetLastWriteTimeUtc(entryRef, modifiedUtc, out reason);
+    }
+
+    public void SetLastWriteTimeUtc(
+        VfsNode entry,
+        DateTime modifiedUtc,
+        CancellationToken cancellationToken = default)
+    {
+        if (_rawReader is null || entry.Metadata is not XfsNodeRef entryRef)
+        {
+            throw new NotSupportedException("このXFSレイアウトは書き込み解析に対応していません。");
+        }
+
+        _rawReader.SetLastWriteTimeUtc(entryRef, modifiedUtc, cancellationToken);
+    }
+
     public void Dispose()
     {
         _reader.Dispose();
@@ -129,6 +423,7 @@ public sealed class XfsFileSystem : IReadOnlyFileSystem, IDisposable
         return new VfsNode
         {
             Name = GetDisplayName(path),
+            VirtualPath = NormalizePath(path),
             IsDirectory = isDirectory,
             Size = isDirectory ? 0 : TryGetFileLength(path),
             ModifiedUtc = TryGetLastWriteTimeUtc(path),
@@ -148,6 +443,7 @@ public sealed class XfsFileSystem : IReadOnlyFileSystem, IDisposable
             return new VfsNode
             {
                 Name = GetDisplayName(path),
+                VirtualPath = NormalizePath(path),
                 IsDirectory = false,
                 Size = 0,
                 Metadata = NormalizePath(path)

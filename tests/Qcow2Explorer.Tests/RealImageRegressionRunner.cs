@@ -63,6 +63,7 @@ internal static class RealImageRegressionRunner
             !string.IsNullOrWhiteSpace(item.DeviceSet)
             && !string.Equals(item.DeviceSet, "Linux md RAID1", StringComparison.OrdinalIgnoreCase)
             && !string.Equals(item.DeviceSet, "Linux md RAID0", StringComparison.OrdinalIgnoreCase)
+            && !string.Equals(item.DeviceSet, "Linux md RAID5", StringComparison.OrdinalIgnoreCase)
             && !string.Equals(item.DeviceSet, "Linux md RAID10", StringComparison.OrdinalIgnoreCase)
             && !string.Equals(item.DeviceSet, "LVM2", StringComparison.OrdinalIgnoreCase));
         if (unsupportedDeviceSet is not null)
@@ -116,13 +117,16 @@ internal static class RealImageRegressionRunner
 
                 if (string.Equals(regressionCase.DeviceSet, "Linux md RAID1", StringComparison.OrdinalIgnoreCase)
                     || string.Equals(regressionCase.DeviceSet, "Linux md RAID0", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(regressionCase.DeviceSet, "Linux md RAID5", StringComparison.OrdinalIgnoreCase)
                     || string.Equals(regressionCase.DeviceSet, "Linux md RAID10", StringComparison.OrdinalIgnoreCase))
                 {
                     var expectedLevel = regressionCase.DeviceSet.EndsWith("RAID10", StringComparison.OrdinalIgnoreCase)
                         ? 10
                         : regressionCase.DeviceSet.EndsWith("RAID0", StringComparison.OrdinalIgnoreCase)
                             ? 0
-                            : 1;
+                            : regressionCase.DeviceSet.EndsWith("RAID5", StringComparison.OrdinalIgnoreCase)
+                                ? 5
+                                : 1;
                     Require(mdDiscovery.Arrays.Count == 1, regressionCase.Name, $"expected one {regressionCase.DeviceSet} array, actual={mdDiscovery.Arrays.Count}; {string.Join(" | ", mdDiscovery.Diagnostics)}");
                     Require(mdDiscovery.Arrays[0].Level == expectedLevel, regressionCase.Name, $"md level mismatch: expected={expectedLevel}, actual={mdDiscovery.Arrays[0].Level}");
                     ValidateReader(
