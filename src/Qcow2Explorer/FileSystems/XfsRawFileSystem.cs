@@ -26,6 +26,7 @@ internal sealed partial class XfsRawFileSystem
     private readonly Dictionary<ulong, IReadOnlyList<XfsExtent>> _extentCache = new();
     private readonly Dictionary<ulong, IReadOnlyList<XfsDirectoryEntry>> _directoryCache = new();
     private readonly HashSet<ulong> _diagnosedInodes = [];
+    private readonly HashSet<ulong> _diagnosedOutOfDataDeviceInodes = [];
     private readonly Encoding _fileNameEncoding;
     private bool? _hasCleanLog;
 
@@ -763,7 +764,6 @@ internal sealed partial class XfsRawFileSystem
                 var resultOffset = checked((int)(readStart - offset));
                 var physicalOffset = checked(ExtentToDiskOffset(extent.StartBlock) + (readStart - extentStart));
                 var bytesToRead = checked((int)(readEnd - readStart));
-                DiagnosticLog.Write($"XFS raw extent read: inode={inode.Number}, fileOffset={readStart}, bytes={bytesToRead}, logicalBlock={extent.StartOffset}, physicalBlock={extent.StartBlock}, partitionOffset={physicalOffset}, unwritten={extent.IsUnwritten}");
                 _reader.ReadAt(physicalOffset, result, resultOffset, bytesToRead);
             }
             catch (Exception ex)
@@ -780,9 +780,44 @@ internal sealed partial class XfsRawFileSystem
     internal static long GetExtentByteLength(uint blockCount, uint blockSize) =>
         checked((long)checked((ulong)blockCount * blockSize));
 
+    internal static bool IsExtentWithinAllocationGroup(
+        ulong fileSystemBlock,
+        uint blockCount,
+        uint agBlocks,
+        uint agCount,
+        ulong dataBlocks,
+        byte agBlockLog)
+    {
+        if (blockCount == 0 || agBlocks == 0 || agCount == 0 || agBlockLog >= 64)
+        {
+            return false;
+        }
+
+        var allocationGroup = fileSystemBlock >> agBlockLog;
+        var relativeBlock = fileSystemBlock & ((1UL << agBlockLog) - 1);
+        if (allocationGroup >= agCount)
+        {
+            return false;
+        }
+
+        var precedingBlocks = checked((ulong)agBlocks * (agCount - 1));
+        if (dataBlocks < precedingBlocks)
+        {
+            return false;
+        }
+
+        var allocationGroupBlocks = allocationGroup == agCount - 1
+            ? dataBlocks - precedingBlocks
+            : agBlocks;
+        return relativeBlock < allocationGroupBlocks
+            && blockCount <= allocationGroupBlocks - relativeBlock;
+    }
+
     private void ValidateExtents(XfsInode inode, IReadOnlyList<XfsExtent> extents)
     {
         ulong previousEnd = 0;
+        var readableBeyondSuperBlockCount = 0;
+        XfsExtent? firstReadableBeyondSuperBlock = null;
         foreach (var extent in extents)
         {
             if (extent.BlockCount == 0)
@@ -790,10 +825,29 @@ internal sealed partial class XfsRawFileSystem
                 throw new InvalidDataException($"XFS inode {inode.Number} contains a zero-length extent.");
             }
 
-            if (extent.StartBlock >= _superBlock.DataBlocks || extent.BlockCount > _superBlock.DataBlocks - extent.StartBlock)
+            var exceedsSuperBlockDataDevice = extent.StartBlock >= _superBlock.DataBlocks
+                || extent.BlockCount > _superBlock.DataBlocks - extent.StartBlock;
+            var validAllocationGroupExtent = IsExtentWithinAllocationGroup(
+                extent.StartBlock,
+                extent.BlockCount,
+                _superBlock.AgBlocks,
+                _superBlock.AgCount,
+                _superBlock.DataBlocks,
+                _superBlock.AgBlocksLog2);
+            var physicalOffset = ExtentToDiskOffset(extent.StartBlock);
+            var physicalLength = GetExtentByteLength(extent.BlockCount, _superBlock.BlockSize);
+            var fitsReader = physicalOffset >= 0
+                && physicalLength <= _reader.Length - physicalOffset;
+            if (!validAllocationGroupExtent || !fitsReader)
             {
                 throw new InvalidDataException(
-                    $"XFS inode {inode.Number} extent is outside the data device: startBlock={extent.StartBlock}, blockCount={extent.BlockCount}, dataBlocks={_superBlock.DataBlocks}.");
+                    $"XFS inode {inode.Number} extent is outside the readable XFS allocation group or device: startBlock={extent.StartBlock}, blockCount={extent.BlockCount}, agBlocks={_superBlock.AgBlocks}, agCount={_superBlock.AgCount}, dataBlocks={_superBlock.DataBlocks}, readerLength={_reader.Length}.");
+            }
+
+            if (exceedsSuperBlockDataDevice)
+            {
+                readableBeyondSuperBlockCount++;
+                firstReadableBeyondSuperBlock ??= extent;
             }
 
             var end = checked(extent.StartOffset + extent.BlockCount);
@@ -805,12 +859,14 @@ internal sealed partial class XfsRawFileSystem
             previousEnd = end;
         }
 
-        var requiredBlocks = checked((inode.Length + _superBlock.BlockSize - 1) / _superBlock.BlockSize);
-        if (inode.Length > 0 && (extents.Count == 0 || previousEnd < requiredBlocks))
+        if (firstReadableBeyondSuperBlock is not null
+            && _diagnosedOutOfDataDeviceInodes.Add(inode.Number))
         {
-            throw new InvalidDataException(
-                $"XFS inode {inode.Number} extents do not cover the file: length={inode.Length}, requiredBlocks={requiredBlocks}, coveredBlocks={previousEnd}, extents={extents.Count}.");
+            DiagnosticLog.Write($"XFS extents beyond sb_dblocks are readable from the supplied device: inode={inode.Number}, count={readableBeyondSuperBlockCount}, first={firstReadableBeyondSuperBlock}, dataBlocks={_superBlock.DataBlocks}, readerLength={_reader.Length}");
         }
+
+        // Logical gaps, including a hole at EOF, are valid sparse-file extents.
+        // ReadContent initializes its result with zeroes, so those gaps are read correctly.
     }
 
     private void WriteFileDiagnostics(XfsNodeRef file, XfsInode inode)

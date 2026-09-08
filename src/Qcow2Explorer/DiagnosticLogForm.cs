@@ -1,9 +1,14 @@
+using System.Collections.Concurrent;
 using Qcow2Explorer.Core;
 
 namespace Qcow2Explorer;
 
 public sealed class DiagnosticLogForm : Form
 {
+    private const int MaximumEntriesPerUpdate = 400;
+    private readonly ConcurrentQueue<string> _pendingEntries = new();
+    private int _updateScheduled;
+
     private readonly TextBox _text = new()
     {
         Dock = DockStyle.Fill,
@@ -38,11 +43,35 @@ public sealed class DiagnosticLogForm : Form
             return;
         }
 
-        BeginInvoke(() =>
+        _pendingEntries.Enqueue(entry);
+        if (Interlocked.Exchange(ref _updateScheduled, 1) != 0)
         {
-            _text.AppendText(entry + Environment.NewLine);
-            _text.SelectionStart = _text.TextLength;
-            _text.ScrollToCaret();
-        });
+            return;
+        }
+
+        BeginInvoke(DrainPendingEntries);
+    }
+
+    private void DrainPendingEntries()
+    {
+        var processed = 0;
+        while (processed < MaximumEntriesPerUpdate
+            && _pendingEntries.TryDequeue(out var pendingEntry))
+        {
+            _text.AppendText(pendingEntry + Environment.NewLine);
+            processed++;
+        }
+
+        _text.SelectionStart = _text.TextLength;
+        _text.ScrollToCaret();
+        Volatile.Write(ref _updateScheduled, 0);
+
+        if (!_pendingEntries.IsEmpty
+            && !IsDisposed
+            && IsHandleCreated
+            && Interlocked.Exchange(ref _updateScheduled, 1) == 0)
+        {
+            BeginInvoke(DrainPendingEntries);
+        }
     }
 }
