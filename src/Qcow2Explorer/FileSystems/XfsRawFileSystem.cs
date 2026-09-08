@@ -865,6 +865,8 @@ internal sealed partial class XfsRawFileSystem
             IsDirectory = kind == XfsRawNodeKind.Directory,
             Size = kind == XfsRawNodeKind.Directory ? 0 : (long)Math.Min(inode.Length, long.MaxValue),
             ModifiedUtc = inode.ModifiedUtc,
+            Attributes = (kind == XfsRawNodeKind.Directory ? FileAttributes.Directory : (FileAttributes)0)
+                | ((inode.Mode & 0x92) == 0 ? FileAttributes.ReadOnly : (FileAttributes)0),
             Metadata = new XfsNodeRef(resolvedPath, inode.Number, kind)
         };
         return true;

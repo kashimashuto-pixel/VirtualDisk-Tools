@@ -9,6 +9,11 @@ public enum FileEditOperationKind
     WriteContent,
     CreateFile,
     DeleteFile,
+    CreateDirectory,
+    DeleteDirectory,
+    MoveEntry,
+    SetAttributes,
+    SetLastWriteTimeUtc,
 }
 
 public sealed record FileEditResult(
@@ -18,7 +23,11 @@ public sealed record FileEditResult(
     long PreviousLength,
     long NewLength,
     int ModifiedPageCount,
-    byte[]? Sha256);
+    byte[]? Sha256,
+    string? DestinationVirtualPath = null,
+    bool IsDirectory = false,
+    FileAttributes? Attributes = null,
+    DateTime? ModifiedUtc = null);
 
 public static class FileEditService
 {
@@ -149,15 +158,17 @@ public static class FileEditService
         }
 
         cancellationToken.ThrowIfCancellationRequested();
-        var overlay = new CopyOnWriteBlockDevice(source);
-        var slice = new WritablePartitionSlice(overlay, partition);
+        var editSource = ResolveEditableSource(source, partition);
+        var effectivePartition = editSource.Partition;
+        var overlay = new CopyOnWriteBlockDevice(editSource.Reader);
+        var slice = new WritablePartitionSlice(overlay, effectivePartition);
         string virtualPath;
         long previousLength;
         long newLength;
         using (var writable = FileReplacementService.CreateWritableFileSystem(
                    originalFileSystem.Name,
                    slice,
-                   partition))
+                   effectivePartition))
         {
             var editor = writable.Editor
                 ?? throw new NotSupportedException(
@@ -229,7 +240,7 @@ public static class FileEditService
             }
         }
 
-        var overlayFileSystem = FileSystemDetector.TryOpen(overlay, partition, out var overlayError)
+        var overlayFileSystem = FileSystemDetector.TryOpen(overlay, effectivePartition, out var overlayError)
             ?? throw new InvalidDataException($"仮適用後のファイルシステムを再オープンできません: {overlayError}");
         try
         {
@@ -258,7 +269,7 @@ public static class FileEditService
             await overlay.ExportRawAsync(pendingPath, progress, cancellationToken);
             VerifyExportedImage(
                 pendingPath,
-                partition,
+                effectivePartition,
                 operation,
                 virtualPath,
                 newLength,
@@ -289,11 +300,46 @@ public static class FileEditService
             throw new NotSupportedException("物理ディスクは編集できません。");
         }
 
-        if (partition.ReaderOverride is not null)
-        {
-            throw new NotSupportedException("RAID、LVM、復号レイヤーなどの合成パーティションは編集できません。");
-        }
     }
+
+    internal static EditableSource ResolveEditableSource(IDiskImageReader source, PartitionInfo partition)
+    {
+        ValidateSource(source, partition);
+        if (partition.ReaderOverride is null)
+        {
+            return new EditableSource(source, partition, IsLogicalOutput: false);
+        }
+
+        var logicalReader = partition.ReaderOverride;
+        var sectorSize = logicalReader is ILogicalSectorReader logicalSectorReader
+            ? logicalSectorReader.LogicalSectorSize
+            : partition.SectorSize;
+        if (sectorSize == 0)
+        {
+            sectorSize = 512;
+        }
+
+        var logicalPartition = new PartitionInfo
+        {
+            Number = partition.Number,
+            Scheme = string.IsNullOrWhiteSpace(partition.Scheme) ? "logical-raw" : $"{partition.Scheme}-logical-raw",
+            Name = partition.Name,
+            Type = partition.Type,
+            TypeId = partition.TypeId,
+            Bootable = false,
+            StartLba = 0,
+            SectorCount = checked((ulong)(logicalReader.Length / sectorSize)),
+            SectorSize = sectorSize,
+            LengthOverrideBytes = logicalReader.Length,
+            FileSystem = partition.FileSystem,
+        };
+        return new EditableSource(logicalReader, logicalPartition, IsLogicalOutput: true);
+    }
+
+    internal sealed record EditableSource(
+        IBlockReader Reader,
+        PartitionInfo Partition,
+        bool IsLogicalOutput);
 
     internal static FileStream OpenContent(string path)
     {
@@ -428,7 +474,7 @@ public static class FileEditService
         return true;
     }
 
-    private static byte[] ComputeVirtualFileHash(
+    internal static byte[] ComputeVirtualFileHash(
         IReadOnlyFileSystem fileSystem,
         VfsNode file,
         CancellationToken cancellationToken)

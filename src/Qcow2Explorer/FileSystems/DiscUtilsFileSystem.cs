@@ -1,4 +1,6 @@
 using DiscUtils;
+using System.Collections;
+using System.Reflection;
 using Qcow2Explorer.Core;
 using Qcow2Explorer.Partitions;
 
@@ -300,6 +302,7 @@ public sealed class DiscUtilsFileSystem : IReadOnlyFileSystem, IFileContentWrite
             throw new NotSupportedException(reason);
         }
 
+        RepairFatDirectoryAllocator((string)directory.Metadata!);
         using (var destination = _reader.OpenFile(path, FileMode.CreateNew, FileAccess.ReadWrite))
         {
             PrepareDestinationLength(destination, contentLength);
@@ -368,6 +371,322 @@ public sealed class DiscUtilsFileSystem : IReadOnlyFileSystem, IFileContentWrite
         cancellationToken.ThrowIfCancellationRequested();
         _reader.DeleteFile((string)file.Metadata!);
         _stream.Flush();
+        FinalizeMutation();
+    }
+
+    public bool CanCreateDirectory(VfsNode directory, string name, out string reason)
+    {
+        if (!TryValidateWriteAccess(out reason)
+            || !TryGetNewFilePath(directory, name, out var path, out reason))
+        {
+            return false;
+        }
+
+        try
+        {
+            if (_reader.FileExists(path) || _reader.DirectoryExists(path))
+            {
+                reason = $"同名のファイルまたはディレクトリが既に存在します: {name}";
+                return false;
+            }
+        }
+        catch (Exception ex) when (ex is IOException or ArgumentException or NotSupportedException)
+        {
+            reason = ex.Message;
+            return false;
+        }
+
+        reason = string.Empty;
+        return true;
+    }
+
+    public VfsNode CreateDirectory(
+        VfsNode directory,
+        string name,
+        CancellationToken cancellationToken = default)
+    {
+        if (!CanCreateDirectory(directory, name, out var reason)
+            || !TryGetNewFilePath(directory, name, out var path, out reason))
+        {
+            throw new NotSupportedException(reason);
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+        RepairFatDirectoryAllocator((string)directory.Metadata!);
+        _reader.CreateDirectory(path);
+        PadExFatDirectory(path);
+        FinalizeMutation();
+        return ToNodeSafe(path);
+    }
+
+    public bool CanDeleteDirectory(VfsNode parentDirectory, VfsNode directory, out string reason)
+    {
+        if (!TryValidateWriteAccess(out reason))
+        {
+            return false;
+        }
+
+        if (!TryGetEntryPath(parentDirectory, expectDirectory: true, out var parentPath, out reason)
+            || !TryGetEntryPath(directory, expectDirectory: true, out var directoryPath, out reason)
+            || directoryPath == @"\")
+        {
+            reason = string.IsNullOrEmpty(reason) ? "ルートディレクトリは削除できません。" : reason;
+            return false;
+        }
+
+        if (!string.Equals(
+                GetParentPath(directoryPath).TrimEnd('\\'),
+                parentPath.TrimEnd('\\'),
+                StringComparison.OrdinalIgnoreCase))
+        {
+            reason = "削除対象が指定ディレクトリの直下にありません。";
+            return false;
+        }
+
+        try
+        {
+            if (!_reader.DirectoryExists(directoryPath))
+            {
+                reason = $"削除対象ディレクトリを再確認できません: {directory.Name}";
+                return false;
+            }
+
+            if (_reader.GetFileSystemEntries(directoryPath).Any())
+            {
+                reason = "安全のため空のディレクトリだけを削除できます。先に内容を削除してください。";
+                return false;
+            }
+        }
+        catch (Exception ex) when (ex is IOException or ArgumentException or NotSupportedException)
+        {
+            reason = ex.Message;
+            return false;
+        }
+
+        reason = string.Empty;
+        return true;
+    }
+
+    public void DeleteDirectory(
+        VfsNode parentDirectory,
+        VfsNode directory,
+        CancellationToken cancellationToken = default)
+    {
+        if (!CanDeleteDirectory(parentDirectory, directory, out var reason))
+        {
+            throw new NotSupportedException(reason);
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+        _reader.DeleteDirectory((string)directory.Metadata!, recursive: false);
+        FinalizeMutation();
+    }
+
+    public bool CanMoveEntry(
+        VfsNode sourceDirectory,
+        VfsNode entry,
+        VfsNode destinationDirectory,
+        string destinationName,
+        out string reason)
+    {
+        if (!TryValidateWriteAccess(out reason)
+            || !TryGetEntryPath(sourceDirectory, expectDirectory: true, out var sourceDirectoryPath, out reason)
+            || !TryGetEntryPath(destinationDirectory, expectDirectory: true, out var destinationDirectoryPath, out reason)
+            || !TryGetEntryPath(entry, entry.IsDirectory, out var sourcePath, out reason)
+            || !TryGetNewFilePath(destinationDirectory, destinationName, out var destinationPath, out reason))
+        {
+            return false;
+        }
+
+        if (!string.Equals(
+                GetParentPath(sourcePath).TrimEnd('\\'),
+                sourceDirectoryPath.TrimEnd('\\'),
+                StringComparison.OrdinalIgnoreCase))
+        {
+            reason = "移動対象が指定した移動元ディレクトリの直下にありません。";
+            return false;
+        }
+
+        if (string.Equals(sourcePath, destinationPath, StringComparison.Ordinal))
+        {
+            reason = "移動元と移動先が同じです。";
+            return false;
+        }
+
+        if (entry.IsDirectory
+            && (string.Equals(destinationDirectoryPath, sourcePath, StringComparison.OrdinalIgnoreCase)
+                || destinationDirectoryPath.StartsWith(
+                    sourcePath.TrimEnd('\\') + "\\",
+                    StringComparison.OrdinalIgnoreCase)))
+        {
+            reason = "ディレクトリを自分自身の配下へ移動できません。";
+            return false;
+        }
+
+        try
+        {
+            if ((entry.IsDirectory && !_reader.DirectoryExists(sourcePath))
+                || (!entry.IsDirectory && !_reader.FileExists(sourcePath)))
+            {
+                reason = $"移動対象を再確認できません: {entry.Name}";
+                return false;
+            }
+
+            if (_reader.FileExists(destinationPath) || _reader.DirectoryExists(destinationPath))
+            {
+                reason = $"移動先には同名の項目が既に存在します: {destinationName}";
+                return false;
+            }
+        }
+        catch (Exception ex) when (ex is IOException or ArgumentException or NotSupportedException)
+        {
+            reason = ex.Message;
+            return false;
+        }
+
+        reason = string.Empty;
+        return true;
+    }
+
+    public VfsNode MoveEntry(
+        VfsNode sourceDirectory,
+        VfsNode entry,
+        VfsNode destinationDirectory,
+        string destinationName,
+        CancellationToken cancellationToken = default)
+    {
+        if (!CanMoveEntry(sourceDirectory, entry, destinationDirectory, destinationName, out var reason)
+            || !TryGetNewFilePath(destinationDirectory, destinationName, out var destinationPath, out reason))
+        {
+            throw new NotSupportedException(reason);
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+        var sourcePath = (string)entry.Metadata!;
+        RepairFatDirectoryAllocator((string)destinationDirectory.Metadata!);
+        if (entry.IsDirectory && Name is "FAT16" or "FAT32")
+        {
+            MoveFatDirectory(
+                sourcePath,
+                (string)destinationDirectory.Metadata!,
+                destinationName);
+        }
+        else if (entry.IsDirectory)
+        {
+            _reader.MoveDirectory(sourcePath, destinationPath);
+        }
+        else
+        {
+            _reader.MoveFile(sourcePath, destinationPath, overwrite: false);
+        }
+
+        FinalizeMutation();
+        return ToNodeSafe(destinationPath);
+    }
+
+    public bool CanSetAttributes(VfsNode entry, FileAttributes attributes, out string reason)
+    {
+        if (!TryValidateWriteAccess(out reason)
+            || !TryGetEntryPath(entry, entry.IsDirectory, out var path, out reason))
+        {
+            return false;
+        }
+
+        const FileAttributes editable = FileAttributes.ReadOnly
+            | FileAttributes.Hidden
+            | FileAttributes.System
+            | FileAttributes.Archive;
+        var unsupported = attributes & ~(editable | FileAttributes.Directory | FileAttributes.Normal);
+        if (unsupported != 0
+            || (attributes.HasFlag(FileAttributes.Normal) && (attributes & ~FileAttributes.Normal) != 0)
+            || attributes.HasFlag(FileAttributes.Directory) != entry.IsDirectory)
+        {
+            reason = "ReadOnly、Hidden、System、Archive属性だけを編集でき、Directory属性は変更できません。";
+            return false;
+        }
+
+        try
+        {
+            if ((entry.IsDirectory && !_reader.DirectoryExists(path))
+                || (!entry.IsDirectory && !_reader.FileExists(path)))
+            {
+                reason = $"属性編集対象を再確認できません: {entry.Name}";
+                return false;
+            }
+        }
+        catch (Exception ex) when (ex is IOException or ArgumentException or NotSupportedException)
+        {
+            reason = ex.Message;
+            return false;
+        }
+
+        reason = string.Empty;
+        return true;
+    }
+
+    public void SetAttributes(
+        VfsNode entry,
+        FileAttributes attributes,
+        CancellationToken cancellationToken = default)
+    {
+        if (!CanSetAttributes(entry, attributes, out var reason))
+        {
+            throw new NotSupportedException(reason);
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+        _reader.SetAttributes((string)entry.Metadata!, attributes);
+        FinalizeMutation();
+    }
+
+    public bool CanSetLastWriteTimeUtc(VfsNode entry, DateTime modifiedUtc, out string reason)
+    {
+        if (!TryValidateWriteAccess(out reason)
+            || !TryGetEntryPath(entry, entry.IsDirectory, out var path, out reason))
+        {
+            return false;
+        }
+
+        modifiedUtc = modifiedUtc.Kind == DateTimeKind.Utc ? modifiedUtc : modifiedUtc.ToUniversalTime();
+        if (Name is "FAT16" or "FAT32" or "exFAT"
+            && (modifiedUtc.Year < 1980 || modifiedUtc.Year > 2107))
+        {
+            reason = "FAT系ファイルシステムの更新日時は1980～2107年の範囲で指定してください。";
+            return false;
+        }
+
+        try
+        {
+            if ((entry.IsDirectory && !_reader.DirectoryExists(path))
+                || (!entry.IsDirectory && !_reader.FileExists(path)))
+            {
+                reason = $"更新日時の編集対象を再確認できません: {entry.Name}";
+                return false;
+            }
+        }
+        catch (Exception ex) when (ex is IOException or ArgumentException or NotSupportedException)
+        {
+            reason = ex.Message;
+            return false;
+        }
+
+        reason = string.Empty;
+        return true;
+    }
+
+    public void SetLastWriteTimeUtc(
+        VfsNode entry,
+        DateTime modifiedUtc,
+        CancellationToken cancellationToken = default)
+    {
+        if (!CanSetLastWriteTimeUtc(entry, modifiedUtc, out var reason))
+        {
+            throw new NotSupportedException(reason);
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+        modifiedUtc = modifiedUtc.Kind == DateTimeKind.Utc ? modifiedUtc : modifiedUtc.ToUniversalTime();
+        _reader.SetLastWriteTimeUtc((string)entry.Metadata!, modifiedUtc);
         FinalizeMutation();
     }
 
@@ -549,6 +868,26 @@ public sealed class DiscUtilsFileSystem : IReadOnlyFileSystem, IFileContentWrite
         return index <= 0 ? @"\" : path[..index];
     }
 
+    private static bool TryGetEntryPath(
+        VfsNode entry,
+        bool expectDirectory,
+        out string path,
+        out string reason)
+    {
+        path = string.Empty;
+        if (entry.IsDirectory != expectDirectory || entry.Metadata is not string metadataPath)
+        {
+            reason = expectDirectory
+                ? "ディレクトリを再確認できません。"
+                : "通常ファイルを再確認できません。";
+            return false;
+        }
+
+        path = NormalizePath(metadataPath);
+        reason = string.Empty;
+        return true;
+    }
+
     private static void CopyExact(
         Stream source,
         Stream destination,
@@ -581,6 +920,289 @@ public sealed class DiscUtilsFileSystem : IReadOnlyFileSystem, IFileContentWrite
             ? contentLength - 1
             : contentLength;
         destination.SetLength(preparedLength);
+    }
+
+    private void RepairFatDirectoryAllocator(string directoryPath)
+    {
+        if (Name is not ("FAT16" or "FAT32"))
+        {
+            return;
+        }
+
+        // DiscUtils 1.0.88 can combine deleted directory slots separated by one live
+        // slot while rebuilding its private free-entry table. Reconstruct that table
+        // from its parsed live entries before any operation that allocates a new slot.
+        // This prevents a create/move operation from overwriting an existing entry.
+        const BindingFlags instance = BindingFlags.Instance | BindingFlags.NonPublic;
+        try
+        {
+            var fileSystemType = _reader.GetType();
+            var getDirectory = fileSystemType.GetMethod(
+                "GetDirectory",
+                instance,
+                binder: null,
+                types: [typeof(string)],
+                modifiers: null)
+                ?? throw new MissingMethodException(fileSystemType.FullName, "GetDirectory(string)");
+            var directory = getDirectory.Invoke(_reader, [directoryPath])
+                ?? throw new DirectoryNotFoundException($"FATディレクトリを再確認できません: {directoryPath}");
+            var directoryType = directory.GetType();
+            var entriesField = directoryType.GetField("_entries", instance)
+                ?? throw new MissingFieldException(directoryType.FullName, "_entries");
+            var endField = directoryType.GetField("_endOfEntries", instance)
+                ?? throw new MissingFieldException(directoryType.FullName, "_endOfEntries");
+            var freeTableField = directoryType.GetField("_freeDirectoryEntryTable", instance)
+                ?? throw new MissingFieldException(directoryType.FullName, "_freeDirectoryEntryTable");
+            var selfLocationField = directoryType.GetField("_selfEntryLocation", instance)
+                ?? throw new MissingFieldException(directoryType.FullName, "_selfEntryLocation");
+            var parentLocationField = directoryType.GetField("_parentEntryLocation", instance)
+                ?? throw new MissingFieldException(directoryType.FullName, "_parentEntryLocation");
+
+            const int entrySize = 32;
+            var end = (long)(endField.GetValue(directory)
+                ?? throw new InvalidDataException("FATディレクトリ終端を取得できません。"));
+            if (end < 0 || end % entrySize != 0 || end / entrySize > int.MaxValue)
+            {
+                throw new InvalidDataException("FATディレクトリエントリ範囲が不正です。");
+            }
+
+            var occupied = new bool[checked((int)(end / entrySize))];
+            if (entriesField.GetValue(directory) is not IDictionary entries)
+            {
+                throw new InvalidDataException("FATディレクトリエントリ一覧を取得できません。");
+            }
+
+            foreach (DictionaryEntry item in entries)
+            {
+                var position = Convert.ToInt64(item.Key, System.Globalization.CultureInfo.InvariantCulture);
+                var entry = item.Value
+                    ?? throw new InvalidDataException("FATディレクトリエントリが不正です。");
+                var entryCountProperty = entry.GetType().GetProperty("EntryCount", BindingFlags.Instance | BindingFlags.Public)
+                    ?? throw new MissingMemberException(entry.GetType().FullName, "EntryCount");
+                var entryCount = (int)(entryCountProperty.GetValue(entry)
+                    ?? throw new InvalidDataException("FATディレクトリエントリ長を取得できません。"));
+                MarkOccupied(position, entryCount);
+            }
+
+            MarkSpecialEntry(selfLocationField);
+            MarkSpecialEntry(parentLocationField);
+
+            var freeTable = Activator.CreateInstance(freeTableField.FieldType)
+                ?? throw new InvalidOperationException("FAT空きエントリ表を初期化できません。");
+            var addFreeRange = freeTableField.FieldType.GetMethod(
+                "AddFreeRange",
+                BindingFlags.Instance | BindingFlags.Public,
+                binder: null,
+                types: [typeof(long), typeof(int)],
+                modifiers: null)
+                ?? throw new MissingMethodException(freeTableField.FieldType.FullName, "AddFreeRange(long, int)");
+            for (var index = 0; index < occupied.Length;)
+            {
+                if (occupied[index])
+                {
+                    index++;
+                    continue;
+                }
+
+                var start = index;
+                while (index < occupied.Length && !occupied[index])
+                {
+                    index++;
+                }
+
+                _ = addFreeRange.Invoke(freeTable, [(long)start * entrySize, index - start]);
+            }
+
+            freeTableField.SetValue(directory, freeTable);
+
+            void MarkSpecialEntry(FieldInfo field)
+            {
+                var position = (long)(field.GetValue(directory) ?? -1L);
+                if (position >= 0)
+                {
+                    MarkOccupied(position, 1);
+                }
+            }
+
+            void MarkOccupied(long position, int count)
+            {
+                if (position < 0 || position % entrySize != 0 || count <= 0)
+                {
+                    throw new InvalidDataException("FATディレクトリエントリ位置が不正です。");
+                }
+
+                var first = checked((int)(position / entrySize));
+                if (first > occupied.Length - count)
+                {
+                    throw new InvalidDataException("FATディレクトリエントリが終端を超えています。");
+                }
+
+                Array.Fill(occupied, true, first, count);
+            }
+        }
+        catch (TargetInvocationException ex) when (ex.InnerException is not null)
+        {
+            throw new NotSupportedException(
+                "FATディレクトリの空き領域を安全に再確認できません。",
+                ex.InnerException);
+        }
+        catch (Exception ex) when (ex is MissingMemberException or InvalidCastException or OverflowException)
+        {
+            throw new NotSupportedException(
+                "このDiscUtils版ではFATディレクトリの安全な追加処理を利用できません。",
+                ex);
+        }
+    }
+
+    private void MoveFatDirectory(
+        string sourcePath,
+        string destinationDirectoryPath,
+        string destinationName)
+    {
+        // DiscUtils 1.0.88 resolves the destination parent from the full path but then
+        // passes that same full path as the leaf name. Invoke its directory primitives
+        // with the already validated leaf name so nested moves and renames stay valid.
+        const BindingFlags instance = BindingFlags.Instance | BindingFlags.NonPublic;
+        try
+        {
+            var fileSystemType = _reader.GetType();
+            var getDirectory = fileSystemType.GetMethod(
+                "GetDirectory",
+                instance,
+                binder: null,
+                types: [typeof(string)],
+                modifiers: null)
+                ?? throw new MissingMethodException(fileSystemType.FullName, "GetDirectory(string)");
+            var sourceDirectory = getDirectory.Invoke(_reader, [sourcePath])
+                ?? throw new DirectoryNotFoundException($"移動元FATディレクトリを再確認できません: {sourcePath}");
+            var sourceParentPath = GetParentPath(sourcePath);
+            var sourceParent = getDirectory.Invoke(_reader, [sourceParentPath])
+                ?? throw new DirectoryNotFoundException($"移動元FAT親ディレクトリを再確認できません: {sourceParentPath}");
+            var destinationParent = getDirectory.Invoke(_reader, [destinationDirectoryPath])
+                ?? throw new DirectoryNotFoundException(
+                    $"移動先FATディレクトリを再確認できません: {destinationDirectoryPath}");
+            var directoryType = sourceParent.GetType();
+            var findEntry = directoryType.GetMethod(
+                "FindEntry",
+                instance,
+                binder: null,
+                types: [typeof(string)],
+                modifiers: null)
+                ?? throw new MissingMethodException(directoryType.FullName, "FindEntry(string)");
+            var attachChild = directoryType.GetMethod(
+                "AttachChildDirectory",
+                instance,
+                binder: null,
+                types: [typeof(string), directoryType],
+                modifiers: null)
+                ?? throw new MissingMethodException(directoryType.FullName, "AttachChildDirectory(string, Directory)");
+            var deleteEntry = directoryType.GetMethod(
+                "DeleteEntry",
+                instance,
+                binder: null,
+                types: [typeof(long), typeof(bool)],
+                modifiers: null)
+                ?? throw new MissingMethodException(directoryType.FullName, "DeleteEntry(long, bool)");
+            var sourceName = GetDisplayName(sourcePath);
+            var sourceId = (long)(findEntry.Invoke(sourceParent, [sourceName])
+                ?? throw new InvalidDataException("移動元FATディレクトリエントリを取得できません。"));
+            if (sourceId < 0)
+            {
+                throw new DirectoryNotFoundException($"移動元FATディレクトリを再確認できません: {sourcePath}");
+            }
+
+            _ = attachChild.Invoke(destinationParent, [destinationName, sourceDirectory]);
+            _ = deleteEntry.Invoke(sourceParent, [sourceId, false]);
+        }
+        catch (TargetInvocationException ex) when (ex.InnerException is not null)
+        {
+            throw new NotSupportedException("FATディレクトリの移動に失敗しました。", ex.InnerException);
+        }
+        catch (Exception ex) when (ex is MissingMemberException or InvalidCastException or OverflowException)
+        {
+            throw new NotSupportedException(
+                "このDiscUtils版ではFATディレクトリの安全な移動処理を利用できません。",
+                ex);
+        }
+    }
+
+    private void PadExFatDirectory(string directoryPath)
+    {
+        if (!Name.Equals("exFAT", StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        // The bundled exFAT writer closes a newly created directory at its logical
+        // entry byte count (32/96/...), while exFAT requires directory data lengths
+        // to be cluster aligned. Extend it through the writer's own ClusterStream so
+        // allocation metadata, bitmap, stream entry, and checksums are all updated.
+        const BindingFlags instance = BindingFlags.Instance | BindingFlags.NonPublic;
+        Stream? directoryStream = null;
+        try
+        {
+            var boot = new byte[512];
+            _stream.Position = 0;
+            _stream.ReadExactly(boot);
+            var shift = checked(boot[108] + boot[109]);
+            if (shift is < 9 or > 25)
+            {
+                throw new InvalidDataException("exFAT cluster sizeが不正です。");
+            }
+
+            var clusterSize = 1L << shift;
+            var fileSystemType = _reader.GetType();
+            var pathFileSystemField = fileSystemType.GetField("_filesystem", instance)
+                ?? throw new MissingFieldException(fileSystemType.FullName, "_filesystem");
+            var pathFileSystem = pathFileSystemField.GetValue(_reader)
+                ?? throw new InvalidDataException("exFAT path filesystemを取得できません。");
+            var pathFileSystemType = pathFileSystem.GetType();
+            var getSafeNode = pathFileSystemType.GetMethod(
+                "GetSafeNode",
+                instance,
+                binder: null,
+                types: [typeof(string)],
+                modifiers: null)
+                ?? throw new MissingMethodException(pathFileSystemType.FullName, "GetSafeNode(string)");
+            var node = getSafeNode.Invoke(pathFileSystem, [directoryPath])
+                ?? throw new DirectoryNotFoundException($"exFATディレクトリを再確認できません: {directoryPath}");
+            var entryProperty = node.GetType().GetProperty("Entry", BindingFlags.Instance | BindingFlags.Public)
+                ?? throw new MissingMemberException(node.GetType().FullName, "Entry");
+            var entry = entryProperty.GetValue(node)
+                ?? throw new InvalidDataException("exFATディレクトリエントリを取得できません。");
+            var entryFileSystemField = pathFileSystemType.GetField("_entryFilesystem", instance)
+                ?? throw new MissingFieldException(pathFileSystemType.FullName, "_entryFilesystem");
+            var entryFileSystem = entryFileSystemField.GetValue(pathFileSystem)
+                ?? throw new InvalidDataException("exFAT entry filesystemを取得できません。");
+            var openData = entryFileSystem.GetType().GetMethod(
+                "OpenData",
+                instance,
+                binder: null,
+                types: [entry.GetType(), typeof(FileAccess)],
+                modifiers: null)
+                ?? throw new MissingMethodException(entryFileSystem.GetType().FullName, "OpenData");
+            directoryStream = openData.Invoke(entryFileSystem, [entry, FileAccess.ReadWrite]) as Stream
+                ?? throw new InvalidDataException("exFATディレクトリストリームを取得できません。");
+            var alignedLength = checked(Math.Max(clusterSize, (directoryStream.Length + clusterSize - 1) / clusterSize * clusterSize));
+            if (directoryStream.Length != alignedLength)
+            {
+                directoryStream.SetLength(alignedLength);
+            }
+        }
+        catch (TargetInvocationException ex) when (ex.InnerException is not null)
+        {
+            throw new NotSupportedException("exFATディレクトリのallocation調整に失敗しました。", ex.InnerException);
+        }
+        catch (Exception ex) when (ex is MissingMemberException or InvalidCastException or OverflowException)
+        {
+            throw new NotSupportedException(
+                "このDiscUtils版ではexFATディレクトリを安全に作成できません。",
+                ex);
+        }
+        finally
+        {
+            directoryStream?.Dispose();
+        }
     }
 
     private void FinalizeMutation()

@@ -337,6 +337,355 @@ internal sealed partial class XfsRawFileSystem
         FinishMutation();
     }
 
+    public bool CanCreateDirectory(XfsNodeRef directory, string name, out string reason)
+    {
+        if (!ValidateForEditing(out reason) || !IsValidName(name) || Encoding.UTF8.GetByteCount(name) > 255)
+        {
+            reason = string.IsNullOrEmpty(reason) ? "XFSディレクトリ名が不正です。" : reason;
+            return false;
+        }
+
+        try
+        {
+            var parent = ReadInode(directory.Inode);
+            ValidateLocalDirectory(parent);
+            if (ReadDirectoryEntries(parent).Any(entry => entry.Name == name))
+            {
+                throw new IOException($"同名の項目が既に存在します: {name}");
+            }
+
+            ValidateShortFormCapacity(parent, name);
+            var ag = new XfsAllocationGroup(this, GetInodeAllocationGroup(parent.Number), loadTrees: true);
+            _ = ag.FindFreeInode();
+            reason = string.Empty;
+            return true;
+        }
+        catch (Exception ex) when (ex is IOException or InvalidDataException or NotSupportedException or OverflowException)
+        {
+            reason = ex.Message;
+            return false;
+        }
+    }
+
+    public XfsNodeRef CreateDirectory(
+        XfsNodeRef directory,
+        string name,
+        CancellationToken cancellationToken)
+    {
+        if (!CanCreateDirectory(directory, name, out var reason))
+        {
+            throw new NotSupportedException(reason);
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+        var parent = ReadInode(directory.Inode);
+        var ag = new XfsAllocationGroup(this, GetInodeAllocationGroup(parent.Number), loadTrees: true);
+        var inodeNumber = ag.AllocateInode();
+        WriteNewDirectoryInode(inodeNumber, parent);
+        AddShortFormEntry(parent, name, inodeNumber, fileType: 2);
+        UpdateInodeLinkCount(parent, 1);
+        ag.Commit();
+        UpdateSuperBlock(freeBlockDelta: 0, freeInodeDelta: -1);
+        FinishMutation();
+        var created = ReadInode(inodeNumber);
+        ValidateLocalDirectory(created);
+        if (!ReadDirectoryEntries(ReadInode(parent.Number)).Any(entry => entry.Name == name && entry.Inode == inodeNumber))
+        {
+            throw new InvalidDataException("作成したXFSディレクトリエントリを再確認できません。");
+        }
+
+        return new XfsNodeRef(CombinePath(directory.Path, name), inodeNumber, XfsRawNodeKind.Directory);
+    }
+
+    public bool CanDeleteDirectory(
+        XfsNodeRef parentDirectory,
+        XfsNodeRef directory,
+        string name,
+        out string reason)
+    {
+        if (!ValidateForEditing(out reason))
+        {
+            return false;
+        }
+
+        try
+        {
+            var parent = ReadInode(parentDirectory.Inode);
+            var inode = ReadInode(directory.Inode);
+            ValidateLocalDirectory(parent);
+            ValidateLocalDirectory(inode);
+            if (inode.Number == _superBlock.RootInode
+                || inode.LinkCount != 2
+                || !string.Equals(directory.Path, CombinePath(parentDirectory.Path, name), StringComparison.Ordinal)
+                || ReadDirectoryEntries(inode).Count != 0)
+            {
+                throw new NotSupportedException("指定した親の直下にある通常の空XFSディレクトリだけを削除できます。");
+            }
+
+            _ = FindShortFormEntry(parent, name, inode.Number);
+            var agNumber = GetInodeAllocationGroup(inode.Number);
+            if (agNumber != GetInodeAllocationGroup(parent.Number))
+            {
+                throw new NotSupportedException("親directoryと異なるallocation groupのinodeはまだ削除できません。");
+            }
+
+            var ag = new XfsAllocationGroup(this, agNumber, loadTrees: true);
+            ag.ValidateInodeCanBeFreed(inode.Number);
+            reason = string.Empty;
+            return true;
+        }
+        catch (Exception ex) when (ex is IOException or InvalidDataException or NotSupportedException or OverflowException)
+        {
+            reason = ex.Message;
+            return false;
+        }
+    }
+
+    public void DeleteDirectory(
+        XfsNodeRef parentDirectory,
+        XfsNodeRef directory,
+        string name,
+        CancellationToken cancellationToken)
+    {
+        if (!CanDeleteDirectory(parentDirectory, directory, name, out var reason))
+        {
+            throw new NotSupportedException(reason);
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+        var parent = ReadInode(parentDirectory.Inode);
+        var inode = ReadInode(directory.Inode);
+        var ag = new XfsAllocationGroup(this, GetInodeAllocationGroup(inode.Number), loadTrees: true);
+        ag.FreeInode(inode.Number);
+        RemoveShortFormEntry(parent, name, inode.Number);
+        UpdateInodeLinkCount(parent, -1);
+        WriteFreedInode(inode);
+        ag.Commit();
+        UpdateSuperBlock(freeBlockDelta: 0, freeInodeDelta: 1);
+        FinishMutation();
+    }
+
+    public bool CanMoveEntry(
+        XfsNodeRef sourceDirectory,
+        XfsNodeRef entry,
+        XfsNodeRef destinationDirectory,
+        string sourceName,
+        string destinationName,
+        out string reason)
+    {
+        if (!ValidateForEditing(out reason)
+            || !IsValidName(destinationName)
+            || Encoding.UTF8.GetByteCount(destinationName) > 255)
+        {
+            reason = string.IsNullOrEmpty(reason) ? "XFS移動先名が不正です。" : reason;
+            return false;
+        }
+
+        if (!string.Equals(entry.Path, CombinePath(sourceDirectory.Path, sourceName), StringComparison.Ordinal))
+        {
+            reason = "移動対象が指定した移動元ディレクトリの直下にありません。";
+            return false;
+        }
+
+        var destinationPath = CombinePath(destinationDirectory.Path, destinationName);
+        if (string.Equals(entry.Path, destinationPath, StringComparison.Ordinal))
+        {
+            reason = "移動元と移動先が同じです。";
+            return false;
+        }
+
+        if (entry.Kind == XfsRawNodeKind.Directory
+            && (string.Equals(destinationDirectory.Path, entry.Path, StringComparison.Ordinal)
+                || destinationDirectory.Path.StartsWith(entry.Path.TrimEnd('\\') + "\\", StringComparison.Ordinal)))
+        {
+            reason = "ディレクトリを自分自身の配下へ移動できません。";
+            return false;
+        }
+
+        try
+        {
+            var sourceParent = ReadInode(sourceDirectory.Inode);
+            var destinationParent = ReadInode(destinationDirectory.Inode);
+            var inode = ReadInode(entry.Inode);
+            ValidateLocalDirectory(sourceParent);
+            ValidateLocalDirectory(destinationParent);
+            if (entry.Kind == XfsRawNodeKind.Directory)
+            {
+                ValidateLocalDirectory(inode);
+            }
+            else
+            {
+                ValidateEditableRegularInode(inode);
+            }
+
+            if (ReadDirectoryEntries(destinationParent).Any(candidate => candidate.Name == destinationName))
+            {
+                throw new IOException($"移動先には同名の項目が既に存在します: {destinationName}");
+            }
+
+            _ = FindShortFormEntry(sourceParent, sourceName, inode.Number);
+            ValidateShortFormCapacity(destinationParent, destinationName);
+            reason = string.Empty;
+            return true;
+        }
+        catch (Exception ex) when (ex is IOException or InvalidDataException or NotSupportedException or OverflowException)
+        {
+            reason = ex.Message;
+            return false;
+        }
+    }
+
+    public XfsNodeRef MoveEntry(
+        XfsNodeRef sourceDirectory,
+        XfsNodeRef entry,
+        XfsNodeRef destinationDirectory,
+        string sourceName,
+        string destinationName,
+        CancellationToken cancellationToken)
+    {
+        if (!CanMoveEntry(
+                sourceDirectory,
+                entry,
+                destinationDirectory,
+                sourceName,
+                destinationName,
+                out var reason))
+        {
+            throw new NotSupportedException(reason);
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+        var sourceParent = ReadInode(sourceDirectory.Inode);
+        var destinationParent = ReadInode(destinationDirectory.Inode);
+        var inode = ReadInode(entry.Inode);
+        AddShortFormEntry(
+            destinationParent,
+            destinationName,
+            inode.Number,
+            inode.IsDirectory ? (byte)2 : (byte)1);
+        RemoveShortFormEntry(sourceParent, sourceName, inode.Number);
+        if (inode.IsDirectory && sourceParent.Number != destinationParent.Number)
+        {
+            UpdateShortFormParent(inode, destinationParent.Number);
+            UpdateInodeLinkCount(sourceParent, -1);
+            UpdateInodeLinkCount(destinationParent, 1);
+        }
+
+        WriteInodeChangeTime(inode);
+        FinishMutation();
+        return new XfsNodeRef(
+            CombinePath(destinationDirectory.Path, destinationName),
+            inode.Number,
+            entry.Kind);
+    }
+
+    public bool CanSetAttributes(XfsNodeRef entry, FileAttributes attributes, out string reason)
+    {
+        if (!ValidateForEditing(out reason))
+        {
+            return false;
+        }
+
+        var allowed = FileAttributes.ReadOnly | FileAttributes.Directory;
+        if ((attributes & ~allowed) != 0
+            || attributes.HasFlag(FileAttributes.Directory) != (entry.Kind == XfsRawNodeKind.Directory))
+        {
+            reason = "XFSではReadOnly属性だけを編集でき、Directory属性は変更できません。";
+            return false;
+        }
+
+        try
+        {
+            var inode = ReadInode(entry.Inode);
+            if (entry.Kind == XfsRawNodeKind.Directory)
+            {
+                ValidateLocalDirectory(inode);
+            }
+            else
+            {
+                ValidateEditableRegularInode(inode);
+            }
+
+            reason = string.Empty;
+            return true;
+        }
+        catch (Exception ex) when (ex is IOException or InvalidDataException or NotSupportedException or OverflowException)
+        {
+            reason = ex.Message;
+            return false;
+        }
+    }
+
+    public void SetAttributes(
+        XfsNodeRef entry,
+        FileAttributes attributes,
+        CancellationToken cancellationToken)
+    {
+        if (!CanSetAttributes(entry, attributes, out var reason))
+        {
+            throw new NotSupportedException(reason);
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+        var inode = ReadInode(entry.Inode);
+        var mode = attributes.HasFlag(FileAttributes.ReadOnly)
+            ? (ushort)(inode.Mode & ~0x92)
+            : (ushort)(inode.Mode | 0x80);
+        WriteInodeMode(inode, mode);
+        FinishMutation();
+    }
+
+    public bool CanSetLastWriteTimeUtc(XfsNodeRef entry, DateTime modifiedUtc, out string reason)
+    {
+        if (!ValidateForEditing(out reason))
+        {
+            return false;
+        }
+
+        try
+        {
+            var seconds = new DateTimeOffset(modifiedUtc.ToUniversalTime()).ToUnixTimeSeconds();
+            var inode = ReadInode(entry.Inode);
+            if ((inode.Flags2 & BigTimeInodeFlag) == 0 && (seconds < int.MinValue || seconds > int.MaxValue))
+            {
+                reason = "このXFS inodeの更新日時は1901年から2038年の範囲で指定してください。";
+                return false;
+            }
+
+            if (entry.Kind == XfsRawNodeKind.Directory)
+            {
+                ValidateLocalDirectory(inode);
+            }
+            else
+            {
+                ValidateEditableRegularInode(inode);
+            }
+
+            reason = string.Empty;
+            return true;
+        }
+        catch (Exception ex) when (ex is IOException or InvalidDataException or NotSupportedException or OverflowException or ArgumentOutOfRangeException)
+        {
+            reason = ex.Message;
+            return false;
+        }
+    }
+
+    public void SetLastWriteTimeUtc(
+        XfsNodeRef entry,
+        DateTime modifiedUtc,
+        CancellationToken cancellationToken)
+    {
+        if (!CanSetLastWriteTimeUtc(entry, modifiedUtc, out var reason))
+        {
+            throw new NotSupportedException(reason);
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+        WriteInodeModifiedTime(ReadInode(entry.Inode), modifiedUtc.ToUniversalTime());
+        FinishMutation();
+    }
+
     private void ValidateEditableRegularInode(XfsInode inode)
     {
         if (inode.FileType != 8 || inode.Version != 3 || inode.LinkCount != 1)
@@ -456,7 +805,7 @@ internal sealed partial class XfsRawFileSystem
         throw new FileNotFoundException($"XFS short-form directory entryを再確認できません: {name}");
     }
 
-    private void AddShortFormEntry(XfsInode directory, string name, ulong inodeNumber)
+    private void AddShortFormEntry(XfsInode directory, string name, ulong inodeNumber, byte fileType = 1)
     {
         ValidateShortFormCapacity(directory, name);
         var raw = (byte[])directory.RawData.Clone();
@@ -479,7 +828,7 @@ internal sealed partial class XfsRawFileSystem
         var cursor = offset + 3 + nameBytes.Length;
         if (_superBlock.HasFType)
         {
-            fork[cursor++] = 1;
+            fork[cursor++] = fileType;
         }
 
         BinaryPrimitives.WriteUInt32BigEndian(fork.Slice(cursor, 4), checked((uint)inodeNumber));
@@ -581,6 +930,43 @@ internal sealed partial class XfsRawFileSystem
         _writer!.WriteAt(offset, raw, 0, raw.Length);
     }
 
+    private void WriteNewDirectoryInode(ulong inodeNumber, XfsInode parent)
+    {
+        var offset = GetInodeDiskOffset(inodeNumber);
+        var old = ReadMetadata(offset, _superBlock.InodeSize);
+        var raw = new byte[_superBlock.InodeSize];
+        BinaryPrimitives.WriteUInt16BigEndian(raw.AsSpan(0, 2), InodeMagic);
+        BinaryPrimitives.WriteUInt16BigEndian(raw.AsSpan(2, 2), 0x41ed);
+        raw[4] = 3;
+        raw[5] = 1;
+        parent.RawData.AsSpan(8, 8).CopyTo(raw.AsSpan(8, 8));
+        BinaryPrimitives.WriteUInt32BigEndian(raw.AsSpan(0x10, 4), 2);
+        parent.RawData.AsSpan(0x14, 4).CopyTo(raw.AsSpan(0x14, 4));
+        BinaryPrimitives.WriteUInt64BigEndian(
+            raw.AsSpan(0x78, 8),
+            (_superBlock.IncompatibleFeatures & BigTimeFeature) != 0 ? BigTimeInodeFlag : 0);
+        SetAllTimes(raw);
+        BinaryPrimitives.WriteUInt64BigEndian(raw.AsSpan(0x38, 8), 6);
+        raw[0x53] = 2;
+        BinaryPrimitives.WriteUInt32BigEndian(raw.AsSpan(0x5c, 4), checked((uint)Random.Shared.Next(1, int.MaxValue)));
+        BinaryPrimitives.WriteUInt32BigEndian(raw.AsSpan(0x60, 4), uint.MaxValue);
+        BinaryPrimitives.WriteUInt64BigEndian(raw.AsSpan(0x68, 8), 1);
+        BinaryPrimitives.WriteUInt64BigEndian(raw.AsSpan(0x98, 8), inodeNumber);
+        _superBlock.Uuid.CopyTo(raw.AsSpan(0xa0, 16));
+        raw[0xb0] = 0;
+        raw[0xb1] = 0;
+        BinaryPrimitives.WriteUInt32BigEndian(raw.AsSpan(0xb2, 4), checked((uint)parent.Number));
+
+        if (old[4] != 3 || EndianUtilities.ReadUInt64Big(old, 0x98) != inodeNumber)
+        {
+            throw new InvalidDataException("XFS free inode slotのself-identificationが一致しません。");
+        }
+
+        ValidateChecksum(old, 0x64, $"XFS free inode {inodeNumber}");
+        UpdateChecksum(raw, 0x64);
+        _writer!.WriteAt(offset, raw, 0, raw.Length);
+    }
+
     private void WriteFreedInode(XfsInode inode)
     {
         var raw = (byte[])inode.RawData.Clone();
@@ -589,6 +975,67 @@ internal sealed partial class XfsRawFileSystem
         BinaryPrimitives.WriteUInt32BigEndian(raw.AsSpan(0x60, 4), uint.MaxValue);
         BinaryPrimitives.WriteUInt64BigEndian(raw.AsSpan(0x98, 8), inode.Number);
         _superBlock.Uuid.CopyTo(raw.AsSpan(0xa0, 16));
+        UpdateChecksum(raw, 0x64);
+        _writer!.WriteAt(inode.DiskOffset, raw, 0, raw.Length);
+    }
+
+    private void UpdateInodeLinkCount(XfsInode inode, int delta)
+    {
+        var raw = ReadMetadata(inode.DiskOffset, inode.RawData.Length);
+        var linkCount = checked((long)EndianUtilities.ReadUInt32Big(raw, 0x10) + delta);
+        if (linkCount is < 0 or > uint.MaxValue)
+        {
+            throw new InvalidDataException("XFS inode link countが範囲外になります。");
+        }
+
+        BinaryPrimitives.WriteUInt32BigEndian(raw.AsSpan(0x10, 4), checked((uint)linkCount));
+        SetModificationTimes(raw);
+        IncrementChangeCount(raw);
+        UpdateChecksum(raw, 0x64);
+        _writer!.WriteAt(inode.DiskOffset, raw, 0, raw.Length);
+    }
+
+    private void UpdateShortFormParent(XfsInode directory, ulong parentInodeNumber)
+    {
+        ValidateLocalDirectory(directory);
+        var raw = (byte[])directory.RawData.Clone();
+        if (raw[0xb1] != 0)
+        {
+            throw new NotSupportedException("64-bit parent inodeを持つXFS short-form directoryは移動できません。");
+        }
+
+        BinaryPrimitives.WriteUInt32BigEndian(raw.AsSpan(0xb2, 4), checked((uint)parentInodeNumber));
+        SetModificationTimes(raw);
+        IncrementChangeCount(raw);
+        UpdateChecksum(raw, 0x64);
+        _writer!.WriteAt(directory.DiskOffset, raw, 0, raw.Length);
+    }
+
+    private void WriteInodeChangeTime(XfsInode inode)
+    {
+        var raw = ReadMetadata(inode.DiskOffset, inode.RawData.Length);
+        SetTimestamp(raw, 0x30);
+        IncrementChangeCount(raw);
+        UpdateChecksum(raw, 0x64);
+        _writer!.WriteAt(inode.DiskOffset, raw, 0, raw.Length);
+    }
+
+    private void WriteInodeMode(XfsInode inode, ushort mode)
+    {
+        var raw = ReadMetadata(inode.DiskOffset, inode.RawData.Length);
+        BinaryPrimitives.WriteUInt16BigEndian(raw.AsSpan(2, 2), mode);
+        SetTimestamp(raw, 0x30);
+        IncrementChangeCount(raw);
+        UpdateChecksum(raw, 0x64);
+        _writer!.WriteAt(inode.DiskOffset, raw, 0, raw.Length);
+    }
+
+    private void WriteInodeModifiedTime(XfsInode inode, DateTime modifiedUtc)
+    {
+        var raw = ReadMetadata(inode.DiskOffset, inode.RawData.Length);
+        SetTimestamp(raw, 0x28, modifiedUtc);
+        SetTimestamp(raw, 0x30);
+        IncrementChangeCount(raw);
         UpdateChecksum(raw, 0x64);
         _writer!.WriteAt(inode.DiskOffset, raw, 0, raw.Length);
     }
@@ -764,9 +1211,14 @@ internal sealed partial class XfsRawFileSystem
 
     private static void SetTimestamp(byte[] inode, int offset)
     {
-        var now = DateTimeOffset.UtcNow;
-        var seconds = now.ToUnixTimeSeconds();
-        var nanoseconds = checked((uint)((now.Ticks % TimeSpan.TicksPerSecond) * 100));
+        SetTimestamp(inode, offset, DateTime.UtcNow);
+    }
+
+    private static void SetTimestamp(byte[] inode, int offset, DateTime utc)
+    {
+        var value = new DateTimeOffset(utc.ToUniversalTime());
+        var seconds = value.ToUnixTimeSeconds();
+        var nanoseconds = checked((uint)((value.Ticks % TimeSpan.TicksPerSecond) * 100));
         var bigTime = EndianUtilities.ReadUInt64Big(inode, 0x78) is var flags2
             && (flags2 & BigTimeInodeFlag) != 0;
         if (bigTime)

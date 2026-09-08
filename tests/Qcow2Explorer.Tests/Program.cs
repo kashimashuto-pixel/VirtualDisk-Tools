@@ -48,6 +48,19 @@ if (args.Length == 5 && string.Equals(args[0], "--batch-edit-smoke", StringCompa
     return;
 }
 
+if (args.Length == 1 && string.Equals(args[0], "--generated-fat-editing", StringComparison.OrdinalIgnoreCase))
+{
+    TestFatFileEditingOperations();
+    Console.WriteLine("Generated FAT editing tests passed.");
+    return;
+}
+
+if (args.Length == 3 && string.Equals(args[0], "--metadata-edit-smoke", StringComparison.OrdinalIgnoreCase))
+{
+    MetadataEditRawImage(args[1], args[2]);
+    return;
+}
+
 if (args.Length > 0 && string.Equals(args[0], "--list-physical", StringComparison.OrdinalIgnoreCase))
 {
     foreach (var disk in PhysicalDiskReader.Enumerate())
@@ -273,6 +286,46 @@ static void BatchEditRawImage(
     }
 }
 
+static void MetadataEditRawImage(string imagePath, string outputPath)
+{
+    using var source = new RawDiskImageReader(imagePath);
+    var partition = CreateRawFileSystemPartition(source);
+    var fileSystem = OpenDetectedFileSystem(source, partition);
+    try
+    {
+        var timestamp = new DateTime(2024, 2, 3, 4, 5, 6, DateTimeKind.Utc);
+        var attributes = partition.FileSystem.StartsWith("ext", StringComparison.OrdinalIgnoreCase)
+            || partition.FileSystem.Equals("XFS", StringComparison.OrdinalIgnoreCase)
+            ? FileAttributes.ReadOnly
+            : FileAttributes.Hidden | FileAttributes.Archive;
+        PendingFileEdit[] edits =
+        [
+            new(FileEditOperationKind.CreateDirectory, "/Work"),
+            new(FileEditOperationKind.MoveEntry, "/payload.bin", DestinationVirtualPath: "/Work/Renamed.bin"),
+            new(FileEditOperationKind.SetAttributes, "/Work/Renamed.bin", Attributes: attributes),
+            new(FileEditOperationKind.SetLastWriteTimeUtc, "/Work/Renamed.bin", ModifiedUtc: timestamp),
+            new(FileEditOperationKind.CreateDirectory, "/Empty"),
+            new(FileEditOperationKind.DeleteDirectory, "/Empty"),
+            new(FileEditOperationKind.CreateDirectory, "/Target"),
+            new(FileEditOperationKind.MoveEntry, "/Work", DestinationVirtualPath: "/Target/Renamed folder"),
+        ];
+        var result = FileEditBatchService.ApplyToRawAsync(
+            source,
+            partition,
+            fileSystem,
+            edits,
+            outputPath,
+            new Progress<DiskImageProgress>(update => Console.WriteLine(update.Message))).GetAwaiter().GetResult();
+        Console.WriteLine(
+            $"Metadata edit passed: fs={partition.FileSystem}, edits={result.EditCount:N0}, "
+            + $"pages={result.ModifiedPageCount:N0}, output={result.DestinationPath}");
+    }
+    finally
+    {
+        (fileSystem as IDisposable)?.Dispose();
+    }
+}
+
 static PartitionInfo CreateRawFileSystemPartition(RawDiskImageReader source)
 {
     var partition = new PartitionInfo
@@ -358,6 +411,7 @@ static void RunGeneratedImageTests()
     TestCopyOnWriteBlockDevice();
     TestFatSameLengthReplacement();
     TestFatFileEditingOperations();
+    TestLogicalLayerEditing();
     TestExt4SameLengthReplacement();
     TestAvhdxDifferencingDisk();
     TestNtfsMftMirrorFallback();
@@ -5436,6 +5490,7 @@ static void TestFatFileEditingOperations()
         var finalPath = Path.Combine(AppContext.BaseDirectory, $"sample-{prefix}-edit-final.raw");
         var batchPath = Path.Combine(AppContext.BaseDirectory, $"sample-{prefix}-edit-batch.raw");
         var failedBatchPath = Path.Combine(AppContext.BaseDirectory, $"sample-{prefix}-edit-batch-failed.raw");
+        var nonEmptyFailedPath = Path.Combine(AppContext.BaseDirectory, $"sample-{prefix}-edit-nonempty-failed.raw");
         var grownContentPath = Path.Combine(AppContext.BaseDirectory, $"sample-{prefix}-edit-grown.bin");
         var addedContentPath = Path.Combine(AppContext.BaseDirectory, $"sample-{prefix}-edit-added.bin");
         var shrunkContentPath = Path.Combine(AppContext.BaseDirectory, $"sample-{prefix}-edit-small.bin");
@@ -5448,6 +5503,7 @@ static void TestFatFileEditingOperations()
                      finalPath,
                      batchPath,
                      failedBatchPath,
+                     nonEmptyFailedPath,
                      grownContentPath,
                      addedContentPath,
                      shrunkContentPath,
@@ -5550,6 +5606,34 @@ static void TestFatFileEditingOperations()
                 new PendingFileEdit(FileEditOperationKind.CreateFile, "/Added batch.bin", addedContentPath),
                 new PendingFileEdit(FileEditOperationKind.WriteContent, "/Added batch.bin", shrunkContentPath),
                 new PendingFileEdit(FileEditOperationKind.DeleteFile, "/HELLO.TXT"),
+                new PendingFileEdit(FileEditOperationKind.CreateDirectory, "/Work"),
+                new PendingFileEdit(
+                    FileEditOperationKind.MoveEntry,
+                    "/Added batch.bin",
+                    DestinationVirtualPath: "/Work/Renamed.bin"),
+                new PendingFileEdit(
+                    FileEditOperationKind.SetAttributes,
+                    "/Work/Renamed.bin",
+                    Attributes: FileAttributes.Hidden | FileAttributes.Archive),
+                new PendingFileEdit(
+                    FileEditOperationKind.SetLastWriteTimeUtc,
+                    "/Work/Renamed.bin",
+                    ModifiedUtc: new DateTime(2024, 2, 3, 4, 5, 6, DateTimeKind.Utc)),
+                new PendingFileEdit(FileEditOperationKind.CreateDirectory, "/Empty"),
+                new PendingFileEdit(FileEditOperationKind.DeleteDirectory, "/Empty"),
+                new PendingFileEdit(FileEditOperationKind.CreateDirectory, "/Target"),
+                new PendingFileEdit(
+                    FileEditOperationKind.MoveEntry,
+                    "/Work",
+                    DestinationVirtualPath: "/Target/Renamed folder"),
+                new PendingFileEdit(
+                    FileEditOperationKind.SetAttributes,
+                    "/Target/Renamed folder",
+                    Attributes: FileAttributes.Directory | FileAttributes.Hidden),
+                new PendingFileEdit(
+                    FileEditOperationKind.SetLastWriteTimeUtc,
+                    "/Target/Renamed folder",
+                    ModifiedUtc: new DateTime(2023, 12, 30, 11, 22, 34, DateTimeKind.Utc)),
             };
             var batch = FileEditBatchService.ApplyToRawAsync(
                 source,
@@ -5567,8 +5651,24 @@ static void TestFatFileEditingOperations()
             var fileSystem = OpenFileSystem(batch, partition);
             var entries = fileSystem.ListDirectory(fileSystem.Root);
             Assert(entries.All(node => node.Name != "HELLO.TXT"), $"{expectedFileSystem} batch deleted file absent");
-            var added = entries.Single(node => node.Name == "Added batch.bin");
+            Assert(entries.All(node => node.Name != "Empty" && node.Name != "Work"), $"{expectedFileSystem} batch old directories absent");
+            var targetDirectory = entries.Single(node => node.Name == "Target" && node.IsDirectory);
+            var renamedDirectory = fileSystem.ListDirectory(targetDirectory)
+                .Single(node => node.Name == "Renamed folder" && node.IsDirectory);
+            Assert(
+                renamedDirectory.Attributes.HasFlag(FileAttributes.Hidden),
+                $"{expectedFileSystem} batch directory attributes");
+            Assert(
+                renamedDirectory.ModifiedUtc == new DateTime(2023, 12, 30, 11, 22, 34, DateTimeKind.Utc),
+                $"{expectedFileSystem} batch directory timestamp");
+            var added = fileSystem.ListDirectory(renamedDirectory).Single(node => node.Name == "Renamed.bin");
             Assert(added.Size == shrunkContent.Length, $"{expectedFileSystem} batch final length");
+            Assert(
+                added.Attributes == (FileAttributes.Hidden | FileAttributes.Archive),
+                $"{expectedFileSystem} batch file attributes");
+            Assert(
+                added.ModifiedUtc == new DateTime(2024, 2, 3, 4, 5, 6, DateTimeKind.Utc),
+                $"{expectedFileSystem} batch file timestamp");
             Assert(
                 fileSystem.ReadFile(added, 0, shrunkContent.Length).SequenceEqual(shrunkContent),
                 $"{expectedFileSystem} batch final content");
@@ -5598,6 +5698,36 @@ static void TestFatFileEditingOperations()
 
             Assert(rejected, $"{expectedFileSystem} batch invalid operation rejected");
             Assert(!File.Exists(failedBatchPath), $"{expectedFileSystem} failed batch not published");
+        }
+
+        using (var source = new RawDiskImageReader(sourcePath))
+        {
+            var partition = GetFatPartition(source, expectedFileSystem, usePartitionTable);
+            var fileSystem = OpenFileSystem(source, partition);
+            var rejected = false;
+            try
+            {
+                _ = FileEditBatchService.ApplyToRawAsync(
+                    source,
+                    partition,
+                    fileSystem,
+                    [
+                        new PendingFileEdit(FileEditOperationKind.CreateDirectory, "/Nonempty"),
+                        new PendingFileEdit(
+                            FileEditOperationKind.MoveEntry,
+                            "/HELLO.TXT",
+                            DestinationVirtualPath: "/Nonempty/HELLO.TXT"),
+                        new PendingFileEdit(FileEditOperationKind.DeleteDirectory, "/Nonempty"),
+                    ],
+                    nonEmptyFailedPath).GetAwaiter().GetResult();
+            }
+            catch (NotSupportedException)
+            {
+                rejected = true;
+            }
+
+            Assert(rejected, $"{expectedFileSystem} non-empty directory deletion rejected");
+            Assert(!File.Exists(nonEmptyFailedPath), $"{expectedFileSystem} non-empty failure not published");
         }
 
         Assert(
@@ -5630,6 +5760,70 @@ static void TestFatFileEditingOperations()
         return FileSystemDetector.TryOpen(reader, partition, out var error)
             ?? throw new InvalidDataException(error);
     }
+}
+
+static void TestLogicalLayerEditing()
+{
+    var sourcePath = Path.Combine(AppContext.BaseDirectory, "sample-logical-edit-source.raw");
+    var outputPath = Path.Combine(AppContext.BaseDirectory, "sample-logical-edit-output.raw");
+    File.Delete(sourcePath);
+    File.Delete(outputPath);
+    TestImageFactory.CreateRawFat16Disk(sourcePath);
+    var sourceHash = SHA256.HashData(File.ReadAllBytes(sourcePath));
+
+    using var source = new RawDiskImageReader(sourcePath);
+    var physicalPartition = PartitionTableReader.ReadPartitions(source).Single();
+    physicalPartition.FileSystem = FileSystemDetector.Detect(source, physicalPartition);
+    var logicalReader = new PartitionSliceReader(source, physicalPartition);
+    var logicalPartition = new PartitionInfo
+    {
+        Number = physicalPartition.Number,
+        Scheme = "synthetic-logical-layer",
+        Name = "assembled/decrypted test volume",
+        SectorSize = physicalPartition.SectorSize,
+        SectorCount = checked((ulong)(logicalReader.Length / physicalPartition.SectorSize)),
+        LengthOverrideBytes = logicalReader.Length,
+        FileSystem = physicalPartition.FileSystem,
+        ReaderOverride = logicalReader,
+    };
+    var fileSystem = FileSystemDetector.TryOpen(source, logicalPartition, out var error)
+        ?? throw new InvalidDataException(error);
+    try
+    {
+        var result = FileEditBatchService.ApplyToRawAsync(
+            source,
+            logicalPartition,
+            fileSystem,
+            [new PendingFileEdit(FileEditOperationKind.CreateDirectory, "/Logical output")],
+            outputPath).GetAwaiter().GetResult();
+        Assert(result.IsLogicalVolumeOutput, "logical-layer edit result kind");
+        Assert(new FileInfo(outputPath).Length == logicalReader.Length, "logical-layer flat RAW length");
+    }
+    finally
+    {
+        (fileSystem as IDisposable)?.Dispose();
+    }
+
+    using (var output = new RawDiskImageReader(outputPath))
+    {
+        var partition = CreateRawFileSystemPartition(output);
+        var outputFileSystem = OpenDetectedFileSystem(output, partition);
+        try
+        {
+            Assert(
+                outputFileSystem.ListDirectory(outputFileSystem.Root)
+                    .Any(node => node.IsDirectory && node.Name == "Logical output"),
+                "logical-layer flat RAW directory");
+        }
+        finally
+        {
+            (outputFileSystem as IDisposable)?.Dispose();
+        }
+    }
+
+    Assert(
+        SHA256.HashData(File.ReadAllBytes(sourcePath)).SequenceEqual(sourceHash),
+        "logical-layer physical source remains unchanged");
 }
 
 static void TestNtfsMftMirrorFallback()

@@ -36,12 +36,6 @@ public static class FileReplacementService
             return false;
         }
 
-        if (partition.ReaderOverride is not null)
-        {
-            reason = "RAID、LVM、復号レイヤーなどの合成パーティションはまだ書き込めません。";
-            return false;
-        }
-
         if (file.IsDirectory)
         {
             reason = "通常ファイルだけを置換できます。";
@@ -50,9 +44,13 @@ public static class FileReplacementService
 
         try
         {
-            var overlay = new CopyOnWriteBlockDevice(source);
-            var slice = new WritablePartitionSlice(overlay, partition);
-            using var writableFileSystem = CreateWritableFileSystem(originalFileSystem.Name, slice, partition);
+            var editSource = FileEditService.ResolveEditableSource(source, partition);
+            var overlay = new CopyOnWriteBlockDevice(editSource.Reader);
+            var slice = new WritablePartitionSlice(overlay, editSource.Partition);
+            using var writableFileSystem = CreateWritableFileSystem(
+                originalFileSystem.Name,
+                slice,
+                editSource.Partition);
             var writableFile = writableFileSystem.MapFile(file);
             return writableFileSystem.Writer.CanReplaceFile(writableFile, replacementLength, out reason);
         }
@@ -101,9 +99,13 @@ public static class FileReplacementService
         }
 
         cancellationToken.ThrowIfCancellationRequested();
-        var overlay = new CopyOnWriteBlockDevice(source);
-        var slice = new WritablePartitionSlice(overlay, partition);
-        using var writableFileSystem = CreateWritableFileSystem(originalFileSystem.Name, slice, partition);
+        var editSource = FileEditService.ResolveEditableSource(source, partition);
+        var overlay = new CopyOnWriteBlockDevice(editSource.Reader);
+        var slice = new WritablePartitionSlice(overlay, editSource.Partition);
+        using var writableFileSystem = CreateWritableFileSystem(
+            originalFileSystem.Name,
+            slice,
+            editSource.Partition);
         var writableFile = writableFileSystem.MapFile(file);
         byte[] sourceHash;
         await using (var replacement = new FileStream(

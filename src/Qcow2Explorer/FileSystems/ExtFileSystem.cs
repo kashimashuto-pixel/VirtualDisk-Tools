@@ -483,6 +483,390 @@ public sealed class ExtFileSystem : IReadOnlyFileSystem, IFileContentWriter, IFi
         _writer!.Flush();
     }
 
+    public bool CanCreateDirectory(VfsNode directory, string name, out string reason)
+    {
+        if (!TryValidateEditableFileSystem(requireWriter: true, out reason)
+            || !TryValidateDirectoryInsertion(directory, name, out var parent, out reason))
+        {
+            return false;
+        }
+
+        try
+        {
+            var probe = new ExtMutationContext(this);
+            _ = probe.FindFreeInode((parent.Number - 1) / _inodesPerGroup);
+            _ = probe.FindContiguousBlocks(1);
+            reason = string.Empty;
+            return true;
+        }
+        catch (Exception ex) when (ex is InvalidDataException or NotSupportedException or OverflowException)
+        {
+            reason = ex.Message;
+            return false;
+        }
+    }
+
+    public VfsNode CreateDirectory(
+        VfsNode directory,
+        string name,
+        CancellationToken cancellationToken = default)
+    {
+        if (!CanCreateDirectory(directory, name, out var reason)
+            || !TryValidateDirectoryInsertion(directory, name, out var parent, out reason))
+        {
+            throw new NotSupportedException(reason);
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+        var mutation = new ExtMutationContext(this);
+        var inodeNumber = mutation.FindFreeInode((parent.Number - 1) / _inodesPerGroup);
+        var block = mutation.FindContiguousBlocks(1);
+        mutation.SetInodeAllocated(inodeNumber, allocated: true);
+        mutation.SetBlocksAllocated(block, 1, allocated: true);
+        mutation.AdjustUsedDirectories(inodeNumber, 1);
+        var generation = checked((uint)Random.Shared.Next(1, int.MaxValue));
+        WriteNewDirectoryInode(inodeNumber, parent, generation, block);
+        var inode = ReadInode(inodeNumber);
+        WriteNewDirectoryBlock(inode, parent.Number, block);
+        InsertDirectoryEntry(parent, name, inodeNumber, fileType: 2);
+        UpdateInodeLinkCount(parent, 1);
+        mutation.Commit();
+        _writer!.Flush();
+        return new VfsNode
+        {
+            Name = name,
+            VirtualPath = directory.VirtualPath.TrimEnd('\\') + "\\" + name,
+            IsDirectory = true,
+            Size = 0,
+            ModifiedUtc = DateTime.UtcNow,
+            Attributes = FileAttributes.Directory,
+            Metadata = inodeNumber,
+        };
+    }
+
+    public bool CanDeleteDirectory(VfsNode parentDirectory, VfsNode directory, out string reason)
+    {
+        if (!TryValidateEditableFileSystem(requireWriter: true, out reason))
+        {
+            return false;
+        }
+
+        if (!parentDirectory.IsDirectory
+            || parentDirectory.Metadata is not uint parentInodeNumber
+            || !directory.IsDirectory
+            || directory.Metadata is not uint directoryInodeNumber
+            || directoryInodeNumber == 2)
+        {
+            reason = "ルート以外のディレクトリと、その親ディレクトリを指定してください。";
+            return false;
+        }
+
+        try
+        {
+            var parent = ReadInode(parentInodeNumber);
+            var inode = ReadInode(directoryInodeNumber);
+            if (!parent.IsDirectory || !inode.IsDirectory || inode.LinkCount != 2)
+            {
+                reason = "通常の空ディレクトリだけを削除できます。";
+                return false;
+            }
+
+            if ((inode.Flags & (ImmutableInodeFlag | AppendOnlyInodeFlag | InlineDataInodeFlag | DirectoryIndexInodeFlag)) != 0)
+            {
+                reason = "保護属性、inline data、indexed directoryを持つext4ディレクトリは削除できません。";
+                return false;
+            }
+
+            if (!IsDirectChild(parentDirectory.VirtualPath, directory.VirtualPath)
+                || ListDirectory(directory).Count != 0)
+            {
+                reason = "指定した親の直下にある空ディレクトリだけを削除できます。";
+                return false;
+            }
+
+            var extents = GetOwnedInlineExtents(inode);
+            EnsureBlocksExclusivelyOwned(inode.Number, extents);
+            _ = FindDirectoryEntry(parent, directory.Name, inode.Number);
+            ValidateInodeChecksum(parent);
+            ValidateInodeChecksum(inode);
+            reason = string.Empty;
+            return true;
+        }
+        catch (Exception ex) when (ex is InvalidDataException or NotSupportedException or OverflowException)
+        {
+            reason = ex.Message;
+            return false;
+        }
+    }
+
+    public void DeleteDirectory(
+        VfsNode parentDirectory,
+        VfsNode directory,
+        CancellationToken cancellationToken = default)
+    {
+        if (!CanDeleteDirectory(parentDirectory, directory, out var reason))
+        {
+            throw new NotSupportedException(reason);
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+        var parent = ReadInode((uint)parentDirectory.Metadata!);
+        var inode = ReadInode((uint)directory.Metadata!);
+        var mutation = new ExtMutationContext(this);
+        foreach (var extent in GetOwnedInlineExtents(inode))
+        {
+            mutation.SetBlocksAllocated(extent.PhysicalBlock, extent.BlockCount, allocated: false);
+        }
+
+        mutation.SetInodeAllocated(inode.Number, allocated: false);
+        mutation.AdjustUsedDirectories(inode.Number, -1);
+        RemoveDirectoryEntry(parent, directory.Name, inode.Number);
+        UpdateInodeLinkCount(parent, -1);
+        WriteDeletedInode(inode);
+        mutation.Commit();
+        _writer!.Flush();
+    }
+
+    public bool CanMoveEntry(
+        VfsNode sourceDirectory,
+        VfsNode entry,
+        VfsNode destinationDirectory,
+        string destinationName,
+        out string reason)
+    {
+        if (!TryValidateEditableFileSystem(requireWriter: true, out reason)
+            || !sourceDirectory.IsDirectory
+            || sourceDirectory.Metadata is not uint sourceParentNumber
+            || entry.Metadata is not uint inodeNumber
+            || !TryValidateDirectoryInsertion(destinationDirectory, destinationName, out var destinationParent, out reason))
+        {
+            reason = string.IsNullOrEmpty(reason) ? "移動元または移動先を再確認できません。" : reason;
+            return false;
+        }
+
+        if (!IsDirectChild(sourceDirectory.VirtualPath, entry.VirtualPath))
+        {
+            reason = "移動対象が指定した移動元ディレクトリの直下にありません。";
+            return false;
+        }
+
+        var destinationPath = destinationDirectory.VirtualPath.TrimEnd('\\') + "\\" + destinationName;
+        if (string.Equals(entry.VirtualPath, destinationPath, StringComparison.Ordinal))
+        {
+            reason = "移動元と移動先が同じです。";
+            return false;
+        }
+
+        if (entry.IsDirectory
+            && (string.Equals(destinationDirectory.VirtualPath, entry.VirtualPath, StringComparison.Ordinal)
+                || destinationDirectory.VirtualPath.StartsWith(
+                    entry.VirtualPath.TrimEnd('\\') + "\\",
+                    StringComparison.Ordinal)))
+        {
+            reason = "ディレクトリを自分自身の配下へ移動できません。";
+            return false;
+        }
+
+        try
+        {
+            var sourceParent = ReadInode(sourceParentNumber);
+            var inode = ReadInode(inodeNumber);
+            if (!sourceParent.IsDirectory
+                || entry.IsDirectory != inode.IsDirectory
+                || (!inode.IsDirectory && !inode.IsRegularFile))
+            {
+                reason = "移動対象のinode種別を再確認できません。";
+                return false;
+            }
+
+            if ((sourceParent.Flags & (InlineDataInodeFlag | DirectoryIndexInodeFlag | ImmutableInodeFlag | AppendOnlyInodeFlag)) != 0)
+            {
+                reason = "inline、indexed、immutable、append-only directoryからの移動はまだ対応していません。";
+                return false;
+            }
+
+            if ((inode.Flags & (ImmutableInodeFlag | AppendOnlyInodeFlag | InlineDataInodeFlag | VerityInodeFlag)) != 0
+                || (inode.IsDirectory && (inode.Flags & DirectoryIndexInodeFlag) != 0))
+            {
+                reason = "保護属性または未対応属性を持つext4項目は移動できません。";
+                return false;
+            }
+
+            _ = FindDirectoryEntry(sourceParent, entry.Name, inode.Number);
+            ValidateInodeChecksum(sourceParent);
+            ValidateInodeChecksum(destinationParent);
+            ValidateInodeChecksum(inode);
+            reason = string.Empty;
+            return true;
+        }
+        catch (Exception ex) when (ex is InvalidDataException or NotSupportedException or OverflowException)
+        {
+            reason = ex.Message;
+            return false;
+        }
+    }
+
+    public VfsNode MoveEntry(
+        VfsNode sourceDirectory,
+        VfsNode entry,
+        VfsNode destinationDirectory,
+        string destinationName,
+        CancellationToken cancellationToken = default)
+    {
+        if (!CanMoveEntry(sourceDirectory, entry, destinationDirectory, destinationName, out var reason))
+        {
+            throw new NotSupportedException(reason);
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+        var sourceParent = ReadInode((uint)sourceDirectory.Metadata!);
+        var destinationParent = ReadInode((uint)destinationDirectory.Metadata!);
+        var inode = ReadInode((uint)entry.Metadata!);
+        InsertDirectoryEntry(destinationParent, destinationName, inode.Number, inode.IsDirectory ? (byte)2 : (byte)1);
+        RemoveDirectoryEntry(sourceParent, entry.Name, inode.Number);
+        if (inode.IsDirectory && sourceParent.Number != destinationParent.Number)
+        {
+            UpdateDirectoryParentEntry(inode, sourceParent.Number, destinationParent.Number);
+            UpdateInodeLinkCount(sourceParent, -1);
+            UpdateInodeLinkCount(destinationParent, 1);
+        }
+
+        WriteInodeChangeTime(inode);
+        _writer!.Flush();
+        return new VfsNode
+        {
+            Name = destinationName,
+            VirtualPath = destinationDirectory.VirtualPath.TrimEnd('\\') + "\\" + destinationName,
+            IsDirectory = inode.IsDirectory,
+            Size = inode.IsDirectory ? 0 : checked((long)inode.Size),
+            ModifiedUtc = inode.ModifiedUtc,
+            Attributes = ToFileAttributes(inode),
+            Metadata = inode.Number,
+        };
+    }
+
+    public bool CanSetAttributes(VfsNode entry, FileAttributes attributes, out string reason)
+    {
+        if (!TryValidateEditableFileSystem(requireWriter: true, out reason)
+            || entry.Metadata is not uint inodeNumber)
+        {
+            reason = string.IsNullOrEmpty(reason) ? "属性編集対象を再確認できません。" : reason;
+            return false;
+        }
+
+        var allowed = FileAttributes.ReadOnly | FileAttributes.Directory;
+        if ((attributes & ~allowed) != 0
+            || attributes.HasFlag(FileAttributes.Directory) != entry.IsDirectory)
+        {
+            reason = "ext4ではReadOnly属性だけを編集でき、Directory属性は変更できません。";
+            return false;
+        }
+
+        try
+        {
+            var inode = ReadInode(inodeNumber);
+            if (entry.IsDirectory != inode.IsDirectory || (!inode.IsDirectory && !inode.IsRegularFile))
+            {
+                reason = "属性編集対象のinode種別を再確認できません。";
+                return false;
+            }
+
+            if ((inode.Flags & (ImmutableInodeFlag | AppendOnlyInodeFlag | InlineDataInodeFlag | VerityInodeFlag)) != 0
+                || (inode.IsDirectory && (inode.Flags & DirectoryIndexInodeFlag) != 0))
+            {
+                reason = "保護属性または未対応属性を持つext4項目の属性は編集できません。";
+                return false;
+            }
+
+            ValidateInodeChecksum(inode);
+            reason = string.Empty;
+            return true;
+        }
+        catch (Exception ex) when (ex is InvalidDataException or NotSupportedException or OverflowException)
+        {
+            reason = ex.Message;
+            return false;
+        }
+    }
+
+    public void SetAttributes(
+        VfsNode entry,
+        FileAttributes attributes,
+        CancellationToken cancellationToken = default)
+    {
+        if (!CanSetAttributes(entry, attributes, out var reason))
+        {
+            throw new NotSupportedException(reason);
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+        var inode = ReadInode((uint)entry.Metadata!);
+        var mode = attributes.HasFlag(FileAttributes.ReadOnly)
+            ? (ushort)(inode.Mode & ~0x92)
+            : (ushort)(inode.Mode | 0x80);
+        WriteInodeMode(inode, mode);
+        _writer!.Flush();
+    }
+
+    public bool CanSetLastWriteTimeUtc(VfsNode entry, DateTime modifiedUtc, out string reason)
+    {
+        if (!TryValidateEditableFileSystem(requireWriter: true, out reason)
+            || entry.Metadata is not uint inodeNumber)
+        {
+            reason = string.IsNullOrEmpty(reason) ? "更新日時の編集対象を再確認できません。" : reason;
+            return false;
+        }
+
+        try
+        {
+            var seconds = new DateTimeOffset(modifiedUtc.ToUniversalTime()).ToUnixTimeSeconds();
+            if (seconds is < 0 or > uint.MaxValue)
+            {
+                reason = "ext4の更新日時は1970年から2106年の範囲で指定してください。";
+                return false;
+            }
+
+            var inode = ReadInode(inodeNumber);
+            if (entry.IsDirectory != inode.IsDirectory || (!inode.IsDirectory && !inode.IsRegularFile))
+            {
+                reason = "更新日時の編集対象を再確認できません。";
+                return false;
+            }
+
+            if ((inode.Flags & (ImmutableInodeFlag | AppendOnlyInodeFlag | InlineDataInodeFlag | VerityInodeFlag)) != 0
+                || (inode.IsDirectory && (inode.Flags & DirectoryIndexInodeFlag) != 0))
+            {
+                reason = "保護属性または未対応属性を持つext4項目の更新日時は編集できません。";
+                return false;
+            }
+
+            ValidateInodeChecksum(inode);
+            reason = string.Empty;
+            return true;
+        }
+        catch (Exception ex) when (ex is InvalidDataException or NotSupportedException or OverflowException or ArgumentOutOfRangeException)
+        {
+            reason = ex.Message;
+            return false;
+        }
+    }
+
+    public void SetLastWriteTimeUtc(
+        VfsNode entry,
+        DateTime modifiedUtc,
+        CancellationToken cancellationToken = default)
+    {
+        if (!CanSetLastWriteTimeUtc(entry, modifiedUtc, out var reason))
+        {
+            throw new NotSupportedException(reason);
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+        var inode = ReadInode((uint)entry.Metadata!);
+        WriteInodeModifiedTime(inode, modifiedUtc.ToUniversalTime());
+        _writer!.Flush();
+    }
+
     private IReadOnlyList<VfsNode> ParseDirectory(byte[] data, string parentPath)
     {
         var nodes = new Dictionary<(uint Inode, string Name), VfsNode>();
@@ -547,6 +931,7 @@ public sealed class ExtFileSystem : IReadOnlyFileSystem, IFileContentWriter, IFi
                         IsDirectory = isDirectory,
                         Size = isDirectory ? 0 : ToLongSize(inode.Size),
                         ModifiedUtc = inode.ModifiedUtc,
+                        Attributes = ToFileAttributes(inode),
                         Metadata = inodeNumber
                     };
                 }
@@ -746,6 +1131,17 @@ public sealed class ExtFileSystem : IReadOnlyFileSystem, IFileContentWriter, IFi
         return value > long.MaxValue ? long.MaxValue : (long)value;
     }
 
+    private static FileAttributes ToFileAttributes(ExtInode inode)
+    {
+        var attributes = inode.IsDirectory ? FileAttributes.Directory : (FileAttributes)0;
+        if ((inode.Mode & 0x92) == 0)
+        {
+            attributes |= FileAttributes.ReadOnly;
+        }
+
+        return attributes;
+    }
+
     private bool CanChangeAllocation(ExtInode inode, long newBlocks, out string reason)
     {
         if (!_hasMetadataChecksum
@@ -790,11 +1186,49 @@ public sealed class ExtFileSystem : IReadOnlyFileSystem, IFileContentWriter, IFi
         out string reason)
     {
         parent = null!;
+        if (contentLength < 0 || GetRequiredBlocks(contentLength) > 0x8000)
+        {
+            reason = "追加ファイルは1 extent（最大32,768 blocks）に収めてください。";
+            return false;
+        }
+
+        if (!TryValidateDirectoryInsertion(directory, name, out parent, out reason))
+        {
+            return false;
+        }
+
+        try
+        {
+            var probe = new ExtMutationContext(this);
+            _ = probe.FindFreeInode((parent.Number - 1) / _inodesPerGroup);
+            var blocks = GetRequiredBlocks(contentLength);
+            if (blocks > 0)
+            {
+                _ = probe.FindContiguousBlocks(checked((uint)blocks));
+            }
+
+            reason = string.Empty;
+            return true;
+        }
+        catch (Exception ex) when (ex is InvalidDataException or NotSupportedException or OverflowException)
+        {
+            reason = ex.Message;
+            return false;
+        }
+    }
+
+    private bool TryValidateDirectoryInsertion(
+        VfsNode directory,
+        string name,
+        out ExtInode parent,
+        out string reason)
+    {
+        parent = null!;
         if (!_hasMetadataChecksum
             || (_readOnlyCompatibleFeatures & BigAllocReadOnlyCompatibleFlag) != 0
             || (_incompatibleFeatures & FileTypeIncompatFlag) == 0)
         {
-            reason = "ext4のファイル追加にはmetadata_csum、filetype、通常block allocationが必要です。";
+            reason = "ext4の項目追加にはmetadata_csum、filetype、通常block allocationが必要です。";
             return false;
         }
 
@@ -804,15 +1238,9 @@ public sealed class ExtFileSystem : IReadOnlyFileSystem, IFileContentWriter, IFi
             return false;
         }
 
-        if (contentLength < 0 || GetRequiredBlocks(contentLength) > 0x8000)
-        {
-            reason = "追加ファイルは1 extent（最大32,768 blocks）に収めてください。";
-            return false;
-        }
-
         if (string.IsNullOrEmpty(name))
         {
-            reason = "ext4ファイル名を指定してください。";
+            reason = "ext4項目名を指定してください。";
             return false;
         }
 
@@ -822,7 +1250,7 @@ public sealed class ExtFileSystem : IReadOnlyFileSystem, IFileContentWriter, IFi
             || name.IndexOfAny(['/', '\\', '\0']) >= 0
             || name.Any(char.IsControl))
         {
-            reason = "ext4ファイル名が不正です。UTF-8で255 bytes以内にしてください。";
+            reason = "ext4項目名が不正です。UTF-8で255 bytes以内にしてください。";
             return false;
         }
 
@@ -844,14 +1272,6 @@ public sealed class ExtFileSystem : IReadOnlyFileSystem, IFileContentWriter, IFi
             }
 
             _ = FindDirectoryInsertion(parent, checked((ushort)Align4(8 + nameBytes.Length)));
-            var probe = new ExtMutationContext(this);
-            _ = probe.FindFreeInode((parent.Number - 1) / _inodesPerGroup);
-            var blocks = GetRequiredBlocks(contentLength);
-            if (blocks > 0)
-            {
-                _ = probe.FindContiguousBlocks(checked((uint)blocks));
-            }
-
             reason = string.Empty;
             return true;
         }
@@ -1127,7 +1547,7 @@ public sealed class ExtFileSystem : IReadOnlyFileSystem, IFileContentWriter, IFi
         return result;
     }
 
-    private void InsertDirectoryEntry(ExtInode parent, string name, uint inodeNumber)
+    private void InsertDirectoryEntry(ExtInode parent, string name, uint inodeNumber, byte fileType = 1)
     {
         var nameBytes = Encoding.UTF8.GetBytes(name);
         var requiredLength = checked((ushort)Align4(8 + nameBytes.Length));
@@ -1151,10 +1571,23 @@ public sealed class ExtFileSystem : IReadOnlyFileSystem, IFileContentWriter, IFi
         BinaryPrimitives.WriteUInt32LittleEndian(data.AsSpan(location.Offset, 4), inodeNumber);
         BinaryPrimitives.WriteUInt16LittleEndian(data.AsSpan(location.Offset + 4, 2), newRecordLength);
         data[location.Offset + 6] = checked((byte)nameBytes.Length);
-        data[location.Offset + 7] = 1;
+        data[location.Offset + 7] = fileType;
         nameBytes.CopyTo(data.AsSpan(location.Offset + 8));
         WriteDirectoryBlock(parent, location.Block);
         WriteInodeTimes(parent);
+    }
+
+    private void UpdateDirectoryParentEntry(
+        ExtInode directory,
+        uint oldParentInodeNumber,
+        uint newParentInodeNumber)
+    {
+        var location = FindDirectoryEntry(directory, "..", oldParentInodeNumber);
+        BinaryPrimitives.WriteUInt32LittleEndian(
+            location.Block.Data.AsSpan(location.Offset, 4),
+            newParentInodeNumber);
+        WriteDirectoryBlock(directory, location.Block);
+        WriteInodeChangeTime(directory);
     }
 
     private void RemoveDirectoryEntry(ExtInode parent, string name, uint inodeNumber)
@@ -1271,6 +1704,62 @@ public sealed class ExtFileSystem : IReadOnlyFileSystem, IFileContentWriter, IFi
         _writer!.WriteAt(inodeOffset, data, 0, data.Length);
     }
 
+    private void WriteNewDirectoryInode(
+        uint inodeNumber,
+        ExtInode parent,
+        uint generation,
+        ulong block)
+    {
+        var data = new byte[_inodeSize];
+        BinaryPrimitives.WriteUInt16LittleEndian(data.AsSpan(0, 2), 0x41ed);
+        parent.RawData.AsSpan(2, 2).CopyTo(data.AsSpan(2, 2));
+        parent.RawData.AsSpan(24, 2).CopyTo(data.AsSpan(24, 2));
+        BinaryPrimitives.WriteUInt16LittleEndian(data.AsSpan(26, 2), 2);
+        BinaryPrimitives.WriteUInt32LittleEndian(data.AsSpan(32, 4), ExtentsFlag);
+        BinaryPrimitives.WriteUInt32LittleEndian(data.AsSpan(100, 4), generation);
+        if (_inodeSize > 128)
+        {
+            var desiredExtraSize = EndianUtilities.ReadUInt16Little(ReadSuperBlockForWrite(), 0x15e);
+            var extraSize = Math.Min(desiredExtraSize, _inodeSize - 128);
+            BinaryPrimitives.WriteUInt16LittleEndian(data.AsSpan(0x80, 2), checked((ushort)extraSize));
+            if (HasLargeInodeField(data, 0x78, 4))
+            {
+                parent.RawData.AsSpan(0x78, 4).CopyTo(data.AsSpan(0x78, 4));
+            }
+        }
+
+        SetInodeAllocationFields(data, block, 1, _blockSize);
+        SetAllInodeTimes(data);
+        SetInodeChecksum(inodeNumber, generation, data);
+        _writer!.WriteAt(GetInodeDiskOffset(inodeNumber), data, 0, data.Length);
+    }
+
+    private void WriteNewDirectoryBlock(ExtInode inode, uint parentInodeNumber, ulong block)
+    {
+        var data = new byte[_blockSize];
+        var entryBytes = _hasMetadataChecksum ? _blockSize - 12 : _blockSize;
+        WriteEntry(0, inode.Number, ".", 12);
+        WriteEntry(12, parentInodeNumber, "..", checked((ushort)(entryBytes - 12)));
+        if (_hasMetadataChecksum)
+        {
+            BinaryPrimitives.WriteUInt16LittleEndian(data.AsSpan(entryBytes + 4, 2), 12);
+            data[entryBytes + 7] = 0xde;
+        }
+
+        var directoryBlock = new ExtDirectoryBlock(block, data, entryBytes);
+        WriteDirectoryBlock(inode, directoryBlock);
+
+        void WriteEntry(int offset, uint inodeNumber, string name, ushort recordLength)
+        {
+            var nameBytes = Encoding.UTF8.GetBytes(name);
+            BinaryPrimitives.WriteUInt32LittleEndian(data.AsSpan(offset, 4), inodeNumber);
+            BinaryPrimitives.WriteUInt16LittleEndian(data.AsSpan(offset + 4, 2), recordLength);
+            data[offset + 6] = checked((byte)nameBytes.Length);
+            data[offset + 7] = 2;
+            nameBytes.CopyTo(data.AsSpan(offset + 8));
+        }
+    }
+
     private void WriteExistingInodeAllocation(ExtInode inode, ulong startBlock, uint blockCount, long size)
     {
         var data = (byte[])inode.RawData.Clone();
@@ -1318,6 +1807,71 @@ public sealed class ExtFileSystem : IReadOnlyFileSystem, IFileContentWriter, IFi
     {
         var data = (byte[])inode.RawData.Clone();
         SetModificationTimes(data);
+        SetInodeChecksum(inode.Number, inode.Generation, data);
+        _writer!.WriteAt(inode.DiskOffset, data, 0, data.Length);
+    }
+
+    private void UpdateInodeLinkCount(ExtInode inode, int delta)
+    {
+        var data = (byte[])inode.RawData.Clone();
+        var linkCount = checked(inode.LinkCount + delta);
+        if (linkCount is < 0 or > ushort.MaxValue)
+        {
+            throw new InvalidDataException("ext4 inode link countが範囲外になります。");
+        }
+
+        BinaryPrimitives.WriteUInt16LittleEndian(data.AsSpan(26, 2), checked((ushort)linkCount));
+        SetModificationTimes(data);
+        SetInodeChecksum(inode.Number, inode.Generation, data);
+        _writer!.WriteAt(inode.DiskOffset, data, 0, data.Length);
+    }
+
+    private void WriteInodeChangeTime(ExtInode inode)
+    {
+        var data = (byte[])inode.RawData.Clone();
+        var now = checked((uint)DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+        BinaryPrimitives.WriteUInt32LittleEndian(data.AsSpan(12, 4), now);
+        if (HasLargeInodeField(data, 0x84, 4))
+        {
+            data.AsSpan(0x84, 4).Clear();
+        }
+
+        SetInodeChecksum(inode.Number, inode.Generation, data);
+        _writer!.WriteAt(inode.DiskOffset, data, 0, data.Length);
+    }
+
+    private void WriteInodeMode(ExtInode inode, ushort mode)
+    {
+        var data = (byte[])inode.RawData.Clone();
+        BinaryPrimitives.WriteUInt16LittleEndian(data.AsSpan(0, 2), mode);
+        var now = checked((uint)DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+        BinaryPrimitives.WriteUInt32LittleEndian(data.AsSpan(12, 4), now);
+        if (HasLargeInodeField(data, 0x84, 4))
+        {
+            data.AsSpan(0x84, 4).Clear();
+        }
+
+        SetInodeChecksum(inode.Number, inode.Generation, data);
+        _writer!.WriteAt(inode.DiskOffset, data, 0, data.Length);
+    }
+
+    private void WriteInodeModifiedTime(ExtInode inode, DateTime modifiedUtc)
+    {
+        var data = (byte[])inode.RawData.Clone();
+        var seconds = checked((uint)new DateTimeOffset(modifiedUtc).ToUnixTimeSeconds());
+        BinaryPrimitives.WriteUInt32LittleEndian(data.AsSpan(16, 4), seconds);
+        if (HasLargeInodeField(data, 0x88, 4))
+        {
+            data.AsSpan(0x88, 4).Clear();
+        }
+
+        var now = checked((uint)DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+        BinaryPrimitives.WriteUInt32LittleEndian(data.AsSpan(12, 4), now);
+        if (HasLargeInodeField(data, 0x84, 4))
+        {
+            data.AsSpan(0x84, 4).Clear();
+        }
+
         SetInodeChecksum(inode.Number, inode.Generation, data);
         _writer!.WriteAt(inode.DiskOffset, data, 0, data.Length);
     }
@@ -2162,6 +2716,28 @@ public sealed class ExtFileSystem : IReadOnlyFileSystem, IFileContentWriter, IFi
             }
 
             state.InodeBitmapDirty = true;
+            state.DescriptorDirty = true;
+        }
+
+        public void AdjustUsedDirectories(uint inodeNumber, int delta)
+        {
+            if (inodeNumber == 0 || inodeNumber > _fileSystem._inodeCount)
+            {
+                throw new ArgumentOutOfRangeException(nameof(inodeNumber));
+            }
+
+            var group = (inodeNumber - 1) / _fileSystem._inodesPerGroup;
+            var state = GetState(group);
+            var current = _fileSystem.ReadDescriptorCount(state.Descriptor, 0x10, 0x30);
+            var updated = delta >= 0
+                ? checked((ulong)current + (uint)delta)
+                : checked((ulong)current - (uint)-delta);
+            if (updated > uint.MaxValue)
+            {
+                throw new OverflowException("ext4 used directory countが範囲外になります。");
+            }
+
+            _fileSystem.WriteDescriptorCount(state.Descriptor, (uint)updated, 0x10, 0x30);
             state.DescriptorDirty = true;
         }
 

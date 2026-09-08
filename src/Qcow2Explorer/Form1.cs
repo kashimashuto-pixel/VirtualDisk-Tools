@@ -368,6 +368,16 @@ public partial class Form1 : Form
         queueCreateItem.Click += (_, _) => QueueFileCreation();
         var queueDeleteItem = new ToolStripMenuItem("選択ファイルを削除予定に追加");
         queueDeleteItem.Click += (_, _) => QueueSelectedFileDeletion();
+        var queueCreateDirectoryItem = new ToolStripMenuItem("表示フォルダーへディレクトリを作成...");
+        queueCreateDirectoryItem.Click += (_, _) => QueueDirectoryCreation();
+        var queueDeleteDirectoryItem = new ToolStripMenuItem("選択ディレクトリを削除予定に追加");
+        queueDeleteDirectoryItem.Click += (_, _) => QueueSelectedDirectoryDeletion();
+        var queueMoveItem = new ToolStripMenuItem("選択項目を移動・名前変更...");
+        queueMoveItem.Click += (_, _) => QueueSelectedEntryMove();
+        var queueAttributesItem = new ToolStripMenuItem("選択項目の属性を変更...");
+        queueAttributesItem.Click += (_, _) => QueueSelectedEntryAttributes();
+        var queueTimestampItem = new ToolStripMenuItem("選択項目の更新日時を変更...");
+        queueTimestampItem.Click += (_, _) => QueueSelectedEntryTimestamp();
         var saveEditsItem = new ToolStripMenuItem("変更一覧を新しいRAWへ保存...");
         saveEditsItem.Click += async (_, _) => await SavePendingEditsAsync();
         var undoEditItem = new ToolStripMenuItem("最後の変更を取り消す");
@@ -375,6 +385,11 @@ public partial class Form1 : Form
         editButton.DropDownItems.Add(queueWriteItem);
         editButton.DropDownItems.Add(queueCreateItem);
         editButton.DropDownItems.Add(queueDeleteItem);
+        editButton.DropDownItems.Add(queueCreateDirectoryItem);
+        editButton.DropDownItems.Add(queueDeleteDirectoryItem);
+        editButton.DropDownItems.Add(queueMoveItem);
+        editButton.DropDownItems.Add(queueAttributesItem);
+        editButton.DropDownItems.Add(queueTimestampItem);
         editButton.DropDownItems.Add(new ToolStripSeparator());
         editButton.DropDownItems.Add(undoEditItem);
         editButton.DropDownItems.Add(saveEditsItem);
@@ -468,7 +483,7 @@ public partial class Form1 : Form
     {
         _pendingEditList.Columns.Add("操作", 90);
         _pendingEditList.Columns.Add("仮想パス", 360);
-        _pendingEditList.Columns.Add("入力ファイル", 420);
+        _pendingEditList.Columns.Add("入力・設定内容", 420);
         _pendingEditList.Columns.Add("入力サイズ", 110, HorizontalAlignment.Right);
 
         var undoButton = new Button { Text = "選択を取り消す", AutoSize = true };
@@ -3527,6 +3542,146 @@ public partial class Form1 : Form
         AddPendingEdit(new PendingFileEdit(FileEditOperationKind.DeleteFile, path));
     }
 
+    private void QueueDirectoryCreation()
+    {
+        if (!CanQueuePendingEdit() || _currentDirectory is null || !TryPreparePendingEditContext())
+        {
+            return;
+        }
+
+        var name = PromptForNewFileName("New folder", isDirectory: true);
+        if (name is not null)
+        {
+            AddPendingEdit(new PendingFileEdit(
+                FileEditOperationKind.CreateDirectory,
+                VirtualPath.Combine(_currentDirectoryPath, name)));
+        }
+    }
+
+    private void QueueSelectedDirectoryDeletion()
+    {
+        if (!CanQueuePendingEdit()
+            || !TryGetSelectedEditableEntry(
+                "削除予定に追加するディレクトリを1個選択してください。",
+                out var directory,
+                out var path))
+        {
+            return;
+        }
+
+        if (!directory.IsDirectory)
+        {
+            MessageBox.Show(this, "削除予定に追加するディレクトリを1個選択してください。", "実験的なファイル編集", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        if (!TryPreparePendingEditContext())
+        {
+            return;
+        }
+
+        AddPendingEdit(new PendingFileEdit(FileEditOperationKind.DeleteDirectory, path));
+    }
+
+    private void QueueSelectedEntryMove()
+    {
+        if (!CanQueuePendingEdit()
+            || !TryGetSelectedEditableEntry(
+                "移動または名前変更する項目を1個選択してください。",
+                out _,
+                out var sourcePath)
+            || !TryPreparePendingEditContext())
+        {
+            return;
+        }
+
+        var destinationPath = PromptForVirtualPath(
+            "移動・名前変更先",
+            "移動先の絶対仮想パス（例: /Folder/New name.bin）",
+            sourcePath);
+        if (destinationPath is not null)
+        {
+            AddPendingEdit(new PendingFileEdit(
+                FileEditOperationKind.MoveEntry,
+                sourcePath,
+                DestinationVirtualPath: destinationPath));
+        }
+    }
+
+    private void QueueSelectedEntryAttributes()
+    {
+        if (!CanQueuePendingEdit()
+            || !TryGetSelectedEditableEntry(
+                "属性を変更する項目を1個選択してください。",
+                out var entry,
+                out var path)
+            || !TryPreparePendingEditContext())
+        {
+            return;
+        }
+
+        var attributes = PromptForAttributes(entry);
+        if (attributes.HasValue)
+        {
+            AddPendingEdit(new PendingFileEdit(
+                FileEditOperationKind.SetAttributes,
+                path,
+                Attributes: attributes.Value));
+        }
+    }
+
+    private void QueueSelectedEntryTimestamp()
+    {
+        if (!CanQueuePendingEdit()
+            || !TryGetSelectedEditableEntry(
+                "更新日時を変更する項目を1個選択してください。",
+                out var entry,
+                out var path)
+            || !TryPreparePendingEditContext())
+        {
+            return;
+        }
+
+        var modifiedUtc = PromptForUtcTimestamp(entry.ModifiedUtc ?? DateTime.UtcNow);
+        if (modifiedUtc.HasValue)
+        {
+            AddPendingEdit(new PendingFileEdit(
+                FileEditOperationKind.SetLastWriteTimeUtc,
+                path,
+                ModifiedUtc: modifiedUtc.Value));
+        }
+    }
+
+    private bool CanQueuePendingEdit()
+    {
+        if (!_isWritingImage && !_isLoadingImage)
+        {
+            return true;
+        }
+
+        _statusLabel.Text = "イメージの読み込み・RAW保存中は変更予定を編集できません";
+        return false;
+    }
+
+    private bool TryGetSelectedEditableEntry(string message, out VfsNode entry, out string path)
+    {
+        entry = null!;
+        path = string.Empty;
+        if (_fileList.SelectedItems.Count != 1
+            || _fileList.SelectedItems[0].Tag is not VfsNode selected)
+        {
+            MessageBox.Show(this, message, "実験的なファイル編集", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return false;
+        }
+
+        entry = selected;
+        path = VirtualPath.Normalize(
+            string.IsNullOrWhiteSpace(selected.VirtualPath)
+                ? GetListItemPath(_fileList.SelectedItems[0])
+                : selected.VirtualPath);
+        return path != "/";
+    }
+
     private bool TryGetSelectedEditableFile(string message, out VfsNode file, out string path)
     {
         file = null!;
@@ -3581,7 +3736,13 @@ public partial class Form1 : Form
     {
         _pendingEditFileSystem ??= _currentFileSystem
             ?? throw new InvalidOperationException("編集対象のファイルシステムが選択されていません。");
-        _pendingFileEdits.Add(edit with { VirtualPath = VirtualPath.Normalize(edit.VirtualPath) });
+        _pendingFileEdits.Add(edit with
+        {
+            VirtualPath = VirtualPath.Normalize(edit.VirtualPath),
+            DestinationVirtualPath = edit.DestinationVirtualPath is null
+                ? null
+                : VirtualPath.Normalize(edit.DestinationVirtualPath),
+        });
         RefreshPendingEditList();
         _explorerDetailTabs.SelectedIndex = 1;
         _statusLabel.Text = $"変更予定に追加しました: {edit.VirtualPath}";
@@ -3598,13 +3759,24 @@ public partial class Form1 : Form
                 var operation = edit.Operation switch
                 {
                     FileEditOperationKind.WriteContent => "内容変更",
-                    FileEditOperationKind.CreateFile => "追加",
-                    FileEditOperationKind.DeleteFile => "削除",
+                    FileEditOperationKind.CreateFile => "ファイル追加",
+                    FileEditOperationKind.DeleteFile => "ファイル削除",
+                    FileEditOperationKind.CreateDirectory => "ディレクトリ作成",
+                    FileEditOperationKind.DeleteDirectory => "ディレクトリ削除",
+                    FileEditOperationKind.MoveEntry => "移動・名前変更",
+                    FileEditOperationKind.SetAttributes => "属性変更",
+                    FileEditOperationKind.SetLastWriteTimeUtc => "更新日時変更",
                     _ => edit.Operation.ToString(),
                 };
                 var item = new ListViewItem(operation) { Tag = edit };
                 item.SubItems.Add(edit.VirtualPath);
-                item.SubItems.Add(edit.ContentPath ?? "-");
+                item.SubItems.Add(edit.Operation switch
+                {
+                    FileEditOperationKind.MoveEntry => edit.DestinationVirtualPath ?? "-",
+                    FileEditOperationKind.SetAttributes => edit.Attributes?.ToString() ?? "-",
+                    FileEditOperationKind.SetLastWriteTimeUtc => edit.ModifiedUtc?.ToString("O") ?? "-",
+                    _ => edit.ContentPath ?? "-",
+                });
                 if (edit.ContentPath is not null)
                 {
                     try
@@ -3755,14 +3927,17 @@ public partial class Form1 : Form
             return;
         }
 
+        var isLogicalOutput = _pendingEditFileSystem.Partition.ReaderOverride is not null;
         using var outputDialog = new SaveFileDialog
         {
-            Title = "変更済みディスクを新しいRAWイメージとして保存",
+            Title = isLogicalOutput
+                ? "変更済み論理ボリュームを新しいRAWイメージとして保存"
+                : "変更済みディスクを新しいRAWイメージとして保存",
             Filter = "RAW disk image (*.raw)|*.raw|Disk image (*.img)|*.img|All files (*.*)|*.*",
             DefaultExt = "raw",
             AddExtension = true,
             OverwritePrompt = false,
-            FileName = $"{Path.GetFileNameWithoutExtension(_reader.Path)}-modified.raw",
+            FileName = $"{Path.GetFileNameWithoutExtension(_reader.Path)}-modified{(isLogicalOutput ? "-logical" : "")}.raw",
         };
         if (outputDialog.ShowDialog(this) != DialogResult.OK)
         {
@@ -3791,6 +3966,9 @@ public partial class Form1 : Form
                 this,
                 $"実験的な書き込み機能です。\r\n\r\n{summary}\r\n\r\n"
                     + $"出力: {outputDialog.FileName}\r\n\r\n"
+                    + (isLogicalOutput
+                        ? "RAID/LVM/復号レイヤーの構成元は変更せず、選択した論理ボリュームを平坦なRAWとして出力します。\r\n"
+                        : string.Empty)
                     + "原本は変更せず、変更を上から順に仮適用して検証後、新しいRAWへ保存します。続行しますか？",
                 "変更済みRAW保存の確認",
                 MessageBoxButtons.YesNo,
@@ -3844,6 +4022,7 @@ public partial class Form1 : Form
             MessageBox.Show(
                 this,
                 $"変更済みRAWを保存しました。\r\n\r\n{result.DestinationPath}\r\n"
+                    + (result.IsLogicalVolumeOutput ? "形式: 構成元へ書き戻さない平坦化済み論理RAW\r\n" : string.Empty)
                     + $"変更: {result.EditCount:N0}件\r\n変更ページ: {result.ModifiedPageCount:N0}",
                 "ファイル編集完了",
                 MessageBoxButtons.OK,
@@ -3873,11 +4052,11 @@ public partial class Form1 : Form
         }
     }
 
-    private string? PromptForNewFileName(string defaultName)
+    private string? PromptForNewFileName(string defaultName, bool isDirectory = false)
     {
         using var dialog = new Form
         {
-            Text = "仮想ディスク内のファイル名",
+            Text = isDirectory ? "仮想ディスク内のディレクトリ名" : "仮想ディスク内のファイル名",
             Width = 540,
             Height = 165,
             StartPosition = FormStartPosition.CenterParent,
@@ -3891,7 +4070,7 @@ public partial class Form1 : Form
             AutoSize = true,
             Left = 12,
             Top = 14,
-            Text = $"{_currentDirectoryPath} に作成するファイル名",
+            Text = $"{_currentDirectoryPath} に作成する{(isDirectory ? "ディレクトリ" : "ファイル")}名",
         };
         var input = new TextBox { Left = 12, Top = 40, Width = 500, Text = defaultName };
         var ok = new Button { Text = "追加", Left = 326, Top = 76, Width = 88 };
@@ -3905,7 +4084,7 @@ public partial class Form1 : Form
                 || name.IndexOfAny(['/', '\\', '\0']) >= 0
                 || name.Any(char.IsControl))
             {
-                MessageBox.Show(dialog, "255文字以内で、パス区切りや制御文字を含まない通常のファイル名を指定してください。", "ファイル名が不正です", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                MessageBox.Show(dialog, "255文字以内で、パス区切りや制御文字を含まない名前を指定してください。", "名前が不正です", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 input.Focus();
                 return;
             }
@@ -3925,11 +4104,134 @@ public partial class Form1 : Form
         return dialog.ShowDialog(this) == DialogResult.OK ? input.Text : null;
     }
 
+    private string? PromptForVirtualPath(string title, string labelText, string defaultValue)
+    {
+        using var dialog = new Form
+        {
+            Text = title,
+            Width = 620,
+            Height = 165,
+            StartPosition = FormStartPosition.CenterParent,
+            FormBorderStyle = FormBorderStyle.FixedDialog,
+            MinimizeBox = false,
+            MaximizeBox = false,
+            ShowInTaskbar = false,
+        };
+        var label = new Label { AutoSize = true, Left = 12, Top = 14, Text = labelText };
+        var input = new TextBox { Left = 12, Top = 40, Width = 580, Text = defaultValue };
+        var ok = new Button { Text = "追加", Left = 406, Top = 76, Width = 88 };
+        var cancel = new Button { Text = "キャンセル", Left = 504, Top = 76, Width = 88, DialogResult = DialogResult.Cancel };
+        ok.Click += (_, _) =>
+        {
+            var value = input.Text.Trim();
+            try
+            {
+                if (!value.StartsWith('/') && !value.StartsWith('\\'))
+                {
+                    throw new ArgumentException();
+                }
+
+                var normalized = VirtualPath.Normalize(value);
+                if (normalized == "/" || VirtualPath.Split(normalized).Any(part => part is "." or ".." || part.Any(char.IsControl)))
+                {
+                    throw new ArgumentException();
+                }
+
+                input.Text = normalized;
+                dialog.DialogResult = DialogResult.OK;
+                dialog.Close();
+            }
+            catch (ArgumentException)
+            {
+                MessageBox.Show(dialog, "ルート以外の有効な絶対仮想パスを指定してください。", "仮想パスが不正です", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                input.Focus();
+            }
+        };
+        dialog.Controls.AddRange([label, input, ok, cancel]);
+        dialog.AcceptButton = ok;
+        dialog.CancelButton = cancel;
+        dialog.Shown += (_, _) => input.Focus();
+        return dialog.ShowDialog(this) == DialogResult.OK ? input.Text : null;
+    }
+
+    private FileAttributes? PromptForAttributes(VfsNode entry)
+    {
+        using var dialog = new Form
+        {
+            Text = $"属性を変更: {entry.Name}",
+            Width = 430,
+            Height = 235,
+            StartPosition = FormStartPosition.CenterParent,
+            FormBorderStyle = FormBorderStyle.FixedDialog,
+            MinimizeBox = false,
+            MaximizeBox = false,
+            ShowInTaskbar = false,
+        };
+        var readOnly = new CheckBox { Left = 16, Top = 18, AutoSize = true, Text = "ReadOnly", Checked = entry.Attributes.HasFlag(FileAttributes.ReadOnly) };
+        var hidden = new CheckBox { Left = 16, Top = 48, AutoSize = true, Text = "Hidden", Checked = entry.Attributes.HasFlag(FileAttributes.Hidden) };
+        var system = new CheckBox { Left = 16, Top = 78, AutoSize = true, Text = "System", Checked = entry.Attributes.HasFlag(FileAttributes.System) };
+        var archive = new CheckBox { Left = 16, Top = 108, AutoSize = true, Text = "Archive", Checked = entry.Attributes.HasFlag(FileAttributes.Archive) };
+        var note = new Label { Left = 140, Top = 18, Width = 255, Height = 75, Text = "FAT/exFAT/NTFSは4属性、ext4/XFSはReadOnlyだけを利用できます。Directory属性は自動的に保持します。" };
+        var ok = new Button { Text = "追加", Left = 214, Top = 145, Width = 88, DialogResult = DialogResult.OK };
+        var cancel = new Button { Text = "キャンセル", Left = 312, Top = 145, Width = 88, DialogResult = DialogResult.Cancel };
+        dialog.Controls.AddRange([readOnly, hidden, system, archive, note, ok, cancel]);
+        dialog.AcceptButton = ok;
+        dialog.CancelButton = cancel;
+        if (dialog.ShowDialog(this) != DialogResult.OK)
+        {
+            return null;
+        }
+
+        var attributes = entry.IsDirectory ? FileAttributes.Directory : (FileAttributes)0;
+        if (readOnly.Checked) attributes |= FileAttributes.ReadOnly;
+        if (hidden.Checked) attributes |= FileAttributes.Hidden;
+        if (system.Checked) attributes |= FileAttributes.System;
+        if (archive.Checked) attributes |= FileAttributes.Archive;
+        return attributes;
+    }
+
+    private DateTime? PromptForUtcTimestamp(DateTime initialUtc)
+    {
+        using var dialog = new Form
+        {
+            Text = "更新日時（UTC）",
+            Width = 430,
+            Height = 150,
+            StartPosition = FormStartPosition.CenterParent,
+            FormBorderStyle = FormBorderStyle.FixedDialog,
+            MinimizeBox = false,
+            MaximizeBox = false,
+            ShowInTaskbar = false,
+        };
+        var picker = new DateTimePicker
+        {
+            Left = 16,
+            Top = 20,
+            Width = 384,
+            Format = DateTimePickerFormat.Custom,
+            CustomFormat = "yyyy-MM-dd HH:mm:ss 'UTC'",
+            Value = initialUtc.ToUniversalTime(),
+        };
+        var ok = new Button { Text = "追加", Left = 214, Top = 58, Width = 88, DialogResult = DialogResult.OK };
+        var cancel = new Button { Text = "キャンセル", Left = 312, Top = 58, Width = 88, DialogResult = DialogResult.Cancel };
+        dialog.Controls.AddRange([picker, ok, cancel]);
+        dialog.AcceptButton = ok;
+        dialog.CancelButton = cancel;
+        return dialog.ShowDialog(this) == DialogResult.OK
+            ? DateTime.SpecifyKind(picker.Value, DateTimeKind.Utc)
+            : null;
+    }
+
     private static string FormatEditOperation(FileEditOperationKind operation) => operation switch
     {
         FileEditOperationKind.WriteContent => "内容変更",
-        FileEditOperationKind.CreateFile => "追加",
-        FileEditOperationKind.DeleteFile => "削除",
+        FileEditOperationKind.CreateFile => "ファイル追加",
+        FileEditOperationKind.DeleteFile => "ファイル削除",
+        FileEditOperationKind.CreateDirectory => "ディレクトリ作成",
+        FileEditOperationKind.DeleteDirectory => "ディレクトリ削除",
+        FileEditOperationKind.MoveEntry => "移動・名前変更",
+        FileEditOperationKind.SetAttributes => "属性変更",
+        FileEditOperationKind.SetLastWriteTimeUtc => "更新日時変更",
         _ => operation.ToString(),
     };
 
