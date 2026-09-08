@@ -2,6 +2,7 @@ using System.Security.Cryptography;
 using Qcow2Explorer.Core;
 using Qcow2Explorer.Partitions;
 using DiscExFatFileSystem = DiscUtils.ExFat.ExFatFileSystem;
+using DiscFatFileSystem = DiscUtils.Fat.FatFileSystem;
 
 namespace Qcow2Explorer.FileSystems;
 
@@ -168,7 +169,7 @@ public static class FileReplacementService
         return hash.GetHashAndReset();
     }
 
-    private static WritableFileSystemHandle CreateWritableFileSystem(
+    internal static WritableFileSystemHandle CreateWritableFileSystem(
         string fileSystemName,
         WritablePartitionSlice slice,
         PartitionInfo partition)
@@ -187,8 +188,20 @@ public static class FileReplacementService
 
         if (fileSystemName is "FAT16" or "FAT32")
         {
-            var fileSystem = new FatFileSystem(slice, partition);
-            return new WritableFileSystemHandle(fileSystem, fileSystem, disposable: null);
+            var validator = new FatFileSystem(slice, partition);
+            var fileSystem = new DiscUtilsFileSystem(
+                slice,
+                partition,
+                stream => new DiscFatFileSystem(stream),
+                fileSystemName,
+                validator.ValidateForEditing,
+                validator.SynchronizeFsInfo);
+            return new WritableFileSystemHandle(
+                fileSystem,
+                fileSystem,
+                fileSystem,
+                fileSystem,
+                original => MapFatNode(validator, fileSystem, original));
         }
 
         if (fileSystemName.Equals("NTFS", StringComparison.OrdinalIgnoreCase))
@@ -198,7 +211,7 @@ public static class FileReplacementService
                 fileSystem,
                 fileSystem,
                 disposable: null,
-                original => MapNtfsFile(fileSystem, original));
+                mapFile: original => MapNtfsFile(fileSystem, original));
         }
 
         if (fileSystemName.Equals("exFAT", StringComparison.OrdinalIgnoreCase))
@@ -208,7 +221,7 @@ public static class FileReplacementService
                 partition,
                 stream => new DiscExFatFileSystem(stream, ['\\', '/']),
                 "exFAT");
-            return new WritableFileSystemHandle(fileSystem, fileSystem, fileSystem);
+            return new WritableFileSystemHandle(fileSystem, fileSystem, fileSystem, fileSystem);
         }
 
         throw new NotSupportedException($"{fileSystemName}の書き込みにはまだ対応していません。");
@@ -229,14 +242,34 @@ public static class FileReplacementService
         throw new FileNotFoundException($"NTFS上で置換対象を再解決できません: {original.Name}");
     }
 
-    private sealed class WritableFileSystemHandle(
+    private static VfsNode MapFatNode(
+        FatFileSystem validator,
+        DiscUtilsFileSystem fileSystem,
+        VfsNode original)
+    {
+        if (original.Metadata is string path && fileSystem.TryResolvePath(path, out var mapped))
+        {
+            return mapped;
+        }
+
+        if (validator.TryGetPath(original, out path) && fileSystem.TryResolvePath(path, out mapped))
+        {
+            return mapped;
+        }
+
+        throw new FileNotFoundException($"FAT上で編集対象を再解決できません: {original.Name}");
+    }
+
+    internal sealed class WritableFileSystemHandle(
         IReadOnlyFileSystem fileSystem,
         IFileContentWriter writer,
         IDisposable? disposable,
+        IFileSystemEditor? editor = null,
         Func<VfsNode, VfsNode>? mapFile = null) : IDisposable
     {
         public IReadOnlyFileSystem FileSystem { get; } = fileSystem;
         public IFileContentWriter Writer { get; } = writer;
+        public IFileSystemEditor? Editor { get; } = editor;
 
         public VfsNode MapFile(VfsNode original) => mapFile?.Invoke(original) ?? original;
 

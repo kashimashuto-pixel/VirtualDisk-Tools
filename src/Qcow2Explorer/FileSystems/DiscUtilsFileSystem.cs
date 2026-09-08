@@ -4,19 +4,29 @@ using Qcow2Explorer.Partitions;
 
 namespace Qcow2Explorer.FileSystems;
 
-public sealed class DiscUtilsFileSystem : IReadOnlyFileSystem, IFileContentWriter, IDisposable
+public sealed class DiscUtilsFileSystem : IReadOnlyFileSystem, IFileContentWriter, IFileSystemEditor, IDisposable
 {
     private readonly BlockReaderStream _stream;
     private readonly DiscFileSystem _reader;
     private readonly bool _canWrite;
     private readonly ushort _exFatVolumeFlags;
+    private readonly Func<(bool IsValid, string Reason)>? _additionalWriteValidator;
+    private readonly Action? _afterMutation;
 
-    public DiscUtilsFileSystem(IBlockReader reader, PartitionInfo partition, Func<Stream, DiscFileSystem> openFileSystem, string name)
+    public DiscUtilsFileSystem(
+        IBlockReader reader,
+        PartitionInfo partition,
+        Func<Stream, DiscFileSystem> openFileSystem,
+        string name,
+        Func<(bool IsValid, string Reason)>? additionalWriteValidator = null,
+        Action? afterMutation = null)
     {
         Partition = partition;
         Name = name;
         _stream = new BlockReaderStream(reader);
         _canWrite = _stream.CanWrite;
+        _additionalWriteValidator = additionalWriteValidator;
+        _afterMutation = afterMutation;
         if (name.Equals("exFAT", StringComparison.OrdinalIgnoreCase))
         {
             var boot = EndianUtilities.ReadBytes(reader, 0, 512);
@@ -98,58 +108,13 @@ public sealed class DiscUtilsFileSystem : IReadOnlyFileSystem, IFileContentWrite
 
     public bool CanReplaceFile(VfsNode file, long replacementLength, out string reason)
     {
-        if (!Name.Equals("exFAT", StringComparison.OrdinalIgnoreCase))
-        {
-            reason = $"{Name}のDiscUtils書き込み経路は有効にしていません。";
-            return false;
-        }
-
-        if (!_canWrite)
-        {
-            reason = "変更を保持する書き込みオーバーレイがありません。";
-            return false;
-        }
-
-        if (file.IsDirectory || file.Metadata is not string path)
-        {
-            reason = "通常ファイルだけを置換できます。";
-            return false;
-        }
-
         if (replacementLength < 0 || replacementLength != file.Size)
         {
             reason = $"現在は元ファイルと同じサイズ（{file.Size:N0} bytes）の置換だけに対応しています。";
             return false;
         }
 
-        if ((_exFatVolumeFlags & 0x0002) != 0)
-        {
-            reason = "dirty状態のexFAT volumeは書き込めません。先に標準ツールで検査してください。";
-            return false;
-        }
-
-        if ((_exFatVolumeFlags & 0x0004) != 0)
-        {
-            reason = "media failure状態が記録されたexFAT volumeは書き込めません。";
-            return false;
-        }
-
-        try
-        {
-            if (!_reader.FileExists(path) || _reader.GetFileLength(path) != replacementLength)
-            {
-                reason = "exFAT上の置換対象またはサイズを再確認できません。";
-                return false;
-            }
-        }
-        catch (Exception ex) when (ex is IOException or ArgumentException or NotSupportedException)
-        {
-            reason = ex.Message;
-            return false;
-        }
-
-        reason = string.Empty;
-        return true;
+        return CanWriteFile(file, replacementLength, out reason);
     }
 
     public void ReplaceFileContent(
@@ -193,12 +158,249 @@ public sealed class DiscUtilsFileSystem : IReadOnlyFileSystem, IFileContentWrite
 
         destination.Flush();
         _stream.Flush();
+        FinalizeMutation();
+    }
+
+    public bool CanWriteFile(VfsNode file, long contentLength, out string reason)
+    {
+        if (!TryValidateWriteAccess(out reason))
+        {
+            return false;
+        }
+
+        if (file.IsDirectory || file.Metadata is not string path)
+        {
+            reason = "通常ファイルだけを編集できます。";
+            return false;
+        }
+
+        if (contentLength < 0)
+        {
+            reason = "ファイルサイズが不正です。";
+            return false;
+        }
+
+        try
+        {
+            if (!_reader.FileExists(path) || _reader.GetFileLength(path) != file.Size)
+            {
+                reason = $"{Name}上の編集対象または現在のサイズを再確認できません。";
+                return false;
+            }
+        }
+        catch (Exception ex) when (ex is IOException or ArgumentException or NotSupportedException)
+        {
+            reason = ex.Message;
+            return false;
+        }
+
+        reason = string.Empty;
+        return true;
+    }
+
+    public bool ValidateFileSystem(out string reason)
+    {
+        if (!TryValidateWriteAccess(out reason))
+        {
+            return false;
+        }
+
+        try
+        {
+            _ = _reader.GetFileSystemEntries(@"\").ToArray();
+            reason = string.Empty;
+            return true;
+        }
+        catch (Exception ex) when (ex is IOException or ArgumentException or NotSupportedException)
+        {
+            reason = ex.Message;
+            return false;
+        }
+    }
+
+    public void WriteFileContent(
+        VfsNode file,
+        Stream content,
+        long contentLength,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(content);
+        if (!content.CanRead)
+        {
+            throw new ArgumentException("編集内容のストリームを読み取れません。", nameof(content));
+        }
+
+        if (!CanWriteFile(file, contentLength, out var reason))
+        {
+            throw new NotSupportedException(reason);
+        }
+
+        using var destination = _reader.OpenFile((string)file.Metadata!, FileMode.Open, FileAccess.ReadWrite);
+        destination.SetLength(contentLength);
+        destination.Position = 0;
+        CopyExact(content, destination, contentLength, cancellationToken);
+        destination.Flush();
+        _stream.Flush();
+        FinalizeMutation();
+    }
+
+    public bool CanCreateFile(VfsNode directory, string name, long contentLength, out string reason)
+    {
+        if (!TryValidateWriteAccess(out reason))
+        {
+            return false;
+        }
+
+        if (!TryGetNewFilePath(directory, name, out var path, out reason))
+        {
+            return false;
+        }
+
+        if (contentLength < 0)
+        {
+            reason = "ファイルサイズが不正です。";
+            return false;
+        }
+
+        try
+        {
+            if (_reader.FileExists(path) || _reader.DirectoryExists(path))
+            {
+                reason = $"同名のファイルまたはディレクトリが既に存在します: {name}";
+                return false;
+            }
+        }
+        catch (Exception ex) when (ex is IOException or ArgumentException or NotSupportedException)
+        {
+            reason = ex.Message;
+            return false;
+        }
+
+        reason = string.Empty;
+        return true;
+    }
+
+    public VfsNode CreateFile(
+        VfsNode directory,
+        string name,
+        Stream content,
+        long contentLength,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(content);
+        if (!content.CanRead)
+        {
+            throw new ArgumentException("追加内容のストリームを読み取れません。", nameof(content));
+        }
+
+        if (!CanCreateFile(directory, name, contentLength, out var reason)
+            || !TryGetNewFilePath(directory, name, out var path, out reason))
+        {
+            throw new NotSupportedException(reason);
+        }
+
+        using (var destination = _reader.OpenFile(path, FileMode.CreateNew, FileAccess.ReadWrite))
+        {
+            destination.SetLength(contentLength);
+            destination.Position = 0;
+            CopyExact(content, destination, contentLength, cancellationToken);
+            destination.Flush();
+        }
+
+        _stream.Flush();
+        FinalizeMutation();
+        return ToNodeSafe(path);
+    }
+
+    public bool CanDeleteFile(VfsNode directory, VfsNode file, out string reason)
+    {
+        if (!TryValidateWriteAccess(out reason))
+        {
+            return false;
+        }
+
+        if (!directory.IsDirectory || directory.Metadata is not string directoryPath)
+        {
+            reason = "削除元ディレクトリを再確認できません。";
+            return false;
+        }
+
+        if (file.IsDirectory || file.Metadata is not string filePath)
+        {
+            reason = "最初の実験版では通常ファイルだけを削除できます。";
+            return false;
+        }
+
+        var expectedParent = NormalizePath(directoryPath).TrimEnd('\\');
+        var actualParent = GetParentPath(filePath).TrimEnd('\\');
+        if (!string.Equals(expectedParent, actualParent, StringComparison.OrdinalIgnoreCase))
+        {
+            reason = "削除対象が指定ディレクトリの直下にありません。";
+            return false;
+        }
+
+        try
+        {
+            if (!_reader.FileExists(filePath) || _reader.GetFileLength(filePath) != file.Size)
+            {
+                reason = $"{Name}上の削除対象または現在のサイズを再確認できません。";
+                return false;
+            }
+        }
+        catch (Exception ex) when (ex is IOException or ArgumentException or NotSupportedException)
+        {
+            reason = ex.Message;
+            return false;
+        }
+
+        reason = string.Empty;
+        return true;
+    }
+
+    public void DeleteFile(VfsNode directory, VfsNode file, CancellationToken cancellationToken = default)
+    {
+        if (!CanDeleteFile(directory, file, out var reason))
+        {
+            throw new NotSupportedException(reason);
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+        _reader.DeleteFile((string)file.Metadata!);
+        _stream.Flush();
+        FinalizeMutation();
     }
 
     public void Dispose()
     {
         _reader.Dispose();
         _stream.Dispose();
+    }
+
+    internal bool TryResolvePath(string path, out VfsNode node)
+    {
+        path = NormalizePath(path);
+        if (path == @"\")
+        {
+            node = Root;
+            return true;
+        }
+
+        try
+        {
+            if (!_reader.FileExists(path) && !_reader.DirectoryExists(path))
+            {
+                node = null!;
+                return false;
+            }
+
+            node = ToNodeSafe(path);
+            return true;
+        }
+        catch (Exception ex) when (ex is IOException or ArgumentException or NotSupportedException)
+        {
+            node = null!;
+            return false;
+        }
     }
 
     private VfsNode ToNodeSafe(string path)
@@ -270,5 +472,106 @@ public sealed class DiscUtilsFileSystem : IReadOnlyFileSystem, IFileContentWrite
         }
 
         return path.Replace('/', '\\');
+    }
+
+    private bool TryValidateWriteAccess(out string reason)
+    {
+        if (!_canWrite)
+        {
+            reason = "変更を保持する書き込みオーバーレイがありません。";
+            return false;
+        }
+
+        if (Name.Equals("exFAT", StringComparison.OrdinalIgnoreCase))
+        {
+            if ((_exFatVolumeFlags & 0x0002) != 0)
+            {
+                reason = "dirty状態のexFAT volumeは書き込めません。先に標準ツールで検査してください。";
+                return false;
+            }
+
+            if ((_exFatVolumeFlags & 0x0004) != 0)
+            {
+                reason = "media failure状態が記録されたexFAT volumeは書き込めません。";
+                return false;
+            }
+        }
+
+        if (_additionalWriteValidator is not null)
+        {
+            var validation = _additionalWriteValidator();
+            if (!validation.IsValid)
+            {
+                reason = validation.Reason;
+                return false;
+            }
+        }
+
+        reason = string.Empty;
+        return true;
+    }
+
+    private bool TryGetNewFilePath(
+        VfsNode directory,
+        string name,
+        out string path,
+        out string reason)
+    {
+        path = string.Empty;
+        if (!directory.IsDirectory || directory.Metadata is not string directoryPath)
+        {
+            reason = "追加先ディレクトリを再確認できません。";
+            return false;
+        }
+
+        if (string.IsNullOrWhiteSpace(name)
+            || name is "." or ".."
+            || name.Length > 255
+            || name.IndexOfAny(['\\', '/', '\0']) >= 0
+            || name.Any(char.IsControl))
+        {
+            reason = "ファイル名が不正です。区切り文字、制御文字、予約名は使用できません。";
+            return false;
+        }
+
+        path = NormalizePath(directoryPath).TrimEnd('\\') + "\\" + name;
+        reason = string.Empty;
+        return true;
+    }
+
+    private static string GetParentPath(string path)
+    {
+        path = NormalizePath(path).TrimEnd('\\');
+        var index = path.LastIndexOf('\\');
+        return index <= 0 ? @"\" : path[..index];
+    }
+
+    private static void CopyExact(
+        Stream source,
+        Stream destination,
+        long length,
+        CancellationToken cancellationToken)
+    {
+        var buffer = new byte[1024 * 1024];
+        long remaining = length;
+        while (remaining > 0)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var count = checked((int)Math.Min(buffer.Length, remaining));
+            source.ReadExactly(buffer.AsSpan(0, count));
+            destination.Write(buffer, 0, count);
+            remaining -= count;
+        }
+
+        if (source.ReadByte() != -1 || destination.Position != length)
+        {
+            throw new InvalidDataException("入力または書き込み後ファイルのサイズが指定値と一致しません。");
+        }
+    }
+
+    private void FinalizeMutation()
+    {
+        _afterMutation?.Invoke();
+        _stream.Flush();
     }
 }
