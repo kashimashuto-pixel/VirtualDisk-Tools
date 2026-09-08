@@ -293,7 +293,7 @@ public sealed class OvaDiskImageReader : IDiskImageReader
     private static bool IsSupportedDisk(string path)
     {
         var extension = System.IO.Path.GetExtension(path).ToLowerInvariant();
-        return extension is ".vmdk" or ".vhd" or ".vhdx" or ".vdi" or ".qcow" or ".qcow2" or ".img" or ".raw" or ".dd";
+        return extension is ".vmdk" or ".vhd" or ".vhdx" or ".avhdx" or ".vdi" or ".qcow" or ".qcow2" or ".img" or ".raw" or ".dd";
     }
 
     private static string NormalizeArchivePath(string path)

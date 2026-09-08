@@ -11,7 +11,7 @@ public enum LzopOpenMode
 public static class DiskImageReaderFactory
 {
     public const string DialogFilter =
-        "対応/検出ディスク (*.qcow2;*.qcow;*.vhd;*.vhdx;*.vmdk;*.vdi;*.ova;*.hdd;*.hds;*.vma;*.dd;*.img;*.raw;*.lzo;*.E01)|*.qcow2;*.qcow;*.vhd;*.vhdx;*.vmdk;*.vdi;*.ova;*.hdd;*.hds;*.vma;*.dd;*.img;*.raw;*.lzo;*.E01|All files (*.*)|*.*";
+        "対応/検出ディスク (*.qcow2;*.qcow;*.vhd;*.vhdx;*.avhdx;*.vmdk;*.vdi;*.ova;*.hdd;*.hds;*.vma;*.dd;*.img;*.raw;*.lzo;*.E01)|*.qcow2;*.qcow;*.vhd;*.vhdx;*.avhdx;*.vmdk;*.vdi;*.ova;*.hdd;*.hds;*.vma;*.dd;*.img;*.raw;*.lzo;*.E01|All files (*.*)|*.*";
 
     public static IDiskImageReader Open(
         string path,
@@ -101,7 +101,7 @@ public static class DiskImageReaderFactory
         var extension = Path.GetExtension(path).ToLowerInvariant();
         return extension switch
         {
-            ".vhd" or ".vhdx" or ".vmdk" or ".vdi" => DiscUtilsDiskImageReader.Open(path),
+            ".vhd" or ".vhdx" or ".avhdx" or ".vmdk" or ".vdi" => DiscUtilsDiskImageReader.Open(path),
             ".hdd" or ".hds" => ParallelsHddReader.Open(path),
             ".dd" or ".img" or ".raw" => new RawDiskImageReader(path),
             _ => new RawDiskImageReader(path, "raw/dd (拡張子未判定)")

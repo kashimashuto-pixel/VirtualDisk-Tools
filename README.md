@@ -72,7 +72,9 @@ C# / Windows Forms で作成した、読み取り専用の仮想ディスク解�
 
 - qcow2 / qcow
 - VHD
-- VHDX
+- VHDX / Hyper-V checkpoint (`.vhdx` / `.avhdx`)
+  - AVHDXから親VHDX／AVHDXを自動解決し、親由来データと各差分層を読み取り専用で合成
+  - 各層のUnique ID、親Unique ID、容量、論理sector size、チェーン終端を検証し、概要に全レイヤーパスを表示
 - VMDK
 - VDI
 - OVA (`.ova`)
@@ -206,6 +208,7 @@ ProjFS マウントは Windows の Client-ProjFS 機能を使い、選択した�
 - 一部PVが入力されていないVG、thin snapshot／external origin、通常snapshot、cache、mirror、RAID segmentは未対応です。検出できたメタデータから該当理由を表示します。
 - Parallels HDD は単一 Storage の Plain / Compressed image を読み取ります。split image、未知の image type、仕様外の拡張は未対応です。
 - OVAは読み取り中に内容を一時フォルダへ展開するため、アーカイブ内のファイル容量と同程度の空き容量が必要です。一時ファイルはイメージを閉じると削除します。
+- AVHDXは単体で完結せず、チェックポイント作成時の親VHDX／AVHDXチェーン全体が必要です。親ファイルが見つからない、移動後のパスを解決できない、Unique IDや容量が一致しない場合は読み取りを拒否します。実行中VMが使用しているファイルを直接開かず、整合した状態でチェーン全体をコピーしてから解析してください。
 - ProjFS マウントはフォルダ投影型です。Windows のドライブ文字としての実マウントではありません。
 - Office別窓プレビューは内容確認用です。Wordの画像・厳密なレイアウト・変更履歴、Excelの書式・グラフ・マクロ実行には対応しません。
 - 旧バイナリOffice形式の `.doc` / `.xls` は別窓プレビュー対象外です。
