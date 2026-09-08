@@ -20,6 +20,7 @@ fat32_image="$output_dir/fat32-source.raw"
 ntfs_image="$output_dir/ntfs-source.raw"
 exfat_image="$output_dir/exfat-source.raw"
 replacement="$output_dir/replacement.bin"
+final_content="$output_dir/final-content.bin"
 ext_mount="$output_dir/ext-mount"
 xfs_mount="$output_dir/xfs-mount"
 fat16_mount="$output_dir/fat16-mount"
@@ -34,7 +35,7 @@ for command_name in truncate mkfs.ext4 e2fsck mkfs.xfs xfs_repair mkfs.fat fsck.
     fi
 done
 
-for path in "$ext_image" "$xfs_image" "$fat16_image" "$fat32_image" "$ntfs_image" "$exfat_image" "$replacement"; do
+for path in "$ext_image" "$xfs_image" "$fat16_image" "$fat32_image" "$ntfs_image" "$exfat_image" "$replacement" "$final_content"; do
     if [[ -e "$path" ]]; then
         echo "Refusing to overwrite existing fixture: $path" >&2
         exit 1
@@ -65,6 +66,7 @@ cleanup() {
 trap cleanup EXIT
 
 dd if=/dev/urandom of="$replacement" bs=1M count=1 status=none
+dd if=/dev/urandom of="$final_content" bs=64K count=1 status=none
 
 truncate -s 128M "$ext_image"
 mkfs.ext4 -q -F -L VDT_WRITE_EXT4 "$ext_image"
@@ -108,5 +110,5 @@ dd if=/dev/zero of="$exfat_mount/payload.bin" bs=1M count=1 conv=fsync status=no
 umount "$exfat_mount"
 fsck.exfat -n "$exfat_image"
 
-sha256sum "$ext_image" "$xfs_image" "$fat16_image" "$fat32_image" "$ntfs_image" "$exfat_image" "$replacement" > "$output_dir/source.sha256"
+sha256sum "$ext_image" "$xfs_image" "$fat16_image" "$fat32_image" "$ntfs_image" "$exfat_image" "$replacement" "$final_content" > "$output_dir/source.sha256"
 echo "Write regression fixtures created in $output_dir"

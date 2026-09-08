@@ -1,20 +1,22 @@
 # 次回対応予定
 
 - 最終更新: 2026-09-08
-- 基準ブランチ: `experimental/write-support`
+- 基準ブランチ: `experimental/fs-editing`
 
 この文書は、次回の開発作業へ引き継ぐための優先順位付きロードマップです。
 通常の解析は読み取り専用を維持し、書き込み機能は原本を変更しないコピーオンライト方式で段階的に実装します。
 
 ## 書き込み対応ロードマップ
 
-### 対応済み: ext4／XFS／FAT16／FAT32／NTFS／exFATの同サイズファイル置換
+### 対応済み: ext4／XFS／FAT16／FAT32／NTFS／exFATの通常ファイル編集
 
 - 原本を変更しない64 KiBページ単位のコピーオンライトブロックデバイス
-- ext4 extent／legacy block pointerとXFS inline／B+tree extentの物理位置へ内容を書き込み
+- 既存ファイルの内容変更（拡大・縮小を含む）、新規ファイル作成、通常ファイル削除
+- 複数操作を1つのコピーオンライト領域へ順番に適用し、操作ごとの再オープン検証と最終RAW検証を実施
+- UIの変更予定一覧、選択／直前／全操作の取り消し、別イメージ切替・終了時の未保存確認
 - スパース、未初期化extent、XFS realtime／共有reflink、暗号化などを事前に拒否
 - XFS logのcycleからheadを確認し、直前の正常unmount recordを認識できる単純なclean状態だけを許可（未回収logと複雑な循環状態は安全側で拒否）
-- 置換後の仮想ファイルをSHA-256で読み戻し検証してから、新規RAWへ原子的に保存
+- 内容変更／追加後の仮想ファイルをSHA-256で読み戻し、削除後のパス消失を検証してから新規RAWへ原子的に保存
 - 物理ディスク、RAID、LVM、復号パーティション、既存出力の上書きを拒否
 - C#生成ext4 fixtureの原本不変・保存後再読込テスト
 - Linux生成ext4／XFSで`e2fsck -fn`、`xfs_repair -n`、読み取り専用マウント後の内容一致を検証
@@ -27,11 +29,10 @@
 
 ### 次段階
 
-1. ext4の空きblock／inode bitmap、group descriptor、superblock checksumを更新し、新規ファイル作成とサイズ変更へ対応
-2. ext4 directory entry、link count、extent tree、journalを安全に更新し、削除／移動へ対応
-3. XFS allocation groupのfree-space／inode btree、rmap／refcount、directory、inode CRC、log更新へ対応
-4. XFSの新規作成、サイズ変更、削除、reflink CoWへ段階的に対応
-5. RAW以外のコンテナーを同形式で保存するwriterを追加
+1. 現在安全側で拒否する複雑なext4 extent tree／directory layoutの対応範囲を、実fixtureとfsck検証付きで拡張
+2. XFSのdirectory／extent btree、複数allocation group、reflink CoWを、rmap／refcount更新と実fixture検証付きで段階的に拡張
+3. ファイル移動、ディレクトリ作成／削除、属性・時刻編集をファイルシステムごとに追加
+4. RAW以外のコンテナーを同形式で保存するwriterを追加
 
 ## 対応済み
 

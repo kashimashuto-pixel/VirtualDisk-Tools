@@ -9,7 +9,7 @@ C# / Windows Forms で作成した、原本を変更しない仮想ディスク�
 
 - 仮想ディスクの概要表示
 - Windows物理ディスク (`\\.\PhysicalDriveN`) の読み取り専用解析
-- ext4／XFS／FAT16／FAT32／NTFS／exFAT内の既存ファイルを同サイズの内容で置換し、変更済み論理ディスクを新しいRAWへ保存（実験的）
+- ext4／XFS／FAT16／FAT32／NTFS／exFAT内の通常ファイルを内容変更（拡大・縮小を含む）／追加／削除し、変更済み論理ディスクを新しいRAWへ保存（実験的）
 - 仮想ディスクデータの Hex 表示
 - MBR / GPT パーティション一覧の表示
 - ファイルシステム検出と読み取り
@@ -112,20 +112,20 @@ C# / Windows Forms で作成した、原本を変更しない仮想ディスク�
 
 ## 実験的なext4／XFS／FAT16／FAT32／NTFS／exFAT書き込み
 
-エクスプローラーでext4、XFS、FAT16、FAT32、NTFS、exFAT内の通常ファイルを1個選択し、「同サイズ置換→RAW保存」から置換元ファイルと出力先を指定します。
+エクスプローラーの「編集（実験）」から、通常ファイルの内容変更（拡大・縮小を含む）、表示フォルダーへの新規ファイル追加、通常ファイルの削除を変更予定へ登録できます。「変更予定」タブでは登録順、入力ファイル、入力サイズを確認し、選択項目／最後の操作／全操作を取り消せます。保存時は全操作を上から順に同じコピーオンライト領域へ適用し、新しいRAWイメージを1個生成します。
 
 - 原本、物理ディスク、既存の出力ファイルへは書き込みません。変更はメモリ上のコピーオンライト領域へ保持し、最後に新しいRAWイメージとして保存します。
-- 置換直後に仮想ファイルを読み戻し、置換元とSHA-256が一致した場合だけRAW保存へ進みます。
-- 現在はファイルサイズを変更しない内容置換に限定しています。FATはclean volumeかつ全FAT copyが一致する完全なcluster chainだけを扱います。NTFSはclean volume上の単一MFT recordに収まる、非resident・非圧縮・非暗号化・非sparseの無名data streamだけを扱い、runlistと`$Bitmap`の割り当てを検証します。exFATはdirty／media-failure状態を拒否し、DiscUtils上で既存ファイルとサイズを再確認してからコピーオンライトへ反映します。XFSはlogのhead直前に正常unmount recordがある単純なclean状態だけを許可し、未回収logや複雑な循環状態は拒否します。ファイルの新規作成、削除、拡大・縮小、スパース／未初期化extent、XFSの共有reflink extentは未対応です。
+- 各操作の直後にファイルシステムを再オープンし、内容変更／追加は入力ファイルとのサイズとSHA-256一致、削除はパス消失を検証します。全操作後も出力RAWを再オープンして最終状態を検証できた場合だけ完成名へ移動します。失敗・キャンセル時は完成ファイルを公開しません。
+- 対象は各writerが安全に更新できる単純な構成に限定されます。dirty状態、メタデータ矛盾、スパース／未初期化extent、圧縮・暗号化・共有reflinkなどは形式に応じて事前に拒否します。XFSはv5 CRC、finobt／rmapbt、完全なinode chunk、shortform directory、単純なinline extent、正常unmount済みのclean logという制限があります。複雑なdirectory／extent btreeやreflinkは未対応です。
 - RAID、LVM、BitLocker／LUKSなどの合成・復号パーティションと物理ディスクは書き込み対象外です。
 - qcow2、VHDXなどを開いた場合も、出力はコンテナー形式ではなく展開済みの論理ディスク全体を格納するRAWです。出力先には元の仮想ディスクと同程度の空き容量が必要です。
 - 実験的機能のため、重要なイメージでは使用せず、出力RAWもLinux標準ツールで検査してから利用してください。
 
-Linux／WSLで実ext4・XFS・FAT16・FAT32・NTFS・exFATイメージを生成し、置換後に`e2fsck -fn`、`xfs_repair -n`、`fsck.fat -vn`、`ntfsfix -n`、`fsck.exfat -n`、読み取り専用マウントと内容比較を行う検証スクリプトも用意しています。
+Linux／WSLで実ext4・XFS・FAT16・FAT32・NTFS・exFATイメージを生成し、編集後に`e2fsck -fn`、`xfs_repair -n`、`fsck.fat -vn`、`ntfsfix -n`、`fsck.exfat -n`、読み取り専用マウントと内容比較を行う検証スクリプトも用意しています。
 
 ```bash
 sudo ./tools/new-write-regression-fixtures.sh /path/to/fixtures
-# テストプロジェクトの --replace-file で ext4/xfs/fat16/fat32/ntfs/exfat-modified.raw を生成
+# テストプロジェクトの --batch-edit-smoke で各形式の変更済みRAWを生成
 sudo ./tools/validate-write-regression-output.sh /path/to/fixtures
 ```
 
@@ -196,7 +196,7 @@ ProjFS マウントは Windows の Client-ProjFS 機能を使い、選択した�
 
 ## 現在の制限
 
-- 通常の解析・コピー・マウントは読み取り専用です。実験的なext4／XFS／FAT16／FAT32／NTFS／exFAT置換だけが、原本とは別の新規RAWイメージを生成します。
+- 通常の解析・コピー・マウントは読み取り専用です。実験的なext4／XFS／FAT16／FAT32／NTFS／exFAT編集だけが、原本とは別の新規RAWイメージを生成します。
 - 物理ディスクを開くには管理者権限が必要です。使用中ディスクの一貫したスナップショットは作成しません。
 - qcow2コンテナー自体の暗号化機能は未対応です。パーティションとして格納された対応形式のLUKS1/LUKS2は読み取れます。
 - qcow2 external data fileは、ヘッダー拡張にファイル名があり、同じPCから参照できる場合に読み取ります。

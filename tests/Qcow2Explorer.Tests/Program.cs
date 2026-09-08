@@ -42,6 +42,12 @@ if (args.Length == 4 && string.Equals(args[0], "--delete-file", StringComparison
     return;
 }
 
+if (args.Length == 5 && string.Equals(args[0], "--batch-edit-smoke", StringComparison.OrdinalIgnoreCase))
+{
+    BatchEditRawImage(args[1], args[2], args[3], args[4]);
+    return;
+}
+
 if (args.Length > 0 && string.Equals(args[0], "--list-physical", StringComparison.OrdinalIgnoreCase))
 {
     foreach (var disk in PhysicalDiskReader.Enumerate())
@@ -224,6 +230,42 @@ static void DeleteFileInRawImage(string imagePath, string virtualPath, string ou
             file,
             outputPath).GetAwaiter().GetResult();
         PrintEditResult(result);
+    }
+    finally
+    {
+        (fileSystem as IDisposable)?.Dispose();
+    }
+}
+
+static void BatchEditRawImage(
+    string imagePath,
+    string replacementPath,
+    string finalContentPath,
+    string outputPath)
+{
+    using var source = new RawDiskImageReader(imagePath);
+    var partition = CreateRawFileSystemPartition(source);
+    var fileSystem = OpenDetectedFileSystem(source, partition);
+    try
+    {
+        PendingFileEdit[] edits =
+        [
+            new(FileEditOperationKind.WriteContent, "/payload.bin", replacementPath),
+            new(FileEditOperationKind.CreateFile, "/Added batch.bin", replacementPath),
+            new(FileEditOperationKind.WriteContent, "/Added batch.bin", finalContentPath),
+            new(FileEditOperationKind.DeleteFile, "/payload.bin"),
+        ];
+        var progress = new Progress<DiskImageProgress>(update => Console.WriteLine(update.Message));
+        var result = FileEditBatchService.ApplyToRawAsync(
+            source,
+            partition,
+            fileSystem,
+            edits,
+            outputPath,
+            progress).GetAwaiter().GetResult();
+        Console.WriteLine(
+            $"Batch edit passed: fs={partition.FileSystem}, edits={result.EditCount:N0}, "
+            + $"pages={result.ModifiedPageCount:N0}, output={result.DestinationPath}");
     }
     finally
     {
@@ -5079,6 +5121,7 @@ static void TestVirtualPaths()
 {
     Assert(VirtualPath.Normalize("") == "/", "virtual path empty normalization");
     Assert(VirtualPath.Normalize("//backup//images/") == "/backup/images", "virtual path normalization");
+    Assert(VirtualPath.Normalize(@"\backup\images\") == "/backup/images", "virtual path backslash normalization");
     Assert(VirtualPath.Combine("/", "disk.qcow2") == "/disk.qcow2", "virtual path root combination");
     Assert(VirtualPath.Combine("/backup", "disk.qcow2") == "/backup/disk.qcow2", "virtual path nested combination");
     Assert(VirtualPath.GetParent("/disk.qcow2") == "/", "virtual path root parent");
@@ -5391,6 +5434,8 @@ static void TestFatFileEditingOperations()
         var createdPath = Path.Combine(AppContext.BaseDirectory, $"sample-{prefix}-edit-created.raw");
         var shrunkPath = Path.Combine(AppContext.BaseDirectory, $"sample-{prefix}-edit-shrunk.raw");
         var finalPath = Path.Combine(AppContext.BaseDirectory, $"sample-{prefix}-edit-final.raw");
+        var batchPath = Path.Combine(AppContext.BaseDirectory, $"sample-{prefix}-edit-batch.raw");
+        var failedBatchPath = Path.Combine(AppContext.BaseDirectory, $"sample-{prefix}-edit-batch-failed.raw");
         var grownContentPath = Path.Combine(AppContext.BaseDirectory, $"sample-{prefix}-edit-grown.bin");
         var addedContentPath = Path.Combine(AppContext.BaseDirectory, $"sample-{prefix}-edit-added.bin");
         var shrunkContentPath = Path.Combine(AppContext.BaseDirectory, $"sample-{prefix}-edit-small.bin");
@@ -5401,6 +5446,8 @@ static void TestFatFileEditingOperations()
                      createdPath,
                      shrunkPath,
                      finalPath,
+                     batchPath,
+                     failedBatchPath,
                      grownContentPath,
                      addedContentPath,
                      shrunkContentPath,
@@ -5412,7 +5459,7 @@ static void TestFatFileEditingOperations()
         createImage(sourcePath);
         var sourceHash = SHA256.HashData(File.ReadAllBytes(sourcePath));
         var grownContent = Enumerable.Range(0, 9_137).Select(index => (byte)(index * 31 + 17)).ToArray();
-        var addedContent = Enumerable.Range(0, 4_219).Select(index => (byte)(index * 13 + 5)).ToArray();
+        var addedContent = Enumerable.Range(0, 8_192).Select(index => (byte)(index * 13 + 5)).ToArray();
         var shrunkContent = Enumerable.Range(0, 73).Select(index => (byte)(255 - index)).ToArray();
         File.WriteAllBytes(grownContentPath, grownContent);
         File.WriteAllBytes(addedContentPath, addedContent);
@@ -5491,6 +5538,66 @@ static void TestFatFileEditingOperations()
                 $"{expectedFileSystem} shrunk file content");
             var validation = ((FatFileSystem)fileSystem).ValidateForEditing();
             Assert(validation.IsValid, $"{expectedFileSystem} final allocation graph: {validation.Reason}");
+        }
+
+        using (var source = new RawDiskImageReader(sourcePath))
+        {
+            var partition = GetFatPartition(source, expectedFileSystem, usePartitionTable);
+            var fileSystem = OpenFileSystem(source, partition);
+            var edits = new[]
+            {
+                new PendingFileEdit(FileEditOperationKind.WriteContent, "/HELLO.TXT", grownContentPath),
+                new PendingFileEdit(FileEditOperationKind.CreateFile, "/Added batch.bin", addedContentPath),
+                new PendingFileEdit(FileEditOperationKind.WriteContent, "/Added batch.bin", shrunkContentPath),
+                new PendingFileEdit(FileEditOperationKind.DeleteFile, "/HELLO.TXT"),
+            };
+            var batch = FileEditBatchService.ApplyToRawAsync(
+                source,
+                partition,
+                fileSystem,
+                edits,
+                batchPath).GetAwaiter().GetResult();
+            Assert(batch.EditCount == edits.Length, $"{expectedFileSystem} batch edit count");
+            Assert(batch.ModifiedPageCount > 0, $"{expectedFileSystem} batch modified pages");
+        }
+
+        using (var batch = new RawDiskImageReader(batchPath))
+        {
+            var partition = GetFatPartition(batch, expectedFileSystem, usePartitionTable);
+            var fileSystem = OpenFileSystem(batch, partition);
+            var entries = fileSystem.ListDirectory(fileSystem.Root);
+            Assert(entries.All(node => node.Name != "HELLO.TXT"), $"{expectedFileSystem} batch deleted file absent");
+            var added = entries.Single(node => node.Name == "Added batch.bin");
+            Assert(added.Size == shrunkContent.Length, $"{expectedFileSystem} batch final length");
+            Assert(
+                fileSystem.ReadFile(added, 0, shrunkContent.Length).SequenceEqual(shrunkContent),
+                $"{expectedFileSystem} batch final content");
+        }
+
+        using (var source = new RawDiskImageReader(sourcePath))
+        {
+            var partition = GetFatPartition(source, expectedFileSystem, usePartitionTable);
+            var fileSystem = OpenFileSystem(source, partition);
+            var rejected = false;
+            try
+            {
+                _ = FileEditBatchService.ApplyToRawAsync(
+                    source,
+                    partition,
+                    fileSystem,
+                    [
+                        new PendingFileEdit(FileEditOperationKind.WriteContent, @"\HELLO.TXT", grownContentPath),
+                        new PendingFileEdit(FileEditOperationKind.DeleteFile, "/missing.bin"),
+                    ],
+                    failedBatchPath).GetAwaiter().GetResult();
+            }
+            catch (FileNotFoundException)
+            {
+                rejected = true;
+            }
+
+            Assert(rejected, $"{expectedFileSystem} batch invalid operation rejected");
+            Assert(!File.Exists(failedBatchPath), $"{expectedFileSystem} failed batch not published");
         }
 
         Assert(

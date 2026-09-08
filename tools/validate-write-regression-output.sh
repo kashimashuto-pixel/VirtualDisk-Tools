@@ -19,6 +19,7 @@ fat32_image="$fixture_dir/fat32-modified.raw"
 ntfs_image="$fixture_dir/ntfs-modified.raw"
 exfat_image="$fixture_dir/exfat-modified.raw"
 replacement="$fixture_dir/replacement.bin"
+final_content="$fixture_dir/final-content.bin"
 ext_mount="$fixture_dir/ext-verify-mount"
 xfs_mount="$fixture_dir/xfs-verify-mount"
 fat16_mount="$fixture_dir/fat16-verify-mount"
@@ -26,7 +27,7 @@ fat32_mount="$fixture_dir/fat32-verify-mount"
 ntfs_mount="$fixture_dir/ntfs-verify-mount"
 exfat_mount="$fixture_dir/exfat-verify-mount"
 
-for path in "$ext_image" "$xfs_image" "$fat16_image" "$fat32_image" "$ntfs_image" "$exfat_image" "$replacement" "$fixture_dir/source.sha256"; do
+for path in "$ext_image" "$xfs_image" "$fat16_image" "$fat32_image" "$ntfs_image" "$exfat_image" "$replacement" "$final_content" "$fixture_dir/source.sha256"; do
     if [[ ! -f "$path" ]]; then
         echo "Required validation input not found: $path" >&2
         exit 1
@@ -72,27 +73,33 @@ ntfsfix -n "$ntfs_image"
 fsck.exfat -n "$exfat_image"
 
 mount -o loop,ro "$ext_image" "$ext_mount"
-cmp "$replacement" "$ext_mount/payload.bin"
+cmp "$final_content" "$ext_mount/Added batch.bin"
+test ! -e "$ext_mount/payload.bin"
 umount "$ext_mount"
 
 mount -o loop,ro,norecovery "$xfs_image" "$xfs_mount"
-cmp "$replacement" "$xfs_mount/payload.bin"
+cmp "$final_content" "$xfs_mount/Added batch.bin"
+test ! -e "$xfs_mount/payload.bin"
 umount "$xfs_mount"
 
 mount -o loop,ro "$fat16_image" "$fat16_mount"
-cmp "$replacement" "$fat16_mount/payload.bin"
+cmp "$final_content" "$fat16_mount/Added batch.bin"
+test ! -e "$fat16_mount/payload.bin"
 umount "$fat16_mount"
 
 mount -o loop,ro "$fat32_image" "$fat32_mount"
-cmp "$replacement" "$fat32_mount/payload.bin"
+cmp "$final_content" "$fat32_mount/Added batch.bin"
+test ! -e "$fat32_mount/payload.bin"
 umount "$fat32_mount"
 
 mount -o loop,ro "$ntfs_image" "$ntfs_mount"
-cmp "$replacement" "$ntfs_mount/payload.bin"
+cmp "$final_content" "$ntfs_mount/Added batch.bin"
+test ! -e "$ntfs_mount/payload.bin"
 umount "$ntfs_mount"
 
 mount -o loop,ro "$exfat_image" "$exfat_mount"
-cmp "$replacement" "$exfat_mount/payload.bin"
+cmp "$final_content" "$exfat_mount/Added batch.bin"
+test ! -e "$exfat_mount/payload.bin"
 umount "$exfat_mount"
 
-echo "ext4, XFS, FAT16, FAT32, NTFS, and exFAT write regression validation passed."
+echo "ext4, XFS, FAT16, FAT32, NTFS, and exFAT batch-edit regression validation passed."

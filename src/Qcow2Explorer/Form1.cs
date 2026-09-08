@@ -41,6 +41,9 @@ public partial class Form1 : Form
     private readonly TreeView _tree = new() { Dock = DockStyle.Fill, HideSelection = false };
     private readonly ListView _fileList = new() { Dock = DockStyle.Fill, View = View.Details, FullRowSelect = true, GridLines = true, MultiSelect = true };
     private readonly TextBox _previewText = new() { Dock = DockStyle.Fill, Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Both, WordWrap = false, Font = new Font("Consolas", 10) };
+    private readonly ListView _pendingEditList = new() { Dock = DockStyle.Fill, View = View.Details, FullRowSelect = true, GridLines = true, MultiSelect = true };
+    private readonly List<PendingFileEdit> _pendingFileEdits = [];
+    private readonly TabControl _explorerDetailTabs = new() { Dock = DockStyle.Fill };
     private readonly ListView _mountList = new() { Dock = DockStyle.Fill, View = View.Details, FullRowSelect = true, GridLines = true, MultiSelect = true };
     private readonly TextBox _mountText = new() { Dock = DockStyle.Fill, Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical };
 
@@ -53,6 +56,7 @@ public partial class Form1 : Form
     private readonly List<ProjectedFileSystemMount> _mounts = new();
     private readonly List<string> _analysisWarnings = new();
     private IReadOnlyFileSystem? _currentFileSystem;
+    private IReadOnlyFileSystem? _pendingEditFileSystem;
     private VfsNode? _currentDirectory;
     private string _currentDirectoryPath = "/";
     private CancellationTokenSource? _searchCancellation;
@@ -357,8 +361,23 @@ public partial class Form1 : Form
         copyButton.Click += async (_, _) => await CopySelectedItemsAsync();
         var copyFolderButton = new ToolStripButton("表示フォルダをコピー");
         copyFolderButton.Click += async (_, _) => await CopyCurrentDirectoryAsync();
-        var replaceFileButton = new ToolStripButton("同サイズ置換→RAW保存");
-        replaceFileButton.Click += async (_, _) => await ReplaceSelectedFileToRawAsync();
+        var editButton = new ToolStripDropDownButton("編集（実験）");
+        var queueWriteItem = new ToolStripMenuItem("選択ファイルの内容を変更...");
+        queueWriteItem.Click += (_, _) => QueueSelectedFileWrite();
+        var queueCreateItem = new ToolStripMenuItem("表示フォルダーへファイルを追加...");
+        queueCreateItem.Click += (_, _) => QueueFileCreation();
+        var queueDeleteItem = new ToolStripMenuItem("選択ファイルを削除予定に追加");
+        queueDeleteItem.Click += (_, _) => QueueSelectedFileDeletion();
+        var saveEditsItem = new ToolStripMenuItem("変更一覧を新しいRAWへ保存...");
+        saveEditsItem.Click += async (_, _) => await SavePendingEditsAsync();
+        var undoEditItem = new ToolStripMenuItem("最後の変更を取り消す");
+        undoEditItem.Click += (_, _) => UndoLastPendingEdit();
+        editButton.DropDownItems.Add(queueWriteItem);
+        editButton.DropDownItems.Add(queueCreateItem);
+        editButton.DropDownItems.Add(queueDeleteItem);
+        editButton.DropDownItems.Add(new ToolStripSeparator());
+        editButton.DropDownItems.Add(undoEditItem);
+        editButton.DropDownItems.Add(saveEditsItem);
         var mountButton = new ToolStripButton("マウント");
         mountButton.Click += (_, _) => MountSelectedPartition();
         var deletedButton = new ToolStripButton("削除済みNTFS");
@@ -407,7 +426,7 @@ public partial class Form1 : Form
         explorerStrip.Items.Add(_copyProgressBar);
         explorerStrip.Items.Add(_cancelCopyButton);
         explorerStrip.Items.Add(new ToolStripSeparator());
-        explorerStrip.Items.Add(replaceFileButton);
+        explorerStrip.Items.Add(editButton);
         explorerStrip.Items.Add(_writeProgressBar);
         explorerStrip.Items.Add(_cancelWriteButton);
         explorerStrip.Items.Add(deletedButton);
@@ -416,7 +435,9 @@ public partial class Form1 : Form
 
         var right = new SplitContainer { Dock = DockStyle.Fill, Orientation = Orientation.Horizontal, FixedPanel = FixedPanel.Panel2 };
         right.Panel1.Controls.Add(_fileList);
-        right.Panel2.Controls.Add(_previewText);
+        _explorerDetailTabs.TabPages.Add(new TabPage("プレビュー") { Controls = { _previewText } });
+        _explorerDetailTabs.TabPages.Add(new TabPage("変更予定") { Controls = { CreatePendingEditPanel() } });
+        right.Panel2.Controls.Add(_explorerDetailTabs);
 
         var split = new SplitContainer { Dock = DockStyle.Fill, FixedPanel = FixedPanel.Panel1 };
         split.Panel1.Controls.Add(_tree);
@@ -441,6 +462,50 @@ public partial class Form1 : Form
         layout.Controls.Add(split, 0, 1);
 
         return new TabPage("エクスプローラー") { Controls = { layout } };
+    }
+
+    private Control CreatePendingEditPanel()
+    {
+        _pendingEditList.Columns.Add("操作", 90);
+        _pendingEditList.Columns.Add("仮想パス", 360);
+        _pendingEditList.Columns.Add("入力ファイル", 420);
+        _pendingEditList.Columns.Add("入力サイズ", 110, HorizontalAlignment.Right);
+
+        var undoButton = new Button { Text = "選択を取り消す", AutoSize = true };
+        undoButton.Click += (_, _) => UndoSelectedPendingEdits();
+        var undoLastButton = new Button { Text = "最後を取り消す", AutoSize = true };
+        undoLastButton.Click += (_, _) => UndoLastPendingEdit();
+        var clearButton = new Button { Text = "すべて取り消す", AutoSize = true };
+        clearButton.Click += (_, _) => ClearPendingEditsWithPrompt();
+        var saveButton = new Button { Text = "新しいRAWへ保存...", AutoSize = true };
+        saveButton.Click += async (_, _) => await SavePendingEditsAsync();
+        var description = new Label
+        {
+            Dock = DockStyle.Fill,
+            AutoEllipsis = true,
+            Padding = new Padding(8, 4, 8, 0),
+            Text = "原本は変更されません。変更は上から順に仮適用し、全検証後に新規RAWとして保存します。",
+        };
+        var buttons = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            FlowDirection = FlowDirection.RightToLeft,
+            WrapContents = false,
+            Padding = new Padding(4, 2, 4, 2),
+        };
+        buttons.Controls.Add(saveButton);
+        buttons.Controls.Add(clearButton);
+        buttons.Controls.Add(undoLastButton);
+        buttons.Controls.Add(undoButton);
+
+        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, RowCount = 3, ColumnCount = 1 };
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 28));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
+        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        layout.Controls.Add(description, 0, 0);
+        layout.Controls.Add(buttons, 0, 1);
+        layout.Controls.Add(_pendingEditList, 0, 2);
+        return layout;
     }
 
     private TabPage CreateMountTab()
@@ -984,6 +1049,11 @@ public partial class Form1 : Form
             return;
         }
 
+        if (!ConfirmDiscardPendingEdits("別のディスクイメージを開くと変更予定を破棄します。続行しますか？"))
+        {
+            return;
+        }
+
         var lzopSelection = new LzopOpenSelection(LzopOpenMode.OnDemand, null, OverwriteSavedRaw: false);
         if (DiskImageReaderFactory.IsLzopFile(path))
         {
@@ -1035,6 +1105,7 @@ public partial class Form1 : Form
                 return;
             }
 
+            ClearPendingEdits();
             DisposeFileSystems();
             DisposePartitionReaders();
             DisposeCompanionReaders();
@@ -1509,6 +1580,12 @@ public partial class Form1 : Form
 
     private void SelectQcow2Snapshot()
     {
+        if (_isWritingImage || _isLoadingImage)
+        {
+            _statusLabel.Text = "イメージ処理中はqcow2スナップショットを切り替えられません";
+            return;
+        }
+
         if (_reader is not Qcow2Reader qcow2 || qcow2.Snapshots.Count == 0)
         {
             MessageBox.Show(this, "このイメージには選択可能なqcow2内部スナップショットがありません。", "スナップショット", MessageBoxButtons.OK, MessageBoxIcon.Information);
@@ -1547,6 +1624,12 @@ public partial class Form1 : Form
             return;
         }
 
+        if (!ConfirmDiscardPendingEdits("別のqcow2スナップショットへ切り替えると変更予定を破棄します。続行しますか？"))
+        {
+            return;
+        }
+
+        ClearPendingEdits();
         DisposeFileSystems();
         DisposePartitionReaders();
         _partitions.Clear();
@@ -1560,6 +1643,12 @@ public partial class Form1 : Form
 
     private void SelectVmaDisk()
     {
+        if (_isWritingImage || _isLoadingImage)
+        {
+            _statusLabel.Text = "イメージ処理中はVMAディスクを切り替えられません";
+            return;
+        }
+
         if (_reader is not VmaDiskImageReader vma)
         {
             MessageBox.Show(this, "現在のイメージはVMAではありません。", "VMAディスク", MessageBoxButtons.OK, MessageBoxIcon.Information);
@@ -1603,6 +1692,12 @@ public partial class Form1 : Form
             return;
         }
 
+        if (!ConfirmDiscardPendingEdits("別のVMAディスクへ切り替えると変更予定を破棄します。続行しますか？"))
+        {
+            return;
+        }
+
+        ClearPendingEdits();
         DisposeFileSystems();
         DisposePartitionReaders();
         _partitions.Clear();
@@ -1614,6 +1709,12 @@ public partial class Form1 : Form
 
     private void SelectOvaDisk()
     {
+        if (_isWritingImage || _isLoadingImage)
+        {
+            _statusLabel.Text = "イメージ処理中はOVAディスクを切り替えられません";
+            return;
+        }
+
         if (_reader is not OvaDiskImageReader ova)
         {
             MessageBox.Show(this, "現在のイメージはOVAではありません。", "OVAディスク", MessageBoxButtons.OK, MessageBoxIcon.Information);
@@ -1657,6 +1758,12 @@ public partial class Form1 : Form
             return;
         }
 
+        if (!ConfirmDiscardPendingEdits("別のOVAディスクへ切り替えると変更予定を破棄します。続行しますか？"))
+        {
+            return;
+        }
+
+        ClearPendingEdits();
         DisposeFileSystems();
         DisposePartitionReaders();
         _partitions.Clear();
@@ -3343,48 +3450,308 @@ public partial class Form1 : Form
         }
     }
 
-    private async Task ReplaceSelectedFileToRawAsync()
+    private void QueueSelectedFileWrite()
     {
-        if (_isWritingImage)
+        if (_isWritingImage || _isLoadingImage)
         {
-            _statusLabel.Text = "別の変更済みRAWを保存中です";
+            _statusLabel.Text = "イメージの読み込み・RAW保存中は変更予定を編集できません";
             return;
         }
 
-        if (_reader is null || _currentFileSystem is null
-            || _fileList.SelectedItems.Count != 1
-            || _fileList.SelectedItems[0].Tag is not VfsNode file
-            || file.IsDirectory)
+        if (!TryGetSelectedEditableFile("内容を変更する通常ファイルを1個選択してください。", out var file, out var path)
+            || !TryPreparePendingEditContext())
+        {
+            return;
+        }
+
+        using var dialog = new OpenFileDialog
+        {
+            Title = $"{file.Name} の新しい内容を選択（サイズ変更可）",
+            Filter = "すべてのファイル (*.*)|*.*",
+        };
+        if (dialog.ShowDialog(this) == DialogResult.OK)
+        {
+            AddPendingEdit(new PendingFileEdit(FileEditOperationKind.WriteContent, path, dialog.FileName));
+        }
+    }
+
+    private void QueueFileCreation()
+    {
+        if (_isWritingImage || _isLoadingImage)
+        {
+            _statusLabel.Text = "イメージの読み込み・RAW保存中は変更予定を編集できません";
+            return;
+        }
+
+        if (_currentDirectory is null || _currentFileSystem is null || !TryPreparePendingEditContext())
+        {
+            return;
+        }
+
+        using var contentDialog = new OpenFileDialog
+        {
+            Title = "追加するファイルの内容を選択",
+            Filter = "すべてのファイル (*.*)|*.*",
+        };
+        if (contentDialog.ShowDialog(this) != DialogResult.OK)
+        {
+            return;
+        }
+
+        var name = PromptForNewFileName(Path.GetFileName(contentDialog.FileName));
+        if (name is null)
+        {
+            return;
+        }
+
+        AddPendingEdit(new PendingFileEdit(
+            FileEditOperationKind.CreateFile,
+            VirtualPath.Combine(_currentDirectoryPath, name),
+            contentDialog.FileName));
+    }
+
+    private void QueueSelectedFileDeletion()
+    {
+        if (_isWritingImage || _isLoadingImage)
+        {
+            _statusLabel.Text = "イメージの読み込み・RAW保存中は変更予定を編集できません";
+            return;
+        }
+
+        if (!TryGetSelectedEditableFile("削除予定に追加する通常ファイルを1個選択してください。", out _, out var path)
+            || !TryPreparePendingEditContext())
+        {
+            return;
+        }
+
+        AddPendingEdit(new PendingFileEdit(FileEditOperationKind.DeleteFile, path));
+    }
+
+    private bool TryGetSelectedEditableFile(string message, out VfsNode file, out string path)
+    {
+        file = null!;
+        path = string.Empty;
+        if (_fileList.SelectedItems.Count != 1
+            || _fileList.SelectedItems[0].Tag is not VfsNode selected
+            || selected.IsDirectory)
+        {
+            MessageBox.Show(this, message, "実験的なファイル編集", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return false;
+        }
+
+        file = selected;
+        path = VirtualPath.Normalize(
+            string.IsNullOrWhiteSpace(selected.VirtualPath)
+                ? GetListItemPath(_fileList.SelectedItems[0])
+                : selected.VirtualPath);
+        return true;
+    }
+
+    private bool TryPreparePendingEditContext()
+    {
+        if (_reader is null || _currentFileSystem is null)
+        {
+            MessageBox.Show(this, "編集するファイルシステムを開いてください。", "実験的なファイル編集", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return false;
+        }
+
+        ResetPendingEditContextIfEmpty();
+        if (_pendingEditFileSystem is not null
+            && !ReferenceEquals(_pendingEditFileSystem.Partition, _currentFileSystem.Partition))
         {
             MessageBox.Show(
                 this,
-                "ext4、XFS、FAT16、FAT32、NTFS、exFATの通常ファイルを1個選択してください。",
-                "ファイル置換",
+                "変更一覧には別のパーティションの操作が含まれています。先に保存するか、変更一覧を取り消してください。",
+                "パーティションが異なります",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+            return false;
+        }
+
+        if (!FileEditBatchService.CanEdit(_reader, _currentFileSystem.Partition, _currentFileSystem, out var reason))
+        {
+            MessageBox.Show(this, reason, "このファイルシステムは編集できません", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return false;
+        }
+
+        return true;
+    }
+
+    private void AddPendingEdit(PendingFileEdit edit)
+    {
+        _pendingEditFileSystem ??= _currentFileSystem
+            ?? throw new InvalidOperationException("編集対象のファイルシステムが選択されていません。");
+        _pendingFileEdits.Add(edit with { VirtualPath = VirtualPath.Normalize(edit.VirtualPath) });
+        RefreshPendingEditList();
+        _explorerDetailTabs.SelectedIndex = 1;
+        _statusLabel.Text = $"変更予定に追加しました: {edit.VirtualPath}";
+    }
+
+    private void RefreshPendingEditList()
+    {
+        _pendingEditList.BeginUpdate();
+        try
+        {
+            _pendingEditList.Items.Clear();
+            foreach (var edit in _pendingFileEdits)
+            {
+                var operation = edit.Operation switch
+                {
+                    FileEditOperationKind.WriteContent => "内容変更",
+                    FileEditOperationKind.CreateFile => "追加",
+                    FileEditOperationKind.DeleteFile => "削除",
+                    _ => edit.Operation.ToString(),
+                };
+                var item = new ListViewItem(operation) { Tag = edit };
+                item.SubItems.Add(edit.VirtualPath);
+                item.SubItems.Add(edit.ContentPath ?? "-");
+                if (edit.ContentPath is not null)
+                {
+                    try
+                    {
+                        var info = new FileInfo(edit.ContentPath);
+                        item.SubItems.Add(info.Exists ? FormatBytes(info.Length) : "見つかりません");
+                    }
+                    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+                    {
+                        item.SubItems.Add("確認できません");
+                    }
+                }
+                else
+                {
+                    item.SubItems.Add("-");
+                }
+
+                _pendingEditList.Items.Add(item);
+            }
+        }
+        finally
+        {
+            _pendingEditList.EndUpdate();
+        }
+    }
+
+    private void UndoSelectedPendingEdits()
+    {
+        if (_isWritingImage)
+        {
+            _statusLabel.Text = "RAW保存中は変更予定を編集できません";
+            return;
+        }
+
+        var indices = _pendingEditList.SelectedIndices.Cast<int>().OrderByDescending(index => index).ToArray();
+        if (indices.Length == 0)
+        {
+            _statusLabel.Text = "取り消す変更を選択してください";
+            return;
+        }
+
+        foreach (var index in indices)
+        {
+            _pendingFileEdits.RemoveAt(index);
+        }
+
+        ResetPendingEditContextIfEmpty();
+        RefreshPendingEditList();
+        _statusLabel.Text = $"変更予定を{indices.Length:N0}件取り消しました";
+    }
+
+    private void UndoLastPendingEdit()
+    {
+        if (_isWritingImage)
+        {
+            _statusLabel.Text = "RAW保存中は変更予定を編集できません";
+            return;
+        }
+
+        if (_pendingFileEdits.Count == 0)
+        {
+            _statusLabel.Text = "取り消す変更はありません";
+            return;
+        }
+
+        var removed = _pendingFileEdits[^1];
+        _pendingFileEdits.RemoveAt(_pendingFileEdits.Count - 1);
+        ResetPendingEditContextIfEmpty();
+        RefreshPendingEditList();
+        _statusLabel.Text = $"最後の変更予定を取り消しました: {removed.VirtualPath}";
+    }
+
+    private void ClearPendingEditsWithPrompt()
+    {
+        if (_isWritingImage)
+        {
+            _statusLabel.Text = "RAW保存中は変更予定を編集できません";
+            return;
+        }
+
+        if (_pendingFileEdits.Count == 0)
+        {
+            return;
+        }
+
+        if (MessageBox.Show(
+                this,
+                $"保存していない変更予定{_pendingFileEdits.Count:N0}件をすべて取り消しますか？",
+                "変更予定を取り消す",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Question,
+                MessageBoxDefaultButton.Button2) == DialogResult.Yes)
+        {
+            ClearPendingEdits();
+            _statusLabel.Text = "変更予定をすべて取り消しました";
+        }
+    }
+
+    private bool ConfirmDiscardPendingEdits(string message)
+    {
+        return _pendingFileEdits.Count == 0
+            || MessageBox.Show(
+                this,
+                $"{message}\r\n\r\n保存していない変更予定: {_pendingFileEdits.Count:N0}件",
+                "変更予定の破棄",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Warning,
+                MessageBoxDefaultButton.Button2) == DialogResult.Yes;
+    }
+
+    private void ClearPendingEdits()
+    {
+        _pendingFileEdits.Clear();
+        _pendingEditFileSystem = null;
+        RefreshPendingEditList();
+    }
+
+    private void ResetPendingEditContextIfEmpty()
+    {
+        if (_pendingFileEdits.Count == 0)
+        {
+            _pendingEditFileSystem = null;
+        }
+    }
+
+    private async Task SavePendingEditsAsync()
+    {
+        if (_isWritingImage || _isLoadingImage)
+        {
+            _statusLabel.Text = "イメージの読み込み・RAW保存中は保存を開始できません";
+            return;
+        }
+
+        if (_searchCancellation is not null || _copyCancellations.Count > 0)
+        {
+            MessageBox.Show(
+                this,
+                "検索またはホストへのコピーが完了してから変更済みRAWを保存してください。",
+                "読み取り処理を実行中です",
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Information);
             return;
         }
 
-        using var replacementDialog = new OpenFileDialog
+        if (_reader is null || _pendingEditFileSystem is null || _pendingFileEdits.Count == 0)
         {
-            Title = $"{file.Name} と同じサイズの置換元ファイルを選択",
-            Filter = "すべてのファイル (*.*)|*.*",
-        };
-        if (replacementDialog.ShowDialog(this) != DialogResult.OK)
-        {
-            return;
-        }
-
-        var replacementLength = new FileInfo(replacementDialog.FileName).Length;
-        if (!FileReplacementService.CanReplaceToRaw(
-                _reader,
-                _currentFileSystem.Partition,
-                _currentFileSystem,
-                file,
-                replacementLength,
-                out var reason))
-        {
-            MessageBox.Show(this, reason, "このファイルはまだ置換できません", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            MessageBox.Show(this, "保存する変更予定がありません。", "実験的なファイル編集", MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
 
@@ -3413,17 +3780,27 @@ public partial class Form1 : Form
             return;
         }
 
-        var confirmation = MessageBox.Show(
-            this,
-            $"実験的な書き込み機能です。\r\n\r\n"
-                + $"仮想ファイル: {file.Name} ({file.Size:N0} bytes)\r\n"
-                + $"出力: {outputDialog.FileName}\r\n\r\n"
-                + "原本は変更せず、変更後の論理ディスク全体を新しいRAWイメージへ保存します。続行しますか？",
-            "ファイル置換の確認",
-            MessageBoxButtons.YesNo,
-            MessageBoxIcon.Warning,
-            MessageBoxDefaultButton.Button2);
-        if (confirmation != DialogResult.Yes)
+        var summary = string.Join("\r\n", _pendingFileEdits.Take(8).Select(edit =>
+            $"・{FormatEditOperation(edit.Operation)}: {edit.VirtualPath}"));
+        if (_pendingFileEdits.Count > 8)
+        {
+            summary += $"\r\n・ほか {_pendingFileEdits.Count - 8:N0}件";
+        }
+
+        if (MessageBox.Show(
+                this,
+                $"実験的な書き込み機能です。\r\n\r\n{summary}\r\n\r\n"
+                    + $"出力: {outputDialog.FileName}\r\n\r\n"
+                    + "原本は変更せず、変更を上から順に仮適用して検証後、新しいRAWへ保存します。続行しますか？",
+                "変更済みRAW保存の確認",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Warning,
+                MessageBoxDefaultButton.Button2) != DialogResult.Yes)
+        {
+            return;
+        }
+
+        if (!ConfirmAndDisposeMounts("変更済みRAWを保存する前に、現在の読み取り専用マウントを解除します。続行しますか？"))
         {
             return;
         }
@@ -3452,23 +3829,23 @@ public partial class Form1 : Form
         try
         {
             var source = _reader;
-            var fileSystem = _currentFileSystem;
-            var result = await Task.Run(() => FileReplacementService.ReplaceToRawAsync(
+            var fileSystem = _pendingEditFileSystem;
+            var edits = _pendingFileEdits.ToArray();
+            var result = await Task.Run(() => FileEditBatchService.ApplyToRawAsync(
                 source,
                 fileSystem.Partition,
                 fileSystem,
-                file,
-                replacementDialog.FileName,
+                edits,
                 outputDialog.FileName,
                 progress,
                 cancellation.Token), cancellation.Token);
+            ClearPendingEdits();
             _statusLabel.Text = $"変更済みRAWを保存しました: {result.DestinationPath}";
             MessageBox.Show(
                 this,
                 $"変更済みRAWを保存しました。\r\n\r\n{result.DestinationPath}\r\n"
-                    + $"置換: {result.BytesReplaced:N0} bytes\r\n"
-                    + $"SHA-256: {Convert.ToHexString(result.Sha256).ToLowerInvariant()}",
-                "ファイル置換完了",
+                    + $"変更: {result.EditCount:N0}件\r\n変更ページ: {result.ModifiedPageCount:N0}",
+                "ファイル編集完了",
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Information);
         }
@@ -3479,7 +3856,7 @@ public partial class Form1 : Form
         catch (Exception ex)
         {
             _statusLabel.Text = "変更済みRAWの保存に失敗しました";
-            MessageBox.Show(this, ex.Message, "ファイル置換エラー", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            MessageBox.Show(this, ex.Message, "ファイル編集エラー", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
         finally
         {
@@ -3495,6 +3872,66 @@ public partial class Form1 : Form
             }
         }
     }
+
+    private string? PromptForNewFileName(string defaultName)
+    {
+        using var dialog = new Form
+        {
+            Text = "仮想ディスク内のファイル名",
+            Width = 540,
+            Height = 165,
+            StartPosition = FormStartPosition.CenterParent,
+            FormBorderStyle = FormBorderStyle.FixedDialog,
+            MinimizeBox = false,
+            MaximizeBox = false,
+            ShowInTaskbar = false,
+        };
+        var label = new Label
+        {
+            AutoSize = true,
+            Left = 12,
+            Top = 14,
+            Text = $"{_currentDirectoryPath} に作成するファイル名",
+        };
+        var input = new TextBox { Left = 12, Top = 40, Width = 500, Text = defaultName };
+        var ok = new Button { Text = "追加", Left = 326, Top = 76, Width = 88 };
+        var cancel = new Button { Text = "キャンセル", Left = 424, Top = 76, Width = 88, DialogResult = DialogResult.Cancel };
+        ok.Click += (_, _) =>
+        {
+            var name = input.Text.Trim();
+            if (name.Length == 0
+                || name.Length > 255
+                || name is "." or ".."
+                || name.IndexOfAny(['/', '\\', '\0']) >= 0
+                || name.Any(char.IsControl))
+            {
+                MessageBox.Show(dialog, "255文字以内で、パス区切りや制御文字を含まない通常のファイル名を指定してください。", "ファイル名が不正です", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                input.Focus();
+                return;
+            }
+
+            input.Text = name;
+            dialog.DialogResult = DialogResult.OK;
+            dialog.Close();
+        };
+        dialog.Controls.AddRange([label, input, ok, cancel]);
+        dialog.AcceptButton = ok;
+        dialog.CancelButton = cancel;
+        dialog.Shown += (_, _) =>
+        {
+            input.SelectAll();
+            input.Focus();
+        };
+        return dialog.ShowDialog(this) == DialogResult.OK ? input.Text : null;
+    }
+
+    private static string FormatEditOperation(FileEditOperationKind operation) => operation switch
+    {
+        FileEditOperationKind.WriteContent => "内容変更",
+        FileEditOperationKind.CreateFile => "追加",
+        FileEditOperationKind.DeleteFile => "削除",
+        _ => operation.ToString(),
+    };
 
     private void MountSelectedPartition()
     {
@@ -3670,12 +4107,6 @@ public partial class Form1 : Form
 
     private void Form1FormClosing(object? sender, FormClosingEventArgs e)
     {
-        if (!ConfirmAndDisposeMounts("アプリ終了前にマウントを解除します。続行しますか？"))
-        {
-            e.Cancel = true;
-            return;
-        }
-
         if (_isLoadingImage)
         {
             _closeAfterLoadCancellation = true;
@@ -3688,6 +4119,18 @@ public partial class Form1 : Form
         {
             _closeAfterWriteCancellation = true;
             _writeCancellation?.Cancel();
+            e.Cancel = true;
+            return;
+        }
+
+        if (!ConfirmDiscardPendingEdits("アプリを終了すると変更予定を破棄します。続行しますか？"))
+        {
+            e.Cancel = true;
+            return;
+        }
+
+        if (!ConfirmAndDisposeMounts("アプリ終了前にマウントを解除します。続行しますか？"))
+        {
             e.Cancel = true;
             return;
         }

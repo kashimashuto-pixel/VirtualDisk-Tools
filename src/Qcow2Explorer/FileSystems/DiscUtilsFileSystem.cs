@@ -237,7 +237,7 @@ public sealed class DiscUtilsFileSystem : IReadOnlyFileSystem, IFileContentWrite
         }
 
         using var destination = _reader.OpenFile((string)file.Metadata!, FileMode.Open, FileAccess.ReadWrite);
-        destination.SetLength(contentLength);
+        PrepareDestinationLength(destination, contentLength);
         destination.Position = 0;
         CopyExact(content, destination, contentLength, cancellationToken);
         destination.Flush();
@@ -302,7 +302,7 @@ public sealed class DiscUtilsFileSystem : IReadOnlyFileSystem, IFileContentWrite
 
         using (var destination = _reader.OpenFile(path, FileMode.CreateNew, FileAccess.ReadWrite))
         {
-            destination.SetLength(contentLength);
+            PrepareDestinationLength(destination, contentLength);
             destination.Position = 0;
             CopyExact(content, destination, contentLength, cancellationToken);
             destination.Flush();
@@ -570,6 +570,17 @@ public sealed class DiscUtilsFileSystem : IReadOnlyFileSystem, IFileContentWrite
         {
             throw new InvalidDataException("入力または書き込み後ファイルのサイズが指定値と一致しません。");
         }
+    }
+
+    private void PrepareDestinationLength(Stream destination, long contentLength)
+    {
+        // DiscUtils FAT resolves the cluster containing the requested end position while growing.
+        // At an exact cluster boundary that reserves one cluster too many. Let the final write grow
+        // the logical length by one byte so the allocated chain still has the required cluster count.
+        var preparedLength = Name is "FAT16" or "FAT32" && contentLength > 0
+            ? contentLength - 1
+            : contentLength;
+        destination.SetLength(preparedLength);
     }
 
     private void FinalizeMutation()

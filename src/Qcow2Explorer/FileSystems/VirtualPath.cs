@@ -26,6 +26,6 @@ internal static class VirtualPath
 
     public static string[] Split(string path)
     {
-        return path.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        return path.Replace('\\', '/').Split('/', StringSplitOptions.RemoveEmptyEntries);
     }
 }

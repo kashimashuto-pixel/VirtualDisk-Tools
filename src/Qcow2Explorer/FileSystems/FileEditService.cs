@@ -282,7 +282,7 @@ public static class FileEditService
             contentHash);
     }
 
-    private static void ValidateSource(IDiskImageReader source, PartitionInfo partition)
+    internal static void ValidateSource(IDiskImageReader source, PartitionInfo partition)
     {
         if (PhysicalDiskReader.IsPhysicalDiskPath(source.Path))
         {
@@ -295,7 +295,7 @@ public static class FileEditService
         }
     }
 
-    private static FileStream OpenContent(string path)
+    internal static FileStream OpenContent(string path)
     {
         return new FileStream(
             path,
@@ -314,7 +314,7 @@ public static class FileEditService
             ?? throw new InvalidDataException($"編集対象の仮想パスを取得できません: {node.Name}");
     }
 
-    private static void VerifyOperation(
+    internal static void VerifyOperation(
         IReadOnlyFileSystem fileSystem,
         FileEditOperationKind operation,
         string virtualPath,
@@ -389,7 +389,7 @@ public static class FileEditService
         }
     }
 
-    private static void ValidateReadOnlyFileSystem(IReadOnlyFileSystem fileSystem, string stage)
+    internal static void ValidateReadOnlyFileSystem(IReadOnlyFileSystem fileSystem, string stage)
     {
         if (fileSystem is FatFileSystem fat)
         {
@@ -406,7 +406,7 @@ public static class FileEditService
         }
     }
 
-    private static bool TryResolvePath(IReadOnlyFileSystem fileSystem, string path, out VfsNode node)
+    internal static bool TryResolvePath(IReadOnlyFileSystem fileSystem, string path, out VfsNode node)
     {
         node = fileSystem.Root;
         var comparison = fileSystem.Name is "FAT16" or "FAT32" or "exFAT" or "NTFS"
@@ -452,7 +452,7 @@ public static class FileEditService
         return hash.GetHashAndReset();
     }
 
-    private static void TryDelete(string path)
+    internal static void TryDelete(string path)
     {
         try
         {

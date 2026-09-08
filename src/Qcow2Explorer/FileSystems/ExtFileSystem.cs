@@ -2088,7 +2088,7 @@ public sealed class ExtFileSystem : IReadOnlyFileSystem, IFileContentWriter, IFi
                 if (current == allocated)
                 {
                     throw new InvalidDataException(
-                        $"ext4 block {block:N0}のallocation状態が想定と異なります。" );
+                        $"ext4 block {block:N0}のallocation状態が想定と異なります。");
                 }
 
                 SetBit(state.BlockBitmap, bit, allocated);
@@ -2133,7 +2133,7 @@ public sealed class ExtFileSystem : IReadOnlyFileSystem, IFileContentWriter, IFi
             if (current == allocated)
             {
                 throw new InvalidDataException(
-                    $"ext4 inode {inodeNumber:N0}のallocation状態が想定と異なります。" );
+                    $"ext4 inode {inodeNumber:N0}のallocation状態が想定と異なります。");
             }
 
             SetBit(state.InodeBitmap, bit, allocated);
