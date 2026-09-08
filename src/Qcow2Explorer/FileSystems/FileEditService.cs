@@ -308,7 +308,9 @@ public static class FileEditService
 
     private static string GetVirtualPath(VfsNode node)
     {
-        return node.Metadata as string
+        return !string.IsNullOrWhiteSpace(node.VirtualPath)
+            ? node.VirtualPath
+            : node.Metadata as string
             ?? throw new InvalidDataException($"編集対象の仮想パスを取得できません: {node.Name}");
     }
 
@@ -396,6 +398,11 @@ public static class FileEditService
             {
                 throw new InvalidDataException($"{stage}FATの割り当て検証に失敗しました: {validation.Reason}");
             }
+        }
+
+        if (fileSystem is ExtFileSystem ext && !ext.ValidateReadOnlyIntegrity(out var reason))
+        {
+            throw new InvalidDataException($"{stage}ext4の割り当て検証に失敗しました: {reason}");
         }
     }
 

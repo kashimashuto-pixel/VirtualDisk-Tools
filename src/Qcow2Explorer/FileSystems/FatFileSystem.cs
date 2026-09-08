@@ -81,6 +81,7 @@ public sealed class FatFileSystem : IReadOnlyFileSystem, IFileContentWriter
         Root = new VfsNode
         {
             Name = "",
+            VirtualPath = @"\",
             IsDirectory = true,
             Metadata = new FatNodeMeta(_fatBits == 32 ? Math.Max(2U, _rootCluster) : 0, @"\")
         };
@@ -777,6 +778,7 @@ public sealed class FatFileSystem : IReadOnlyFileSystem, IFileContentWriter
             nodes.Add(new VfsNode
             {
                 Name = name,
+                VirtualPath = CombinePath(parentPath, name),
                 IsDirectory = isDirectory,
                 Size = isDirectory ? 0 : size,
                 ModifiedUtc = ReadFatDateTime(data, offset + 22, offset + 24),

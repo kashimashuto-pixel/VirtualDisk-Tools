@@ -5067,11 +5067,15 @@ static void TestExt4SameLengthReplacement()
     var sourcePath = Path.Combine(AppContext.BaseDirectory, "sample-ext4-write-source.raw");
     var outputPath = Path.Combine(AppContext.BaseDirectory, "sample-ext4-write-output.raw");
     var serviceOutputPath = Path.Combine(AppContext.BaseDirectory, "sample-ext4-write-service-output.raw");
+    var resizedOutputPath = Path.Combine(AppContext.BaseDirectory, "sample-ext4-edit-resized.raw");
     var replacementPath = Path.Combine(AppContext.BaseDirectory, "sample-ext4-write-replacement.bin");
+    var resizedContentPath = Path.Combine(AppContext.BaseDirectory, "sample-ext4-edit-resized.bin");
     File.Delete(sourcePath);
     File.Delete(outputPath);
     File.Delete(serviceOutputPath);
+    File.Delete(resizedOutputPath);
     File.Delete(replacementPath);
+    File.Delete(resizedContentPath);
     TestImageFactory.CreateExt4RawDisk(sourcePath);
 
     using var source = new RawDiskImageReader(sourcePath);
@@ -5092,6 +5096,7 @@ static void TestExt4SameLengthReplacement()
     Assert(replacement.Length == hello.Size, "ext4 replacement fixture length");
     Assert(fileSystem.CanReplaceFile(hello, replacement.Length, out var reason), $"ext4 replacement support: {reason}");
     Assert(!fileSystem.CanReplaceFile(hello, replacement.Length + 1, out _), "ext4 size change rejection");
+    Assert(!fileSystem.CanWriteFile(hello, 4097, out _), "ext4 allocation-changing resize rejection");
 
     using (var replacementStream = new MemoryStream(replacement, writable: false))
     {
@@ -5129,6 +5134,24 @@ static void TestExt4SameLengthReplacement()
     Assert(
         serviceFileSystem.ReadFile(serviceHello, 0, replacement.Length).SequenceEqual(replacement),
         "ext4 replacement service exported data");
+
+    var resizedContent = Enumerable.Range(0, 17).Select(index => (byte)(index * 19 + 3)).ToArray();
+    File.WriteAllBytes(resizedContentPath, resizedContent);
+    var editResult = FileEditService.WriteFileToRawAsync(
+        source,
+        partition,
+        unchanged,
+        hello,
+        resizedContentPath,
+        resizedOutputPath).GetAwaiter().GetResult();
+    Assert(editResult.NewLength == resizedContent.Length, "ext4 same-allocation resize length");
+    using var resizedOutput = new RawDiskImageReader(resizedOutputPath);
+    var resizedFileSystem = new ExtFileSystem(new PartitionSliceReader(resizedOutput, partition), partition);
+    var resizedHello = resizedFileSystem.ListDirectory(resizedFileSystem.Root).Single(node => node.Name == "HELLO.TXT");
+    Assert(resizedHello.Size == resizedContent.Length, "ext4 resized output inode size");
+    Assert(
+        resizedFileSystem.ReadFile(resizedHello, 0, resizedContent.Length).SequenceEqual(resizedContent),
+        "ext4 resized output content");
 
     var dirtyBytes = File.ReadAllBytes(sourcePath);
     dirtyBytes[1024 + 0x3a] = 0;
@@ -7922,6 +7945,7 @@ internal static class TestImageFactory
         int blockCount)
     {
         WriteU16Le(disk, offset, mode);
+        WriteU16Le(disk, offset + 26, (mode & 0xf000) == 0x4000 ? 2 : 1);
         WriteU32Le(disk, offset + 4, size);
         WriteU32Le(disk, offset + 32, 0x00080000);
         WriteU16Le(disk, offset + 40, 0xf30a);

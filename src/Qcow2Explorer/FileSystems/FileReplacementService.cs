@@ -177,7 +177,7 @@ public static class FileReplacementService
         if (fileSystemName.StartsWith("ext", StringComparison.OrdinalIgnoreCase))
         {
             var fileSystem = new ExtFileSystem(slice, partition);
-            return new WritableFileSystemHandle(fileSystem, fileSystem, disposable: null);
+            return new WritableFileSystemHandle(fileSystem, fileSystem, disposable: null, fileSystem);
         }
 
         if (fileSystemName.Equals("XFS", StringComparison.OrdinalIgnoreCase))

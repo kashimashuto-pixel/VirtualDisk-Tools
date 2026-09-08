@@ -49,6 +49,7 @@ public sealed class DiscUtilsFileSystem : IReadOnlyFileSystem, IFileContentWrite
         Root = new VfsNode
         {
             Name = "",
+            VirtualPath = @"\",
             IsDirectory = true,
             Metadata = @"\"
         };
@@ -413,6 +414,7 @@ public sealed class DiscUtilsFileSystem : IReadOnlyFileSystem, IFileContentWrite
             return new VfsNode
             {
                 Name = GetDisplayName(normalized),
+                VirtualPath = normalized,
                 IsDirectory = isDirectory,
                 Size = isDirectory ? 0 : TryGetFileLength(normalized),
                 ModifiedUtc = TryGetLastWriteTimeUtc(normalized),
@@ -426,6 +428,7 @@ public sealed class DiscUtilsFileSystem : IReadOnlyFileSystem, IFileContentWrite
             return new VfsNode
             {
                 Name = GetDisplayName(normalized),
+                VirtualPath = normalized,
                 IsDirectory = false,
                 Size = 0,
                 Metadata = normalized
