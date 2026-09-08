@@ -3,6 +3,7 @@ using Qcow2Explorer.Core;
 using Qcow2Explorer.Partitions;
 using DiscExFatFileSystem = DiscUtils.ExFat.ExFatFileSystem;
 using DiscFatFileSystem = DiscUtils.Fat.FatFileSystem;
+using DiscNtfsFileSystem = DiscUtils.Ntfs.NtfsFileSystem;
 
 namespace Qcow2Explorer.FileSystems;
 
@@ -206,12 +207,31 @@ public static class FileReplacementService
 
         if (fileSystemName.Equals("NTFS", StringComparison.OrdinalIgnoreCase))
         {
-            var fileSystem = new NtfsFileSystem(slice, partition);
+            (bool IsValid, string Reason) ValidateNtfs()
+            {
+                try
+                {
+                    var validator = new NtfsFileSystem(slice, partition);
+                    return validator.ValidateForEditing();
+                }
+                catch (Exception ex) when (ex is IOException or InvalidDataException or NotSupportedException or OverflowException)
+                {
+                    return (false, ex.Message);
+                }
+            }
+
+            var fileSystem = new DiscUtilsFileSystem(
+                slice,
+                partition,
+                OpenNtfs,
+                "NTFS",
+                ValidateNtfs);
             return new WritableFileSystemHandle(
                 fileSystem,
                 fileSystem,
-                disposable: null,
-                mapFile: original => MapNtfsFile(fileSystem, original));
+                fileSystem,
+                fileSystem,
+                original => MapDiscUtilsNode(fileSystem, original));
         }
 
         if (fileSystemName.Equals("exFAT", StringComparison.OrdinalIgnoreCase))
@@ -227,19 +247,29 @@ public static class FileReplacementService
         throw new NotSupportedException($"{fileSystemName}の書き込みにはまだ対応していません。");
     }
 
-    private static VfsNode MapNtfsFile(NtfsFileSystem fileSystem, VfsNode original)
+    private static DiscNtfsFileSystem OpenNtfs(Stream stream)
     {
-        if (original.Metadata is long)
+        var ntfs = new DiscNtfsFileSystem(stream);
+        ntfs.NtfsOptions.HideHiddenFiles = false;
+        ntfs.NtfsOptions.HideSystemFiles = false;
+        ntfs.NtfsOptions.HideMetafiles = false;
+        return ntfs;
+    }
+
+    private static VfsNode MapDiscUtilsNode(DiscUtilsFileSystem fileSystem, VfsNode original)
+    {
+        var path = original.Metadata as string;
+        if (string.IsNullOrWhiteSpace(path))
         {
-            return original;
+            path = original.VirtualPath;
         }
 
-        if (original.Metadata is string path && fileSystem.TryResolvePath(path, out var mapped))
+        if (!string.IsNullOrWhiteSpace(path) && fileSystem.TryResolvePath(path, out var mapped))
         {
             return mapped;
         }
 
-        throw new FileNotFoundException($"NTFS上で置換対象を再解決できません: {original.Name}");
+        throw new FileNotFoundException($"{fileSystem.Name}上で編集対象を再解決できません: {original.Name}");
     }
 
     private static VfsNode MapFatNode(

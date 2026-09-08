@@ -25,6 +25,7 @@ public sealed class NtfsFileSystem : IReadOnlyFileSystem, IFileContentWriter
     private readonly bool _deletedOnly;
     private readonly long _volumeClusterCount;
     private readonly ushort? _volumeFlags;
+    private readonly bool _mftRecoveredFromMirror;
 
     public NtfsFileSystem(IBlockReader reader, PartitionInfo partition, bool deletedOnly = false)
     {
@@ -63,6 +64,7 @@ public sealed class NtfsFileSystem : IReadOnlyFileSystem, IFileContentWriter
         _volumeClusterCount = totalSectors / sectorsPerCluster;
 
         var mft0 = ReadMftRecordZero(mftMirrorLcn, out var recoveredFromMirror);
+        _mftRecoveredFromMirror = recoveredFromMirror;
         // Record 0 describes $MFT itself and is always an in-use record. Parse it
         // regardless of the requested scan filter so deleted-only scans can first
         // discover the data runs that contain the remaining MFT records.
@@ -74,7 +76,13 @@ public sealed class NtfsFileSystem : IReadOnlyFileSystem, IFileContentWriter
 
         _mftRuns = mftEntry.Data.Runs;
         _mftSize = mftEntry.Data.Size;
-        Root = new VfsNode { Name = deletedOnly ? "Deleted files" : "", IsDirectory = true, Metadata = deletedOnly ? -1L : 5L };
+        Root = new VfsNode
+        {
+            Name = deletedOnly ? "Deleted files" : "",
+            VirtualPath = @"\",
+            IsDirectory = true,
+            Metadata = deletedOnly ? -1L : 5L
+        };
         ScanMft();
         _volumeFlags = TryReadVolumeFlags();
         if (!deletedOnly && !_entries.ContainsKey(5))
@@ -195,6 +203,65 @@ public sealed class NtfsFileSystem : IReadOnlyFileSystem, IFileContentWriter
         }
 
         return true;
+    }
+
+    internal (bool IsValid, string Reason) ValidateForEditing()
+    {
+        if (_deletedOnly)
+        {
+            return (false, "削除済みファイル走査ビューは編集できません。");
+        }
+
+        if (_mftRecoveredFromMirror)
+        {
+            return (false, "$MFTの主レコードが破損し、$MFTMirrから復旧されたvolumeには書き込めません。");
+        }
+
+        if (_volumeFlags is null)
+        {
+            return (false, "NTFS $Volumeの状態を確認できません。");
+        }
+
+        if (_volumeFlags != 0)
+        {
+            return (false, $"dirtyまたは保守状態のNTFS volumeは編集できません: flags=0x{_volumeFlags:X4}");
+        }
+
+        if (!_entries.TryGetValue(6, out var bitmapEntry) || bitmapEntry.Data is null)
+        {
+            return (false, "NTFS $Bitmapを読み取れません。");
+        }
+
+        var requiredBitmapBytes = checked((_volumeClusterCount + 7) / 8);
+        if (bitmapEntry.Data.Size < requiredBitmapBytes)
+        {
+            return (false, "NTFS $Bitmapがvolume cluster数より短いです。");
+        }
+
+        try
+        {
+            foreach (var entry in _entries.Values)
+            {
+                var data = entry.Data;
+                if (data is null || data.ResidentData is not null)
+                {
+                    continue;
+                }
+
+                if ((data.Flags & (CompressedAttributeFlag | EncryptedAttributeFlag | SparseAttributeFlag)) != 0)
+                {
+                    continue;
+                }
+
+                ValidateWritableRuns(data);
+            }
+
+            return (true, string.Empty);
+        }
+        catch (Exception ex) when (ex is IOException or InvalidDataException or NotSupportedException or OverflowException)
+        {
+            return (false, ex.Message);
+        }
     }
 
     public bool CanReplaceFile(VfsNode file, long replacementLength, out string reason)
@@ -685,17 +752,45 @@ public sealed class NtfsFileSystem : IReadOnlyFileSystem, IFileContentWriter
         }
     }
 
-    private static VfsNode ToNode(NtfsFileEntry entry)
+    private VfsNode ToNode(NtfsFileEntry entry)
     {
         return new VfsNode
         {
             Name = entry.Name,
+            VirtualPath = GetVirtualPath(entry),
             IsDirectory = entry.IsDirectory,
             Size = entry.IsDirectory ? 0 : entry.Data?.Size ?? entry.FileNameSize,
             ModifiedUtc = entry.ModifiedUtc,
             Attributes = entry.Attributes,
             Metadata = entry.Id
         };
+    }
+
+    private string GetVirtualPath(NtfsFileEntry entry)
+    {
+        var components = new Stack<string>();
+        var visited = new HashSet<long>();
+        var current = entry;
+        while (current.Id != 5)
+        {
+            if (!visited.Add(current.Id))
+            {
+                throw new InvalidDataException("NTFS parent参照が循環しています。");
+            }
+
+            components.Push(current.Name);
+            if (current.ParentId == 5)
+            {
+                break;
+            }
+
+            if (!_entries.TryGetValue(current.ParentId, out current))
+            {
+                break;
+            }
+        }
+
+        return @"\" + string.Join(@"\", components);
     }
 
     private ushort? TryReadVolumeFlags()
