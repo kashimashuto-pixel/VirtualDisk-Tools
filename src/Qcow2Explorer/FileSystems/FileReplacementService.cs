@@ -30,12 +30,6 @@ public static class FileReplacementService
         ArgumentNullException.ThrowIfNull(originalFileSystem);
         ArgumentNullException.ThrowIfNull(file);
 
-        if (PhysicalDiskReader.IsPhysicalDiskPath(source.Path))
-        {
-            reason = "物理ディスクへの書き込みや、物理ディスクを元にした変更イメージ作成には対応していません。";
-            return false;
-        }
-
         if (file.IsDirectory)
         {
             reason = "通常ファイルだけを置換できます。";

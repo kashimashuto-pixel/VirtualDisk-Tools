@@ -49,7 +49,7 @@ public sealed partial class PhysicalDiskReader : IDiskImageReader, ILogicalSecto
     }
 
     public string Path { get; }
-    public string FormatName => "Physical disk (read-only)";
+    public string FormatName => "Physical disk";
     public long Length { get; }
     public uint LogicalSectorSize => checked((uint)_sectorSize);
 
@@ -108,7 +108,7 @@ public sealed partial class PhysicalDiskReader : IDiskImageReader, ILogicalSecto
     {
         return new[]
         {
-            "物理ディスクを読み取り専用で直接参照しています。アプリからディスクへの書き込みは行いません。",
+            "通常の解析は読み取り専用です。変更予定から明示的に物理ディスクへの適用を選んだ場合だけ、排他ロックと復旧ジャーナルを使用して書き込みます。",
             "使用中のディスクは解析中にも内容が変化するため、一覧やファイル内容が一時的に整合しない場合があります。"
         };
     }

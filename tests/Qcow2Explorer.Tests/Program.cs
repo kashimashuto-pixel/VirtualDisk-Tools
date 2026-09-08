@@ -409,6 +409,7 @@ static void RunGeneratedImageTests()
     TestNavigationHistory();
     TestVirtualPaths();
     TestCopyOnWriteBlockDevice();
+    TestPhysicalDiskCommitEngine();
     TestFatSameLengthReplacement();
     TestFatFileEditingOperations();
     TestLogicalLayerEditing();
@@ -5232,6 +5233,182 @@ static void TestCopyOnWriteBlockDevice()
     var streamWritten = new byte[partitionReplacement.Length];
     overlay.ReadAt(12345, streamWritten, 0, streamWritten.Length);
     Assert(streamWritten.SequenceEqual(partitionReplacement), "block reader stream write forwarding");
+
+    var noOpOverlay = new CopyOnWriteBlockDevice(new MemorySectorReader(sourceData, 512), 4096);
+    noOpOverlay.WriteAt(4096, sourceData, 4096, 4096);
+    Assert(noOpOverlay.GetModifiedPages().Count == 0, "copy-on-write no-op pages excluded from commit");
+}
+
+static void TestPhysicalDiskCommitEngine()
+{
+    var original = Enumerable.Range(0, 16 * 1024).Select(index => (byte)(index * 17 + 9)).ToArray();
+    var overlay = new CopyOnWriteBlockDevice(new MemorySectorReader(original, 512), 4096);
+    var firstChange = Enumerable.Repeat((byte)0xa5, 700).ToArray();
+    var secondChange = Enumerable.Repeat((byte)0x5a, 900).ToArray();
+    overlay.WriteAt(512, firstChange, 0, firstChange.Length);
+    overlay.WriteAt(8192, secondChange, 0, secondChange.Length);
+    var pages = overlay.GetModifiedPages();
+    Assert(pages.Count == 2, "physical commit changed-page snapshot count");
+    Assert(pages[0].OriginalData.AsSpan().SequenceEqual(original.AsSpan(0, 4096)), "physical commit original snapshot");
+
+    var targetInfo = new PhysicalDiskTargetInfo(
+        7,
+        @"\\.\PhysicalDrive7",
+        original.Length,
+        512,
+        IsRemovable: false,
+        IsSystemDisk: false,
+        "Test disk",
+        "TEST-0007",
+        "Test",
+        "identity-test-0007");
+    var journalPath = Path.Combine(AppContext.BaseDirectory, "physical-commit.vdt-recovery");
+    File.Delete(journalPath);
+    var target = new TestBlockDevice(original);
+    var verifierCalled = false;
+    PhysicalDiskCommitEngine.Apply(
+        target,
+        targetInfo,
+        pages,
+        journalPath,
+        finalVerifier: reader =>
+        {
+            verifierCalled = true;
+            var data = new byte[firstChange.Length];
+            reader.ReadAt(512, data, 0, data.Length);
+            Assert(data.SequenceEqual(firstChange), "physical commit final verifier data");
+        });
+    Assert(verifierCalled, "physical commit final verifier called");
+    Assert(
+        PhysicalDiskRecoveryJournal.Read(journalPath).State == PhysicalDiskRecoveryState.Committed,
+        "physical commit journal committed state");
+    Assert(target.Data.AsSpan(512, firstChange.Length).SequenceEqual(firstChange), "physical commit first page applied");
+    Assert(target.Data.AsSpan(8192, secondChange.Length).SequenceEqual(secondChange), "physical commit second page applied");
+
+    var mismatchedTargetInfo = targetInfo with { IdentityToken = "different-device" };
+    var identityRejected = false;
+    try
+    {
+        PhysicalDiskCommitEngine.Restore(target, mismatchedTargetInfo, journalPath);
+    }
+    catch (IOException)
+    {
+        identityRejected = true;
+    }
+
+    Assert(identityRejected, "physical recovery target identity mismatch rejection");
+    Assert(target.Data.AsSpan(512, firstChange.Length).SequenceEqual(firstChange), "identity rejection writes nothing");
+
+    PhysicalDiskCommitEngine.Restore(target, targetInfo, journalPath);
+    Assert(target.Data.SequenceEqual(original), "physical commit journal restore");
+    Assert(
+        PhysicalDiskRecoveryJournal.Read(journalPath).State == PhysicalDiskRecoveryState.RolledBack,
+        "physical commit journal rolled-back state");
+
+    var interruptedTarget = new TestBlockDevice(original);
+    Array.Copy(pages[0].ModifiedData, 0, interruptedTarget.Data, pages[0].Offset, 512);
+    PhysicalDiskCommitEngine.Restore(interruptedTarget, targetInfo, journalPath);
+    Assert(interruptedTarget.Data.SequenceEqual(original), "physical recovery accepts mixed old/new sectors");
+
+    var conflictJournalPath = Path.Combine(AppContext.BaseDirectory, "physical-conflict.vdt-recovery");
+    File.Delete(conflictJournalPath);
+    var conflictTarget = new TestBlockDevice(original);
+    conflictTarget.Data[checked((int)pages[0].Offset)] ^= 0xff;
+    var conflictRejected = false;
+    try
+    {
+        PhysicalDiskCommitEngine.Apply(conflictTarget, targetInfo, pages, conflictJournalPath);
+    }
+    catch (IOException)
+    {
+        conflictRejected = true;
+    }
+
+    Assert(conflictRejected, "physical commit stale-source conflict rejection");
+    Assert(!File.Exists(conflictJournalPath), "physical commit conflict does not create journal");
+
+    var failedJournalPath = Path.Combine(AppContext.BaseDirectory, "physical-failed.vdt-recovery");
+    File.Delete(failedJournalPath);
+    var failedTarget = new TestBlockDevice(original, failOnWriteCall: 2);
+    PhysicalDiskCommitException? commitFailure = null;
+    try
+    {
+        PhysicalDiskCommitEngine.Apply(failedTarget, targetInfo, pages, failedJournalPath);
+    }
+    catch (PhysicalDiskCommitException ex)
+    {
+        commitFailure = ex;
+    }
+
+    Assert(commitFailure?.RollbackSucceeded == true, "physical commit write failure automatic rollback status");
+    Assert(failedTarget.Data.SequenceEqual(original), "physical commit write failure automatic rollback data");
+    Assert(
+        PhysicalDiskRecoveryJournal.Read(failedJournalPath).State == PhysicalDiskRecoveryState.RolledBack,
+        "physical commit write failure journal state");
+
+    var verifyFailureJournalPath = Path.Combine(AppContext.BaseDirectory, "physical-verify-failed.vdt-recovery");
+    File.Delete(verifyFailureJournalPath);
+    var verifyFailureTarget = new TestBlockDevice(original);
+    try
+    {
+        PhysicalDiskCommitEngine.Apply(
+            verifyFailureTarget,
+            targetInfo,
+            pages,
+            verifyFailureJournalPath,
+            finalVerifier: _ => throw new InvalidDataException("injected final verification failure"));
+        Assert(false, "physical commit final verification failure must throw");
+    }
+    catch (PhysicalDiskCommitException ex)
+    {
+        Assert(ex.RollbackSucceeded, "physical commit verification failure rollback status");
+    }
+
+    Assert(verifyFailureTarget.Data.SequenceEqual(original), "physical commit verification failure rollback data");
+
+    var corruptedJournalPath = Path.Combine(AppContext.BaseDirectory, "physical-corrupt.vdt-recovery");
+    File.Copy(journalPath, corruptedJournalPath, overwrite: true);
+    using (var stream = new FileStream(corruptedJournalPath, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+    {
+        stream.Position = stream.Length - 1;
+        var value = stream.ReadByte();
+        stream.Position--;
+        stream.WriteByte((byte)(value ^ 0xff));
+    }
+
+    var corruptRejected = false;
+    try
+    {
+        _ = PhysicalDiskRecoveryJournal.Read(corruptedJournalPath);
+    }
+    catch (InvalidDataException)
+    {
+        corruptRejected = true;
+    }
+
+    Assert(corruptRejected, "physical commit corrupt journal rejection");
+
+    var corruptedMetadataPath = Path.Combine(AppContext.BaseDirectory, "physical-corrupt-metadata.vdt-recovery");
+    File.Copy(journalPath, corruptedMetadataPath, overwrite: true);
+    using (var stream = new FileStream(corruptedMetadataPath, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+    {
+        stream.Position = 16;
+        var value = stream.ReadByte();
+        stream.Position--;
+        stream.WriteByte((byte)(value ^ 0x01));
+    }
+
+    var corruptMetadataRejected = false;
+    try
+    {
+        _ = PhysicalDiskRecoveryJournal.Read(corruptedMetadataPath);
+    }
+    catch (InvalidDataException)
+    {
+        corruptMetadataRejected = true;
+    }
+
+    Assert(corruptMetadataRejected, "physical commit corrupt metadata rejection");
 }
 
 static void TestExt4SameLengthReplacement()
@@ -8654,6 +8831,43 @@ internal sealed class MemorySectorReader : IBlockReader, ILogicalSectorReader
 
         var available = checked((int)Math.Min(count, Length - offset));
         Array.Copy(_data, offset, buffer, bufferOffset, available);
+    }
+}
+
+internal sealed class TestBlockDevice : IBlockDevice
+{
+    private readonly int? _failOnWriteCall;
+    private int _writeCount;
+    private bool _failureInjected;
+
+    public TestBlockDevice(byte[] data, int? failOnWriteCall = null)
+    {
+        Data = (byte[])data.Clone();
+        _failOnWriteCall = failOnWriteCall;
+    }
+
+    public byte[] Data { get; }
+    public long Length => Data.LongLength;
+
+    public void ReadAt(long offset, byte[] buffer, int bufferOffset, int count)
+    {
+        Array.Copy(Data, offset, buffer, bufferOffset, count);
+    }
+
+    public void WriteAt(long offset, byte[] buffer, int bufferOffset, int count)
+    {
+        _writeCount++;
+        if (!_failureInjected && _failOnWriteCall == _writeCount)
+        {
+            _failureInjected = true;
+            throw new IOException("injected physical write failure");
+        }
+
+        Array.Copy(buffer, bufferOffset, Data, offset, count);
+    }
+
+    public void Flush()
+    {
     }
 }
 

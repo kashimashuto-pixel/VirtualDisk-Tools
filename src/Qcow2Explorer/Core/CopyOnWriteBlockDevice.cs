@@ -1,5 +1,10 @@
 namespace Qcow2Explorer.Core;
 
+public sealed record CopyOnWritePage(
+    long Offset,
+    byte[] OriginalData,
+    byte[] ModifiedData);
+
 public sealed class CopyOnWriteBlockDevice : IBlockDevice
 {
     private const int DefaultPageSize = 64 * 1024;
@@ -8,6 +13,7 @@ public sealed class CopyOnWriteBlockDevice : IBlockDevice
     private readonly IBlockReader _source;
     private readonly int _pageSize;
     private readonly Dictionary<long, byte[]> _pages = [];
+    private readonly Dictionary<long, byte[]> _originalPages = [];
     private readonly object _sync = new();
 
     public CopyOnWriteBlockDevice(IBlockReader source, int pageSize = DefaultPageSize)
@@ -40,6 +46,21 @@ public sealed class CopyOnWriteBlockDevice : IBlockDevice
     }
 
     public long ModifiedStorageBytes => checked((long)ModifiedPageCount * _pageSize);
+
+    public IReadOnlyList<CopyOnWritePage> GetModifiedPages()
+    {
+        lock (_sync)
+        {
+            return _pages
+                .OrderBy(entry => entry.Key)
+                .Where(entry => !_originalPages[entry.Key].AsSpan().SequenceEqual(entry.Value))
+                .Select(entry => new CopyOnWritePage(
+                    checked(entry.Key * _pageSize),
+                    (byte[])_originalPages[entry.Key].Clone(),
+                    (byte[])entry.Value.Clone()))
+                .ToArray();
+        }
+    }
 
     public void ReadAt(long offset, byte[] buffer, int bufferOffset, int count)
     {
@@ -178,9 +199,11 @@ public sealed class CopyOnWriteBlockDevice : IBlockDevice
             return page;
         }
 
-        page = new byte[pageLength];
+        var original = new byte[pageLength];
         var pageOffset = checked(pageIndex * _pageSize);
-        _source.ReadAt(pageOffset, page, 0, page.Length);
+        _source.ReadAt(pageOffset, original, 0, original.Length);
+        page = (byte[])original.Clone();
+        _originalPages.Add(pageIndex, original);
         _pages.Add(pageIndex, page);
         return page;
     }

@@ -136,6 +136,8 @@ public partial class Form1 : Form
         openFolderButton.Click += async (_, _) => await OpenImageFolderDialogAsync();
         var openPhysicalDiskButton = new ToolStripButton("物理ディスク");
         openPhysicalDiskButton.Click += async (_, _) => await OpenPhysicalDiskDialogAsync();
+        var recoverPhysicalDiskButton = new ToolStripButton("物理ディスク復旧");
+        recoverPhysicalDiskButton.Click += async (_, _) => await RestorePhysicalDiskAsync();
         var reportButton = new ToolStripButton("解析レポート");
         reportButton.Click += (_, _) => SaveAnalysisReport();
         var snapshotButton = new ToolStripButton("スナップショット");
@@ -148,6 +150,7 @@ public partial class Form1 : Form
         toolStrip.Items.Add(openDeviceSetButton);
         toolStrip.Items.Add(openFolderButton);
         toolStrip.Items.Add(openPhysicalDiskButton);
+        toolStrip.Items.Add(recoverPhysicalDiskButton);
         toolStrip.Items.Add(new ToolStripSeparator());
         toolStrip.Items.Add(new ToolStripLabel("ファイル"));
         toolStrip.Items.Add(_pathBox);
@@ -494,12 +497,14 @@ public partial class Form1 : Form
         clearButton.Click += (_, _) => ClearPendingEditsWithPrompt();
         var saveButton = new Button { Text = "新しいRAWへ保存...", AutoSize = true };
         saveButton.Click += async (_, _) => await SavePendingEditsAsync();
+        var applyPhysicalButton = new Button { Text = "物理ディスクへ適用...", AutoSize = true };
+        applyPhysicalButton.Click += async (_, _) => await ApplyPendingEditsToPhysicalDiskAsync();
         var description = new Label
         {
             Dock = DockStyle.Fill,
             AutoEllipsis = true,
             Padding = new Padding(8, 4, 8, 0),
-            Text = "原本は変更されません。変更は上から順に仮適用し、全検証後に新規RAWとして保存します。",
+            Text = "通常は新規RAWへ保存します。物理ディスクへの直接適用は復旧ジャーナルと排他ロックを使用します。",
         };
         var buttons = new FlowLayoutPanel
         {
@@ -509,6 +514,7 @@ public partial class Form1 : Form
             Padding = new Padding(4, 2, 4, 2),
         };
         buttons.Controls.Add(saveButton);
+        buttons.Controls.Add(applyPhysicalButton);
         buttons.Controls.Add(clearButton);
         buttons.Controls.Add(undoLastButton);
         buttons.Controls.Add(undoButton);
@@ -4049,6 +4055,243 @@ public partial class Form1 : Form
                 _closeAfterWriteCancellation = false;
                 BeginInvoke(new Action(Close));
             }
+        }
+    }
+
+    private async Task ApplyPendingEditsToPhysicalDiskAsync()
+    {
+        if (_isWritingImage || _isLoadingImage)
+        {
+            _statusLabel.Text = "別の読み込み・書き込み処理が完了してから開始してください";
+            return;
+        }
+
+        if (_searchCancellation is not null || _copyCancellations.Count > 0)
+        {
+            MessageBox.Show(
+                this,
+                "検索またはホストへのコピーが完了してから物理ディスクへ適用してください。",
+                "読み取り処理を実行中です",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+            return;
+        }
+
+        if (_reader is null || _pendingEditFileSystem is null || _pendingFileEdits.Count == 0)
+        {
+            MessageBox.Show(this, "物理ディスクへ適用する変更予定がありません。", "物理ディスク書き込み", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        if (!PhysicalDiskEditService.CanApply(
+                _reader,
+                _pendingEditFileSystem.Partition,
+                _pendingEditFileSystem,
+                out var target,
+                out var reason)
+            || target is null)
+        {
+            MessageBox.Show(this, reason, "物理ディスクへ適用できません", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        var defaultJournalPath = PhysicalDiskEditService.GetDefaultRecoveryJournalPath(target);
+        using var confirmation = new PhysicalDiskWriteConfirmationDialog(
+            target,
+            defaultJournalPath,
+            _pendingFileEdits);
+        if (confirmation.ShowDialog(this) != DialogResult.OK)
+        {
+            return;
+        }
+
+        if (!ConfirmAndDisposeMounts("物理ディスクへ書き込む前に、このアプリの読み取り専用マウントを解除します。続行しますか？"))
+        {
+            return;
+        }
+
+        using var cancellation = new CancellationTokenSource();
+        _writeCancellation = cancellation;
+        _isWritingImage = true;
+        _cancelWriteButton.Enabled = true;
+        _writeProgressBar.Visible = true;
+        _writeProgressBar.Style = ProgressBarStyle.Marquee;
+        var progress = CreateWriteProgress();
+        string? reloadPath = null;
+        try
+        {
+            var source = _reader;
+            var fileSystem = _pendingEditFileSystem;
+            var edits = _pendingFileEdits.ToArray();
+            var result = await Task.Run(() => PhysicalDiskEditService.ApplyAsync(
+                source,
+                fileSystem.Partition,
+                fileSystem,
+                edits,
+                target,
+                confirmation.ConfirmationText,
+                confirmation.RecoveryJournalPath,
+                progress,
+                cancellation.Token), cancellation.Token);
+            ClearPendingEdits();
+            reloadPath = source.Path;
+            _statusLabel.Text = $"PhysicalDrive{result.Target.DiskNumber}へ変更を適用しました";
+            MessageBox.Show(
+                this,
+                $"物理ディスクへの書き込みと読み戻し検証が完了しました。\r\n\r\n"
+                    + $"対象: {result.Target.DevicePath}\r\n"
+                    + $"種類: {(result.Target.IsRemovable ? "リムーバブル／ホットプラグ" : "固定ディスク")}\r\n"
+                    + $"変更: {result.EditCount:N0}件\r\n"
+                    + $"差分: {result.ModifiedPageCount:N0}ページ ({FormatBytes(result.ModifiedBytes)})\r\n\r\n"
+                    + $"復旧ジャーナル:\r\n{result.RecoveryJournalPath}\r\n\r\n"
+                    + "復旧が不要と確認できるまではジャーナルを保管してください。",
+                "物理ディスク書き込み完了",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+        }
+        catch (PhysicalDiskCommitException ex)
+        {
+            _statusLabel.Text = ex.RollbackSucceeded
+                ? "物理ディスクへの書き込みに失敗しました（自動復旧済み）"
+                : "物理ディスクへの書き込みと自動復旧に失敗しました";
+            MessageBox.Show(
+                this,
+                ex.Message,
+                ex.RollbackSucceeded ? "書き込み失敗・自動復旧済み" : "重大な物理ディスク書き込みエラー",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error);
+        }
+        catch (OperationCanceledException)
+        {
+            _statusLabel.Text = "物理ディスクへの変更準備をキャンセルしました";
+        }
+        catch (Exception ex)
+        {
+            _statusLabel.Text = "物理ディスクへの書き込みを開始できませんでした";
+            MessageBox.Show(this, ex.Message, "物理ディスク書き込みエラー", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+        finally
+        {
+            FinishWriteUi();
+        }
+
+        if (reloadPath is not null && !IsDisposed)
+        {
+            await LoadImageAsync(reloadPath);
+        }
+    }
+
+    private async Task RestorePhysicalDiskAsync()
+    {
+        if (_isWritingImage || _isLoadingImage)
+        {
+            _statusLabel.Text = "別の読み込み・書き込み処理が完了してから復旧してください";
+            return;
+        }
+
+        using var fileDialog = new OpenFileDialog
+        {
+            Title = "物理ディスク復旧ジャーナルを選択",
+            Filter = "Virtual Disk Tools recovery journal (*.vdt-recovery)|*.vdt-recovery|All files (*.*)|*.*",
+        };
+        if (fileDialog.ShowDialog(this) != DialogResult.OK)
+        {
+            return;
+        }
+
+        try
+        {
+            var journal = PhysicalDiskRecoveryJournal.Read(fileDialog.FileName);
+            var target = PhysicalDiskWriteSession.Inspect(journal.Target.DevicePath);
+            using var confirmation = new PhysicalDiskWriteConfirmationDialog(
+                target,
+                fileDialog.FileName,
+                isRecovery: true);
+            if (confirmation.ShowDialog(this) != DialogResult.OK
+                || !ConfirmAndDisposeMounts("物理ディスクを復旧する前に、このアプリの読み取り専用マウントを解除します。続行しますか？"))
+            {
+                return;
+            }
+
+            using var cancellation = new CancellationTokenSource();
+            _writeCancellation = cancellation;
+            _isWritingImage = true;
+            _cancelWriteButton.Enabled = true;
+            _writeProgressBar.Visible = true;
+            _writeProgressBar.Style = ProgressBarStyle.Marquee;
+            var progress = CreateWriteProgress();
+            try
+            {
+                await Task.Run(() => PhysicalDiskEditService.RestoreAsync(
+                    fileDialog.FileName,
+                    confirmation.ConfirmationText,
+                    progress,
+                    cancellation.Token), cancellation.Token);
+                _statusLabel.Text = $"PhysicalDrive{target.DiskNumber}を変更前へ復旧しました";
+                MessageBox.Show(
+                    this,
+                    $"復旧ジャーナルに保存された変更前データを書き戻し、読み戻し検証を完了しました。\r\n\r\n対象: {target.DevicePath}",
+                    "物理ディスク復旧完了",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
+            }
+            catch (OperationCanceledException)
+            {
+                _statusLabel.Text = "物理ディスク復旧の開始前検証をキャンセルしました";
+            }
+            catch (Exception ex)
+            {
+                _statusLabel.Text = "物理ディスクの復旧に失敗しました";
+                MessageBox.Show(this, ex.Message, "物理ディスク復旧エラー", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+            finally
+            {
+                FinishWriteUi();
+            }
+
+            if (_reader is not null
+                && string.Equals(_reader.Path, target.DevicePath, StringComparison.OrdinalIgnoreCase)
+                && !IsDisposed)
+            {
+                await LoadImageAsync(target.DevicePath);
+            }
+        }
+        catch (Exception ex) when (ex is IOException
+                                   or InvalidDataException
+                                   or UnauthorizedAccessException
+                                   or NotSupportedException
+                                   or ArgumentException)
+        {
+            MessageBox.Show(this, ex.Message, "復旧ジャーナルを使用できません", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
+    private Progress<DiskImageProgress> CreateWriteProgress() => new(update =>
+    {
+        _statusLabel.Text = update.Message;
+        if (update.Percentage is int percentage)
+        {
+            _writeProgressBar.Style = ProgressBarStyle.Blocks;
+            _writeProgressBar.Value = Math.Clamp(percentage, 0, 100);
+            _statusLabel.Text = $"{update.Message}: {percentage}%";
+        }
+        else
+        {
+            _writeProgressBar.Style = ProgressBarStyle.Marquee;
+        }
+    });
+
+    private void FinishWriteUi()
+    {
+        _writeCancellation = null;
+        _isWritingImage = false;
+        _cancelWriteButton.Enabled = false;
+        _writeProgressBar.Visible = false;
+        _writeProgressBar.Value = 0;
+        if (_closeAfterWriteCancellation && !IsDisposed)
+        {
+            _closeAfterWriteCancellation = false;
+            BeginInvoke(new Action(Close));
         }
     }
 

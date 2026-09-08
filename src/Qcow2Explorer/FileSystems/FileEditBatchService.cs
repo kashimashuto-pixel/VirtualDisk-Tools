@@ -19,6 +19,13 @@ public sealed record FileEditBatchResult(
     IReadOnlyList<FileEditResult> Edits,
     bool IsLogicalVolumeOutput = false);
 
+internal sealed record PreparedFileEditBatch(
+    CopyOnWriteBlockDevice Overlay,
+    PartitionInfo EffectivePartition,
+    string FileSystemName,
+    IReadOnlyList<FileEditResult> Results,
+    bool IsLogicalVolumeOutput);
+
 public static class FileEditBatchService
 {
     public static bool CanEdit(
@@ -71,7 +78,6 @@ public static class FileEditBatchService
             throw new ArgumentException("保存する変更がありません。", nameof(edits));
         }
 
-        FileEditService.ValidateSource(source, partition);
         destinationPath = Path.GetFullPath(destinationPath);
         if (File.Exists(destinationPath) || Directory.Exists(destinationPath))
         {
@@ -81,6 +87,63 @@ public static class FileEditBatchService
         if (string.Equals(Path.GetFullPath(source.Path), destinationPath, StringComparison.OrdinalIgnoreCase))
         {
             throw new IOException("原本と同じパスには保存できません。");
+        }
+
+        var prepared = await PrepareAsync(
+            source,
+            partition,
+            originalFileSystem,
+            edits,
+            destinationPath,
+            progress,
+            cancellationToken);
+        var effectivePartition = prepared.EffectivePartition;
+        var overlay = prepared.Overlay;
+        var results = prepared.Results;
+
+        var destinationDirectory = Path.GetDirectoryName(destinationPath)
+            ?? throw new ArgumentException("出力先フォルダーを取得できません。", nameof(destinationPath));
+        Directory.CreateDirectory(destinationDirectory);
+        var pendingPath = Path.Combine(
+            destinationDirectory,
+            $".{Path.GetFileName(destinationPath)}.{Guid.NewGuid():N}.vdt-partial");
+        try
+        {
+            await overlay.ExportRawAsync(pendingPath, progress, cancellationToken);
+            VerifyFinalImage(pendingPath, effectivePartition, prepared.FileSystemName, results, cancellationToken);
+            File.Move(pendingPath, destinationPath);
+        }
+        catch
+        {
+            FileEditService.TryDelete(pendingPath);
+            throw;
+        }
+
+        return new FileEditBatchResult(
+            destinationPath,
+            results.Count,
+            overlay.ModifiedPageCount,
+            results,
+            prepared.IsLogicalVolumeOutput);
+    }
+
+    internal static async Task<PreparedFileEditBatch> PrepareAsync(
+        IDiskImageReader source,
+        PartitionInfo partition,
+        IReadOnlyFileSystem originalFileSystem,
+        IReadOnlyList<PendingFileEdit> edits,
+        string resultDestinationPath,
+        IProgress<DiskImageProgress>? progress = null,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        ArgumentNullException.ThrowIfNull(partition);
+        ArgumentNullException.ThrowIfNull(originalFileSystem);
+        ArgumentNullException.ThrowIfNull(edits);
+        ArgumentException.ThrowIfNullOrWhiteSpace(resultDestinationPath);
+        if (edits.Count == 0)
+        {
+            throw new ArgumentException("適用する変更がありません。", nameof(edits));
         }
 
         var editSource = FileEditService.ResolveEditableSource(source, partition);
@@ -98,34 +161,16 @@ public static class FileEditBatchService
                 effectivePartition,
                 originalFileSystem.Name,
                 edit,
-                destinationPath,
+                resultDestinationPath,
                 cancellationToken);
             results.Add(result);
             VerifyOverlay(overlay, effectivePartition, result, cancellationToken);
         }
 
-        var destinationDirectory = Path.GetDirectoryName(destinationPath)
-            ?? throw new ArgumentException("出力先フォルダーを取得できません。", nameof(destinationPath));
-        Directory.CreateDirectory(destinationDirectory);
-        var pendingPath = Path.Combine(
-            destinationDirectory,
-            $".{Path.GetFileName(destinationPath)}.{Guid.NewGuid():N}.vdt-partial");
-        try
-        {
-            await overlay.ExportRawAsync(pendingPath, progress, cancellationToken);
-            VerifyFinalImage(pendingPath, effectivePartition, originalFileSystem.Name, results, cancellationToken);
-            File.Move(pendingPath, destinationPath);
-        }
-        catch
-        {
-            FileEditService.TryDelete(pendingPath);
-            throw;
-        }
-
-        return new FileEditBatchResult(
-            destinationPath,
-            results.Count,
-            overlay.ModifiedPageCount,
+        return new PreparedFileEditBatch(
+            overlay,
+            effectivePartition,
+            originalFileSystem.Name,
             results,
             editSource.IsLogicalOutput);
     }
@@ -507,6 +552,16 @@ public static class FileEditBatchService
         };
         var fileSystem = FileSystemDetector.TryOpen(reader, outputPartition, out var error)
             ?? throw new InvalidDataException($"出力RAWのファイルシステムを再オープンできません: {error}");
+        VerifyFinalFileSystem(fileSystem, results, cancellationToken);
+    }
+
+    internal static void VerifyFinalFileSystem(
+        IReadOnlyFileSystem fileSystem,
+        IReadOnlyList<FileEditResult> results,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(fileSystem);
+        ArgumentNullException.ThrowIfNull(results);
         try
         {
             FileEditService.ValidateReadOnlyFileSystem(fileSystem, "出力");

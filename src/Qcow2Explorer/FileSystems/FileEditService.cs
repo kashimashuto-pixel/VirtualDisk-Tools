@@ -295,11 +295,25 @@ public static class FileEditService
 
     internal static void ValidateSource(IDiskImageReader source, PartitionInfo partition)
     {
-        if (PhysicalDiskReader.IsPhysicalDiskPath(source.Path))
+        ArgumentNullException.ThrowIfNull(source);
+        ArgumentNullException.ThrowIfNull(partition);
+
+        if (partition.ReaderOverride is { } logicalReader)
         {
-            throw new NotSupportedException("物理ディスクは編集できません。");
+            if (logicalReader.Length <= 0)
+            {
+                throw new InvalidDataException("編集対象の論理ボリュームサイズが不正です。");
+            }
+
+            return;
         }
 
+        var start = partition.StartOffset;
+        var length = partition.LengthBytes;
+        if (start < 0 || length <= 0 || start > source.Length - length)
+        {
+            throw new InvalidDataException("編集対象パーティションが入力ディスク範囲内にありません。");
+        }
     }
 
     internal static EditableSource ResolveEditableSource(IDiskImageReader source, PartitionInfo partition)
