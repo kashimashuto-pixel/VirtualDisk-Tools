@@ -1,9 +1,13 @@
+using System.Collections.Concurrent;
 using Qcow2Explorer.Core;
 
 namespace Qcow2Explorer;
 
 public sealed class DiagnosticLogForm : Form
 {
+    private readonly ConcurrentQueue<string> _pendingEntries = new();
+    private int _updateScheduled;
+
     private readonly TextBox _text = new()
     {
         Dock = DockStyle.Fill,
@@ -38,11 +42,27 @@ public sealed class DiagnosticLogForm : Form
             return;
         }
 
+        _pendingEntries.Enqueue(entry);
+        if (Interlocked.Exchange(ref _updateScheduled, 1) != 0)
+        {
+            return;
+        }
+
         BeginInvoke(() =>
         {
-            _text.AppendText(entry + Environment.NewLine);
+            while (_pendingEntries.TryDequeue(out var pendingEntry))
+            {
+                _text.AppendText(pendingEntry + Environment.NewLine);
+            }
+
             _text.SelectionStart = _text.TextLength;
             _text.ScrollToCaret();
+            Volatile.Write(ref _updateScheduled, 0);
+
+            if (!_pendingEntries.IsEmpty)
+            {
+                OnEntryAdded(null, string.Empty);
+            }
         });
     }
 }

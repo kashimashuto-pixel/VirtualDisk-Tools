@@ -24,6 +24,7 @@ internal sealed class XfsRawFileSystem
     private readonly Dictionary<ulong, IReadOnlyList<XfsExtent>> _extentCache = new();
     private readonly Dictionary<ulong, IReadOnlyList<XfsDirectoryEntry>> _directoryCache = new();
     private readonly HashSet<ulong> _diagnosedInodes = [];
+    private readonly HashSet<ulong> _diagnosedOutOfDataDeviceInodes = [];
     private readonly Encoding _fileNameEncoding;
 
     private XfsRawFileSystem(IBlockReader reader)
@@ -607,7 +608,6 @@ internal sealed class XfsRawFileSystem
                 var resultOffset = checked((int)(readStart - offset));
                 var physicalOffset = checked(ExtentToDiskOffset(extent.StartBlock) + (readStart - extentStart));
                 var bytesToRead = checked((int)(readEnd - readStart));
-                DiagnosticLog.Write($"XFS raw extent read: inode={inode.Number}, fileOffset={readStart}, bytes={bytesToRead}, logicalBlock={extent.StartOffset}, physicalBlock={extent.StartBlock}, partitionOffset={physicalOffset}, unwritten={extent.IsUnwritten}");
                 _reader.ReadAt(physicalOffset, result, resultOffset, bytesToRead);
             }
             catch (Exception ex)
@@ -627,6 +627,9 @@ internal sealed class XfsRawFileSystem
     private void ValidateExtents(XfsInode inode, IReadOnlyList<XfsExtent> extents)
     {
         ulong previousEnd = 0;
+        var requiredBlocks = checked((inode.Length + _superBlock.BlockSize - 1) / _superBlock.BlockSize);
+        var readableBeyondSuperBlockCount = 0;
+        XfsExtent? firstReadableBeyondSuperBlock = null;
         foreach (var extent in extents)
         {
             if (extent.BlockCount == 0)
@@ -634,10 +637,22 @@ internal sealed class XfsRawFileSystem
                 throw new InvalidDataException($"XFS inode {inode.Number} contains a zero-length extent.");
             }
 
-            if (extent.StartBlock >= _superBlock.DataBlocks || extent.BlockCount > _superBlock.DataBlocks - extent.StartBlock)
+            var exceedsSuperBlockDataDevice = extent.StartBlock >= _superBlock.DataBlocks
+                || extent.BlockCount > _superBlock.DataBlocks - extent.StartBlock;
+            var physicalOffset = ExtentToDiskOffset(extent.StartBlock);
+            var physicalLength = GetExtentByteLength(extent.BlockCount, _superBlock.BlockSize);
+            var fitsReader = physicalOffset >= 0
+                && physicalLength <= _reader.Length - physicalOffset;
+            if (exceedsSuperBlockDataDevice && !fitsReader)
             {
                 throw new InvalidDataException(
-                    $"XFS inode {inode.Number} extent is outside the data device: startBlock={extent.StartBlock}, blockCount={extent.BlockCount}, dataBlocks={_superBlock.DataBlocks}.");
+                    $"XFS inode {inode.Number} extent is outside the readable device: startBlock={extent.StartBlock}, blockCount={extent.BlockCount}, dataBlocks={_superBlock.DataBlocks}, readerLength={_reader.Length}.");
+            }
+
+            if (exceedsSuperBlockDataDevice)
+            {
+                readableBeyondSuperBlockCount++;
+                firstReadableBeyondSuperBlock ??= extent;
             }
 
             var end = checked(extent.StartOffset + extent.BlockCount);
@@ -646,15 +661,23 @@ internal sealed class XfsRawFileSystem
                 throw new InvalidDataException($"XFS inode {inode.Number} contains overlapping or unsorted extents.");
             }
 
+            if (end > requiredBlocks)
+            {
+                throw new InvalidDataException(
+                    $"XFS inode {inode.Number} extent exceeds the file: logicalStart={extent.StartOffset}, blockCount={extent.BlockCount}, requiredBlocks={requiredBlocks}.");
+            }
+
             previousEnd = end;
         }
 
-        var requiredBlocks = checked((inode.Length + _superBlock.BlockSize - 1) / _superBlock.BlockSize);
-        if (inode.Length > 0 && (extents.Count == 0 || previousEnd < requiredBlocks))
+        if (firstReadableBeyondSuperBlock is not null
+            && _diagnosedOutOfDataDeviceInodes.Add(inode.Number))
         {
-            throw new InvalidDataException(
-                $"XFS inode {inode.Number} extents do not cover the file: length={inode.Length}, requiredBlocks={requiredBlocks}, coveredBlocks={previousEnd}, extents={extents.Count}.");
+            DiagnosticLog.Write($"XFS extents beyond sb_dblocks are readable from the supplied device: inode={inode.Number}, count={readableBeyondSuperBlockCount}, first={firstReadableBeyondSuperBlock}, dataBlocks={_superBlock.DataBlocks}, readerLength={_reader.Length}");
         }
+
+        // Logical gaps, including a hole at EOF, are valid sparse-file extents.
+        // ReadContent initializes its result with zeroes, so those gaps are read correctly.
     }
 
     private void WriteFileDiagnostics(XfsNodeRef file, XfsInode inode)
