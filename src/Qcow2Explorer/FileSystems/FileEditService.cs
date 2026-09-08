@@ -151,89 +151,101 @@ public static class FileEditService
         cancellationToken.ThrowIfCancellationRequested();
         var overlay = new CopyOnWriteBlockDevice(source);
         var slice = new WritablePartitionSlice(overlay, partition);
-        using var writable = FileReplacementService.CreateWritableFileSystem(
-            originalFileSystem.Name,
-            slice,
-            partition);
-        var editor = writable.Editor
-            ?? throw new NotSupportedException($"{originalFileSystem.Name}のサイズ変更・追加・削除はまだ対応していません。");
-
         string virtualPath;
         long previousLength;
         long newLength;
-        switch (operation)
+        using (var writable = FileReplacementService.CreateWritableFileSystem(
+                   originalFileSystem.Name,
+                   slice,
+                   partition))
         {
-            case FileEditOperationKind.WriteContent:
-                {
-                    ArgumentNullException.ThrowIfNull(file);
-                    var writableFile = writable.MapFile(file);
-                    if (!editor.CanWriteFile(writableFile, contentInfo!.Length, out var reason))
+            var editor = writable.Editor
+                ?? throw new NotSupportedException(
+                    $"{originalFileSystem.Name}のサイズ変更・追加・削除はまだ対応していません。");
+            switch (operation)
+            {
+                case FileEditOperationKind.WriteContent:
                     {
-                        throw new NotSupportedException(reason);
-                    }
+                        ArgumentNullException.ThrowIfNull(file);
+                        var writableFile = writable.MapFile(file);
+                        if (!editor.CanWriteFile(writableFile, contentInfo!.Length, out var reason))
+                        {
+                            throw new NotSupportedException(reason);
+                        }
 
-                    virtualPath = GetVirtualPath(writableFile);
-                    previousLength = writableFile.Size;
-                    newLength = contentInfo.Length;
-                    await using var content = OpenContent(contentInfo.FullName);
-                    editor.WriteFileContent(writableFile, content, newLength, cancellationToken);
-                    break;
-                }
-            case FileEditOperationKind.CreateFile:
-                {
-                    ArgumentNullException.ThrowIfNull(directory);
-                    ArgumentException.ThrowIfNullOrWhiteSpace(name);
-                    var writableDirectory = writable.MapFile(directory);
-                    if (!editor.CanCreateFile(writableDirectory, name, contentInfo!.Length, out var reason))
+                        virtualPath = GetVirtualPath(writableFile);
+                        previousLength = writableFile.Size;
+                        newLength = contentInfo.Length;
+                        await using var content = OpenContent(contentInfo.FullName);
+                        editor.WriteFileContent(writableFile, content, newLength, cancellationToken);
+                        break;
+                    }
+                case FileEditOperationKind.CreateFile:
                     {
-                        throw new NotSupportedException(reason);
-                    }
+                        ArgumentNullException.ThrowIfNull(directory);
+                        ArgumentException.ThrowIfNullOrWhiteSpace(name);
+                        var writableDirectory = writable.MapFile(directory);
+                        if (!editor.CanCreateFile(writableDirectory, name, contentInfo!.Length, out var reason))
+                        {
+                            throw new NotSupportedException(reason);
+                        }
 
-                    await using var content = OpenContent(contentInfo.FullName);
-                    var created = editor.CreateFile(
-                        writableDirectory,
-                        name,
-                        content,
-                        contentInfo.Length,
-                        cancellationToken);
-                    virtualPath = GetVirtualPath(created);
-                    previousLength = 0;
-                    newLength = contentInfo.Length;
-                    break;
-                }
-            case FileEditOperationKind.DeleteFile:
-                {
-                    ArgumentNullException.ThrowIfNull(directory);
-                    ArgumentNullException.ThrowIfNull(file);
-                    var writableDirectory = writable.MapFile(directory);
-                    var writableFile = writable.MapFile(file);
-                    if (!editor.CanDeleteFile(writableDirectory, writableFile, out var reason))
+                        await using var content = OpenContent(contentInfo.FullName);
+                        var created = editor.CreateFile(
+                            writableDirectory,
+                            name,
+                            content,
+                            contentInfo.Length,
+                            cancellationToken);
+                        virtualPath = GetVirtualPath(created);
+                        previousLength = 0;
+                        newLength = contentInfo.Length;
+                        break;
+                    }
+                case FileEditOperationKind.DeleteFile:
                     {
-                        throw new NotSupportedException(reason);
-                    }
+                        ArgumentNullException.ThrowIfNull(directory);
+                        ArgumentNullException.ThrowIfNull(file);
+                        var writableDirectory = writable.MapFile(directory);
+                        var writableFile = writable.MapFile(file);
+                        if (!editor.CanDeleteFile(writableDirectory, writableFile, out var reason))
+                        {
+                            throw new NotSupportedException(reason);
+                        }
 
-                    virtualPath = GetVirtualPath(writableFile);
-                    previousLength = writableFile.Size;
-                    newLength = 0;
-                    editor.DeleteFile(writableDirectory, writableFile, cancellationToken);
-                    break;
-                }
-            default:
-                throw new ArgumentOutOfRangeException(nameof(operation));
+                        virtualPath = GetVirtualPath(writableFile);
+                        previousLength = writableFile.Size;
+                        newLength = 0;
+                        editor.DeleteFile(writableDirectory, writableFile, cancellationToken);
+                        break;
+                    }
+                default:
+                    throw new ArgumentOutOfRangeException(nameof(operation));
+            }
+
+            if (!editor.ValidateFileSystem(out var validationReason))
+            {
+                throw new InvalidDataException($"仮適用後のファイルシステム検証に失敗しました: {validationReason}");
+            }
         }
 
-        if (!editor.ValidateFileSystem(out var validationReason))
+        var overlayFileSystem = FileSystemDetector.TryOpen(overlay, partition, out var overlayError)
+            ?? throw new InvalidDataException($"仮適用後のファイルシステムを再オープンできません: {overlayError}");
+        try
         {
-            throw new InvalidDataException($"仮適用後のファイルシステム検証に失敗しました: {validationReason}");
+            ValidateReadOnlyFileSystem(overlayFileSystem, "仮適用後");
+            VerifyOperation(
+                overlayFileSystem,
+                operation,
+                virtualPath,
+                newLength,
+                contentHash,
+                cancellationToken);
         }
-
-        VerifyOperation(
-            writable.FileSystem,
-            operation,
-            virtualPath,
-            newLength,
-            contentHash,
-            cancellationToken);
+        finally
+        {
+            (overlayFileSystem as IDisposable)?.Dispose();
+        }
 
         var destinationDirectory = Path.GetDirectoryName(destinationPath)
             ?? throw new ArgumentException("出力先フォルダーを取得できません。", nameof(destinationPath));
@@ -359,14 +371,7 @@ public static class FileEditService
             ?? throw new InvalidDataException($"出力RAWのファイルシステムを再オープンできません: {error}");
         try
         {
-            if (fileSystem is FatFileSystem fat)
-            {
-                var validation = fat.ValidateForEditing();
-                if (!validation.IsValid)
-                {
-                    throw new InvalidDataException($"出力FATの割り当て検証に失敗しました: {validation.Reason}");
-                }
-            }
+            ValidateReadOnlyFileSystem(fileSystem, "出力");
 
             VerifyOperation(
                 fileSystem,
@@ -379,6 +384,18 @@ public static class FileEditService
         finally
         {
             (fileSystem as IDisposable)?.Dispose();
+        }
+    }
+
+    private static void ValidateReadOnlyFileSystem(IReadOnlyFileSystem fileSystem, string stage)
+    {
+        if (fileSystem is FatFileSystem fat)
+        {
+            var validation = fat.ValidateForEditing();
+            if (!validation.IsValid)
+            {
+                throw new InvalidDataException($"{stage}FATの割り当て検証に失敗しました: {validation.Reason}");
+            }
         }
     }
 
