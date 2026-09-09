@@ -108,6 +108,12 @@ if (args.Length == 2 && string.Equals(args[0], "--physical-system-disk-refusal",
     return;
 }
 
+if (args.Length == 2 && string.Equals(args[0], "--prepare-lzop-interop", StringComparison.OrdinalIgnoreCase))
+{
+    PrepareLzopInteropFixture(args[1]);
+    return;
+}
+
 if (args.Length > 0 && string.Equals(args[0], "--real-image-regression", StringComparison.OrdinalIgnoreCase))
 {
     if (args.Length != 2)
@@ -404,6 +410,7 @@ static void RunGeneratedImageTests()
     TestXfsFallbackPolicy();
     TestFileSystemExporterUnexpectedEofDiagnostics();
     TestPendingEditContentStore();
+    TestPendingEditSequenceValidation();
     Test4KnGptParsing();
     TestGeneratedMdRaid1Image();
     TestGeneratedMdRaid0Image();
@@ -3537,6 +3544,53 @@ static void TestXfsExtentDecoding()
         "XFS extent rejects AG boundary crossing");
 }
 
+static void PrepareLzopInteropFixture(string outputDirectory)
+{
+    outputDirectory = Path.GetFullPath(outputDirectory);
+    Directory.CreateDirectory(outputDirectory);
+    if (Directory.EnumerateFileSystemEntries(outputDirectory).Any())
+    {
+        throw new IOException($"LZO相互検証の出力フォルダーは空である必要があります: {outputDirectory}");
+    }
+
+    var sourcePath = Path.Combine(outputDirectory, "interop-source.dd.lzo");
+    TestImageFactory.CreateExt4LzopDisk(sourcePath);
+    using var reader = new LzopDiskImageReader(sourcePath);
+    var exportedBlocks = new HashSet<int>();
+    foreach (var rawOffset in new[] { 0L, reader.Length / 3, reader.Length / 3 * 2, reader.Length - 1 })
+    {
+        var temporaryPath = Path.Combine(outputDirectory, $"candidate-{rawOffset:X}.lzo");
+        var block = reader.ExportVerificationBlock(rawOffset, temporaryPath);
+        if (!exportedBlocks.Add(block.BlockIndex))
+        {
+            File.Delete(temporaryPath);
+            continue;
+        }
+
+        var blockPath = Path.Combine(outputDirectory, $"block-{block.BlockIndex:D6}.lzo");
+        File.Move(temporaryPath, blockPath);
+        var expectedPath = Path.Combine(outputDirectory, $"block-{block.BlockIndex:D6}.expected.raw");
+        var expected = new byte[block.BlockRawSize];
+        reader.ReadAt(block.BlockRawOffset, expected, 0, expected.Length);
+        File.WriteAllBytes(expectedPath, expected);
+        Console.WriteLine(
+            $"block={block.BlockIndex};requestedOffset={rawOffset};blockRawOffset={block.BlockRawOffset};"
+            + $"blockRawSize={block.BlockRawSize};lzo={blockPath};expected={expectedPath}");
+    }
+
+    if (exportedBlocks.Count < 2)
+    {
+        throw new InvalidDataException("LZO相互検証用に複数blockを生成できませんでした。");
+    }
+
+    if (!LzopIndexCacheManager.TryDelete(
+            Path.GetFileName(LzopIndexCacheManager.GetCachePath(sourcePath)),
+            out var cacheDeleteError))
+    {
+        Console.Error.WriteLine($"LZO interop index cache cleanup warning: {cacheDeleteError}");
+    }
+}
+
 static void TestXfsFallbackPolicy()
 {
     Assert(
@@ -4735,6 +4789,24 @@ static void TestGeneratedLzopExt4Image()
         progressEvents.Any(item => item.Message.Contains("ブロック展開", StringComparison.Ordinal)),
         "dd.lzo decompression progress");
 
+    var verificationBlockPath = Path.Combine(AppContext.BaseDirectory, "sample-ext4-verification-block.lzo");
+    File.Delete(verificationBlockPath);
+    var verificationBlock = ((LzopDiskImageReader)reader).ExportVerificationBlock(60 * 1024, verificationBlockPath);
+    var verificationIndexPath = LzopIndexCacheManager.GetCachePath(verificationBlockPath);
+    File.Delete(verificationIndexPath);
+    using (var verificationReader = new LzopDiskImageReader(verificationBlockPath))
+    {
+        Assert(verificationReader.Length == verificationBlock.BlockRawSize, "dd.lzo verification export block size");
+        var expectedBlock = new byte[verificationBlock.BlockRawSize];
+        var actualBlock = new byte[verificationBlock.BlockRawSize];
+        reader.ReadAt(verificationBlock.BlockRawOffset, expectedBlock, 0, expectedBlock.Length);
+        verificationReader.ReadAt(0, actualBlock, 0, actualBlock.Length);
+        Assert(actualBlock.SequenceEqual(expectedBlock), "dd.lzo verification export round trip");
+    }
+
+    File.Delete(verificationBlockPath);
+    File.Delete(verificationIndexPath);
+
     var fastProgressEvents = new List<DiskImageProgress>();
     var fastTemporaryRoot = Path.Combine(AppContext.BaseDirectory, "lzo-fast-temporary-root");
     if (Directory.Exists(fastTemporaryRoot))
@@ -5180,6 +5252,73 @@ static void TestPendingEditContentStore()
     Assert(!Directory.Exists(storeRoot), "pending edit store cleanup on dispose");
     Assert(File.Exists(sourcePath), "pending edit source survives store cleanup");
     Directory.Delete(basePath, recursive: true);
+}
+
+static void TestPendingEditSequenceValidation()
+{
+    var contentPath = Path.Combine(AppContext.BaseDirectory, "pending-sequence-content.bin");
+    File.WriteAllBytes(contentPath, [1, 2, 3, 4]);
+    try
+    {
+        var fileSystem = new PlannedEditFixtureFileSystem();
+        PendingFileEdit[] valid =
+        [
+            new(FileEditOperationKind.CreateDirectory, "/Work"),
+            new(FileEditOperationKind.CreateFile, "/Work/new.txt", contentPath),
+            new(FileEditOperationKind.WriteContent, "/Work/new.txt", contentPath),
+            new(FileEditOperationKind.MoveEntry, "/Work/new.txt", DestinationVirtualPath: "/Work/renamed.txt"),
+            new(FileEditOperationKind.SetAttributes, "/Work/renamed.txt", Attributes: FileAttributes.Archive),
+            new(FileEditOperationKind.DeleteFile, "/Work/renamed.txt"),
+            new(FileEditOperationKind.DeleteDirectory, "/Work"),
+        ];
+        Assert(PendingEditSequenceValidator.Validate(fileSystem, valid).Count == 0, "pending sequence valid create-edit-move-delete chain");
+
+        var duplicate = PendingEditSequenceValidator.Validate(
+            fileSystem,
+            [
+                new PendingFileEdit(FileEditOperationKind.CreateFile, "/new.txt", contentPath),
+                new PendingFileEdit(FileEditOperationKind.CreateFile, "/NEW.TXT", contentPath),
+            ]);
+        Assert(duplicate is [{ EditIndex: 1 }], "pending sequence case-insensitive duplicate create");
+
+        var deletedWrite = PendingEditSequenceValidator.Validate(
+            fileSystem,
+            [
+                new PendingFileEdit(FileEditOperationKind.DeleteFile, "/keep.txt"),
+                new PendingFileEdit(FileEditOperationKind.WriteContent, "/keep.txt", contentPath),
+            ]);
+        Assert(deletedWrite is [{ EditIndex: 1 }], "pending sequence write after delete conflict");
+
+        var movedDirectory = PendingEditSequenceValidator.Validate(
+            fileSystem,
+            [
+                new PendingFileEdit(FileEditOperationKind.MoveEntry, "/Folder", DestinationVirtualPath: "/Moved"),
+                new PendingFileEdit(FileEditOperationKind.WriteContent, "/Moved/item.bin", contentPath),
+                new PendingFileEdit(FileEditOperationKind.WriteContent, "/Folder/item.bin", contentPath),
+            ]);
+        Assert(movedDirectory is [{ EditIndex: 2 }], "pending sequence follows moved directory descendants");
+
+        var nonemptyDelete = PendingEditSequenceValidator.Validate(
+            fileSystem,
+            [new PendingFileEdit(FileEditOperationKind.DeleteDirectory, "/Folder")]);
+        Assert(nonemptyDelete is [{ EditIndex: 0 }], "pending sequence rejects nonempty directory delete");
+        var emptiedDelete = PendingEditSequenceValidator.Validate(
+            fileSystem,
+            [
+                new PendingFileEdit(FileEditOperationKind.DeleteFile, "/Folder/item.bin"),
+                new PendingFileEdit(FileEditOperationKind.DeleteDirectory, "/Folder"),
+            ]);
+        Assert(emptiedDelete.Count == 0, "pending sequence accepts child delete before directory delete");
+
+        var missingContent = PendingEditSequenceValidator.Validate(
+            fileSystem,
+            [new PendingFileEdit(FileEditOperationKind.CreateFile, "/missing-source.bin", contentPath + ".missing")]);
+        Assert(missingContent is [{ EditIndex: 0 }], "pending sequence rejects missing input content");
+    }
+    finally
+    {
+        File.Delete(contentPath);
+    }
 }
 
 static void TestGeneratedVmaLzopImage()
@@ -9306,4 +9445,32 @@ internal sealed class ExternalEditFixtureFileSystem : IReadOnlyFileSystem
         var available = checked((int)Math.Min(Math.Min(count, 257 * 1024), _data.LongLength - offset));
         return _data.AsSpan(checked((int)offset), available).ToArray();
     }
+}
+
+internal sealed class PlannedEditFixtureFileSystem : IReadOnlyFileSystem
+{
+    private readonly VfsNode _folder = new() { Name = "Folder", VirtualPath = "/Folder", IsDirectory = true };
+
+    public string Name => "NTFS";
+    public PartitionInfo Partition { get; } = new();
+    public VfsNode Root { get; } = new() { VirtualPath = "/", IsDirectory = true };
+
+    public IReadOnlyList<VfsNode> ListDirectory(VfsNode directory)
+    {
+        if (ReferenceEquals(directory, Root))
+        {
+            return
+            [
+                new VfsNode { Name = "keep.txt", VirtualPath = "/keep.txt", Size = 4 },
+                _folder,
+                new VfsNode { Name = "Empty", VirtualPath = "/Empty", IsDirectory = true },
+            ];
+        }
+
+        return ReferenceEquals(directory, _folder)
+            ? [new VfsNode { Name = "item.bin", VirtualPath = "/Folder/item.bin", Size = 4 }]
+            : Array.Empty<VfsNode>();
+    }
+
+    public byte[] ReadFile(VfsNode file, long offset, int count) => new byte[count];
 }

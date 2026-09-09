@@ -44,6 +44,8 @@ public partial class Form1 : Form
     private readonly ListView _pendingEditList = new() { Dock = DockStyle.Fill, View = View.Details, FullRowSelect = true, GridLines = true, MultiSelect = true };
     private readonly Button _pendingReplaceContentButton = new() { Text = "内容元を差し替え...", AutoSize = true, Enabled = false };
     private readonly Button _pendingExternalEditButton = new() { Text = "外部エディターで編集...", AutoSize = true, Enabled = false };
+    private readonly Button _pendingMoveUpButton = new() { Text = "上へ", AutoSize = true, Enabled = false };
+    private readonly Button _pendingMoveDownButton = new() { Text = "下へ", AutoSize = true, Enabled = false };
     private readonly List<PendingFileEdit> _pendingFileEdits = [];
     private readonly TabControl _explorerDetailTabs = new() { Dock = DockStyle.Fill };
     private readonly ListView _mountList = new() { Dock = DockStyle.Fill, View = View.Details, FullRowSelect = true, GridLines = true, MultiSelect = true };
@@ -571,11 +573,14 @@ public partial class Form1 : Form
         _pendingEditList.Columns.Add("仮想パス", 360);
         _pendingEditList.Columns.Add("入力・設定内容", 420);
         _pendingEditList.Columns.Add("入力サイズ", 110, HorizontalAlignment.Right);
+        _pendingEditList.Columns.Add("事前確認", 300);
 
         var undoButton = new Button { Text = "選択を取り消す", AutoSize = true };
         undoButton.Click += (_, _) => UndoSelectedPendingEdits();
         _pendingReplaceContentButton.Click += (_, _) => ReplaceSelectedPendingEditContent();
         _pendingExternalEditButton.Click += async (_, _) => await EditSelectedPendingContentExternallyAsync();
+        _pendingMoveUpButton.Click += (_, _) => MoveSelectedPendingEdits(-1);
+        _pendingMoveDownButton.Click += (_, _) => MoveSelectedPendingEdits(1);
         _pendingEditList.SelectedIndexChanged += (_, _) => UpdatePendingContentButtons();
         _pendingEditList.DoubleClick += async (_, _) => await EditSelectedPendingContentExternallyAsync();
         var undoLastButton = new Button { Text = "最後を取り消す", AutoSize = true };
@@ -597,7 +602,7 @@ public partial class Form1 : Form
         {
             Dock = DockStyle.Fill,
             FlowDirection = FlowDirection.RightToLeft,
-            WrapContents = false,
+            WrapContents = true,
             Padding = new Padding(4, 2, 4, 2),
         };
         buttons.Controls.Add(saveButton);
@@ -607,10 +612,12 @@ public partial class Form1 : Form
         buttons.Controls.Add(undoButton);
         buttons.Controls.Add(_pendingExternalEditButton);
         buttons.Controls.Add(_pendingReplaceContentButton);
+        buttons.Controls.Add(_pendingMoveDownButton);
+        buttons.Controls.Add(_pendingMoveUpButton);
 
         var layout = new TableLayoutPanel { Dock = DockStyle.Fill, RowCount = 3, ColumnCount = 1 };
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 28));
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 72));
         layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         layout.Controls.Add(description, 0, 0);
         layout.Controls.Add(buttons, 0, 1);
@@ -4300,8 +4307,12 @@ public partial class Form1 : Form
         try
         {
             _pendingEditList.Items.Clear();
-            foreach (var edit in _pendingFileEdits)
+            var issues = GetPendingEditSequenceIssues()
+                .GroupBy(issue => issue.EditIndex)
+                .ToDictionary(group => group.Key, group => string.Join(" / ", group.Select(issue => issue.Message)));
+            for (var index = 0; index < _pendingFileEdits.Count; index++)
             {
+                var edit = _pendingFileEdits[index];
                 var operation = edit.Operation switch
                 {
                     FileEditOperationKind.WriteContent => "内容変更",
@@ -4340,6 +4351,16 @@ public partial class Form1 : Form
                     item.SubItems.Add("-");
                 }
 
+                if (issues.TryGetValue(index, out var issue))
+                {
+                    item.SubItems.Add(issue);
+                    item.ForeColor = Color.DarkRed;
+                }
+                else
+                {
+                    item.SubItems.Add("OK");
+                }
+
                 _pendingEditList.Items.Add(item);
             }
         }
@@ -4358,6 +4379,88 @@ public partial class Form1 : Form
             && TryGetSelectedPendingContentEdit(out _, out _, showMessage: false);
         _pendingReplaceContentButton.Enabled = enabled;
         _pendingExternalEditButton.Enabled = enabled;
+        var selected = _pendingEditList.SelectedIndices.Cast<int>().OrderBy(index => index).ToArray();
+        var canReorder = !_isWritingImage && !_isLoadingImage && selected.Length > 0;
+        _pendingMoveUpButton.Enabled = canReorder && selected[0] > 0;
+        _pendingMoveDownButton.Enabled = canReorder && selected[^1] < _pendingFileEdits.Count - 1;
+    }
+
+    private IReadOnlyList<PendingEditSequenceIssue> GetPendingEditSequenceIssues()
+    {
+        return _pendingEditFileSystem is null || _pendingFileEdits.Count == 0
+            ? Array.Empty<PendingEditSequenceIssue>()
+            : PendingEditSequenceValidator.Validate(_pendingEditFileSystem, _pendingFileEdits);
+    }
+
+    private bool ValidatePendingEditSequence(bool showMessage)
+    {
+        var issues = GetPendingEditSequenceIssues();
+        if (issues.Count == 0)
+        {
+            return true;
+        }
+
+        _explorerDetailTabs.SelectedIndex = 1;
+        if (showMessage)
+        {
+            var details = string.Join(
+                Environment.NewLine,
+                issues.Take(8).Select(issue => $"{issue.EditIndex + 1:N0}. {issue.Message}"));
+            if (issues.Count > 8)
+            {
+                details += $"{Environment.NewLine}ほか {issues.Count - 8:N0} 件";
+            }
+
+            MessageBox.Show(
+                this,
+                "変更予定の順序または対象に問題があります。［事前確認］列を確認し、必要に応じて並べ替えてください。"
+                + Environment.NewLine
+                + Environment.NewLine
+                + details,
+                "変更予定を保存できません",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+        }
+
+        return false;
+    }
+
+    private void MoveSelectedPendingEdits(int direction)
+    {
+        if (_isWritingImage || _isLoadingImage || direction is not (-1 or 1))
+        {
+            return;
+        }
+
+        var selected = _pendingEditList.SelectedIndices.Cast<int>().OrderBy(index => index).ToArray();
+        if (selected.Length == 0
+            || (direction < 0 && selected[0] == 0)
+            || (direction > 0 && selected[^1] == _pendingFileEdits.Count - 1))
+        {
+            return;
+        }
+
+        var iteration = direction < 0 ? selected : selected.Reverse().ToArray();
+        foreach (var index in iteration)
+        {
+            var destination = index + direction;
+            (_pendingFileEdits[index], _pendingFileEdits[destination]) =
+                (_pendingFileEdits[destination], _pendingFileEdits[index]);
+        }
+
+        var newSelection = selected.Select(index => index + direction).ToArray();
+        RefreshPendingEditList();
+        foreach (var index in newSelection)
+        {
+            _pendingEditList.Items[index].Selected = true;
+        }
+
+        _pendingEditList.Items[newSelection[0]].Focused = true;
+        _pendingEditList.Items[newSelection[0]].EnsureVisible();
+        var issueCount = GetPendingEditSequenceIssues().Count;
+        _statusLabel.Text = issueCount == 0
+            ? "変更予定の順序を更新しました（事前確認OK）"
+            : $"変更予定の順序を更新しました（要確認 {issueCount:N0}件）";
     }
 
     private bool TryGetSelectedPendingContentEdit(
@@ -4554,6 +4657,11 @@ public partial class Form1 : Form
             return;
         }
 
+        if (!ValidatePendingEditSequence(showMessage: true))
+        {
+            return;
+        }
+
         var isLogicalOutput = _pendingEditFileSystem.Partition.ReaderOverride is not null;
         using var outputDialog = new SaveFileDialog
         {
@@ -4613,6 +4721,7 @@ public partial class Form1 : Form
         using var cancellation = new CancellationTokenSource();
         _writeCancellation = cancellation;
         _isWritingImage = true;
+        UpdatePendingContentButtons();
         _cancelWriteButton.Enabled = true;
         _writeProgressBar.Visible = true;
         _writeProgressBar.Style = ProgressBarStyle.Marquee;
@@ -4668,6 +4777,7 @@ public partial class Form1 : Form
         {
             _writeCancellation = null;
             _isWritingImage = false;
+            UpdatePendingContentButtons();
             _cancelWriteButton.Enabled = false;
             _writeProgressBar.Visible = false;
             _writeProgressBar.Value = 0;
@@ -4704,6 +4814,11 @@ public partial class Form1 : Form
             return;
         }
 
+        if (!ValidatePendingEditSequence(showMessage: true))
+        {
+            return;
+        }
+
         if (!PhysicalDiskEditService.CanApply(
                 _reader,
                 _pendingEditFileSystem.Partition,
@@ -4734,6 +4849,7 @@ public partial class Form1 : Form
         using var cancellation = new CancellationTokenSource();
         _writeCancellation = cancellation;
         _isWritingImage = true;
+        UpdatePendingContentButtons();
         _cancelWriteButton.Enabled = true;
         _writeProgressBar.Visible = true;
         _writeProgressBar.Style = ProgressBarStyle.Marquee;
@@ -4837,6 +4953,7 @@ public partial class Form1 : Form
             using var cancellation = new CancellationTokenSource();
             _writeCancellation = cancellation;
             _isWritingImage = true;
+            UpdatePendingContentButtons();
             _cancelWriteButton.Enabled = true;
             _writeProgressBar.Visible = true;
             _writeProgressBar.Style = ProgressBarStyle.Marquee;
@@ -4906,6 +5023,7 @@ public partial class Form1 : Form
     {
         _writeCancellation = null;
         _isWritingImage = false;
+        UpdatePendingContentButtons();
         _cancelWriteButton.Enabled = false;
         _writeProgressBar.Visible = false;
         _writeProgressBar.Value = 0;
