@@ -50,7 +50,11 @@ public static class LzopRawCacheManager
         }
 
         var entries = new List<LzopRawCacheEntry>();
-        foreach (var directory in Directory.EnumerateDirectories(root))
+        foreach (var directory in Directory.EnumerateDirectories(root)
+                     .Where(directory => !string.Equals(
+                         Path.GetFileName(directory),
+                         "Index",
+                         StringComparison.OrdinalIgnoreCase)))
         {
             var metadata = TryReadMetadata(directory);
             if (metadata is null)

@@ -46,7 +46,7 @@ internal sealed partial class XfsRawFileSystem
         {
             return new XfsRawFileSystem(reader);
         }
-        catch (Exception ex) when (ex is IOException or InvalidDataException or ArgumentOutOfRangeException or NotSupportedException)
+        catch (NotSupportedException)
         {
             return null;
         }

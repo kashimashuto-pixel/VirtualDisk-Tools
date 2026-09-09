@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.ComponentModel;
 using System.Globalization;
 using System.IO.Compression;
 using System.Formats.Tar;
@@ -86,6 +87,24 @@ if (args.Length > 1 && string.Equals(args[0], "--probe-physical", StringComparis
         Console.WriteLine($"Access denied as expected without elevation: {ex.Message}");
     }
 
+    return;
+}
+
+if (args.Length == 7 && string.Equals(args[0], "--physical-vhdx-integration", StringComparison.OrdinalIgnoreCase))
+{
+    TestPhysicalVhdxIntegration(
+        args[1],
+        long.Parse(args[2], CultureInfo.InvariantCulture),
+        long.Parse(args[3], CultureInfo.InvariantCulture),
+        args[4],
+        args[5],
+        args[6]);
+    return;
+}
+
+if (args.Length == 2 && string.Equals(args[0], "--physical-system-disk-refusal", StringComparison.OrdinalIgnoreCase))
+{
+    TestPhysicalSystemDiskRefusal(args[1]);
     return;
 }
 
@@ -382,7 +401,9 @@ static void RunGeneratedImageTests()
     TestLuks2Unlock();
     TestXfsTimestampDecoding();
     TestXfsExtentDecoding();
+    TestXfsFallbackPolicy();
     TestFileSystemExporterUnexpectedEofDiagnostics();
+    TestPendingEditContentStore();
     Test4KnGptParsing();
     TestGeneratedMdRaid1Image();
     TestGeneratedMdRaid0Image();
@@ -3516,6 +3537,25 @@ static void TestXfsExtentDecoding()
         "XFS extent rejects AG boundary crossing");
 }
 
+static void TestXfsFallbackPolicy()
+{
+    Assert(
+        XfsFileSystem.ShouldFallbackToDiscUtils(new NotSupportedException("unsupported layout")),
+        "XFS unsupported raw layout can fall back to DiscUtils");
+    Assert(
+        !XfsFileSystem.ShouldFallbackToDiscUtils(new InvalidDataException("corrupt metadata")),
+        "XFS corrupt raw metadata must not fall back");
+    Assert(
+        !XfsFileSystem.ShouldFallbackToDiscUtils(new IOException("read failure")),
+        "XFS raw I/O failure must not fall back");
+    Assert(
+        !XfsFileSystem.ShouldFallbackToDiscUtils(new OperationCanceledException()),
+        "XFS cancellation must not fall back");
+    Assert(
+        !XfsFileSystem.ShouldFallbackToDiscUtils(new OutOfMemoryException()),
+        "XFS fatal runtime failure must not fall back");
+}
+
 static void TestFileSystemExporterUnexpectedEofDiagnostics()
 {
     var fileSystem = new UnexpectedEofFileSystem();
@@ -4571,16 +4611,85 @@ static void TestGeneratedLzopExt4Image()
 {
     var imagePath = Path.Combine(AppContext.BaseDirectory, "sample-ext4.dd.lzo");
     TestImageFactory.CreateExt4LzopDisk(imagePath);
+    var indexCachePath = LzopIndexCacheManager.GetCachePath(imagePath);
+    File.Delete(indexCachePath);
 
     var progressEvents = new List<DiskImageProgress>();
     using var reader = DiskImageReaderFactory.Open(
         imagePath,
         new CallbackProgress<DiskImageProgress>(progressEvents.Add));
     Assert(reader is LzopDiskImageReader, "dd.lzo reader factory");
+    Assert(reader is LzopDiskImageReader { UsedCachedIndex: false }, "dd.lzo first index build");
+    Assert(File.Exists(indexCachePath), "dd.lzo index cache created");
     Assert(reader.FormatName.Contains("lzop", StringComparison.OrdinalIgnoreCase), "dd.lzo format name");
     Assert(
         progressEvents.Any(item => item.Message.Contains("索引作成", StringComparison.Ordinal)),
         "dd.lzo index progress");
+
+    using (var cachedIndexReader = new LzopDiskImageReader(imagePath))
+    {
+        Assert(cachedIndexReader.UsedCachedIndex, "dd.lzo unchanged index cache reuse");
+        Assert(cachedIndexReader.Length == reader.Length, "dd.lzo cached index raw length");
+    }
+
+    var indexEntry = LzopIndexCacheManager.GetEntries()
+        .Single(entry => string.Equals(entry.CachePath, Path.GetFullPath(indexCachePath), StringComparison.OrdinalIgnoreCase));
+    Assert(indexEntry is { IsUsable: true, SourceIsCurrent: true }, "dd.lzo usable index cache metadata");
+    Assert(indexEntry.StoredBytes > 0 && indexEntry.StoredBytes < reader.Length, "dd.lzo compact index cache size");
+    Assert(!LzopIndexCacheManager.TryDelete("..\\outside.lzop-index.br", out _), "dd.lzo index cache rejects parent deletion");
+    var partialIndexCachePath = indexCachePath + ".partial";
+    File.WriteAllBytes(partialIndexCachePath, [1, 2, 3]);
+    var partialIndexEntry = LzopIndexCacheManager.GetEntries()
+        .Single(entry => string.Equals(entry.CachePath, Path.GetFullPath(partialIndexCachePath), StringComparison.OrdinalIgnoreCase));
+    Assert(!partialIndexEntry.IsUsable, "dd.lzo incomplete index cache detection");
+    Assert(
+        LzopIndexCacheManager.TryDelete(Path.GetFileName(partialIndexCachePath), out var partialIndexDeleteError),
+        partialIndexDeleteError);
+    Assert(!File.Exists(partialIndexCachePath), "dd.lzo incomplete index cache deletion");
+
+    File.WriteAllBytes(indexCachePath, [1, 2, 3]);
+    indexEntry = LzopIndexCacheManager.GetEntries()
+        .Single(entry => string.Equals(entry.CachePath, Path.GetFullPath(indexCachePath), StringComparison.OrdinalIgnoreCase));
+    Assert(!indexEntry.IsUsable && !string.IsNullOrWhiteSpace(indexEntry.Error), "dd.lzo corrupt index cache detection");
+    using (var rebuiltIndexReader = new LzopDiskImageReader(imagePath))
+    {
+        Assert(!rebuiltIndexReader.UsedCachedIndex, "dd.lzo corrupt index cache rebuild");
+        Assert(rebuiltIndexReader.Length == reader.Length, "dd.lzo rebuilt index raw length");
+    }
+
+    using (var recachedIndexReader = new LzopDiskImageReader(imagePath))
+    {
+        Assert(recachedIndexReader.UsedCachedIndex, "dd.lzo rebuilt index cache reuse");
+    }
+
+    var changedIndexSourcePath = Path.Combine(AppContext.BaseDirectory, "sample-ext4-index-changed.dd.lzo");
+    File.Copy(imagePath, changedIndexSourcePath, overwrite: true);
+    var changedIndexCachePath = LzopIndexCacheManager.GetCachePath(changedIndexSourcePath);
+    File.Delete(changedIndexCachePath);
+    using (var changedIndexReader = new LzopDiskImageReader(changedIndexSourcePath))
+    {
+        Assert(!changedIndexReader.UsedCachedIndex, "dd.lzo changed-source index fixture created");
+    }
+
+    var changedIndexWriteTime = File.GetLastWriteTimeUtc(changedIndexSourcePath);
+    using (var changedIndexSource = new FileStream(changedIndexSourcePath, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+    {
+        var firstByte = changedIndexSource.ReadByte();
+        Assert(firstByte >= 0, "dd.lzo changed-source index fixture is nonempty");
+        changedIndexSource.Position = 0;
+        changedIndexSource.WriteByte((byte)(firstByte ^ 0xff));
+    }
+
+    File.SetLastWriteTimeUtc(changedIndexSourcePath, changedIndexWriteTime);
+    var changedIndexEntry = LzopIndexCacheManager.GetEntries()
+        .Single(entry => string.Equals(entry.CachePath, Path.GetFullPath(changedIndexCachePath), StringComparison.OrdinalIgnoreCase));
+    Assert(
+        changedIndexEntry is { IsUsable: false, SourceIsCurrent: false, Status: "元LZO変更" },
+        "dd.lzo index fingerprint detects same-length same-time source replacement");
+    Assert(
+        LzopIndexCacheManager.TryDelete(Path.GetFileName(changedIndexCachePath), out var changedIndexDeleteError),
+        changedIndexDeleteError);
+    File.Delete(changedIndexSourcePath);
 
     var partition = new PartitionInfo
     {
@@ -5004,6 +5113,73 @@ static void TestGeneratedLzopExt4Image()
     {
         File.Delete(corruptedBlockPath);
     }
+
+    Assert(
+        LzopIndexCacheManager.TryDelete(Path.GetFileName(indexCachePath), out var indexDeleteError),
+        indexDeleteError);
+    Assert(!File.Exists(indexCachePath), "dd.lzo index cache manager deletion");
+}
+
+static void TestPendingEditContentStore()
+{
+    Assert(ExternalEditorSafety.CanOpenWithAssociatedApplication("notes.txt"), "external editor allows associated text editor");
+    Assert(ExternalEditorSafety.CanOpenWithAssociatedApplication("disk-image.bin"), "external editor allows associated binary editor");
+    Assert(!ExternalEditorSafety.CanOpenWithAssociatedApplication("payload.EXE"), "external editor blocks associated executable launch");
+    Assert(!ExternalEditorSafety.CanOpenWithAssociatedApplication("script.cmd"), "external editor blocks associated command launch");
+    Assert(!ExternalEditorSafety.CanOpenWithAssociatedApplication("shortcut.lnk"), "external editor blocks associated shortcut launch");
+
+    var basePath = Path.Combine(AppContext.BaseDirectory, "pending-edit-content-store");
+    if (Directory.Exists(basePath))
+    {
+        Directory.Delete(basePath, recursive: true);
+    }
+
+    Directory.CreateDirectory(basePath);
+    var sourcePath = Path.Combine(basePath, "source.txt");
+    File.WriteAllText(sourcePath, "first content", new UTF8Encoding(false));
+    string storeRoot;
+    using (var store = new PendingEditContentStore(basePath))
+    {
+        storeRoot = store.RootPath;
+        var hostWorking = store.CreateWorkingCopy(sourcePath, "host-copy.txt");
+        Assert(store.OwnsPath(hostWorking), "pending edit store owns host working copy");
+        Assert(File.ReadAllText(hostWorking) == "first content", "pending edit host working copy content");
+
+        var emptyWorking = store.CreateEmptyWorkingCopy("new-file.txt");
+        Assert(new FileInfo(emptyWorking).Length == 0, "pending edit empty external working copy");
+        File.WriteAllText(emptyWorking, "edited externally", new UTF8Encoding(false));
+        using (var heldForWrite = new FileStream(emptyWorking, FileMode.Open, FileAccess.Write, FileShare.Read))
+        {
+            try
+            {
+                _ = store.CaptureWorkingCopy(emptyWorking, "new-file.txt");
+                Assert(false, "pending edit refuses capture while external writer remains open");
+            }
+            catch (IOException)
+            {
+            }
+        }
+
+        var captured = store.CaptureWorkingCopy(emptyWorking, "new-file.txt");
+        Assert(File.ReadAllText(captured) == "edited externally", "pending edit external snapshot content");
+        File.AppendAllText(emptyWorking, " later", new UTF8Encoding(false));
+        Assert(File.ReadAllText(captured) == "edited externally", "pending edit snapshot is isolated from later editor writes");
+
+        var virtualData = Enumerable.Range(0, 1024 * 1024 + 17).Select(index => (byte)(index * 31)).ToArray();
+        var fileSystem = new ExternalEditFixtureFileSystem(virtualData);
+        var virtualWorking = store.CreateWorkingCopy(fileSystem, fileSystem.File);
+        Assert(File.ReadAllBytes(virtualWorking).SequenceEqual(virtualData), "pending edit virtual file working copy content");
+
+        Assert(!store.OwnsPath(sourcePath), "pending edit store rejects outside ownership");
+        Assert(!store.TryDeleteOwnedFile(sourcePath), "pending edit store refuses outside deletion");
+        Assert(File.Exists(sourcePath), "pending edit outside file remains after refused deletion");
+        Assert(store.TryDeleteOwnedFile(hostWorking), "pending edit owned working copy deletion");
+        Assert(!File.Exists(hostWorking), "pending edit owned working copy removed");
+    }
+
+    Assert(!Directory.Exists(storeRoot), "pending edit store cleanup on dispose");
+    Assert(File.Exists(sourcePath), "pending edit source survives store cleanup");
+    Directory.Delete(basePath, recursive: true);
 }
 
 static void TestGeneratedVmaLzopImage()
@@ -5437,6 +5613,174 @@ static void TestPhysicalDiskCommitEngine()
     }
 
     Assert(corruptMetadataRejected, "physical commit corrupt metadata rejection");
+
+    var scanDirectory = Path.Combine(AppContext.BaseDirectory, "physical-journal-scan");
+    Directory.CreateDirectory(scanDirectory);
+    foreach (var existing in Directory.EnumerateFiles(scanDirectory))
+    {
+        File.Delete(existing);
+    }
+
+    var preparedPath = Path.Combine(scanDirectory, "prepared.vdt-recovery");
+    var committedPath = Path.Combine(scanDirectory, "committed.vdt-recovery");
+    PhysicalDiskRecoveryJournal.Create(preparedPath, targetInfo, pages);
+    PhysicalDiskRecoveryJournal.Create(committedPath, targetInfo, pages);
+    PhysicalDiskRecoveryJournal.SetState(committedPath, PhysicalDiskRecoveryState.Committed);
+    File.WriteAllText(Path.Combine(scanDirectory, "invalid.vdt-recovery"), "not a recovery journal");
+    var scan = PhysicalDiskRecoveryJournalLocator.Scan(scanDirectory);
+    Assert(scan.Prepared.Count == 1, "physical recovery locator only returns prepared journals");
+    Assert(scan.Prepared[0].Path == Path.GetFullPath(preparedPath), "physical recovery locator path");
+    Assert(scan.Prepared[0].Target == targetInfo, "physical recovery locator target");
+    Assert(scan.Unreadable.Count == 1, "physical recovery locator reports corrupt journals");
+    Assert(
+        scan.Unreadable[0].Path == Path.GetFullPath(Path.Combine(scanDirectory, "invalid.vdt-recovery")),
+        "physical recovery locator corrupt path");
+    Assert(!string.IsNullOrWhiteSpace(scan.Unreadable[0].Error), "physical recovery locator corrupt diagnostics");
+}
+
+static void TestPhysicalVhdxIntegration(
+    string devicePath,
+    long expectedLength,
+    long writeOffset,
+    string markerPath,
+    string expectedMarker,
+    string journalPath)
+{
+    const long requiredLength = 96L * 1024 * 1024;
+    const long requiredWriteOffset = 64L * 1024 * 1024;
+    if (!OperatingSystem.IsWindows())
+    {
+        throw new PlatformNotSupportedException("The physical VHDX integration test requires Windows.");
+    }
+
+    Assert(expectedLength == requiredLength, "VHDX integration requires the fixed test capacity");
+    Assert(writeOffset == requiredWriteOffset, "VHDX integration requires the fixed test write offset");
+    Assert(
+        expectedMarker.StartsWith("VDT-PHYSICAL-INTEGRATION-", StringComparison.Ordinal)
+        && expectedMarker.Length == "VDT-PHYSICAL-INTEGRATION-".Length + 32
+        && expectedMarker["VDT-PHYSICAL-INTEGRATION-".Length..].All(Uri.IsHexDigit),
+        "VHDX integration marker format");
+
+    var target = PhysicalDiskWriteSession.Inspect(devicePath);
+    Console.WriteLine(
+        $"VHDX target inspected: disk={target.DiskNumber}, length={target.Length}, "
+        + $"sector={target.LogicalSectorSize}, model={target.Model}, bus={target.BusType}, "
+        + $"serialPresent={!string.IsNullOrWhiteSpace(target.SerialNumber)}, "
+        + $"identityPresent={!string.IsNullOrWhiteSpace(target.IdentityToken)}");
+    Assert(target.Length == expectedLength, "VHDX integration target length");
+    Assert(!target.IsSystemDisk, "VHDX integration target is not the Windows system disk");
+    Assert(!target.IsRemovable, "VHDX integration target is a fixed disk");
+    Assert(File.ReadAllText(markerPath) == expectedMarker, "VHDX integration marker content");
+    Assert(
+        PhysicalDiskWriteSession.IsPathOnDisk(markerPath, target.DiskNumber),
+        "VHDX integration marker belongs to target disk");
+    Assert(
+        target.BusType is "Virtual" or "File Backed Virtual" or "Unknown",
+        $"VHDX integration target bus type is virtual or unavailable (actual: {target.BusType})");
+    if (string.IsNullOrWhiteSpace(target.SerialNumber) && string.IsNullOrWhiteSpace(target.IdentityToken))
+    {
+        Console.WriteLine(
+            "The VHDX exposes no stable storage identity; product-level CanApply refusal remains expected. "
+            + "The integration harness instead binds the new Hyper-V disk number to an in-volume random marker.");
+    }
+    Assert(
+        !PhysicalDiskWriteSession.IsPathOnDisk(journalPath, target.DiskNumber),
+        "VHDX integration journal is stored on another disk");
+
+    var pageLength = Math.Max(4096, checked((int)target.LogicalSectorSize));
+    Assert(writeOffset % target.LogicalSectorSize == 0, "VHDX integration write offset alignment");
+    Assert(writeOffset >= 48L * 1024 * 1024, "VHDX integration write stays beyond the test partition");
+    Assert(writeOffset <= target.Length - pageLength - 1024 * 1024, "VHDX integration write stays before backup GPT metadata");
+    journalPath = Path.GetFullPath(journalPath);
+    if (File.Exists(journalPath) || Directory.Exists(journalPath))
+    {
+        throw new IOException($"Integration journal path already exists: {journalPath}");
+    }
+
+    byte[] original;
+    byte[] modified;
+    using (var session = OpenPhysicalSessionWithRetry(target))
+    {
+        Assert(session.LockedVolumes.Count > 0, "VHDX integration locked at least one volume");
+        original = new byte[pageLength];
+        session.ReadAt(writeOffset, original, 0, original.Length);
+        modified = original.ToArray();
+        for (var index = 0; index < modified.Length; index++)
+        {
+            modified[index] ^= (byte)(0x5a + index % 37);
+        }
+
+        PhysicalDiskCommitEngine.Apply(
+            session,
+            session.Target,
+            [new CopyOnWritePage(writeOffset, original, modified)],
+            journalPath);
+        Assert(
+            PhysicalDiskRecoveryJournal.Read(journalPath).State == PhysicalDiskRecoveryState.Committed,
+            "VHDX integration committed journal state");
+    }
+
+    using (var session = OpenPhysicalSessionWithRetry(target))
+    {
+        PhysicalDiskCommitEngine.Restore(session, session.Target, journalPath);
+        var restored = new byte[original.Length];
+        session.ReadAt(writeOffset, restored, 0, restored.Length);
+        Assert(restored.SequenceEqual(original), "VHDX integration restored original bytes");
+    }
+
+    Assert(
+        PhysicalDiskRecoveryJournal.Read(journalPath).State == PhysicalDiskRecoveryState.RolledBack,
+        "VHDX integration rolled-back journal state");
+
+    var lockRefused = false;
+    using (var heldFile = new FileStream(markerPath, FileMode.Open, FileAccess.Read, FileShare.Read))
+    {
+        try
+        {
+            using var unexpected = PhysicalDiskWriteSession.Open(target);
+        }
+        catch (Win32Exception)
+        {
+            lockRefused = true;
+        }
+    }
+
+    Assert(lockRefused, "VHDX integration refuses a disk whose volume cannot be locked");
+    Console.WriteLine(
+        $"Physical VHDX integration passed: disk={target.DiskNumber}, bus={target.BusType}, "
+        + $"sector={target.LogicalSectorSize}, offset={writeOffset}, journal={journalPath}");
+}
+
+static PhysicalDiskWriteSession OpenPhysicalSessionWithRetry(PhysicalDiskTargetInfo target)
+{
+    const int retryCount = 10;
+    for (var attempt = 1; ; attempt++)
+    {
+        try
+        {
+            return PhysicalDiskWriteSession.Open(target);
+        }
+        catch (Win32Exception ex) when (ex.NativeErrorCode == 5 && attempt < retryCount)
+        {
+            Console.WriteLine($"Volume lock is temporarily unavailable; retrying ({attempt}/{retryCount - 1}).");
+            Thread.Sleep(500);
+        }
+    }
+}
+
+static void TestPhysicalSystemDiskRefusal(string devicePath)
+{
+    var target = PhysicalDiskWriteSession.Inspect(devicePath);
+    Assert(target.IsSystemDisk, "system-disk refusal test target is the running Windows system disk");
+    try
+    {
+        using var unexpected = PhysicalDiskWriteSession.Open(target);
+        throw new InvalidOperationException("The running Windows system disk was opened for writing.");
+    }
+    catch (NotSupportedException)
+    {
+        Console.WriteLine($"Physical system-disk refusal passed: {target.DevicePath}");
+    }
 }
 
 static void TestExt4SameLengthReplacement()
@@ -8938,4 +9282,28 @@ internal sealed class UnexpectedEofFileSystem : IReadOnlyFileSystem
     public IReadOnlyList<VfsNode> ListDirectory(VfsNode directory) => Array.Empty<VfsNode>();
 
     public byte[] ReadFile(VfsNode file, long offset, int count) => offset == 0 ? new byte[count] : Array.Empty<byte>();
+}
+
+internal sealed class ExternalEditFixtureFileSystem : IReadOnlyFileSystem
+{
+    private readonly byte[] _data;
+
+    public ExternalEditFixtureFileSystem(byte[] data)
+    {
+        _data = data;
+        File = new VfsNode { Name = "virtual-edit.bin", Size = data.LongLength };
+    }
+
+    public string Name => "External edit fixture";
+    public PartitionInfo Partition { get; } = new();
+    public VfsNode Root { get; } = new() { IsDirectory = true };
+    public VfsNode File { get; }
+
+    public IReadOnlyList<VfsNode> ListDirectory(VfsNode directory) => [File];
+
+    public byte[] ReadFile(VfsNode file, long offset, int count)
+    {
+        var available = checked((int)Math.Min(Math.Min(count, 257 * 1024), _data.LongLength - offset));
+        return _data.AsSpan(checked((int)offset), available).ToArray();
+    }
 }

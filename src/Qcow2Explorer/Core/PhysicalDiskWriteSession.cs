@@ -51,6 +51,11 @@ internal sealed class PhysicalDiskWriteSession : IDiskImageReader, IBlockDevice
     private const int ErrorNoMoreFiles = 18;
     private const int ErrorMoreData = 234;
     private const int ErrorAccessDenied = 5;
+    private const uint DriveRemovable = 2;
+    private const uint DriveFixed = 3;
+    private const uint DriveRemote = 4;
+    private const uint DriveCdRom = 5;
+    private const uint DriveRamDisk = 6;
     private const uint StorageDeviceIdProperty = 2;
     private const uint StorageDeviceUniqueIdProperty = 3;
 
@@ -100,7 +105,7 @@ internal sealed class PhysicalDiskWriteSession : IDiskImageReader, IBlockDevice
         }
 
         var normalizedPath = NormalizeDiskPath(devicePath, out var diskNumber);
-        using var handle = OpenDevice(normalizedPath, 0, writeThrough: false, "情報取得");
+        using var handle = OpenDevice(normalizedPath, GenericRead, writeThrough: false, "情報取得");
         var length = GetLength(handle);
         var sectorSize = GetSectorSize(handle);
         var descriptor = GetStorageDescriptor(handle);
@@ -190,7 +195,11 @@ internal sealed class PhysicalDiskWriteSession : IDiskImageReader, IBlockDevice
             throw new Win32Exception(Marshal.GetLastWin32Error(), "復旧ジャーナルの保存先デバイスを特定できませんでした。");
         }
 
-        using var handle = OpenDevice(volumeName.ToString().TrimEnd('\\'), 0, writeThrough: false, "保存先確認");
+        using var handle = OpenDevice(
+            volumeName.ToString().TrimEnd('\\'),
+            GenericRead,
+            writeThrough: false,
+            "保存先確認");
         return GetVolumeDiskNumbers(handle).Contains(diskNumber);
     }
 
@@ -303,8 +312,36 @@ internal sealed class PhysicalDiskWriteSession : IDiskImageReader, IBlockDevice
         {
             foreach (var volumePath in EnumerateVolumePaths())
             {
-                using var queryHandle = OpenDevice(volumePath, 0, writeThrough: false, "ボリューム確認");
-                if (!GetVolumeDiskNumbers(queryHandle).Contains(diskNumber))
+                var driveType = GetDriveTypeW(volumePath + "\\");
+                if (driveType is not DriveRemovable and not DriveFixed)
+                {
+                    if (driveType is DriveRemote or DriveCdRom or DriveRamDisk)
+                    {
+                        continue;
+                    }
+
+                    throw new IOException(
+                        $"ボリューム種別を安全に判定できませんでした: {volumePath} (driveType={driveType})");
+                }
+
+                bool belongsToTarget;
+                try
+                {
+                    using var queryHandle = OpenDevice(
+                        volumePath,
+                        GenericRead,
+                        writeThrough: false,
+                        "ボリューム確認");
+                    belongsToTarget = GetVolumeDiskNumbers(queryHandle).Contains(diskNumber);
+                }
+                catch (Win32Exception ex)
+                {
+                    throw new Win32Exception(
+                        ex.NativeErrorCode,
+                        $"ボリュームの所属ディスクを確認できませんでした: {volumePath}");
+                }
+
+                if (!belongsToTarget)
                 {
                     continue;
                 }
@@ -392,7 +429,11 @@ internal sealed class PhysicalDiskWriteSession : IDiskImageReader, IBlockDevice
         }
 
         var systemVolumePath = $@"\\.\{root[..2]}";
-        using var handle = OpenDevice(systemVolumePath, 0, writeThrough: false, "システムボリューム確認");
+        using var handle = OpenDevice(
+            systemVolumePath,
+            GenericRead,
+            writeThrough: false,
+            "システムボリューム確認");
         return GetVolumeDiskNumbers(handle).Contains(diskNumber);
     }
 
@@ -654,6 +695,9 @@ internal sealed class PhysicalDiskWriteSession : IDiskImageReader, IBlockDevice
         11 => "SATA",
         12 => "SD",
         13 => "MMC",
+        14 => "Virtual",
+        15 => "File Backed Virtual",
+        16 => "Storage Spaces",
         17 => "NVMe",
         18 => "SCM",
         19 => "UFS",
@@ -794,4 +838,7 @@ internal sealed class PhysicalDiskWriteSession : IDiskImageReader, IBlockDevice
         string volumeMountPoint,
         StringBuilder volumeName,
         int bufferLength);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern uint GetDriveTypeW(string rootPathName);
 }

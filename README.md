@@ -94,7 +94,8 @@ C# / Windows Forms で作成した、通常は原本を変更しない仮想デ�
   - 開く際に、全体を一時RAWへ展開する「高速モード」と必要なブロックだけを展開する「省容量モード」を選択
   - 高速モードでは「終了時に削除」「検証済みキャッシュとして保持・再利用」「指定場所へ通常RAWとして保存」を選択
   - キャッシュは元LZOのフルパス、サイズ、更新日時、SHA-256、展開RAWサイズ、完了状態が一致する場合だけ再利用
-  - 読み込みダイアログの「キャッシュ管理」から一覧、状態、使用容量を確認し、選択項目や未完成・破損キャッシュを削除
+  - 省容量モードのblock indexも圧縮sidecarとして保持し、元LZOのフルパス、サイズ、更新日時、先頭・末尾fingerprintと全block配置が一致する場合だけ再利用
+  - 読み込みダイアログの「キャッシュ管理」から展開RAW／省容量索引の一覧、状態、使用容量を確認し、選択項目や未完成・破損・旧形式キャッシュを削除
   - 一時・キャッシュ・通常RAWの保存先を指定でき、展開前に必要領域を事前確認・確保
   - 読み込みと解析はバックグラウンドで行い、一時RAW展開・索引作成・ブロック展開の進捗を画面上部に表示
   - キャッシュ作成または通常RAW保存のキャンセル・失敗時は、作成途中のRAWを再利用せず削除
@@ -112,9 +113,12 @@ C# / Windows Forms で作成した、通常は原本を変更しない仮想デ�
 
 ## 実験的なext4／XFS／FAT16／FAT32／NTFS／exFAT書き込み
 
-エクスプローラーの「編集（実験）」から、通常ファイルの内容変更（拡大・縮小を含む）／追加／削除、ディレクトリ作成／空ディレクトリ削除、ファイル・ディレクトリの移動／名前変更、属性・更新日時変更を変更予定へ登録できます。「変更予定」タブでは登録順、入力または設定内容、入力サイズを確認し、選択項目／最後の操作／全操作を取り消せます。保存時は全操作を上から順に同じコピーオンライト領域へ適用し、新しいRAWイメージを1個生成します。
+エクスプローラーの「編集（実験）」から、通常ファイルの内容変更（拡大・縮小を含む）／追加／削除、ディレクトリ作成／空ディレクトリ削除、ファイル・ディレクトリの移動／名前変更、属性・更新日時変更を変更予定へ登録できます。「変更予定」タブでは登録順、入力または設定内容、入力サイズを確認し、追加・内容変更予定の内容元差し替えや外部編集、選択項目／最後の操作／全操作の取り消しを行えます。保存時は全操作を上から順に同じコピーオンライト領域へ適用し、新しいRAWイメージを1個生成します。
 
 - 通常の保存では原本、物理ディスク、既存の出力ファイルへは書き込みません。変更はメモリ上のコピーオンライト領域へ保持し、最後に新しいRAWイメージとして保存します。
+- 既存ファイルは「選択ファイルを外部エディターで編集」、新規ファイルは「空ファイルを作成して外部編集」から、Windowsの既定アプリまたはその都度指定したエディターで編集できます。仮想ディスクから一時作業コピーを取り出し、外部エディターで保存後に「保存内容を取り込む」を押した時点のスナップショットだけを変更予定へ登録します。
+- 外部エディターへ元イメージや物理ディスクを直接渡しません。一時作業コピーと取り込み済み内容は、変更予定の取り消し・保存完了・イメージ切替・アプリ終了時に可能な範囲で削除します。取り込み後も外部エディターで編集を続けた場合は自動反映されないため、変更予定からもう一度外部編集してください。
+- 外部由来イメージ内のファイルをホスト側アプリで開く操作には、そのアプリ固有の脆弱性、マクロ、スクリプト等の危険があります。実行可能・スクリプト・ショートカット等の拡張子は関連付け起動を禁止し、明示指定したエディターへ引数として渡す場合だけ許可します。それ以外の信頼できない内容も、安全なエディターまたは隔離環境で扱ってください。
 - 各操作の直後にファイルシステムを再オープンし、内容変更／追加／移動はサイズとSHA-256、作成／削除はパス状態、属性／更新日時は読み戻し値を検証します。全操作後も出力RAWを再オープンして最終状態を検証できた場合だけ完成名へ移動します。失敗・キャンセル時は完成ファイルを公開しません。
 - 対象は各writerが安全に更新できる単純な構成に限定されます。dirty状態、メタデータ矛盾、スパース／未初期化extent、圧縮・暗号化・共有reflinkなどは形式に応じて事前に拒否します。XFSはv5 CRC、finobt／rmapbt、完全なinode chunk、shortform directory、単純なinline extent、正常unmount済みのclean logという制限があります。複雑なdirectory／extent btreeやreflinkは未対応です。
 - FAT16／FAT32／exFAT／NTFSではReadOnly・Hidden・System・Archive属性、ext4／XFSではUnix modeへ対応付けたReadOnly属性を編集できます。ディレクトリ種別そのものは属性変更できません。
@@ -124,8 +128,17 @@ C# / Windows Forms で作成した、通常は原本を変更しない仮想デ�
 - 置換・追加するファイルは、排他ロック前に復旧ジャーナルと同じ安全なディスクへ一時退避します。退避元が書き込み対象ディスク上にあってもロック後に読み直さないためですが、その合計サイズ分の空き容量が必要です。一時退避は処理終了時に削除します。
 - 書き込み前に全変更ページの原本一致を検証し、対象とは別のローカルディスクへ変更前・変更後ページとSHA-256を含む復旧ジャーナルを同期保存します。セクター境界へ揃えた差分だけを書き込み、ディスクへのflush、全差分の読み戻し、ファイルシステム最終状態の再検証後に完了扱いとします。
 - 書き込み・最終検証に失敗した場合は、同じ排他セッション内で変更前ページを自動復旧して読み戻します。プロセス停止や停電で中断した場合は、ツールバーの「物理ディスク復旧」からジャーナルを選択できます。ただし媒体故障や書き込み中の停電に対して完全な原子性を保証するものではありません。
+- 起動時に既定の復旧フォルダーを確認し、状態が`Prepared`のまま残っているジャーナル、または破損・読取不能なジャーナルがあれば警告します。自動復旧や対象ディスクへの自動書き込みは行いません。
 - qcow2、VHDXなどを開いた場合も、出力はコンテナー形式ではなく展開済みの論理ディスク全体を格納するRAWです。出力先には元の仮想ディスクと同程度の空き容量が必要です。
 - 実験的機能のため、重要なイメージでは使用せず、出力RAWもLinux標準ツールで検査してから利用してください。
+
+物理ディスク用Windows APIの統合テストは、管理者PowerShellから次のスクリプトで実行できます。スクリプトが新規作成した96 MiBの固定VHDXだけを接続し、対象の種類・新規ディスク番号・容量・システムディスクではないこと・VHDX内のランダムなマーカーを確認してから、パーティション外の1ページに対する書き込み、読み戻し、ジャーナル復旧を行います。既存の物理ディスクや既存VHDXは指定できません。
+
+```powershell
+.\tools\Test-PhysicalDiskVhdxIntegration.ps1
+```
+
+このテストは、開いているファイルがある場合のボリュームロック拒否と、実行中Windowsのシステムディスク書き込み拒否も確認します。成功時は一時VHDXを切断して削除し、失敗時は調査用に一時ファイルを`.tmp\physical-vhdx-integration`へ残します。Hyper-V VHDXがシリアル番号とStorage Device IDを公開しない環境では、製品UIの直接適用は設計どおり拒否されますが、統合テストはHyper-Vが返した新規ディスク番号とVHDX内のランダムマーカーを照合して下位の書き込み経路を検証します。実USB機器固有の再識別・取り外し・flush動作は別途、消去してよい試験媒体で確認する必要があります。
 
 Linux／WSLで実ext4・XFS・FAT16・FAT32・NTFS・exFATイメージを生成し、編集後に`e2fsck -fn`、`xfs_repair -n`、`fsck.fat -vn`、`ntfsfix -n`、`fsck.exfat -n`、読み取り専用マウントと内容比較を行う検証スクリプトも用意しています。
 
@@ -222,7 +235,7 @@ ProjFS マウントは Windows の Client-ProjFS 機能を使い、選択した�
 - Btrfsは単一／複数デバイスのsingle profile、RAID0、2-copy RAID1、3-copy RAID1C3、4-copy RAID1C4、striped mirrorのRAID10を読み取り専用で扱い、DEVICE_ITEM、devid、FSID、device UUIDとstripeを相互検証します。mirror profileではmetadata tree blockのCRC32Cまたはdata checksumが一致するコピーだけを採用し、破損時は検証済みの代替コピーへ切り替えます。RAID0／RAID10はchunkごとの`stripe_length`に従ってdeviceを切り替え、RAID10はさらに`sub_stripes`単位でmirrorを選択します。複数RAWはツールバーから一組として指定でき、実イメージ回帰manifestでも各companionのSHA-256を検証します。RAID0は全stripe deviceが必要です。mirror profileはchunk単位ですべてのmirror組に利用可能なstripeが残る場合だけdegraded読み取りで開き、欠損devidを警告へ表示します。subvolume、snapshot、default subvolumeとzlib・LZO・zstd圧縮extentを読み取れ、snapshot内に残る入れ子subvolume境界は元subvolumeへ誤接続せず空ディレクトリとして表示します。RAID5／6、暗号化extent、書き込みは未対応です。
 - Btrfsのsuperblock、metadata tree block、checksum treeに記録されたdata sectorのCRC32Cを検証し、不一致は読み取りを中止します。primary superblockが壊れている場合だけ、公式mirror位置（64 MiB／256 GiB）の検証済みbackupへ復旧し、primaryが有効なら常にprimaryを優先します。
 - SquashFS はライブラリが対応する圧縮形式のみ読み取れます。
-- Linux mdはmetadata 1.0／1.1／1.2のRAID0／RAID1／RAID10を読み取り専用で組み立てます。superblock checksum、array/device UUID、role、event counter、data/super offset、device範囲を検証し、同一eventのactive memberだけを使用します。RAID0はchunk単位のstriping、サイズが異なるmemberのmulti-zone original／alternate layoutに対応し、全active roleが揃わない場合は拒否します。RAID1は1台欠損、RAID10はnear／far／offset layoutとkernelのoriginal／legacy／fixed far-set配置を扱い、各mirror groupに1台以上残る構成をdegraded読み取りします。legacy far-setはLinux kernelと同じ配置を再現しますが、構成によって冗長性が低下するため、実際の論理chunkごとに利用可能なcopyを検証します。複数mirrorの内容が一致しなければ停止します。RAID4／5／6、reshape・recovery中、replacement、bad-block log付きarray、metadata 0.90は未対応です。
+- Linux mdはmetadata 1.0／1.1／1.2のRAID0／RAID1／RAID5／RAID10を読み取り専用で組み立てます。superblock checksum、array/device UUID、role、event counter、data/super offset、device範囲を検証し、同一eventのactive memberだけを使用します。RAID0はchunk単位のstriping、サイズが異なるmemberのmulti-zone original／alternate layoutに対応し、全active roleが揃わない場合は拒否します。RAID1は1台欠損、RAID10はnear／far／offset layoutとkernelのoriginal／legacy／fixed far-set配置を扱い、各mirror groupに1台以上残る構成をdegraded読み取りします。RAID5は主要6 layout（left/right asymmetric、left/right symmetric、parity-first/last）に対応し、1台欠損時はXORで復元します。複数mirrorの内容が一致しない場合や、RAID5で2台以上が欠損する場合は停止します。RAID4／6、reshape・recovery中、replacement、bad-block log付きarray、metadata 0.90は未対応です。
 - BitLockerはAES-XTS（128/256）に対応します。TPM単独保護、TPMとの複合保護、AES-CBC/Elephant Diffuserは未対応です。
 - BitLocker回復パスワード、通常パスワード、スタートアップキー、VMK、FVEKは設定・ログ・解析レポートへ保存しません。不要になったキー配列は可能な範囲で消去します。
 - LUKS1はAES-XTS/plain64の256/512-bit合成キーに対応します。detached header、AES-CBC、ESSIV、plain/plain64以外のIV方式は未対応です。

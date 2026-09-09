@@ -42,7 +42,7 @@ public sealed class XfsFileSystem : IReadOnlyFileSystem, IFileContentWriter, IFi
             {
                 return _rawReader.ListDirectory(nodeRef);
             }
-            catch (Exception ex)
+            catch (Exception ex) when (ShouldFallbackToDiscUtils(ex))
             {
                 WriteRawReadFailure(directory, nodeRef, 0, 0, ex);
             }
@@ -68,7 +68,7 @@ public sealed class XfsFileSystem : IReadOnlyFileSystem, IFileContentWriter, IFi
             {
                 return _rawReader.ReadFile(nodeRef, offset, count);
             }
-            catch (Exception ex)
+            catch (Exception ex) when (ShouldFallbackToDiscUtils(ex))
             {
                 WriteRawReadFailure(file, nodeRef, offset, count, ex);
             }
@@ -415,6 +415,9 @@ public sealed class XfsFileSystem : IReadOnlyFileSystem, IFileContentWriter, IFi
         _reader.Dispose();
         _stream.Dispose();
     }
+
+    internal static bool ShouldFallbackToDiscUtils(Exception exception) =>
+        exception is NotSupportedException;
 
     private VfsNode ToNode(string path)
     {

@@ -90,16 +90,8 @@ public static class PhysicalDiskEditService
     public static string GetDefaultRecoveryJournalPath(PhysicalDiskTargetInfo target)
     {
         ArgumentNullException.ThrowIfNull(target);
-        var localData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-        if (string.IsNullOrWhiteSpace(localData))
-        {
-            throw new InvalidOperationException("復旧ジャーナル用のローカル保存先を取得できません。");
-        }
-
         return Path.Combine(
-            localData,
-            "VirtualDiskTools",
-            "Recovery",
+            PhysicalDiskRecoveryJournalLocator.GetDefaultDirectory(),
             $"PhysicalDrive{target.DiskNumber}-{DateTime.UtcNow:yyyyMMdd-HHmmss}-{Guid.NewGuid():N}.vdt-recovery");
     }
 

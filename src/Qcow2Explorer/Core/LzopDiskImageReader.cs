@@ -19,9 +19,7 @@ public sealed class LzopDiskImageReader : IDiskImageReader
     private const uint FlagHeaderCrc32 = 0x00001000;
     private const uint KnownFlagMask = 0xfff03fff;
     private const uint MaximumBlockSize = 64 * 1024 * 1024;
-    private const int IndexCacheVersion = 2;
-    private const int FingerprintLength = 4096;
-    private static readonly byte[] IndexCacheMagic = "VDLZOIDX"u8.ToArray();
+    private const int MaximumCachedBlockCount = 4_194_304;
 
     private readonly FileStream _stream;
     private readonly IProgress<DiskImageProgress>? _progress;
@@ -531,8 +529,9 @@ public sealed class LzopDiskImageReader : IDiskImageReader
             using var file = new FileStream(cachePath, FileMode.Open, FileAccess.Read, FileShare.Read);
             using var compressed = new BrotliStream(file, CompressionMode.Decompress);
             using var reader = new BinaryReader(compressed, Encoding.UTF8, leaveOpen: false);
-            if (!reader.ReadBytes(IndexCacheMagic.Length).SequenceEqual(IndexCacheMagic)
-                || reader.ReadInt32() != IndexCacheVersion
+            if (!reader.ReadBytes(LzopIndexCacheManager.Magic.Length).SequenceEqual(LzopIndexCacheManager.Magic)
+                || reader.ReadInt32() != LzopIndexCacheManager.Version
+                || !string.Equals(reader.ReadString(), identity.Path, StringComparison.OrdinalIgnoreCase)
                 || reader.ReadInt64() != identity.Length
                 || reader.ReadInt64() != identity.LastWriteUtcTicks
                 || !reader.ReadBytes(identity.Fingerprint.Length).SequenceEqual(identity.Fingerprint))
@@ -543,21 +542,40 @@ public sealed class LzopDiskImageReader : IDiskImageReader
 
             var rawLength = reader.ReadInt64();
             var blockCount = reader.ReadInt32();
-            if (rawLength <= 0 || blockCount <= 0)
+            if (rawLength <= 0
+                || blockCount <= 0
+                || blockCount > MaximumCachedBlockCount
+                || blockCount > Math.Max(1, _compressedLength / (sizeof(uint) * 2)))
             {
                 throw new InvalidDataException("LZO index cache has an invalid length or block count.");
             }
 
             _blocks.Capacity = blockCount;
+            long expectedRawOffset = 0;
+            long previousCompressedEnd = _firstBlockOffset;
             for (var index = 0; index < blockCount; index++)
             {
-                _blocks.Add(new LzopBlock(
+                var block = new LzopBlock(
                     reader.ReadInt64(), reader.ReadInt32(), reader.ReadInt32(), reader.ReadInt64(),
-                    ReadNullableUInt32(reader), ReadNullableUInt32(reader), ReadNullableUInt32(reader), ReadNullableUInt32(reader)));
+                    ReadNullableUInt32(reader), ReadNullableUInt32(reader), ReadNullableUInt32(reader), ReadNullableUInt32(reader));
+                if (block.UncompressedOffset != expectedRawOffset
+                    || block.UncompressedSize <= 0
+                    || block.UncompressedSize > MaximumBlockSize
+                    || block.CompressedSize <= 0
+                    || block.CompressedSize > block.UncompressedSize
+                    || block.DataOffset < previousCompressedEnd
+                    || block.DataOffset > _compressedLength - block.CompressedSize)
+                {
+                    throw new InvalidDataException($"LZO index cache block #{index} is outside the source stream.");
+                }
+
+                _blocks.Add(block);
+                expectedRawOffset = checked(expectedRawOffset + block.UncompressedSize);
+                previousCompressedEnd = checked(block.DataOffset + block.CompressedSize);
             }
 
             if (_blocks[0].UncompressedOffset != 0
-                || checked(_blocks[^1].UncompressedOffset + _blocks[^1].UncompressedSize) != rawLength)
+                || expectedRawOffset != rawLength)
             {
                 throw new InvalidDataException("LZO index cache does not cover the raw image.");
             }
@@ -570,9 +588,23 @@ public sealed class LzopDiskImageReader : IDiskImageReader
                 _compressedLength));
             _cancellationToken.ThrowIfCancellationRequested();
             DiagnosticLog.Write($"LZO index cache hit: path={cachePath}, blocks={blockCount}, rawLength={rawLength}");
+            try
+            {
+                File.SetLastAccessTimeUtc(cachePath, DateTime.UtcNow);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                DiagnosticLog.Write($"LZO index cache last-used update failed: path={cachePath}, error={ex.Message}");
+            }
+
             return true;
         }
-        catch (Exception ex) when (ex is IOException or InvalidDataException or EndOfStreamException or OverflowException)
+        catch (Exception ex) when (ex is IOException
+                                   or InvalidDataException
+                                   or EndOfStreamException
+                                   or OverflowException
+                                   or UnauthorizedAccessException
+                                   or NotSupportedException)
         {
             _blocks.Clear();
             DiagnosticLog.Write($"LZO index cache rejected: path={cachePath}, error={ex}");
@@ -592,8 +624,9 @@ public sealed class LzopDiskImageReader : IDiskImageReader
             using (var compressed = new BrotliStream(file, CompressionLevel.Fastest))
             using (var writer = new BinaryWriter(compressed, Encoding.UTF8, leaveOpen: false))
             {
-                writer.Write(IndexCacheMagic);
-                writer.Write(IndexCacheVersion);
+                writer.Write(LzopIndexCacheManager.Magic);
+                writer.Write(LzopIndexCacheManager.Version);
+                writer.Write(identity.Path);
                 writer.Write(identity.Length);
                 writer.Write(identity.LastWriteUtcTicks);
                 writer.Write(identity.Fingerprint);
@@ -618,26 +651,36 @@ public sealed class LzopDiskImageReader : IDiskImageReader
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or NotSupportedException)
         {
             DiagnosticLog.Write($"LZO index cache save failed: source={Path}, error={ex}");
+            try
+            {
+                File.Delete(temporaryPath);
+            }
+            catch (Exception cleanupEx) when (cleanupEx is IOException or UnauthorizedAccessException)
+            {
+                DiagnosticLog.Write($"LZO partial index cache cleanup failed: path={temporaryPath}, error={cleanupEx.Message}");
+            }
         }
     }
 
     private string GetIndexCachePath()
     {
-        var cacheId = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(System.IO.Path.GetFullPath(Path).ToUpperInvariant()))).ToLowerInvariant();
-        return System.IO.Path.Combine(LzopRawCacheManager.DefaultCacheRoot, "Index", cacheId + ".lzop-index.br");
+        return LzopIndexCacheManager.GetCachePath(Path);
     }
 
     private LzopIndexSourceIdentity GetSourceIdentity()
     {
         var info = new FileInfo(Path);
         using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
-        AppendFingerprint(hash, 0, Math.Min(FingerprintLength, _stream.Length));
-        if (_stream.Length > FingerprintLength)
+        AppendFingerprint(hash, 0, Math.Min(LzopIndexCacheManager.FingerprintLength, _stream.Length));
+        if (_stream.Length > LzopIndexCacheManager.FingerprintLength)
         {
-            AppendFingerprint(hash, _stream.Length - FingerprintLength, FingerprintLength);
+            AppendFingerprint(
+                hash,
+                _stream.Length - LzopIndexCacheManager.FingerprintLength,
+                LzopIndexCacheManager.FingerprintLength);
         }
 
-        return new LzopIndexSourceIdentity(info.Length, info.LastWriteTimeUtc.Ticks, hash.GetHashAndReset());
+        return new LzopIndexSourceIdentity(info.FullName, info.Length, info.LastWriteTimeUtc.Ticks, hash.GetHashAndReset());
     }
 
     private void AppendFingerprint(IncrementalHash hash, long offset, long count)
@@ -730,7 +773,11 @@ public sealed class LzopDiskImageReader : IDiskImageReader
         uint? CompressedAdler32,
         uint? CompressedCrc32);
 
-    private sealed record LzopIndexSourceIdentity(long Length, long LastWriteUtcTicks, byte[] Fingerprint);
+    private sealed record LzopIndexSourceIdentity(
+        string Path,
+        long Length,
+        long LastWriteUtcTicks,
+        byte[] Fingerprint);
 }
 
 public sealed record LzopVerificationBlock(
