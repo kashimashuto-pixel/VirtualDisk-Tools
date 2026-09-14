@@ -88,6 +88,34 @@ internal static class ContainerRobustnessTests
             () => ParallelsHddReader.Open(oversizedBundle),
             "oversized Parallels descriptor rejected");
 
+        var excessiveLayersBundle = Path.Combine(directory, "excessive-layers.hdd");
+        Directory.CreateDirectory(excessiveLayersBundle);
+        var excessiveLayers = new StringBuilder(
+            "<Parallels_disk_image><Disk_size>128</Disk_size><Storage><Start>0</Start><End>128</End>");
+        for (var index = 0; index <= 4096; index++)
+        {
+            excessiveLayers.Append("<Image><File>layer-")
+                .Append(index)
+                .Append(".hds</File></Image>");
+        }
+
+        excessiveLayers.Append("</Storage></Parallels_disk_image>");
+        File.WriteAllText(
+            Path.Combine(excessiveLayersBundle, "DiskDescriptor.xml"),
+            excessiveLayers.ToString());
+        AssertThrows<NotSupportedException>(
+            () => ParallelsHddReader.Open(excessiveLayersBundle),
+            "excessive Parallels layer count rejected");
+
+        var canceledBundle = Path.Combine(directory, "canceled-open.hdd");
+        Directory.CreateDirectory(canceledBundle);
+        File.WriteAllText(
+            Path.Combine(canceledBundle, "DiskDescriptor.xml"),
+            "<Parallels_disk_image><Disk_size>128</Disk_size></Parallels_disk_image>");
+        AssertThrows<OperationCanceledException>(
+            () => ParallelsHddReader.Open(canceledBundle, new CancellationToken(canceled: true)),
+            "canceled Parallels open");
+
         var windowsSeparatorBundle = Path.Combine(directory, "windows-separator.hdd");
         var nestedDirectory = Path.Combine(windowsSeparatorBundle, "layers");
         Directory.CreateDirectory(nestedDirectory);

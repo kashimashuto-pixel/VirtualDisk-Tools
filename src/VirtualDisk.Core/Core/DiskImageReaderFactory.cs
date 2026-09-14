@@ -26,7 +26,7 @@ public static class DiskImageReaderFactory
         {
             if (ParallelsHddReader.CanOpenDirectory(path))
             {
-                return ParallelsHddReader.Open(path);
+                return ParallelsHddReader.Open(path, cancellationToken);
             }
 
             throw new NotSupportedException("フォルダ形式の仮想ディスクは Parallels .hdd の DiskDescriptor.xml がある場合のみ対応しています。");
@@ -97,7 +97,7 @@ public static class DiskImageReaderFactory
         return extension switch
         {
             ".vhd" or ".vhdx" or ".avhdx" or ".vmdk" or ".vdi" => DiscUtilsDiskImageReader.Open(path),
-            ".hdd" or ".hds" => ParallelsHddReader.Open(path),
+            ".hdd" or ".hds" => ParallelsHddReader.Open(path, cancellationToken),
             ".dd" or ".img" or ".raw" => new RawDiskImageReader(path),
             _ => new RawDiskImageReader(path, "raw/dd (拡張子未判定)")
         };

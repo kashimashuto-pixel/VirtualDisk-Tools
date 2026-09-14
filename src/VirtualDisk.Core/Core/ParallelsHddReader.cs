@@ -12,6 +12,8 @@ public sealed class ParallelsHddReader : IDiskImageReader
     private const string ZeroGuid = "{00000000-0000-0000-0000-000000000000}";
     private const string DefaultTopGuid = "{5fbaabe3-6958-40ff-92a7-860e329aab41}";
     private const long MaximumDescriptorBytes = 16L * 1024 * 1024;
+    private const int MaximumLayerCount = 4096;
+    private const int MaximumSnapshotRecordCount = 4096;
 
     private readonly IReadOnlyList<ParallelsLayer> _layers;
     private readonly IReadOnlyList<string> _warnings;
@@ -34,17 +36,20 @@ public sealed class ParallelsHddReader : IDiskImageReader
         return File.Exists(System.IO.Path.Combine(path, DescriptorFileName));
     }
 
-    public static ParallelsHddReader Open(string path)
+    public static ParallelsHddReader Open(
+        string path,
+        CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         if (Directory.Exists(path))
         {
-            return OpenBundle(path);
+            return OpenBundle(path, cancellationToken);
         }
 
         var extension = System.IO.Path.GetExtension(path).ToLowerInvariant();
         if (extension is ".hds" or ".hdd")
         {
-            return OpenSingleExpandableImage(path);
+            return OpenSingleExpandableImage(path, cancellationToken);
         }
 
         throw new NotSupportedException("Parallels HDD は .hdd フォルダまたは .hds ファイルを指定してください。");
@@ -132,15 +137,18 @@ public sealed class ParallelsHddReader : IDiskImageReader
         }
     }
 
-    private static ParallelsHddReader OpenSingleExpandableImage(string path)
+    private static ParallelsHddReader OpenSingleExpandableImage(
+        string path,
+        CancellationToken cancellationToken)
     {
         var warnings = new List<string>();
-        var layer = ExpandableLayer.Open(path, warnings);
+        var layer = ExpandableLayer.Open(path, warnings, cancellationToken);
         return new ParallelsHddReader(path, "Parallels HDD (.hds)", layer.Length, new[] { layer }, warnings);
     }
 
-    private static ParallelsHddReader OpenBundle(string path)
+    private static ParallelsHddReader OpenBundle(string path, CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         var descriptorPath = System.IO.Path.Combine(path, DescriptorFileName);
         if (!File.Exists(descriptorPath))
         {
@@ -163,6 +171,7 @@ public sealed class ParallelsHddReader : IDiskImageReader
                 XmlResolver = null,
             });
         var document = XDocument.Load(descriptorReader, LoadOptions.None);
+        cancellationToken.ThrowIfCancellationRequested();
         var warnings = new List<string>();
         var diskSectors = ParseRequiredInt64(DescendantValue(document, "Disk_size"), "Disk_size");
         if (diskSectors <= 0 || diskSectors > long.MaxValue / SectorSize)
@@ -171,7 +180,7 @@ public sealed class ParallelsHddReader : IDiskImageReader
         }
 
         var diskLength = checked(diskSectors * SectorSize);
-        var storages = Descendants(document, "Storage").ToList();
+        var storages = Descendants(document, "Storage").Take(2).ToList();
         if (storages.Count != 1)
         {
             throw new NotSupportedException($"Parallels HDD の split image は未対応です。Storage={storages.Count}");
@@ -189,20 +198,28 @@ public sealed class ParallelsHddReader : IDiskImageReader
             .Where(e => IsName(e, "Image"))
             .Select(ImageInfo.FromElement)
             .Where(image => !string.IsNullOrWhiteSpace(image.FileName))
+            .Take(MaximumLayerCount + 1)
             .ToList();
         if (images.Count == 0)
         {
             throw new InvalidDataException("Parallels HDD の Image 要素が見つかりません。");
         }
 
-        var orderedImages = OrderSnapshotImages(document, images, warnings);
+        if (images.Count > MaximumLayerCount)
+        {
+            throw new NotSupportedException(
+                $"Parallels HDD のlayer数が対応上限 ({MaximumLayerCount:N0}) を超えています。");
+        }
+
+        var orderedImages = OrderSnapshotImages(document, images, warnings, cancellationToken);
         var layers = new List<ParallelsLayer>();
         try
         {
             foreach (var image in orderedImages)
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 var imagePath = ResolveImagePath(path, image.FileName);
-                layers.Add(OpenLayer(imagePath, image.Type, warnings));
+                layers.Add(OpenLayer(imagePath, image.Type, warnings, cancellationToken));
             }
         }
         catch
@@ -218,8 +235,13 @@ public sealed class ParallelsHddReader : IDiskImageReader
         return new ParallelsHddReader(path, "Parallels HDD (.hdd)", diskLength, layers, warnings);
     }
 
-    private static ParallelsLayer OpenLayer(string path, string type, List<string> warnings)
+    private static ParallelsLayer OpenLayer(
+        string path,
+        string type,
+        List<string> warnings,
+        CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         if (string.Equals(type, "Plain", StringComparison.OrdinalIgnoreCase))
         {
             return PlainLayer.Open(path);
@@ -227,7 +249,7 @@ public sealed class ParallelsHddReader : IDiskImageReader
 
         if (string.Equals(type, "Compressed", StringComparison.OrdinalIgnoreCase) || string.IsNullOrWhiteSpace(type))
         {
-            return ExpandableLayer.Open(path, warnings);
+            return ExpandableLayer.Open(path, warnings, cancellationToken);
         }
 
         throw new NotSupportedException($"Parallels HDD の Image Type={type} は未対応です。");
@@ -243,8 +265,13 @@ public sealed class ParallelsHddReader : IDiskImageReader
             : System.IO.Path.GetFullPath(System.IO.Path.Combine(baseDirectory, imagePath));
     }
 
-    private static IReadOnlyList<ImageInfo> OrderSnapshotImages(XDocument document, IReadOnlyList<ImageInfo> images, List<string> warnings)
+    private static IReadOnlyList<ImageInfo> OrderSnapshotImages(
+        XDocument document,
+        IReadOnlyList<ImageInfo> images,
+        List<string> warnings,
+        CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         if (images.Count == 1)
         {
             return images;
@@ -254,14 +281,25 @@ public sealed class ParallelsHddReader : IDiskImageReader
             .Where(image => !string.IsNullOrWhiteSpace(image.Guid))
             .GroupBy(image => image.Guid, StringComparer.OrdinalIgnoreCase)
             .ToDictionary(group => group.Key, group => group.First(), StringComparer.OrdinalIgnoreCase);
-        var parentByGuid = Descendants(document, "Shot")
+        var shots = Descendants(document, "Shot")
             .Select(shot => new
             {
                 Guid = ChildValue(shot, "GUID"),
                 ParentGuid = ChildValue(shot, "ParentGUID")
             })
             .Where(shot => !string.IsNullOrWhiteSpace(shot.Guid))
-            .ToDictionary(shot => shot.Guid!, shot => shot.ParentGuid ?? ZeroGuid, StringComparer.OrdinalIgnoreCase);
+            .Take(MaximumSnapshotRecordCount + 1)
+            .ToArray();
+        if (shots.Length > MaximumSnapshotRecordCount)
+        {
+            throw new NotSupportedException(
+                $"Parallels HDD のsnapshot記録数が対応上限 ({MaximumSnapshotRecordCount:N0}) を超えています。");
+        }
+
+        var parentByGuid = shots.ToDictionary(
+            shot => shot.Guid!,
+            shot => shot.ParentGuid ?? ZeroGuid,
+            StringComparer.OrdinalIgnoreCase);
 
         var topGuid = DescendantValue(document, "TopGUID");
         if (string.IsNullOrWhiteSpace(topGuid) && byGuid.ContainsKey(DefaultTopGuid))
@@ -281,6 +319,7 @@ public sealed class ParallelsHddReader : IDiskImageReader
         var current = topGuid;
         while (!string.IsNullOrWhiteSpace(current) && !IsZeroGuid(current) && seen.Add(current))
         {
+            cancellationToken.ThrowIfCancellationRequested();
             if (!byGuid.TryGetValue(current, out var image))
             {
                 warnings.Add($"Parallels HDD snapshot {current} に対応する Image が見つからないため、残りの親チェーンを省略しました。");
@@ -442,8 +481,12 @@ public sealed class ParallelsHddReader : IDiskImageReader
             _emptyImage = emptyImage;
         }
 
-        public static ExpandableLayer Open(string path, List<string> warnings)
+        public static ExpandableLayer Open(
+            string path,
+            List<string> warnings,
+            CancellationToken cancellationToken)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var stream = OpenRead(path);
             try
             {
@@ -498,9 +541,15 @@ public sealed class ParallelsHddReader : IDiskImageReader
                 var batBytes = checked((int)batBytes64);
                 var batBuffer = new byte[batBytes];
                 ReadExact(stream, batBuffer, 0, batBuffer.Length);
+                cancellationToken.ThrowIfCancellationRequested();
                 var bat = new uint[checked((int)batEntryCount)];
                 for (var i = 0; i < bat.Length; i++)
                 {
+                    if ((i & 0xfff) == 0)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                    }
+
                     bat[i] = EndianUtilities.ReadUInt32Little(batBuffer, i * 4);
                 }
 
