@@ -15,6 +15,7 @@ internal static class Qcow2RobustnessTests
         TestBoundedConcurrentMetadataCache(directory);
         TestBackingChains(directory);
         TestSparseL2Allocation(directory);
+        TestWriterKeepsSourceOpen(directory);
         TestWriterCancellationCleanup(directory);
     }
 
@@ -246,6 +247,54 @@ internal static class Qcow2RobustnessTests
             !Directory.EnumerateFiles(directory)
                 .Any(path => Path.GetFileName(path).StartsWith(partialPrefix, StringComparison.Ordinal)),
             "cancelled QCOW2 partial output removed");
+    }
+
+    private static void TestWriterKeepsSourceOpen(string directory)
+    {
+        const int rawLength = 1024 * 1024;
+        var rawPath = Path.Combine(directory, "locked-writer-source.raw");
+        var qcow2Path = Path.Combine(directory, "locked-writer-output.qcow2");
+        using (var stream = new FileStream(rawPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+        {
+            stream.SetLength(rawLength);
+            stream.WriteByte(0x5a);
+        }
+
+        var attemptedConcurrentWrite = false;
+        var concurrentWriteWasRejected = false;
+        var progress = new CallbackProgress<DiskImageProgress>(update =>
+        {
+            if (attemptedConcurrentWrite
+                || !string.Equals(update.Message, "QCOW2 data clusterを保存", StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            attemptedConcurrentWrite = true;
+            try
+            {
+                using var concurrentWriter = new FileStream(
+                    rawPath,
+                    FileMode.Open,
+                    FileAccess.Write,
+                    FileShare.ReadWrite);
+            }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+            {
+                concurrentWriteWasRejected = true;
+            }
+        });
+
+        Qcow2SparseWriter.WriteFromRawAsync(rawPath, qcow2Path, progress).GetAwaiter().GetResult();
+        Assert(attemptedConcurrentWrite, "QCOW2 writer reached the data-copy phase");
+        if (OperatingSystem.IsWindows())
+        {
+            Assert(concurrentWriteWasRejected, "QCOW2 writer locks the RAW source against concurrent writes");
+        }
+
+        using var reader = new Qcow2Reader(qcow2Path);
+        Assert(reader.Length == rawLength, "locked-source QCOW2 virtual size");
+        Assert(reader.ReadByte(0) == 0x5a, "locked-source QCOW2 data");
     }
 
     private static void AssertOpenRejected(string path, string description, string expectedMessage)

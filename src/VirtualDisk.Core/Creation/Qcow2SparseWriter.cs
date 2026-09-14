@@ -36,11 +36,20 @@ public static class Qcow2SparseWriter
             throw new IOException("RAW原本と同じパスにはQCOW2を作成できません。");
         }
 
-        var rawLength = new FileInfo(rawPath).Length;
+        await using var raw = new FileStream(
+            rawPath,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.Read,
+            ClusterSize,
+            FileOptions.Asynchronous | FileOptions.RandomAccess);
+        var rawLength = raw.Length;
         if (rawLength <= 0 || rawLength % 512 != 0)
         {
             throw new InvalidDataException("QCOW2へ変換するRAW容量は正の512-byte倍数である必要があります。");
         }
+
+        var rawLastWriteUtc = File.GetLastWriteTimeUtc(rawPath);
 
         var destinationDirectory = Path.GetDirectoryName(destinationPath)
             ?? throw new ArgumentException("QCOW2出力フォルダーを取得できません。", nameof(destinationPath));
@@ -51,7 +60,12 @@ public static class Qcow2SparseWriter
 
         try
         {
-            await WriteCoreAsync(rawPath, rawLength, temporaryPath, progress, cancellationToken);
+            await WriteCoreAsync(raw, rawLength, temporaryPath, progress, cancellationToken);
+            if (raw.Length != rawLength || File.GetLastWriteTimeUtc(rawPath) != rawLastWriteUtc)
+            {
+                throw new IOException("変換中にRAW原本が変更されました。QCOW2出力を破棄します。");
+            }
+
             File.Move(temporaryPath, destinationPath);
         }
         catch
@@ -62,7 +76,7 @@ public static class Qcow2SparseWriter
     }
 
     private static async Task WriteCoreAsync(
-        string rawPath,
+        FileStream raw,
         long rawLength,
         string destinationPath,
         IProgress<DiskImageProgress>? progress,
@@ -81,7 +95,7 @@ public static class Qcow2SparseWriter
         var l1Entries = checked((int)l1EntriesLong);
         var l1Clusters = checked((int)DivideRoundUp(checked((long)l1Entries * 8), ClusterSize));
         var allocatedGuestClusters = await FindAllocatedGuestClustersAsync(
-            rawPath,
+            raw,
             rawLength,
             progress,
             cancellationToken);
@@ -226,13 +240,6 @@ public static class Qcow2SparseWriter
             throw new InvalidDataException("QCOW2 sparse cluster索引をL2 tableに格納できませんでした。");
         }
 
-        await using var raw = new FileStream(
-            rawPath,
-            FileMode.Open,
-            FileAccess.Read,
-            FileShare.Read,
-            ClusterSize,
-            FileOptions.Asynchronous | FileOptions.RandomAccess);
         var data = new byte[ClusterSize];
         for (var index = 0; index < allocatedGuestClusters.Count; index++)
         {
@@ -258,20 +265,14 @@ public static class Qcow2SparseWriter
     }
 
     private static async Task<List<long>> FindAllocatedGuestClustersAsync(
-        string rawPath,
+        FileStream raw,
         long rawLength,
         IProgress<DiskImageProgress>? progress,
         CancellationToken cancellationToken)
     {
         var allocated = new List<long>();
-        await using var raw = new FileStream(
-            rawPath,
-            FileMode.Open,
-            FileAccess.Read,
-            FileShare.Read,
-            ClusterSize,
-            FileOptions.Asynchronous | FileOptions.SequentialScan);
         var buffer = new byte[ClusterSize];
+        raw.Position = 0;
         long offset = 0;
         const long progressInterval = 16L * 1024 * 1024;
         while (offset < rawLength)
