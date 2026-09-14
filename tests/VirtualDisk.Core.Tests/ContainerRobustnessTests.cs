@@ -8,11 +8,27 @@ internal static class ContainerRobustnessTests
 {
     public static void Run(string directory)
     {
+        TestRawTruncationDetected(directory);
         TestMinimalParallelsImage(directory);
         TestParallelsBatLimits(directory);
         TestParallelsDescriptorLimits(directory);
         TestVmaHeaderLimit(directory);
         TestOvaExtractionGuards(directory);
+    }
+
+    private static void TestRawTruncationDetected(string directory)
+    {
+        var path = Path.Combine(directory, "raw-truncated-while-open.raw");
+        File.WriteAllBytes(path, new byte[8192]);
+        using var reader = new RawDiskImageReader(path);
+        using (var writer = new FileStream(path, FileMode.Open, FileAccess.Write, FileShare.ReadWrite))
+        {
+            writer.SetLength(4096);
+        }
+
+        AssertThrows<EndOfStreamException>(
+            () => reader.ReadAt(4096, new byte[512], 0, 512),
+            "RAW truncation after opening is not returned as zero data");
     }
 
     private static void TestMinimalParallelsImage(string directory)
