@@ -3,6 +3,7 @@ using Avalonia.Controls;
 using Avalonia.Input;
 using Avalonia.Layout;
 using Avalonia.Platform.Storage;
+using Avalonia.Threading;
 using Qcow2Explorer.Core;
 using Qcow2Explorer.FileSystems;
 using Qcow2Explorer.Partitions;
@@ -16,12 +17,17 @@ public sealed class MainWindow : Window
     private readonly TextBlock _status = new() { Text = "準備完了" };
     private readonly ListBox _partitions = new();
     private readonly ListBox _entries = new();
+    private readonly Button _openButton = new() { Content = "開く..." };
     private readonly Button _backButton = new() { Content = "上へ", IsEnabled = false };
     private readonly Button _extractButton = new() { Content = "抽出...", IsEnabled = false };
+    private readonly Button _verifyButton = new() { Content = "全読込検証", IsEnabled = false };
+    private readonly Button _cancelButton = new() { Content = "キャンセル", IsEnabled = false };
     private readonly Stack<VfsNode> _directoryHistory = new();
     private IDiskImageReader? _reader;
     private IReadOnlyFileSystem? _fileSystem;
     private VfsNode? _currentDirectory;
+    private CancellationTokenSource? _activeOperation;
+    private bool _busy;
 
     public MainWindow(string? initialPath = null)
     {
@@ -31,13 +37,18 @@ public sealed class MainWindow : Window
         MinWidth = 760;
         MinHeight = 480;
         Content = BuildContent();
-        Closed += (_, _) => DisposeImage();
+        Closed += (_, _) =>
+        {
+            _activeOperation?.Cancel();
+            DisposeImage();
+        };
         _partitions.SelectionChanged += (_, _) => OpenSelectedPartition();
-        _entries.SelectionChanged += (_, _) =>
-            _extractButton.IsEnabled = _entries.SelectedItem is EntryItem { Node.IsDirectory: false };
+        _entries.SelectionChanged += (_, _) => RefreshCommandState();
         _entries.DoubleTapped += (_, _) => NavigateSelectedEntry();
         _backButton.Click += (_, _) => NavigateUp();
         _extractButton.Click += async (_, _) => await ExtractSelectedAsync();
+        _verifyButton.Click += async (_, _) => await VerifyFileSystemAsync();
+        _cancelButton.Click += (_, _) => CancelActiveOperation();
 
         if (!string.IsNullOrWhiteSpace(initialPath))
         {
@@ -47,14 +58,13 @@ public sealed class MainWindow : Window
 
     private Control BuildContent()
     {
-        var openButton = new Button { Content = "開く..." };
-        openButton.Click += async (_, _) => await ChooseAndOpenImageAsync();
+        _openButton.Click += async (_, _) => await ChooseAndOpenImageAsync();
         var toolbar = new StackPanel
         {
             Orientation = Orientation.Horizontal,
             Spacing = 8,
             Margin = new Thickness(12),
-            Children = { openButton, _backButton, _extractButton },
+            Children = { _openButton, _backButton, _extractButton, _verifyButton, _cancelButton },
         };
         var header = new StackPanel
         {
@@ -128,10 +138,10 @@ public sealed class MainWindow : Window
 
     private async Task OpenImageAsync(string path)
     {
+        var operation = BeginOperation("ディスクイメージを解析しています...");
         try
         {
-            SetBusy(true, "ディスクイメージを解析しています...");
-            var opened = await Task.Run(() => OpenImage(path));
+            var opened = await Task.Run(() => OpenImage(path, operation.Token), operation.Token);
             DisposeImage();
             _reader = opened.Reader;
             _partitions.ItemsSource = opened.Partitions;
@@ -142,6 +152,10 @@ public sealed class MainWindow : Window
                 _partitions.SelectedIndex = 0;
             }
         }
+        catch (OperationCanceledException)
+        {
+            _status.Text = "ディスクイメージの解析をキャンセルしました。";
+        }
         catch (Exception ex)
         {
             _status.Text = $"開けませんでした: {ex.Message}";
@@ -149,19 +163,20 @@ public sealed class MainWindow : Window
         }
         finally
         {
-            SetBusy(false);
+            EndOperation(operation);
         }
     }
 
-    private static OpenedImage OpenImage(string path)
+    private static OpenedImage OpenImage(string path, CancellationToken cancellationToken)
     {
-        var reader = DiskImageReaderFactory.Open(path);
+        var reader = DiskImageReaderFactory.Open(path, cancellationToken: cancellationToken);
         try
         {
-            var partitions = PartitionTableReader.ReadPartitionsWithWholeDiskFallback(reader);
+            var partitions = PartitionTableReader.ReadPartitionsWithWholeDiskFallback(reader, cancellationToken);
             foreach (var partition in partitions)
             {
-                partition.FileSystem = FileSystemDetector.Detect(reader, partition);
+                cancellationToken.ThrowIfCancellationRequested();
+                partition.FileSystem = FileSystemDetector.Detect(reader, partition, cancellationToken);
             }
 
             return new OpenedImage(reader, partitions.Select(partition => new PartitionItem(partition)).ToArray());
@@ -192,6 +207,7 @@ public sealed class MainWindow : Window
         _directoryHistory.Clear();
         ShowDirectory(fileSystem.Root);
         _status.Text = $"{fileSystem.Name}を開きました。";
+        RefreshCommandState();
     }
 
     private void NavigateSelectedEntry()
@@ -223,8 +239,7 @@ public sealed class MainWindow : Window
         _currentDirectory = directory;
         _pathLabel.Text = string.IsNullOrWhiteSpace(directory.VirtualPath) ? "/" : directory.VirtualPath;
         _entries.ItemsSource = _fileSystem.ListDirectory(directory).Select(node => new EntryItem(node)).ToArray();
-        _backButton.IsEnabled = _directoryHistory.Count > 0;
-        _extractButton.IsEnabled = false;
+        RefreshCommandState();
     }
 
     private async Task ExtractSelectedAsync()
@@ -245,6 +260,9 @@ public sealed class MainWindow : Window
             return;
         }
 
+        var fileSystem = _fileSystem;
+        var file = selected.Node;
+        var operation = BeginOperation($"{file.Name}を抽出しています...");
         try
         {
             if (_reader is not null && PathsEqual(path, _reader.Path))
@@ -252,22 +270,41 @@ public sealed class MainWindow : Window
                 throw new IOException("開いているディスクイメージ自身には抽出できません。");
             }
 
-            SetBusy(true, $"{selected.Node.Name}を抽出しています...");
-            var progress = new Progress<CopyProgress>(update =>
+            var lastPercentage = -1;
+            var progress = new CallbackProgress<CopyProgress>(update =>
             {
                 var percentage = update.TotalBytes == 0
                     ? 100
                     : (int)Math.Min(100, update.BytesCopied * 100d / update.TotalBytes);
-                _status.Text = $"{selected.Node.Name}を抽出しています... {percentage}%";
+                if (percentage == lastPercentage)
+                {
+                    return;
+                }
+
+                lastPercentage = percentage;
+                Dispatcher.UIThread.Post(() =>
+                {
+                    if (ReferenceEquals(_activeOperation, operation))
+                    {
+                        _status.Text = $"{file.Name}を抽出しています... {percentage}%";
+                    }
+                });
             });
-            await FileSystemExporter.ExtractFileAsync(
-                _fileSystem,
-                selected.Node,
-                path,
-                overwrite: true,
-                progress: progress);
+            await Task.Run(
+                () => FileSystemExporter.ExtractFileAsync(
+                    fileSystem,
+                    file,
+                    path,
+                    overwrite: true,
+                    progress: progress,
+                    cancellationToken: operation.Token),
+                operation.Token);
 
             _status.Text = $"抽出しました: {path}";
+        }
+        catch (OperationCanceledException)
+        {
+            _status.Text = "抽出をキャンセルしました。抽出先は変更されていません。";
         }
         catch (Exception ex)
         {
@@ -276,7 +313,79 @@ public sealed class MainWindow : Window
         }
         finally
         {
-            SetBusy(false);
+            EndOperation(operation);
+        }
+    }
+
+    private async Task VerifyFileSystemAsync()
+    {
+        if (_fileSystem is null)
+        {
+            return;
+        }
+
+        var fileSystem = _fileSystem;
+        var operation = BeginOperation($"{fileSystem.Name}を全読込検証しています...");
+        try
+        {
+            long lastReportedBytes = 0;
+            var lastReportedEntries = 0;
+            var progress = new CallbackProgress<FileSystemVerificationProgress>(update =>
+            {
+                if (update.BytesRead - lastReportedBytes < 256L * 1024 * 1024
+                    && update.EntriesChecked - lastReportedEntries < 1_000)
+                {
+                    return;
+                }
+
+                lastReportedBytes = update.BytesRead;
+                lastReportedEntries = update.EntriesChecked;
+                Dispatcher.UIThread.Post(() =>
+                {
+                    if (ReferenceEquals(_activeOperation, operation))
+                    {
+                        _status.Text =
+                            $"全読込検証: {update.EntriesChecked:N0}項目 / "
+                            + $"{update.BytesRead:N0} bytes — {update.CurrentPath}";
+                    }
+                });
+            });
+            var result = await Task.Run(
+                () => FileSystemVerifier.Verify(
+                    fileSystem,
+                    fileSystem.Root,
+                    progress,
+                    operation.Token),
+                operation.Token);
+            _status.Text = result.IsValid
+                ? $"検証成功: {result.FilesChecked:N0}ファイル / {result.BytesRead:N0} bytes"
+                : $"検証で{result.Issues.Count:N0}件の問題を検出しました。";
+            if (!result.IsValid)
+            {
+                var details = string.Join(
+                    Environment.NewLine,
+                    result.Issues.Take(50).Select(issue =>
+                        $"{issue.Path}: {issue.ErrorType}: {issue.Message}"));
+                if (result.Issues.Count > 50)
+                {
+                    details += $"{Environment.NewLine}... 他{result.Issues.Count - 50:N0}件";
+                }
+
+                await ShowErrorAsync("全読込検証で問題を検出", details);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            _status.Text = "全読込検証をキャンセルしました。";
+        }
+        catch (Exception ex)
+        {
+            _status.Text = $"全読込検証に失敗しました: {ex.Message}";
+            await ShowErrorAsync("全読込検証を実行できません", ex.Message);
+        }
+        finally
+        {
+            EndOperation(operation);
         }
     }
 
@@ -317,13 +426,60 @@ public sealed class MainWindow : Window
 
     private void SetBusy(bool busy, string? status = null)
     {
+        _busy = busy;
         Cursor = busy ? new Cursor(StandardCursorType.Wait) : Cursor.Default;
         _partitions.IsEnabled = !busy;
         _entries.IsEnabled = !busy;
+        _openButton.IsEnabled = !busy;
+        _cancelButton.IsEnabled = busy;
+        RefreshCommandState();
         if (status is not null)
         {
             _status.Text = status;
         }
+    }
+
+    private CancellationTokenSource BeginOperation(string status)
+    {
+        if (_activeOperation is not null)
+        {
+            throw new InvalidOperationException("別の操作が実行中です。");
+        }
+
+        _activeOperation = new CancellationTokenSource();
+        SetBusy(true, status);
+        return _activeOperation;
+    }
+
+    private void EndOperation(CancellationTokenSource operation)
+    {
+        if (ReferenceEquals(_activeOperation, operation))
+        {
+            _activeOperation = null;
+        }
+
+        operation.Dispose();
+        SetBusy(false);
+    }
+
+    private void CancelActiveOperation()
+    {
+        if (_activeOperation is null || _activeOperation.IsCancellationRequested)
+        {
+            return;
+        }
+
+        _activeOperation.Cancel();
+        _cancelButton.IsEnabled = false;
+        _status.Text = "キャンセルを要求しました。安全に中断するまでお待ちください...";
+    }
+
+    private void RefreshCommandState()
+    {
+        _backButton.IsEnabled = !_busy && _directoryHistory.Count > 0;
+        _extractButton.IsEnabled = !_busy
+            && _entries.SelectedItem is EntryItem { Node.IsDirectory: false };
+        _verifyButton.IsEnabled = !_busy && _fileSystem is not null;
     }
 
     private void DisposeImage()
@@ -356,5 +512,10 @@ public sealed class MainWindow : Window
     {
         public override string ToString() =>
             $"{(Node.IsDirectory ? "[DIR]" : "     ")} {Node.Name}  {(Node.IsDirectory ? string.Empty : $"{Node.Size:N0} bytes")}";
+    }
+
+    private sealed class CallbackProgress<T>(Action<T> callback) : IProgress<T>
+    {
+        public void Report(T value) => callback(value);
     }
 }
