@@ -10,6 +10,7 @@ internal static class VerificationRobustnessTests
         TestContentAndErrorAggregation();
         TestDirectoryCycle();
         TestDepthLimit();
+        TestChildCountLimitBeforeEnumeration();
         TestCancellation();
     }
 
@@ -61,6 +62,21 @@ internal static class VerificationRobustnessTests
             fileSystem.File,
             new CallbackProgress<FileSystemVerificationProgress>(_ => cancellationSource.Cancel()),
             cancellationSource.Token));
+    }
+
+    private static void TestChildCountLimitBeforeEnumeration()
+    {
+        var fileSystem = new OversizedDirectoryFileSystem();
+        var result = FileSystemVerifier.Verify(
+            fileSystem,
+            fileSystem.Root,
+            options: new FileSystemVerificationOptions(MaximumEntries: 8));
+        Assert(!result.Completed, "oversized directory verification is incomplete");
+        Assert(result.EntriesChecked == 1, "oversized directory children are not enumerated");
+        Assert(
+            result.Issues.Count == 1
+            && result.Issues[0].Message.Contains("項目数", StringComparison.Ordinal),
+            "oversized directory reports the entry limit");
     }
 
     private static TException AssertThrows<TException>(Action action)
@@ -152,6 +168,24 @@ internal static class VerificationRobustnessTests
         public override VfsNode Root { get; } = DirectoryNode("root", "/");
         public override IReadOnlyList<VfsNode> ListDirectory(VfsNode directory) => [File];
         public override byte[] ReadFile(VfsNode file, long offset, int count) => new byte[count];
+    }
+
+    private sealed class OversizedDirectoryFileSystem : TestFileSystem
+    {
+        public override VfsNode Root { get; } = DirectoryNode("root", "/");
+        public override IReadOnlyList<VfsNode> ListDirectory(VfsNode directory) => new OversizedNodeList();
+        public override byte[] ReadFile(VfsNode file, long offset, int count) => [];
+    }
+
+    private sealed class OversizedNodeList : IReadOnlyList<VfsNode>
+    {
+        public int Count => int.MaxValue;
+        public VfsNode this[int index] => throw new InvalidOperationException("oversized list must not be indexed");
+
+        public IEnumerator<VfsNode> GetEnumerator() =>
+            throw new InvalidOperationException("oversized list must not be enumerated");
+
+        System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
     }
 
     private static VfsNode DirectoryNode(string name, string path) => new()

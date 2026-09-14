@@ -107,6 +107,18 @@ public static class FileSystemVerifier
                 {
                     var children = fileSystem.ListDirectory(node)
                         ?? throw new InvalidDataException("ファイルシステムがnullの一覧を返しました。");
+                    var remainingEntries = options.MaximumEntries - entriesChecked - pending.Count;
+                    if (children.Count > remainingEntries)
+                    {
+                        AddLimitIssue(
+                            path,
+                            $"検査項目数が上限 ({options.MaximumEntries:N0}) を超えます。"
+                            + $" 未処理={pending.Count:N0}, 子項目={children.Count:N0}");
+                        completed = false;
+                        Report(path);
+                        break;
+                    }
+
                     for (var index = children.Count - 1; index >= 0; index--)
                     {
                         var child = children[index]
