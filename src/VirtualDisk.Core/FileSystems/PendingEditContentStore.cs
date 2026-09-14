@@ -1,3 +1,5 @@
+using Qcow2Explorer.Core;
+
 namespace Qcow2Explorer.FileSystems;
 
 internal sealed class PendingEditContentStore : IDisposable
@@ -155,7 +157,7 @@ internal sealed class PendingEditContentStore : IDisposable
         {
             var rootPrefix = Path.GetFullPath(_rootPath).TrimEnd(Path.DirectorySeparatorChar)
                 + Path.DirectorySeparatorChar;
-            return Path.GetFullPath(path).StartsWith(rootPrefix, StringComparison.OrdinalIgnoreCase);
+            return Path.GetFullPath(path).StartsWith(rootPrefix, PathSemantics.Comparison);
         }
         catch (Exception ex) when (ex is ArgumentException or NotSupportedException)
         {

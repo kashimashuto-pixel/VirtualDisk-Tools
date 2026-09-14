@@ -84,7 +84,7 @@ public static class FileEditBatchService
             throw new IOException($"出力先は既に存在します: {destinationPath}");
         }
 
-        if (string.Equals(Path.GetFullPath(source.Path), destinationPath, StringComparison.OrdinalIgnoreCase))
+        if (string.Equals(Path.GetFullPath(source.Path), destinationPath, PathSemantics.Comparison))
         {
             throw new IOException("原本と同じパスには保存できません。");
         }
@@ -192,7 +192,7 @@ public static class FileEditBatchService
             {
                 ArgumentException.ThrowIfNullOrWhiteSpace(edit.ContentPath);
                 var contentPath = Path.GetFullPath(edit.ContentPath);
-                if (string.Equals(contentPath, destinationPath, StringComparison.OrdinalIgnoreCase))
+                if (string.Equals(contentPath, destinationPath, PathSemantics.Comparison))
                 {
                     throw new IOException("編集内容と同じパスには出力できません。");
                 }

@@ -75,8 +75,8 @@ public static class FileReplacementService
             throw new FileNotFoundException("置換元ファイルが見つかりません。", replacementPath);
         }
 
-        if (string.Equals(source.Path, destinationPath, StringComparison.OrdinalIgnoreCase)
-            || string.Equals(replacementPath, destinationPath, StringComparison.OrdinalIgnoreCase))
+        if (string.Equals(source.Path, destinationPath, PathSemantics.Comparison)
+            || string.Equals(replacementPath, destinationPath, PathSemantics.Comparison))
         {
             throw new IOException("原本または置換元と同じパスには保存できません。");
         }

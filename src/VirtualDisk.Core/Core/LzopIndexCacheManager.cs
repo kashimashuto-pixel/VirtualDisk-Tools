@@ -109,7 +109,7 @@ public static class LzopIndexCacheManager
         var root = Path.GetFullPath(DefaultIndexRoot);
         var path = Path.GetFullPath(Path.Combine(root, cacheId));
         var rootPrefix = root.TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
-        if (!path.StartsWith(rootPrefix, StringComparison.OrdinalIgnoreCase))
+        if (!path.StartsWith(rootPrefix, PathSemantics.Comparison))
         {
             error = "索引キャッシュ保存先の外は削除できません。";
             return false;

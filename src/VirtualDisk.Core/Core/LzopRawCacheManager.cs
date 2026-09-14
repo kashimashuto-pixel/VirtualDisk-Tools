@@ -314,7 +314,7 @@ public static class LzopRawCacheManager
     private static bool IsChildPath(string root, string candidate)
     {
         var normalizedRoot = Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
-        return candidate.StartsWith(normalizedRoot, StringComparison.OrdinalIgnoreCase);
+        return candidate.StartsWith(normalizedRoot, PathSemantics.Comparison);
     }
 }
 
