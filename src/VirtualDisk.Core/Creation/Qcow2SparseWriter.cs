@@ -9,6 +9,7 @@ public static class Qcow2SparseWriter
     private const int ClusterSize = 1 << ClusterBits;
     private const int RefcountOrder = 4;
     private const ulong CopiedFlag = 1UL << 63;
+    private const int MaximumL1TableBytes = 64 * 1024 * 1024;
 
     public static async Task WriteFromRawAsync(
         string rawPath,
@@ -67,16 +68,38 @@ public static class Qcow2SparseWriter
         IProgress<DiskImageProgress>? progress,
         CancellationToken cancellationToken)
     {
+        var guestClusterCount = DivideRoundUp(rawLength, ClusterSize);
+        var l2Entries = ClusterSize / 8;
+        var l1EntriesLong = DivideRoundUp(guestClusterCount, l2Entries);
+        var l1Bytes = checked(l1EntriesLong * 8);
+        if (l1EntriesLong > uint.MaxValue || l1Bytes > MaximumL1TableBytes)
+        {
+            throw new NotSupportedException(
+                $"QCOW2 L1 tableが対応上限 ({MaximumL1TableBytes:N0} bytes) を超えています。");
+        }
+
+        var l1Entries = checked((int)l1EntriesLong);
+        var l1Clusters = checked((int)DivideRoundUp(checked((long)l1Entries * 8), ClusterSize));
         var allocatedGuestClusters = await FindAllocatedGuestClustersAsync(
             rawPath,
             rawLength,
             progress,
             cancellationToken);
-        var guestClusterCount = DivideRoundUp(rawLength, ClusterSize);
-        var l2Entries = ClusterSize / 8;
-        var l1Entries = checked((int)DivideRoundUp(guestClusterCount, l2Entries));
-        var l1Clusters = checked((int)DivideRoundUp(checked((long)l1Entries * 8), ClusterSize));
-        var l2Clusters = l1Entries;
+        var allocatedL2Tables = new List<int>();
+        long previousTable = -1;
+        foreach (var guestCluster in allocatedGuestClusters)
+        {
+            var table = guestCluster / l2Entries;
+            if (table == previousTable)
+            {
+                continue;
+            }
+
+            allocatedL2Tables.Add(checked((int)table));
+            previousTable = table;
+        }
+
+        var l2Clusters = allocatedL2Tables.Count;
         var refcountBlockEntries = ClusterSize / 2;
         var refcountBlocks = 1;
         var refcountTableClusters = 1;
@@ -127,10 +150,10 @@ public static class Qcow2SparseWriter
         await WriteAtAsync(output, 0, header, cancellationToken);
 
         var l1 = new byte[checked(l1Clusters * ClusterSize)];
-        for (var index = 0; index < l1Entries; index++)
+        for (var index = 0; index < allocatedL2Tables.Count; index++)
         {
             var offset = checked((ulong)((l2ClusterIndex + index) * ClusterSize));
-            WriteUInt64Big(l1, index * 8, offset | CopiedFlag);
+            WriteUInt64Big(l1, checked(allocatedL2Tables[index] * 8), offset | CopiedFlag);
         }
 
         await WriteAtAsync(output, l1ClusterIndex * ClusterSize, l1, cancellationToken);
@@ -162,34 +185,45 @@ public static class Qcow2SparseWriter
                 cancellationToken);
         }
 
-        var guestToHost = new Dictionary<long, long>(allocatedGuestClusters.Count);
-        for (var index = 0; index < allocatedGuestClusters.Count; index++)
-        {
-            guestToHost.Add(allocatedGuestClusters[index], checked(dataClusterIndex + index));
-        }
-
-        for (var tableIndex = 0; tableIndex < l1Entries; tableIndex++)
+        var allocatedGuestIndex = 0;
+        for (var tablePosition = 0; tablePosition < allocatedL2Tables.Count; tablePosition++)
         {
             var l2 = new byte[ClusterSize];
+            var tableIndex = allocatedL2Tables[tablePosition];
             var firstGuestCluster = checked((long)tableIndex * l2Entries);
             var finalGuestCluster = Math.Min(guestClusterCount, firstGuestCluster + l2Entries);
-            for (var guestCluster = firstGuestCluster; guestCluster < finalGuestCluster; guestCluster++)
+            while (allocatedGuestIndex < allocatedGuestClusters.Count)
             {
-                if (guestToHost.TryGetValue(guestCluster, out var hostCluster))
+                var guestCluster = allocatedGuestClusters[allocatedGuestIndex];
+                if (guestCluster >= finalGuestCluster)
                 {
-                    var index = checked((int)(guestCluster - firstGuestCluster));
-                    WriteUInt64Big(
-                        l2,
-                        index * 8,
-                        checked((ulong)(hostCluster * ClusterSize)) | CopiedFlag);
+                    break;
                 }
+
+                if (guestCluster < firstGuestCluster)
+                {
+                    throw new InvalidDataException("QCOW2 sparse cluster索引の順序が不正です。");
+                }
+
+                var index = checked((int)(guestCluster - firstGuestCluster));
+                var hostCluster = checked(dataClusterIndex + allocatedGuestIndex);
+                WriteUInt64Big(
+                    l2,
+                    index * 8,
+                    checked((ulong)(hostCluster * ClusterSize)) | CopiedFlag);
+                allocatedGuestIndex++;
             }
 
             await WriteAtAsync(
                 output,
-                checked((l2ClusterIndex + tableIndex) * ClusterSize),
+                checked((l2ClusterIndex + tablePosition) * ClusterSize),
                 l2,
                 cancellationToken);
+        }
+
+        if (allocatedGuestIndex != allocatedGuestClusters.Count)
+        {
+            throw new InvalidDataException("QCOW2 sparse cluster索引をL2 tableに格納できませんでした。");
         }
 
         await using var raw = new FileStream(

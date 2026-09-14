@@ -2,6 +2,7 @@ using System.Buffers.Binary;
 using System.Diagnostics;
 using System.Text;
 using Qcow2Explorer.Core;
+using Qcow2Explorer.Creation;
 
 internal static class Qcow2RobustnessTests
 {
@@ -13,6 +14,8 @@ internal static class Qcow2RobustnessTests
         TestDeterministicHeaderMutations(directory);
         TestBoundedConcurrentMetadataCache(directory);
         TestBackingChains(directory);
+        TestSparseL2Allocation(directory);
+        TestWriterCancellationCleanup(directory);
     }
 
     private static void TestMinimalImage(string directory)
@@ -183,6 +186,68 @@ internal static class Qcow2RobustnessTests
         }
     }
 
+    private static void TestSparseL2Allocation(string directory)
+    {
+        const long rawLength = 512L * 1024 * 1024 + 512;
+        const int clusterSize = 64 * 1024;
+        var rawPath = Path.Combine(directory, "large-empty.raw");
+        var qcow2Path = Path.Combine(directory, "large-empty.qcow2");
+        using (var stream = new FileStream(rawPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+        {
+            stream.SetLength(rawLength);
+        }
+
+        Qcow2SparseWriter.WriteFromRawAsync(rawPath, qcow2Path).GetAwaiter().GetResult();
+        Assert(
+            new FileInfo(qcow2Path).Length == 4L * clusterSize,
+            "empty QCOW2 omits unneeded L2 tables");
+        using var reader = new Qcow2Reader(qcow2Path);
+        Assert(reader.Length == rawLength, "large sparse QCOW2 virtual size");
+        Assert(reader.ReadByte(rawLength - 1) == 0, "large sparse QCOW2 trailing data");
+        Assert(reader.LookupCluster(rawLength - 1).HostClusterOffset is null, "large sparse QCOW2 trailing cluster unallocated");
+    }
+
+    private static void TestWriterCancellationCleanup(string directory)
+    {
+        const long rawLength = 64L * 1024 * 1024;
+        var rawPath = Path.Combine(directory, "cancel-writer.raw");
+        var qcow2Path = Path.Combine(directory, "cancel-writer.qcow2");
+        using (var stream = new FileStream(rawPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+        {
+            stream.SetLength(rawLength);
+        }
+
+        using var cancellationSource = new CancellationTokenSource();
+        var progress = new CallbackProgress<DiskImageProgress>(update =>
+        {
+            if (update.Completed >= 16L * 1024 * 1024)
+            {
+                cancellationSource.Cancel();
+            }
+        });
+        var cancelled = false;
+        try
+        {
+            Qcow2SparseWriter.WriteFromRawAsync(
+                rawPath,
+                qcow2Path,
+                progress,
+                cancellationSource.Token).GetAwaiter().GetResult();
+        }
+        catch (OperationCanceledException)
+        {
+            cancelled = true;
+        }
+
+        Assert(cancelled, "QCOW2 writer cancellation propagated");
+        Assert(!File.Exists(qcow2Path), "cancelled QCOW2 destination absent");
+        var partialPrefix = $".{Path.GetFileName(qcow2Path)}.";
+        Assert(
+            !Directory.EnumerateFiles(directory)
+                .Any(path => Path.GetFileName(path).StartsWith(partialPrefix, StringComparison.Ordinal)),
+            "cancelled QCOW2 partial output removed");
+    }
+
     private static void AssertOpenRejected(string path, string description, string expectedMessage)
     {
         var rejected = false;
@@ -308,5 +373,10 @@ internal static class Qcow2RobustnessTests
         var buffer = new byte[1];
         reader.ReadAt(offset, buffer, 0, buffer.Length);
         return buffer[0];
+    }
+
+    private sealed class CallbackProgress<T>(Action<T> callback) : IProgress<T>
+    {
+        public void Report(T value) => callback(value);
     }
 }
