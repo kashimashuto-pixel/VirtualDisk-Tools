@@ -13,7 +13,8 @@ public static class FileSystemSearch
         IProgress<int>? progress = null,
         CancellationToken cancellationToken = default,
         int maximumResults = 5000,
-        int maximumDirectories = 100_000)
+        int maximumDirectories = 100_000,
+        int maximumDepth = 256)
     {
         ArgumentNullException.ThrowIfNull(fileSystem);
         ArgumentException.ThrowIfNullOrWhiteSpace(query);
@@ -23,9 +24,10 @@ public static class FileSystemSearch
         }
 
         ArgumentOutOfRangeException.ThrowIfLessThan(maximumDirectories, 1);
+        ArgumentOutOfRangeException.ThrowIfLessThan(maximumDepth, 1);
         var results = new List<SearchMatch>();
-        var pending = new Stack<(VfsNode Directory, string Path)>();
-        pending.Push((fileSystem.Root, "/"));
+        var pending = new Stack<(VfsNode Directory, string Path, int Depth)>();
+        pending.Push((fileSystem.Root, "/", 0));
         var visitedDirectories = new HashSet<VfsNode>(ReferenceEqualityComparer.Instance);
         var visitedDirectoryPaths = new HashSet<string>(StringComparer.Ordinal);
         var visited = 0;
@@ -39,7 +41,13 @@ public static class FileSystemSearch
                     $"検索対象directory数が対応上限 ({maximumDirectories:N0}) を超えています。");
             }
 
-            var (directory, path) = pending.Pop();
+            var (directory, path, depth) = pending.Pop();
+            if (depth > maximumDepth)
+            {
+                throw new InvalidDataException(
+                    $"検索対象のディレクトリ深度が対応上限 ({maximumDepth:N0}) を超えています: {path}");
+            }
+
             if (!visitedDirectories.Add(directory)
                 || (!string.IsNullOrEmpty(directory.VirtualPath)
                     && !visitedDirectoryPaths.Add(directory.VirtualPath)))
@@ -89,7 +97,7 @@ public static class FileSystemSearch
 
                 if (child.IsDirectory)
                 {
-                    pending.Push((child, childPath));
+                    pending.Push((child, childPath, checked(depth + 1)));
                 }
             }
 

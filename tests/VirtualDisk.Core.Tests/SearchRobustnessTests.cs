@@ -28,9 +28,18 @@ internal static class SearchRobustnessTests
         AssertThrows<InvalidDataException>(
             () => FileSystemSearch.Search(new NullNodeFileSystem(), "item"),
             "search rejects null directory entries");
+        AssertThrows<InvalidDataException>(
+            () => FileSystemSearch.Search(
+                new DeepFileSystem(),
+                "never-matches",
+                maximumDepth: 4),
+            "search bounds directory depth");
         AssertThrows<ArgumentOutOfRangeException>(
             () => FileSystemSearch.Search(new CyclicFileSystem(), "item", maximumResults: 0),
             "search validates result limit");
+        AssertThrows<ArgumentOutOfRangeException>(
+            () => FileSystemSearch.Search(new CyclicFileSystem(), "item", maximumDepth: 0),
+            "search validates depth limit");
     }
 
     private static void AssertThrows<TException>(Action action, string message)
@@ -101,5 +110,24 @@ internal static class SearchRobustnessTests
     private sealed class NullNodeFileSystem : TestFileSystem
     {
         public override IReadOnlyList<VfsNode> ListDirectory(VfsNode directory) => [null!];
+    }
+
+    private sealed class DeepFileSystem : TestFileSystem
+    {
+        private int _nextId;
+
+        public override IReadOnlyList<VfsNode> ListDirectory(VfsNode directory)
+        {
+            _nextId++;
+            return
+            [
+                new VfsNode
+                {
+                    Name = $"level-{_nextId}",
+                    VirtualPath = $"/level-{_nextId}",
+                    IsDirectory = true,
+                },
+            ];
+        }
     }
 }
