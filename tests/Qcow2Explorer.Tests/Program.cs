@@ -5971,6 +5971,18 @@ static void TestGeneratedVmaLzopImage()
     catch (OperationCanceledException)
     {
     }
+
+    var missingClusterPath = Path.Combine(AppContext.BaseDirectory, "sample-fat16-missing-cluster.vma.lzo");
+    TestImageFactory.CreateFat16VmaLzop(missingClusterPath, omitLastCluster: true);
+    try
+    {
+        using var _ = DiskImageReaderFactory.Open(missingClusterPath);
+        Assert(false, "VMA missing cluster throws");
+    }
+    catch (InvalidDataException ex)
+    {
+        Assert(ex.Message.Contains("クラスタが欠落", StringComparison.Ordinal), "VMA missing cluster diagnostic");
+    }
 }
 
 static void TestGeneratedUefiVariableStore()
@@ -8821,9 +8833,13 @@ internal static class TestImageFactory
         File.WriteAllBytes(path, CreateMinimalExt4Disk());
     }
 
-    public static void CreateFat16VmaLzop(string path)
+    public static void CreateFat16VmaLzop(string path, bool omitLastCluster = false)
     {
-        WriteLzop(path, CreateVma(CreateVirtualDisk()), "sample-fat16.vma", corruptHeaderChecksum: false);
+        WriteLzop(
+            path,
+            CreateVma(CreateVirtualDisk(), omitLastCluster),
+            "sample-fat16.vma",
+            corruptHeaderChecksum: false);
     }
 
     public static byte[] CreateUefiVariableStore(bool authenticated = true)
@@ -8989,7 +9005,7 @@ internal static class TestImageFactory
         File.WriteAllBytes(path, output.ToArray());
     }
 
-    private static byte[] CreateVma(byte[] disk)
+    private static byte[] CreateVma(byte[] disk, bool omitLastCluster)
     {
         const int headerSize = 13 * 1024;
         const int blobOffset = 12 * 1024;
@@ -9027,7 +9043,13 @@ internal static class TestImageFactory
         WriteMd5(header, 32);
 
         var output = new List<byte>(header);
-        var clusters = new List<(uint Number, ushort Mask, List<byte[]> Blocks)>();
+        var clusters = new List<(byte DeviceId, uint Number, ushort Mask, List<byte[]> Blocks)>();
+        var efiClusterCount = (528 * 1024 + clusterSize - 1) / clusterSize;
+        for (var clusterNumber = 0; clusterNumber < efiClusterCount; clusterNumber++)
+        {
+            clusters.Add((1, checked((uint)clusterNumber), 0, []));
+        }
+
         var clusterCount = (disk.Length + clusterSize - 1) / clusterSize;
         for (var clusterNumber = 0; clusterNumber < clusterCount; clusterNumber++)
         {
@@ -9050,10 +9072,12 @@ internal static class TestImageFactory
                 }
             }
 
-            if (mask != 0)
-            {
-                clusters.Add((checked((uint)clusterNumber), mask, blocks));
-            }
+            clusters.Add((2, checked((uint)clusterNumber), mask, blocks));
+        }
+
+        if (omitLastCluster)
+        {
+            clusters.RemoveAt(clusters.Count - 1);
         }
 
         for (var clusterStart = 0; clusterStart < clusters.Count; clusterStart += blockInfoCount)
@@ -9073,7 +9097,7 @@ internal static class TestImageFactory
                 var item = extentClusters[index];
                 var infoOffset = 40 + index * 8;
                 WriteU16Be(extentHeader, infoOffset, item.Mask);
-                extentHeader[infoOffset + 3] = 2;
+                extentHeader[infoOffset + 3] = item.DeviceId;
                 WriteU32Be(extentHeader, infoOffset + 4, item.Number);
             }
 

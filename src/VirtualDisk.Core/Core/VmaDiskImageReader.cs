@@ -354,6 +354,19 @@ public sealed class VmaDiskImageReader : IDiskImageReader
             ReportProgress(force: false);
         }
 
+        foreach (var device in Devices)
+        {
+            _cancellationToken.ThrowIfCancellationRequested();
+            var expectedClusters = checked((device.Size - 1) / ClusterSize + 1);
+            var indexedClusters = _clusterMaps[device.Id].Count;
+            if (indexedClusters != expectedClusters)
+            {
+                throw new InvalidDataException(
+                    $"VMA device {device.Id} のクラスタが欠落しています。"
+                    + $" expected={expectedClusters:N0}, indexed={indexedClusters:N0}");
+            }
+        }
+
         _progress?.Report(new DiskImageProgress(
             $"VMA索引作成完了: {_extentCount:N0}エクステント / {Devices.Count:N0}ディスク",
             _source.Length,
