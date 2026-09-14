@@ -9,6 +9,7 @@ internal static class ContainerRobustnessTests
     public static void Run(string directory)
     {
         TestRawTruncationDetected(directory);
+        TestLzopIndexPathBounds();
         TestMinimalParallelsImage(directory);
         TestParallelsBatLimits(directory);
         TestParallelsDescriptorLimits(directory);
@@ -29,6 +30,35 @@ internal static class ContainerRobustnessTests
         AssertThrows<EndOfStreamException>(
             () => reader.ReadAt(4096, new byte[512], 0, 512),
             "RAW truncation after opening is not returned as zero data");
+    }
+
+    private static void TestLzopIndexPathBounds()
+    {
+        using var validStream = new MemoryStream();
+        using (var writer = new BinaryWriter(validStream, Encoding.UTF8, leaveOpen: true))
+        {
+            writer.Write("/tmp/日本語/disk.lzo");
+        }
+
+        validStream.Position = 0;
+        using (var reader = new BinaryReader(validStream, Encoding.UTF8, leaveOpen: true))
+        {
+            Assert(
+                LzopIndexCacheManager.ReadSourcePath(reader) == "/tmp/日本語/disk.lzo",
+                "bounded LZO index source path accepted");
+        }
+
+        using var oversizedStream = new MemoryStream();
+        using (var writer = new BinaryWriter(oversizedStream, Encoding.UTF8, leaveOpen: true))
+        {
+            writer.Write7BitEncodedInt(LzopIndexCacheManager.MaximumSourcePathBytes + 1);
+        }
+
+        oversizedStream.Position = 0;
+        using var oversizedReader = new BinaryReader(oversizedStream, Encoding.UTF8, leaveOpen: true);
+        AssertThrows<InvalidDataException>(
+            () => LzopIndexCacheManager.ReadSourcePath(oversizedReader),
+            "oversized LZO index source path rejected before allocation");
     }
 
     private static void TestMinimalParallelsImage(string directory)

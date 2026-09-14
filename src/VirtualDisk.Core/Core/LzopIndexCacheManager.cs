@@ -29,10 +29,15 @@ public static class LzopIndexCacheManager
     internal const int Version = 3;
     internal const int FingerprintLength = 4096;
     internal const int HashLength = 32;
+    internal const int MaximumSourcePathCharacters = 32_768;
+    internal const int MaximumSourcePathBytes = MaximumSourcePathCharacters * 4;
     private const int MaximumBlockCount = 4_194_304;
     private const int MaximumBlockSize = 64 * 1024 * 1024;
     internal const string FileSuffix = ".lzop-index.br";
     internal static readonly byte[] Magic = "VDLZOIDX"u8.ToArray();
+    private static readonly UTF8Encoding StrictUtf8 = new(
+        encoderShouldEmitUTF8Identifier: false,
+        throwOnInvalidBytes: true);
 
     public static string DefaultIndexRoot => Path.Combine(LzopRawCacheManager.DefaultCacheRoot, "Index");
 
@@ -155,11 +160,7 @@ public static class LzopIndexCacheManager
             throw new InvalidDataException("LZO索引キャッシュは旧形式または未対応バージョンです。");
         }
 
-        var sourcePath = reader.ReadString();
-        if (string.IsNullOrWhiteSpace(sourcePath) || sourcePath.Length > 32_768)
-        {
-            throw new InvalidDataException("LZO索引キャッシュの元ファイルパスが不正です。");
-        }
+        var sourcePath = ReadSourcePath(reader);
 
         var sourceLength = reader.ReadInt64();
         var sourceWriteTicks = reader.ReadInt64();
@@ -219,6 +220,48 @@ public static class LzopIndexCacheManager
     }
 
     private static uint? ReadNullableUInt32(BinaryReader reader) => reader.ReadBoolean() ? reader.ReadUInt32() : null;
+
+    internal static string ReadSourcePath(BinaryReader reader)
+    {
+        ArgumentNullException.ThrowIfNull(reader);
+        int byteCount;
+        try
+        {
+            byteCount = reader.Read7BitEncodedInt();
+        }
+        catch (Exception exception) when (exception is FormatException or EndOfStreamException)
+        {
+            throw new InvalidDataException("LZO索引キャッシュの元ファイルパス長が不正です。", exception);
+        }
+
+        if (byteCount <= 0 || byteCount > MaximumSourcePathBytes)
+        {
+            throw new InvalidDataException("LZO索引キャッシュの元ファイルパスが長すぎます。");
+        }
+
+        var bytes = reader.ReadBytes(byteCount);
+        if (bytes.Length != byteCount)
+        {
+            throw new InvalidDataException("LZO索引キャッシュの元ファイルパスが途中で終了しています。");
+        }
+
+        string sourcePath;
+        try
+        {
+            sourcePath = StrictUtf8.GetString(bytes);
+        }
+        catch (DecoderFallbackException exception)
+        {
+            throw new InvalidDataException("LZO索引キャッシュの元ファイルパスがUTF-8ではありません。", exception);
+        }
+
+        if (string.IsNullOrWhiteSpace(sourcePath) || sourcePath.Length > MaximumSourcePathCharacters)
+        {
+            throw new InvalidDataException("LZO索引キャッシュの元ファイルパスが不正です。");
+        }
+
+        return sourcePath;
+    }
 
     private static bool IsSourceCurrent(LzopIndexCacheHeader header)
     {

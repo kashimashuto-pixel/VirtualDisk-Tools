@@ -533,7 +533,7 @@ public sealed class LzopDiskImageReader : IDiskImageReader
             using var reader = new BinaryReader(compressed, Encoding.UTF8, leaveOpen: false);
             if (!reader.ReadBytes(LzopIndexCacheManager.Magic.Length).SequenceEqual(LzopIndexCacheManager.Magic)
                 || reader.ReadInt32() != LzopIndexCacheManager.Version
-                || !string.Equals(reader.ReadString(), identity.Path, PathSemantics.Comparison)
+                || !string.Equals(LzopIndexCacheManager.ReadSourcePath(reader), identity.Path, PathSemantics.Comparison)
                 || reader.ReadInt64() != identity.Length
                 || reader.ReadInt64() != identity.LastWriteUtcTicks
                 || !reader.ReadBytes(identity.Fingerprint.Length).SequenceEqual(identity.Fingerprint))
