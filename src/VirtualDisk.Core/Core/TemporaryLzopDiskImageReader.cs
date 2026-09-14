@@ -60,7 +60,7 @@ public sealed class TemporaryLzopDiskImageReader : IDiskImageReader
         var temporaryDirectory = System.IO.Path.Combine(
             root,
             $"VirtualDiskExplorer-lzo-{Guid.NewGuid():N}");
-        Directory.CreateDirectory(temporaryDirectory);
+        PrivateStorage.CreateDirectory(temporaryDirectory);
         var temporaryPath = System.IO.Path.Combine(temporaryDirectory, "disk.raw");
 
         RawDiskImageReader? rawReader = null;
@@ -101,6 +101,11 @@ public sealed class TemporaryLzopDiskImageReader : IDiskImageReader
         Directory.CreateDirectory(root);
         var source = LzopRawCacheManager.ReadSourceIdentity(sourcePath, progress, cancellationToken);
         var cacheDirectory = LzopRawCacheManager.GetCacheDirectory(root, sourcePath);
+        if (Directory.Exists(cacheDirectory))
+        {
+            PrivateStorage.CreateDirectory(cacheDirectory);
+        }
+
         var rawPath = System.IO.Path.Combine(cacheDirectory, LzopRawCacheManager.RawFileName);
         var cachedMetadata = LzopRawCacheManager.TryGetUsableMetadata(cacheDirectory, source);
         if (cachedMetadata is not null)
@@ -130,7 +135,7 @@ public sealed class TemporaryLzopDiskImageReader : IDiskImageReader
             LzopRawCacheManager.DeleteDirectory(cacheDirectory);
         }
 
-        Directory.CreateDirectory(cacheDirectory);
+        PrivateStorage.CreateDirectory(cacheDirectory);
         RawDiskImageReader? rawReader = null;
         try
         {

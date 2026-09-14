@@ -251,7 +251,7 @@ public static class LzopRawCacheManager
 
     internal static void WriteMetadata(string directory, LzopCacheMetadata metadata)
     {
-        Directory.CreateDirectory(directory);
+        PrivateStorage.CreateDirectory(directory);
         var metadataPath = Path.Combine(directory, MetadataFileName);
         var temporaryPath = metadataPath + ".tmp";
         File.WriteAllText(temporaryPath, JsonSerializer.Serialize(metadata, JsonOptions), new UTF8Encoding(false));

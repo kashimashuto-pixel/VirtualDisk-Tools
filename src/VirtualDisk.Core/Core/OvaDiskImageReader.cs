@@ -66,7 +66,7 @@ public sealed class OvaDiskImageReader : IDiskImageReader
         var temporaryDirectory = System.IO.Path.Combine(
             temporaryRoot,
             $"VirtualDiskExplorer-ova-{Guid.NewGuid():N}");
-        Directory.CreateDirectory(temporaryDirectory);
+        PrivateStorage.CreateDirectory(temporaryDirectory);
 
         IDiskImageReader? activeReader = null;
         try

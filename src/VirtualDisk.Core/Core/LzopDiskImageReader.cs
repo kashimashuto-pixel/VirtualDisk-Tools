@@ -523,6 +523,8 @@ public sealed class LzopDiskImageReader : IDiskImageReader
             return false;
         }
 
+        PrivateStorage.CreateDirectory(System.IO.Path.GetDirectoryName(cachePath)!);
+
         try
         {
             var identity = GetSourceIdentity();
@@ -618,7 +620,7 @@ public sealed class LzopDiskImageReader : IDiskImageReader
         var temporaryPath = cachePath + ".partial";
         try
         {
-            Directory.CreateDirectory(System.IO.Path.GetDirectoryName(cachePath)!);
+            PrivateStorage.CreateDirectory(System.IO.Path.GetDirectoryName(cachePath)!);
             var identity = GetSourceIdentity();
             using (var file = new FileStream(temporaryPath, FileMode.Create, FileAccess.Write, FileShare.None))
             using (var compressed = new BrotliStream(file, CompressionLevel.Fastest))

@@ -23,6 +23,7 @@ try
     VerificationRobustnessTests.Run();
     SearchRobustnessTests.Run();
     PathSemanticsTests.Run(temporaryDirectory);
+    PrivateStorageTests.Run(temporaryDirectory);
     EncryptionCancellationTests.Run();
     Qcow2RobustnessTests.Run(temporaryDirectory);
     ContainerRobustnessTests.Run(temporaryDirectory);

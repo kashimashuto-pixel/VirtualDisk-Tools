@@ -44,6 +44,8 @@ public static class LzopIndexCacheManager
             return Array.Empty<LzopIndexCacheEntry>();
         }
 
+        PrivateStorage.CreateDirectory(root);
+
         var entries = new List<LzopIndexCacheEntry>();
         foreach (var path in Directory.EnumerateFiles(root, "*", SearchOption.TopDirectoryOnly))
         {

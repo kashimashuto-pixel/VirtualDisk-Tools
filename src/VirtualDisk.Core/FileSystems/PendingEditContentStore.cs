@@ -14,6 +14,7 @@ internal sealed class PendingEditContentStore : IDisposable
             ? Path.Combine(Path.GetTempPath(), "VirtualDiskExplorer", "PendingEdits")
             : Path.GetFullPath(basePath);
         _rootPath = Path.Combine(root, Guid.NewGuid().ToString("N"));
+        PrivateStorage.CreateDirectory(_rootPath);
     }
 
     internal string RootPath => _rootPath;
