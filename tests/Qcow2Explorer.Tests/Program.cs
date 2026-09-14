@@ -5,13 +5,16 @@ using System.IO.Compression;
 using System.Formats.Tar;
 using System.Security.Cryptography;
 using System.Text;
+using System.Windows.Forms;
 using Konscious.Security.Cryptography;
 using Qcow2Explorer;
+using Qcow2Explorer.Creation;
 using Qcow2Explorer.Core;
 using Qcow2Explorer.FileSystems;
 using Qcow2Explorer.Mounting;
 using Qcow2Explorer.Partitions;
 using Qcow2Explorer.Previewing;
+using Qcow2Explorer.Platform.Windows;
 using DiscUtils.Streams;
 using DiscXfsFileSystem = DiscUtils.Xfs.XfsFileSystem;
 using VdiDisk = DiscUtils.Vdi.Disk;
@@ -90,6 +93,18 @@ if (args.Length > 1 && string.Equals(args[0], "--probe-physical", StringComparis
     return;
 }
 
+if (args.Length == 5 && string.Equals(args[0], "--integration-edit-smoke", StringComparison.OrdinalIgnoreCase))
+{
+    IntegrationEditRawImage(args[1], args[2], args[3], args[4]);
+    return;
+}
+
+if (args.Length == 2 && string.Equals(args[0], "--virtual-disk-create-smoke", StringComparison.OrdinalIgnoreCase))
+{
+    TestVirtualDiskCreation(args[1]);
+    return;
+}
+
 if (args.Length == 7 && string.Equals(args[0], "--physical-vhdx-integration", StringComparison.OrdinalIgnoreCase))
 {
     TestPhysicalVhdxIntegration(
@@ -99,6 +114,37 @@ if (args.Length == 7 && string.Equals(args[0], "--physical-vhdx-integration", St
         args[4],
         args[5],
         args[6]);
+    return;
+}
+
+if (args.Length == 10 && string.Equals(args[0], "--physical-removable-integration", StringComparison.OrdinalIgnoreCase))
+{
+    TestPhysicalRemovableIntegration(
+        args[1],
+        long.Parse(args[2], CultureInfo.InvariantCulture),
+        long.Parse(args[3], CultureInfo.InvariantCulture),
+        args[4],
+        args[5],
+        args[6],
+        args[7],
+        args[8],
+        args[9]);
+    return;
+}
+
+if (args.Length == 11 && string.Equals(args[0], "--physical-filesystem-integration", StringComparison.OrdinalIgnoreCase))
+{
+    TestPhysicalFileSystemIntegration(
+        args[1],
+        long.Parse(args[2], CultureInfo.InvariantCulture),
+        long.Parse(args[3], CultureInfo.InvariantCulture),
+        long.Parse(args[4], CultureInfo.InvariantCulture),
+        args[5],
+        args[6],
+        args[7],
+        args[8],
+        args[9],
+        args[10]);
     return;
 }
 
@@ -408,6 +454,9 @@ static void RunGeneratedImageTests()
     TestXfsTimestampDecoding();
     TestXfsExtentDecoding();
     TestXfsFallbackPolicy();
+    TestVirtualDiskCreationPrimitives();
+    TestVirtualDiskCreationDialog();
+    TestMainMenuStructure();
     TestFileSystemExporterUnexpectedEofDiagnostics();
     TestPendingEditContentStore();
     TestPendingEditSequenceValidation();
@@ -3514,6 +3563,12 @@ static void TestXfsExtentDecoding()
     Assert(
         XfsRawFileSystem.GetExtentByteLength(1_540_608, 4_096) == 6_310_330_368,
         "XFS large extent byte length uses 64bit multiplication");
+    Assert(
+        XfsRawFileSystem.GetDiskBlockFromFileSystemBlock(65_543, 20_480, 15) == 40_967,
+        "XFS fsblock removes non-power-of-two AG padding");
+    Assert(
+        XfsRawFileSystem.GetDiskBlockFromFileSystemBlock(65_543, 32_768, 15) == 65_543,
+        "XFS fsblock preserves power-of-two AG layout");
 
     Assert(
         XfsRawFileSystem.IsExtentWithinAllocationGroup(
@@ -3542,6 +3597,500 @@ static void TestXfsExtentDecoding()
             dataBlocks: 4_000,
             agBlockLog: 10),
         "XFS extent rejects AG boundary crossing");
+}
+
+static void TestVirtualDiskCreation(string outputDirectory)
+{
+    outputDirectory = Path.GetFullPath(outputDirectory);
+    if (Directory.Exists(outputDirectory) && Directory.EnumerateFileSystemEntries(outputDirectory).Any())
+    {
+        throw new IOException($"仮想ディスク作成テストの出力フォルダーは空である必要があります: {outputDirectory}");
+    }
+
+    Directory.CreateDirectory(outputDirectory);
+    var contentPath = Path.Combine(outputDirectory, "created-content.bin");
+    var content = new byte[256 * 1024];
+    for (var index = 0; index < content.Length; index++)
+    {
+        content[index] = checked((byte)((index * 29 + 17) & 0xff));
+    }
+
+    File.WriteAllBytes(contentPath, content);
+    var cases = new[]
+    {
+        new
+        {
+            Name = "mbr-raw",
+            Format = VirtualDiskContainerFormat.Raw,
+            Table = VirtualDiskPartitionTableKind.Mbr,
+            Extension = ".raw",
+            Capacity = 512L * 1024 * 1024,
+            Definitions = new VirtualDiskPartitionDefinition[]
+            {
+                new(64L * 1024 * 1024, "Linux data", "VDT_EXT4", VirtualDiskFileSystemKind.Ext4),
+                new(64L * 1024 * 1024, "Windows data", "VDT_NTFS", VirtualDiskFileSystemKind.Ntfs),
+            },
+        },
+        new
+        {
+            Name = "gpt-qcow2",
+            Format = VirtualDiskContainerFormat.Qcow2,
+            Table = VirtualDiskPartitionTableKind.Gpt,
+            Extension = ".qcow2",
+            Capacity = 896L * 1024 * 1024,
+            Definitions = new VirtualDiskPartitionDefinition[]
+            {
+                new(320L * 1024 * 1024, "XFS data", "VDT_XFS", VirtualDiskFileSystemKind.Xfs),
+                new(128L * 1024 * 1024, "Linux data", "VDT_EXT4", VirtualDiskFileSystemKind.Ext4),
+                new(256L * 1024 * 1024, "Windows data", "VDT_NTFS", VirtualDiskFileSystemKind.Ntfs),
+            },
+        },
+    };
+
+    foreach (var testCase in cases)
+    {
+        var outputPath = Path.Combine(outputDirectory, testCase.Name + testCase.Extension);
+        var progress = new Progress<DiskImageProgress>(update =>
+        {
+            if (update.Percentage is int percentage && percentage % 25 == 0)
+            {
+                Console.WriteLine($"[{testCase.Name}] {update.Message}: {percentage}%");
+            }
+        });
+        var result = VirtualDiskCreationService.CreateAsync(
+                new VirtualDiskCreationRequest(
+                    outputPath,
+                    testCase.Capacity,
+                    testCase.Format,
+                    testCase.Table,
+                    testCase.Definitions,
+                    InitialFiles:
+                    testCase.Definitions
+                        .Select((_, index) => new VirtualDiskInitialFile(
+                            index + 1,
+                            contentPath,
+                            $"SEEDED-{index + 1}.BIN"))
+                        .ToArray()),
+                WslFileSystemFormatter.CreateRegistry("Ubuntu-24.04"),
+                progress)
+            .GetAwaiter()
+            .GetResult();
+        Assert(
+            result.Partitions.Count == testCase.Definitions.Length,
+            $"{testCase.Name} creation result partition count");
+
+        using (var source = DiskImageReaderFactory.Open(outputPath))
+        {
+            var partitions = PartitionTableReader.ReadPartitions(source);
+            Assert(partitions.Count == testCase.Definitions.Length, $"{testCase.Name} parsed partition count");
+            for (var index = 0; index < partitions.Count; index++)
+            {
+                var partition = partitions[index];
+                var expectedFileSystem = VirtualDiskPartitionTableWriter.GetDisplayName(
+                    testCase.Definitions[index].FileSystem);
+                partition.FileSystem = FileSystemDetector.Detect(source, partition);
+                Assert(
+                    partition.FileSystem.Equals(expectedFileSystem, StringComparison.OrdinalIgnoreCase),
+                    $"{testCase.Name} partition {partition.Number} {expectedFileSystem} detection");
+                var fileSystem = FileSystemDetector.TryOpen(source, partition, out var error)
+                    ?? throw new InvalidDataException(error);
+                try
+                {
+                    var initialEntries = fileSystem.ListDirectory(fileSystem.Root);
+                    var readme = initialEntries.Single(entry =>
+                        entry.Name.Equals("VDT-README.txt", StringComparison.OrdinalIgnoreCase));
+                    Assert(
+                        Encoding.UTF8.GetString(fileSystem.ReadFile(readme, 0, checked((int)readme.Size)))
+                            .StartsWith("Created by Virtual Disk Explorer.", StringComparison.Ordinal),
+                        $"{testCase.Name} partition {partition.Number} initial README content");
+                    var seeded = initialEntries.Single(entry =>
+                        entry.Name.Equals($"SEEDED-{index + 1}.BIN", StringComparison.OrdinalIgnoreCase));
+                    Assert(
+                        fileSystem.ReadFile(seeded, 0, checked((int)seeded.Size)).SequenceEqual(content),
+                        $"{testCase.Name} partition {partition.Number} seeded content");
+                }
+                finally
+                {
+                    (fileSystem as IDisposable)?.Dispose();
+                }
+            }
+        }
+
+        var editedPath = Path.Combine(outputDirectory, testCase.Name + "-edited.raw");
+        var currentPath = outputPath;
+        for (var index = 0; index < testCase.Definitions.Length; index++)
+        {
+            var nextPath = index == testCase.Definitions.Length - 1
+                ? editedPath
+                : Path.Combine(outputDirectory, $"{testCase.Name}-edit-step-{index + 1}.raw");
+            using (var source = DiskImageReaderFactory.Open(currentPath))
+            {
+                var partitions = PartitionTableReader.ReadPartitions(source);
+                var partition = partitions[index];
+                partition.FileSystem = FileSystemDetector.Detect(source, partition);
+                var fileSystem = FileSystemDetector.TryOpen(source, partition, out var error)
+                    ?? throw new InvalidDataException(error);
+                try
+                {
+                    var edit = new PendingFileEdit(
+                        FileEditOperationKind.CreateFile,
+                        $"/FROM-CREATOR-{index + 1}.BIN",
+                        contentPath);
+                    var editResult = FileEditBatchService.ApplyToRawAsync(
+                            source,
+                            partition,
+                            fileSystem,
+                            [edit],
+                            nextPath)
+                        .GetAwaiter()
+                        .GetResult();
+                    Assert(
+                        editResult.EditCount == 1,
+                        $"{testCase.Name} partition {partition.Number} file create result");
+                }
+                finally
+                {
+                    (fileSystem as IDisposable)?.Dispose();
+                }
+            }
+
+            if (!string.Equals(currentPath, outputPath, StringComparison.OrdinalIgnoreCase))
+            {
+                File.Delete(currentPath);
+            }
+
+            currentPath = nextPath;
+        }
+
+        using (var edited = new RawDiskImageReader(editedPath))
+        {
+            var partitions = PartitionTableReader.ReadPartitions(edited);
+            Assert(partitions.Count == testCase.Definitions.Length, $"{testCase.Name} edited partition count");
+            for (var index = 0; index < partitions.Count; index++)
+            {
+                partitions[index].FileSystem = FileSystemDetector.Detect(edited, partitions[index]);
+                var fileSystem = FileSystemDetector.TryOpen(edited, partitions[index], out var error)
+                    ?? throw new InvalidDataException(error);
+                try
+                {
+                    var entries = fileSystem.ListDirectory(fileSystem.Root);
+                    var created = entries.Single(entry =>
+                        entry.Name.Equals($"FROM-CREATOR-{index + 1}.BIN", StringComparison.OrdinalIgnoreCase));
+                    Assert(created.Size == content.Length, $"{testCase.Name} created file size");
+                    Assert(
+                        fileSystem.ReadFile(created, 0, content.Length).SequenceEqual(content),
+                        $"{testCase.Name} created file content");
+                    var seeded = entries.Single(entry =>
+                        entry.Name.Equals($"SEEDED-{index + 1}.BIN", StringComparison.OrdinalIgnoreCase));
+                    Assert(
+                        fileSystem.ReadFile(seeded, 0, checked((int)seeded.Size)).SequenceEqual(content),
+                        $"{testCase.Name} seeded file content after edits");
+                    Assert(
+                        entries.Any(entry => entry.Name.Equals("VDT-README.txt", StringComparison.OrdinalIgnoreCase)),
+                        $"{testCase.Name} partition retains initial README");
+                }
+                finally
+                {
+                    (fileSystem as IDisposable)?.Dispose();
+                }
+            }
+        }
+
+        Console.WriteLine(
+            $"Virtual disk creation passed: {testCase.Name}, source={outputPath}, edited={editedPath}");
+    }
+}
+
+static void TestVirtualDiskCreationPrimitives()
+{
+    var definitions = new VirtualDiskPartitionDefinition[]
+    {
+        new(320L * 1024 * 1024, "First", "VDT_ONE"),
+        new(320L * 1024 * 1024, "Second", "VDT_TWO"),
+    };
+    foreach (var table in new[] { VirtualDiskPartitionTableKind.Mbr, VirtualDiskPartitionTableKind.Gpt })
+    {
+        var layouts = VirtualDiskPartitionTableWriter.Plan(768L * 1024 * 1024, table, definitions);
+        Assert(layouts.Count == 2, $"{table} creation plan partition count");
+        Assert(layouts[0].OffsetBytes == 1024 * 1024, $"{table} creation plan first alignment");
+        Assert(layouts[1].OffsetBytes == 321L * 1024 * 1024, $"{table} creation plan second alignment");
+        Assert(layouts[1].SizeBytes == 320L * 1024 * 1024, $"{table} creation plan size");
+    }
+
+    var invalidLabelRejected = false;
+    try
+    {
+        _ = VirtualDiskPartitionTableWriter.Plan(
+            512L * 1024 * 1024,
+            VirtualDiskPartitionTableKind.Gpt,
+            [new VirtualDiskPartitionDefinition(320L * 1024 * 1024, "Invalid", "長すぎるラベル")]);
+    }
+    catch (ArgumentException)
+    {
+        invalidLabelRejected = true;
+    }
+
+    Assert(invalidLabelRejected, "XFS creation plan rejects labels over 12 UTF-8 bytes");
+
+    var mixedDefinitions = new VirtualDiskPartitionDefinition[]
+    {
+        new(64L * 1024 * 1024, "Linux", "VDT_EXT4", VirtualDiskFileSystemKind.Ext4),
+        new(64L * 1024 * 1024, "Windows", "VDT_NTFS", VirtualDiskFileSystemKind.Ntfs),
+    };
+    var mixedLayouts = VirtualDiskPartitionTableWriter.Plan(
+        512L * 1024 * 1024,
+        VirtualDiskPartitionTableKind.Mbr,
+        mixedDefinitions);
+    var partitionTablePath = Path.Combine(AppContext.BaseDirectory, "synthetic-mixed-partition-table.raw");
+    File.Delete(partitionTablePath);
+    try
+    {
+        using (var mbr = new FileStream(partitionTablePath, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None))
+        {
+            mbr.SetLength(512L * 1024 * 1024);
+            VirtualDiskPartitionTableWriter.Write(mbr, mbr.Length, VirtualDiskPartitionTableKind.Mbr, mixedLayouts);
+            var sector = new byte[512];
+            mbr.Position = 0;
+            mbr.ReadExactly(sector);
+            Assert(sector[0x1be + 4] == 0x83, "ext4 MBR partition type");
+            Assert(sector[0x1be + 16 + 4] == 0x07, "NTFS MBR partition type");
+        }
+
+        var gptLayouts = VirtualDiskPartitionTableWriter.Plan(
+            512L * 1024 * 1024,
+            VirtualDiskPartitionTableKind.Gpt,
+            mixedDefinitions);
+        using (var gpt = new FileStream(partitionTablePath, FileMode.Create, FileAccess.ReadWrite, FileShare.None))
+        {
+            gpt.SetLength(512L * 1024 * 1024);
+            VirtualDiskPartitionTableWriter.Write(gpt, gpt.Length, VirtualDiskPartitionTableKind.Gpt, gptLayouts);
+            var entries = new byte[256];
+            gpt.Position = 2 * 512;
+            gpt.ReadExactly(entries);
+            Assert(
+                new Guid(entries.AsSpan(0, 16)) == new Guid("0FC63DAF-8483-4772-8E79-3D69D8477DE4"),
+                "ext4 GPT partition type");
+            Assert(
+                new Guid(entries.AsSpan(128, 16)) == new Guid("EBD0A0A2-B9E5-4433-87C0-68B6B72699C7"),
+                "NTFS GPT partition type");
+        }
+    }
+    finally
+    {
+        File.Delete(partitionTablePath);
+    }
+
+    foreach (var invalidDefinition in new[]
+             {
+                 new VirtualDiskPartitionDefinition(
+                     64L * 1024 * 1024,
+                     "Invalid ext4",
+                     "12345678901234567",
+                     VirtualDiskFileSystemKind.Ext4),
+                 new VirtualDiskPartitionDefinition(
+                     64L * 1024 * 1024,
+                     "Invalid NTFS",
+                     "INVALID:LABEL",
+                     VirtualDiskFileSystemKind.Ntfs),
+             })
+    {
+        var rejected = false;
+        try
+        {
+            _ = VirtualDiskPartitionTableWriter.Plan(
+                512L * 1024 * 1024,
+                VirtualDiskPartitionTableKind.Gpt,
+                [invalidDefinition]);
+        }
+        catch (ArgumentException)
+        {
+            rejected = true;
+        }
+
+        Assert(rejected, $"{invalidDefinition.FileSystem} creation plan rejects invalid label");
+    }
+
+    var rawPath = Path.Combine(AppContext.BaseDirectory, "synthetic-qcow2-writer-source.raw");
+    var qcowPath = Path.Combine(AppContext.BaseDirectory, "synthetic-qcow2-writer-output.qcow2");
+    File.Delete(rawPath);
+    File.Delete(qcowPath);
+    try
+    {
+        const int rawLength = 8 * 1024 * 1024;
+        using (var raw = new FileStream(rawPath, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None))
+        {
+            raw.SetLength(rawLength);
+            var first = Enumerable.Range(0, 64 * 1024).Select(index => checked((byte)((index * 17) & 0xff))).ToArray();
+            var second = Enumerable.Range(0, 64 * 1024).Select(index => checked((byte)((255 - index * 13) & 0xff))).ToArray();
+            raw.Position = 0;
+            raw.Write(first);
+            raw.Position = 5L * 1024 * 1024;
+            raw.Write(second);
+        }
+
+        Qcow2SparseWriter.WriteFromRawAsync(rawPath, qcowPath).GetAwaiter().GetResult();
+        using var expected = new RawDiskImageReader(rawPath);
+        using var actual = new Qcow2Reader(qcowPath);
+        Assert(actual.Header.Version == 3, "created QCOW2 version 3");
+        Assert(actual.Header.RefcountOrder == 4, "created QCOW2 16-bit refcounts");
+        Assert(actual.Length == rawLength, "created QCOW2 virtual size");
+        Assert(new FileInfo(qcowPath).Length < rawLength, "created QCOW2 stores zero clusters sparsely");
+        var expectedBuffer = new byte[1024 * 1024];
+        var actualBuffer = new byte[expectedBuffer.Length];
+        for (long offset = 0; offset < rawLength; offset += expectedBuffer.Length)
+        {
+            expected.ReadAt(offset, expectedBuffer, 0, expectedBuffer.Length);
+            actual.ReadAt(offset, actualBuffer, 0, actualBuffer.Length);
+            Assert(actualBuffer.SequenceEqual(expectedBuffer), $"created QCOW2 data at 0x{offset:X}");
+        }
+    }
+    finally
+    {
+        File.Delete(rawPath);
+        File.Delete(qcowPath);
+    }
+}
+
+static void TestVirtualDiskCreationDialog()
+{
+    Exception? failure = null;
+    var thread = new Thread(() =>
+    {
+        try
+        {
+            using var dialog = new VirtualDiskCreationDialog();
+            var controls = EnumerateControls(dialog).ToArray();
+            Assert(dialog.Text == "新規仮想ディスク", "virtual disk creation dialog title");
+            Assert(
+                controls.OfType<Button>().Any(button => button.Text == "初期ファイル追加..."),
+                "virtual disk creation dialog initial file button");
+            Assert(
+                controls.OfType<DataGridView>().Count() == 2,
+                "virtual disk creation dialog partition and initial file grids");
+            Assert(
+                controls.OfType<ComboBox>().Count(combo => combo.Items.Contains("GPT")) == 1,
+                "virtual disk creation dialog GPT selector");
+            Assert(
+                controls.OfType<ComboBox>().Count(combo => combo.Items.Contains("QCOW2")) == 1,
+                "virtual disk creation dialog QCOW2 selector");
+            var partitionGrid = controls.OfType<DataGridView>().Single(grid =>
+                grid.Columns.Contains("FileSystem"));
+            var fileSystemColumn = (DataGridViewComboBoxColumn)partitionGrid.Columns["FileSystem"]!;
+            Assert(
+                fileSystemColumn.Items.Cast<string>().SequenceEqual(["XFS", "ext4", "NTFS"]),
+                "virtual disk creation dialog file-system selector");
+        }
+        catch (Exception ex)
+        {
+            failure = ex;
+        }
+    });
+    thread.SetApartmentState(ApartmentState.STA);
+    thread.Start();
+    thread.Join();
+    if (failure is not null)
+    {
+        throw new InvalidOperationException("Virtual disk creation dialog smoke failed.", failure);
+    }
+
+    static IEnumerable<Control> EnumerateControls(Control root)
+    {
+        foreach (Control control in root.Controls)
+        {
+            yield return control;
+            foreach (var nested in EnumerateControls(control))
+            {
+                yield return nested;
+            }
+        }
+    }
+}
+
+static void TestMainMenuStructure()
+{
+    Exception? failure = null;
+    var thread = new Thread(() =>
+    {
+        try
+        {
+            using var form = new Form1();
+            var menu = form.MainMenuStrip ?? throw new InvalidOperationException("Main menu was not configured.");
+            var fileMenu = menu.Items.OfType<ToolStripMenuItem>()
+                .Single(item => item.Text?.StartsWith("ファイル", StringComparison.Ordinal) == true);
+            var editMenu = menu.Items.OfType<ToolStripMenuItem>()
+                .Single(item => item.Text?.StartsWith("編集", StringComparison.Ordinal) == true);
+            var fileItems = fileMenu.DropDownItems.OfType<ToolStripMenuItem>()
+                .Select(item => item.Text ?? string.Empty)
+                .ToArray();
+            Assert(fileItems.Any(text => text.StartsWith("新規作成", StringComparison.Ordinal)), "main menu new item");
+            Assert(fileItems.Any(text => text.StartsWith("開く", StringComparison.Ordinal)), "main menu open item");
+            Assert(fileItems.Any(text => text.StartsWith("終了", StringComparison.Ordinal)), "main menu exit item");
+            Assert(
+                editMenu.DropDownItems.OfType<ToolStripMenuItem>()
+                    .Single().Text == "編集モードを有効にする",
+                "main menu edit mode item");
+            var topToolStrip = EnumerateControls(form)
+                .OfType<ToolStrip>()
+                .Single(strip => strip is not MenuStrip
+                    && strip.Items.OfType<ToolStripLabel>()
+                        .Any(label => label.Text == "ファイル"));
+            Assert(
+                topToolStrip.Items.OfType<ToolStripButton>().Count() == 1,
+                "main toolbar keeps only the contextual cancel button");
+        }
+        catch (Exception ex)
+        {
+            failure = ex;
+        }
+    });
+    thread.SetApartmentState(ApartmentState.STA);
+    thread.Start();
+    thread.Join();
+    if (failure is not null)
+    {
+        throw new InvalidOperationException("Main menu smoke failed.", failure);
+    }
+
+    static IEnumerable<Control> EnumerateControls(Control root)
+    {
+        foreach (Control control in root.Controls)
+        {
+            yield return control;
+            foreach (var nested in EnumerateControls(control))
+            {
+                yield return nested;
+            }
+        }
+    }
+}
+
+static void IntegrationEditRawImage(
+    string imagePath,
+    string replacementPath,
+    string finalContentPath,
+    string outputPath)
+{
+    using var source = new RawDiskImageReader(imagePath);
+    var partition = CreateRawFileSystemPartition(source);
+    var fileSystem = OpenDetectedFileSystem(source, partition);
+    try
+    {
+        var edits = CreatePhysicalFileSystemIntegrationEdits(replacementPath, finalContentPath);
+        var result = FileEditBatchService.ApplyToRawAsync(
+            source,
+            partition,
+            fileSystem,
+            edits,
+            outputPath,
+            new Progress<DiskImageProgress>(update => Console.WriteLine(update.Message))).GetAwaiter().GetResult();
+        Console.WriteLine(
+            $"Integration edit passed: fs={partition.FileSystem}, edits={result.EditCount:N0}, "
+            + $"pages={result.ModifiedPageCount:N0}, output={result.DestinationPath}");
+    }
+    finally
+    {
+        (fileSystem as IDisposable)?.Dispose();
+    }
 }
 
 static void PrepareLzopInteropFixture(string outputDirectory)
@@ -5904,6 +6453,518 @@ static PhysicalDiskWriteSession OpenPhysicalSessionWithRetry(PhysicalDiskTargetI
             Console.WriteLine($"Volume lock is temporarily unavailable; retrying ({attempt}/{retryCount - 1}).");
             Thread.Sleep(500);
         }
+    }
+}
+
+static void TestPhysicalRemovableIntegration(
+    string devicePath,
+    long expectedLength,
+    long writeOffset,
+    string markerPath,
+    string expectedMarker,
+    string rawJournalPath,
+    string interruptedJournalPath,
+    string fileEditJournalPath,
+    string expectedModel)
+{
+    if (!OperatingSystem.IsWindows())
+    {
+        throw new PlatformNotSupportedException("The physical removable integration test requires Windows.");
+    }
+
+    Assert(expectedLength >= 256L * 1024 * 1024, "removable integration target has a plausible capacity");
+    Assert(writeOffset >= 128L * 1024 * 1024, "removable integration write uses the unpartitioned test area");
+    Assert(
+        expectedMarker.StartsWith("VDT-REMOVABLE-INTEGRATION-", StringComparison.Ordinal)
+        && expectedMarker.Length == "VDT-REMOVABLE-INTEGRATION-".Length + 32
+        && expectedMarker["VDT-REMOVABLE-INTEGRATION-".Length..].All(Uri.IsHexDigit),
+        "removable integration marker format");
+    Assert(!string.IsNullOrWhiteSpace(expectedModel), "removable integration expected model");
+
+    var target = PhysicalDiskWriteSession.Inspect(devicePath);
+    Console.WriteLine(
+        $"Removable target inspected: disk={target.DiskNumber}, length={target.Length}, "
+        + $"sector={target.LogicalSectorSize}, model={target.Model}, bus={target.BusType}, "
+        + $"serialPresent={!string.IsNullOrWhiteSpace(target.SerialNumber)}, "
+        + $"identityPresent={!string.IsNullOrWhiteSpace(target.IdentityToken)}");
+    Assert(target.Length == expectedLength, "removable integration target length");
+    Assert(!target.IsSystemDisk, "removable integration target is not the Windows system disk");
+    Assert(target.IsRemovable, "removable integration target is removable or hot-pluggable");
+    Assert(string.Equals(target.BusType, "USB", StringComparison.OrdinalIgnoreCase), "removable integration target bus is USB");
+    Assert(string.Equals(target.Model, expectedModel, StringComparison.Ordinal), "removable integration target model");
+    Assert(
+        !string.IsNullOrWhiteSpace(target.SerialNumber) || !string.IsNullOrWhiteSpace(target.IdentityToken),
+        "removable integration target has a stable storage identity");
+    Assert(File.ReadAllText(markerPath) == expectedMarker, "removable integration marker content");
+    Assert(
+        PhysicalDiskWriteSession.IsPathOnDisk(markerPath, target.DiskNumber),
+        "removable integration marker belongs to target disk");
+
+    var pageLength = Math.Max(4096, checked((int)target.LogicalSectorSize));
+    Assert(writeOffset % target.LogicalSectorSize == 0, "removable integration write offset alignment");
+    Assert(writeOffset <= target.Length - pageLength - 1024 * 1024, "removable integration write stays before backup GPT metadata");
+    using (var layoutReader = new PhysicalDiskReader(devicePath))
+    {
+        var partitions = PartitionTableReader.ReadPartitions(layoutReader);
+        Assert(partitions.Count == 1, "removable integration has exactly one guard partition");
+        Assert(
+            partitions.All(partition =>
+                writeOffset + pageLength <= partition.StartOffset
+                || writeOffset >= partition.StartOffset + partition.LengthBytes),
+            "removable integration write stays outside every partition");
+    }
+
+    var journals = new[] { rawJournalPath, interruptedJournalPath, fileEditJournalPath }
+        .Select(Path.GetFullPath)
+        .ToArray();
+    Assert(journals.Distinct(StringComparer.OrdinalIgnoreCase).Count() == journals.Length, "removable integration journal paths are distinct");
+    foreach (var journalPath in journals)
+    {
+        if (File.Exists(journalPath) || Directory.Exists(journalPath))
+        {
+            throw new IOException($"Integration journal path already exists: {journalPath}");
+        }
+
+        Assert(
+            !PhysicalDiskWriteSession.IsPathOnDisk(journalPath, target.DiskNumber),
+            "removable integration journal is stored on another disk");
+    }
+
+    var lockRefused = false;
+    using (var heldFile = new FileStream(markerPath, FileMode.Open, FileAccess.Read, FileShare.Read))
+    {
+        try
+        {
+            using var unexpected = PhysicalDiskWriteSession.Open(target);
+        }
+        catch (Win32Exception)
+        {
+            lockRefused = true;
+        }
+    }
+
+    Assert(lockRefused, "removable integration refuses a disk whose volume cannot be locked");
+
+    byte[] original;
+    byte[] modified;
+    var rawWriteApplied = false;
+    try
+    {
+        using (var session = OpenPhysicalSessionWithRetry(target))
+        {
+            Assert(session.LockedVolumes.Count == 1, "removable integration locked the guard volume");
+            original = new byte[pageLength];
+            session.ReadAt(writeOffset, original, 0, original.Length);
+            modified = original.ToArray();
+            for (var index = 0; index < modified.Length; index++)
+            {
+                modified[index] ^= (byte)(0xa5 - index % 53);
+            }
+
+            PhysicalDiskCommitEngine.Apply(
+                session,
+                session.Target,
+                [new CopyOnWritePage(writeOffset, original, modified)],
+                journals[0]);
+            rawWriteApplied = true;
+            Assert(
+                PhysicalDiskRecoveryJournal.Read(journals[0]).State == PhysicalDiskRecoveryState.Committed,
+                "removable integration committed journal state");
+        }
+
+        using (var session = OpenPhysicalSessionWithRetry(target))
+        {
+            PhysicalDiskCommitEngine.Restore(session, session.Target, journals[0]);
+            var restored = new byte[original.Length];
+            session.ReadAt(writeOffset, restored, 0, restored.Length);
+            Assert(restored.SequenceEqual(original), "removable integration restored committed raw change");
+        }
+
+        rawWriteApplied = false;
+        Assert(
+            PhysicalDiskRecoveryJournal.Read(journals[0]).State == PhysicalDiskRecoveryState.RolledBack,
+            "removable integration committed journal rolled-back state");
+    }
+    finally
+    {
+        if (rawWriteApplied
+            && File.Exists(journals[0])
+            && PhysicalDiskRecoveryJournal.Read(journals[0]).State == PhysicalDiskRecoveryState.Committed)
+        {
+            using var recoverySession = OpenPhysicalSessionWithRetry(target);
+            PhysicalDiskCommitEngine.Restore(recoverySession, recoverySession.Target, journals[0]);
+        }
+    }
+
+    PhysicalDiskRecoveryJournal.Create(
+        journals[1],
+        target,
+        [new CopyOnWritePage(writeOffset, original, modified)]);
+    var interruptedWriteStarted = false;
+    try
+    {
+        using (var session = OpenPhysicalSessionWithRetry(target))
+        {
+            interruptedWriteStarted = true;
+            session.WriteAt(writeOffset, modified, 0, modified.Length);
+            session.Flush();
+            var observed = new byte[modified.Length];
+            session.ReadAt(writeOffset, observed, 0, observed.Length);
+            Assert(observed.SequenceEqual(modified), "removable integration simulated interrupted write persisted");
+        }
+
+        using (var session = OpenPhysicalSessionWithRetry(target))
+        {
+            PhysicalDiskCommitEngine.Restore(session, session.Target, journals[1]);
+            var restored = new byte[original.Length];
+            session.ReadAt(writeOffset, restored, 0, restored.Length);
+            Assert(restored.SequenceEqual(original), "removable integration restored prepared journal after reopen");
+        }
+
+        interruptedWriteStarted = false;
+    }
+    finally
+    {
+        if (interruptedWriteStarted
+            && File.Exists(journals[1])
+            && PhysicalDiskRecoveryJournal.Read(journals[1]).State == PhysicalDiskRecoveryState.Prepared)
+        {
+            using var recoverySession = OpenPhysicalSessionWithRetry(target);
+            PhysicalDiskCommitEngine.Restore(recoverySession, recoverySession.Target, journals[1]);
+        }
+    }
+
+    Assert(
+        PhysicalDiskRecoveryJournal.Read(journals[1]).State == PhysicalDiskRecoveryState.RolledBack,
+        "removable integration interrupted journal rolled-back state");
+
+    var contentPath = Path.Combine(Path.GetDirectoryName(journals[2])!, $"removable-content-{Guid.NewGuid():N}.txt");
+    var expectedContent = $"VirtualDisk-Tools removable write {Guid.NewGuid():N}";
+    File.WriteAllText(contentPath, expectedContent, new UTF8Encoding(false));
+    var fileEditApplied = false;
+    try
+    {
+        using (var source = new PhysicalDiskReader(devicePath))
+        {
+            var partition = PartitionTableReader.ReadPartitions(source).Single();
+            var fileSystem = FileSystemDetector.TryOpen(source, partition, out var error)
+                ?? throw new InvalidDataException($"Could not open the removable test file system: {error}");
+            try
+            {
+                Assert(fileSystem.Name == "FAT32", "removable integration guard file system is FAT32");
+                Assert(
+                    PhysicalDiskEditService.CanApply(source, partition, fileSystem, out var editTarget, out var reason)
+                    && editTarget is not null,
+                    $"removable integration product edit preflight: {reason}");
+                var edits = new PendingFileEdit[]
+                {
+                    new(FileEditOperationKind.CreateDirectory, "/VDTTEST"),
+                    new(FileEditOperationKind.CreateFile, "/VDTTEST/CREATED.TXT", contentPath),
+                };
+                var result = PhysicalDiskEditService.ApplyAsync(
+                        source,
+                        partition,
+                        fileSystem,
+                        edits,
+                        editTarget!,
+                        editTarget!.ConfirmationText,
+                        journals[2])
+                    .GetAwaiter()
+                    .GetResult();
+                fileEditApplied = true;
+                Assert(result.EditCount == edits.Length, "removable integration product edit count");
+            }
+            finally
+            {
+                (fileSystem as IDisposable)?.Dispose();
+            }
+        }
+
+        AssertPhysicalFileContent(devicePath, "/VDTTEST/CREATED.TXT", expectedContent);
+        PhysicalDiskEditService.RestoreAsync(journals[2], target.ConfirmationText).GetAwaiter().GetResult();
+        fileEditApplied = false;
+        AssertPhysicalPathMissing(devicePath, "/VDTTEST");
+    }
+    finally
+    {
+        File.Delete(contentPath);
+        if (fileEditApplied
+            && File.Exists(journals[2])
+            && PhysicalDiskRecoveryJournal.Read(journals[2]).State == PhysicalDiskRecoveryState.Committed)
+        {
+            PhysicalDiskEditService.RestoreAsync(journals[2], target.ConfirmationText).GetAwaiter().GetResult();
+        }
+    }
+
+    AssertPhysicalFileContent(devicePath, "/VDT-MARKER.TXT", expectedMarker);
+    Console.WriteLine(
+        $"Physical removable integration passed: disk={target.DiskNumber}, model={target.Model}, "
+        + $"bus={target.BusType}, sector={target.LogicalSectorSize}, rawOffset={writeOffset}");
+}
+
+static void AssertPhysicalFileContent(string devicePath, string virtualPath, string expectedContent)
+{
+    using var source = new PhysicalDiskReader(devicePath);
+    var partition = PartitionTableReader.ReadPartitions(source).Single();
+    var fileSystem = FileSystemDetector.TryOpen(source, partition, out var error)
+        ?? throw new InvalidDataException($"Could not reopen the removable test file system: {error}");
+    try
+    {
+        Assert(FileEditService.TryResolvePath(fileSystem, virtualPath, out var node), $"physical path exists: {virtualPath}");
+        var content = fileSystem.ReadFile(node, 0, checked((int)node.Size));
+        Assert(Encoding.UTF8.GetString(content) == expectedContent, $"physical file content: {virtualPath}");
+    }
+    finally
+    {
+        (fileSystem as IDisposable)?.Dispose();
+    }
+}
+
+static void AssertPhysicalPathMissing(string devicePath, string virtualPath)
+{
+    using var source = new PhysicalDiskReader(devicePath);
+    var partition = PartitionTableReader.ReadPartitions(source).Single();
+    var fileSystem = FileSystemDetector.TryOpen(source, partition, out var error)
+        ?? throw new InvalidDataException($"Could not reopen the removable test file system: {error}");
+    try
+    {
+        Assert(!FileEditService.TryResolvePath(fileSystem, virtualPath, out _), $"physical path is absent: {virtualPath}");
+    }
+    finally
+    {
+        (fileSystem as IDisposable)?.Dispose();
+    }
+}
+
+static void TestPhysicalFileSystemIntegration(
+    string devicePath,
+    long expectedLength,
+    long partitionOffset,
+    long partitionLength,
+    string expectedModel,
+    string expectedFileSystem,
+    string fixturePath,
+    string replacementPath,
+    string finalContentPath,
+    string journalPath)
+{
+    if (!OperatingSystem.IsWindows())
+    {
+        throw new PlatformNotSupportedException("The physical file-system integration test requires Windows.");
+    }
+
+    var supportedFileSystems = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+    {
+        "FAT16",
+        "exFAT",
+        "NTFS",
+        "ext4",
+        "XFS",
+    };
+    Assert(supportedFileSystems.Contains(expectedFileSystem), "physical file-system integration requested an approved file system");
+    Assert(expectedLength >= 1L * 1024 * 1024 * 1024, "physical file-system integration target has a plausible capacity");
+    Assert(partitionOffset >= 1L * 1024 * 1024, "physical file-system integration partition offset");
+    Assert(partitionLength > 0 && partitionOffset <= expectedLength - partitionLength, "physical file-system integration partition range");
+    Assert(!string.IsNullOrWhiteSpace(expectedModel), "physical file-system integration expected model");
+
+    fixturePath = Path.GetFullPath(fixturePath);
+    replacementPath = Path.GetFullPath(replacementPath);
+    finalContentPath = Path.GetFullPath(finalContentPath);
+    journalPath = Path.GetFullPath(journalPath);
+    foreach (var inputPath in new[] { fixturePath, replacementPath, finalContentPath })
+    {
+        Assert(File.Exists(inputPath), $"physical file-system integration input exists: {inputPath}");
+    }
+
+    Assert(new FileInfo(fixturePath).Length == partitionLength, "physical file-system fixture exactly fills the test partition");
+    Assert(new FileInfo(replacementPath).Length > 0, "physical file-system replacement is not empty");
+    Assert(new FileInfo(finalContentPath).Length > 0, "physical file-system final content is not empty");
+    if (File.Exists(journalPath) || Directory.Exists(journalPath))
+    {
+        throw new IOException($"Integration journal path already exists: {journalPath}");
+    }
+
+    var target = PhysicalDiskWriteSession.Inspect(devicePath);
+    Console.WriteLine(
+        $"{expectedFileSystem} target inspected: disk={target.DiskNumber}, length={target.Length}, "
+        + $"sector={target.LogicalSectorSize}, model={target.Model}, bus={target.BusType}, "
+        + $"serialPresent={!string.IsNullOrWhiteSpace(target.SerialNumber)}, "
+        + $"identityPresent={!string.IsNullOrWhiteSpace(target.IdentityToken)}");
+    Assert(target.Length == expectedLength, "physical file-system integration target length");
+    Assert(!target.IsSystemDisk, "physical file-system integration target is not the Windows system disk");
+    Assert(target.IsRemovable, "physical file-system integration target is removable or hot-pluggable");
+    Assert(string.Equals(target.BusType, "USB", StringComparison.OrdinalIgnoreCase), "physical file-system integration target bus is USB");
+    Assert(string.Equals(target.Model, expectedModel, StringComparison.Ordinal), "physical file-system integration target model");
+    Assert(
+        !string.IsNullOrWhiteSpace(target.SerialNumber) && !string.IsNullOrWhiteSpace(target.IdentityToken),
+        "physical file-system integration target has serial and identity values");
+    Assert(!PhysicalDiskWriteSession.IsPathOnDisk(fixturePath, target.DiskNumber), "physical fixture is stored on another disk");
+    Assert(!PhysicalDiskWriteSession.IsPathOnDisk(replacementPath, target.DiskNumber), "physical replacement is stored on another disk");
+    Assert(!PhysicalDiskWriteSession.IsPathOnDisk(finalContentPath, target.DiskNumber), "physical final content is stored on another disk");
+    Assert(!PhysicalDiskWriteSession.IsPathOnDisk(journalPath, target.DiskNumber), "physical integration journal is stored on another disk");
+
+    using (var layoutReader = new PhysicalDiskReader(devicePath))
+    {
+        var partitions = PartitionTableReader.ReadPartitions(layoutReader);
+        Assert(partitions.Count == 1, "physical file-system integration has exactly one test partition");
+        Assert(partitions[0].StartOffset == partitionOffset, "physical file-system integration partition start");
+        Assert(partitions[0].LengthBytes == partitionLength, "physical file-system integration partition length");
+    }
+
+    WriteFixtureToPhysicalPartition(target, partitionOffset, fixturePath);
+    AssertPhysicalPartitionMatchesFile(devicePath, partitionOffset, fixturePath);
+
+    var editApplied = false;
+    try
+    {
+        using (var source = new PhysicalDiskReader(devicePath))
+        {
+            var partition = PartitionTableReader.ReadPartitions(source).Single();
+            partition.FileSystem = FileSystemDetector.Detect(source, partition);
+            Assert(
+                string.Equals(partition.FileSystem, expectedFileSystem, StringComparison.OrdinalIgnoreCase),
+                $"physical file-system integration detected {expectedFileSystem}");
+            var fileSystem = FileSystemDetector.TryOpen(source, partition, out var error)
+                ?? throw new InvalidDataException($"Could not open physical {expectedFileSystem}: {error}");
+            try
+            {
+                Assert(
+                    PhysicalDiskEditService.CanApply(source, partition, fileSystem, out var editTarget, out var reason)
+                    && editTarget is not null,
+                    $"physical {expectedFileSystem} edit preflight: {reason}");
+                var edits = CreatePhysicalFileSystemIntegrationEdits(replacementPath, finalContentPath);
+                var result = PhysicalDiskEditService.ApplyAsync(
+                        source,
+                        partition,
+                        fileSystem,
+                        edits,
+                        editTarget!,
+                        editTarget!.ConfirmationText,
+                        journalPath)
+                    .GetAwaiter()
+                    .GetResult();
+                editApplied = true;
+                Assert(result.EditCount == edits.Length, $"physical {expectedFileSystem} edit count");
+                Assert(result.ModifiedPageCount > 0, $"physical {expectedFileSystem} modified pages");
+                Assert(
+                    PhysicalDiskRecoveryJournal.Read(journalPath).State == PhysicalDiskRecoveryState.Committed,
+                    $"physical {expectedFileSystem} committed journal state");
+            }
+            finally
+            {
+                (fileSystem as IDisposable)?.Dispose();
+            }
+        }
+
+        AssertPhysicalFileBytes(devicePath, "/RESULT.BIN", File.ReadAllBytes(finalContentPath));
+        AssertPhysicalPathMissing(devicePath, "/VDTTEST");
+        PhysicalDiskEditService.RestoreAsync(journalPath, target.ConfirmationText).GetAwaiter().GetResult();
+        editApplied = false;
+        AssertPhysicalPathMissing(devicePath, "/RESULT.BIN");
+        AssertPhysicalPartitionMatchesFile(devicePath, partitionOffset, fixturePath);
+    }
+    finally
+    {
+        if (editApplied
+            && File.Exists(journalPath)
+            && PhysicalDiskRecoveryJournal.Read(journalPath).State == PhysicalDiskRecoveryState.Committed)
+        {
+            PhysicalDiskEditService.RestoreAsync(journalPath, target.ConfirmationText).GetAwaiter().GetResult();
+        }
+    }
+
+    Assert(
+        PhysicalDiskRecoveryJournal.Read(journalPath).State == PhysicalDiskRecoveryState.RolledBack,
+        $"physical {expectedFileSystem} rolled-back journal state");
+    Console.WriteLine($"Physical {expectedFileSystem} integration passed and restored: {devicePath}");
+}
+
+static PendingFileEdit[] CreatePhysicalFileSystemIntegrationEdits(
+    string replacementPath,
+    string finalContentPath) =>
+[
+    new(FileEditOperationKind.CreateDirectory, "/VDTTEST"),
+    new(FileEditOperationKind.CreateFile, "/VDTTEST/CREATED.BIN", replacementPath),
+    new(FileEditOperationKind.WriteContent, "/VDTTEST/CREATED.BIN", finalContentPath),
+    new(FileEditOperationKind.MoveEntry, "/VDTTEST/CREATED.BIN", DestinationVirtualPath: "/VDTTEST/RENAMED.BIN"),
+    new(FileEditOperationKind.CreateFile, "/RESULT.BIN", finalContentPath),
+    new(FileEditOperationKind.DeleteFile, "/VDTTEST/RENAMED.BIN"),
+    new(FileEditOperationKind.DeleteDirectory, "/VDTTEST"),
+];
+
+static void WriteFixtureToPhysicalPartition(
+    PhysicalDiskTargetInfo target,
+    long partitionOffset,
+    string fixturePath)
+{
+    const int bufferSize = 4 * 1024 * 1024;
+    var buffer = new byte[bufferSize];
+    var verify = new byte[bufferSize];
+    using var fixture = new FileStream(fixturePath, FileMode.Open, FileAccess.Read, FileShare.Read, bufferSize, FileOptions.SequentialScan);
+    using var session = OpenPhysicalSessionWithRetry(target);
+    long relativeOffset = 0;
+    while (relativeOffset < fixture.Length)
+    {
+        var count = checked((int)Math.Min(buffer.Length, fixture.Length - relativeOffset));
+        Assert(count % target.LogicalSectorSize == 0, "physical fixture chunk is sector aligned");
+        fixture.ReadExactly(buffer.AsSpan(0, count));
+        session.WriteAt(partitionOffset + relativeOffset, buffer, 0, count);
+        relativeOffset += count;
+    }
+
+    session.Flush();
+    fixture.Position = 0;
+    relativeOffset = 0;
+    while (relativeOffset < fixture.Length)
+    {
+        var count = checked((int)Math.Min(buffer.Length, fixture.Length - relativeOffset));
+        fixture.ReadExactly(buffer.AsSpan(0, count));
+        session.ReadAt(partitionOffset + relativeOffset, verify, 0, count);
+        Assert(
+            verify.AsSpan(0, count).SequenceEqual(buffer.AsSpan(0, count)),
+            $"physical fixture write read-back at 0x{partitionOffset + relativeOffset:X}");
+        relativeOffset += count;
+    }
+
+    session.RefreshDiskProperties();
+}
+
+static void AssertPhysicalPartitionMatchesFile(string devicePath, long partitionOffset, string expectedPath)
+{
+    const int bufferSize = 4 * 1024 * 1024;
+    var expected = new byte[bufferSize];
+    var actual = new byte[bufferSize];
+    using var expectedStream = new FileStream(expectedPath, FileMode.Open, FileAccess.Read, FileShare.Read, bufferSize, FileOptions.SequentialScan);
+    using var source = new PhysicalDiskReader(devicePath);
+    long relativeOffset = 0;
+    while (relativeOffset < expectedStream.Length)
+    {
+        var count = checked((int)Math.Min(expected.Length, expectedStream.Length - relativeOffset));
+        expectedStream.ReadExactly(expected.AsSpan(0, count));
+        source.ReadAt(partitionOffset + relativeOffset, actual, 0, count);
+        Assert(
+            actual.AsSpan(0, count).SequenceEqual(expected.AsSpan(0, count)),
+            $"restored physical partition matches fixture at 0x{partitionOffset + relativeOffset:X}");
+        relativeOffset += count;
+    }
+}
+
+static void AssertPhysicalFileBytes(string devicePath, string virtualPath, byte[] expectedContent)
+{
+    using var source = new PhysicalDiskReader(devicePath);
+    var partition = PartitionTableReader.ReadPartitions(source).Single();
+    var fileSystem = FileSystemDetector.TryOpen(source, partition, out var error)
+        ?? throw new InvalidDataException($"Could not reopen the physical file system: {error}");
+    try
+    {
+        Assert(FileEditService.TryResolvePath(fileSystem, virtualPath, out var node), $"physical path exists: {virtualPath}");
+        Assert(node.Size == expectedContent.Length, $"physical file size: {virtualPath}");
+        var content = fileSystem.ReadFile(node, 0, expectedContent.Length);
+        Assert(content.SequenceEqual(expectedContent), $"physical file bytes: {virtualPath}");
+    }
+    finally
+    {
+        (fileSystem as IDisposable)?.Dispose();
     }
 }
 

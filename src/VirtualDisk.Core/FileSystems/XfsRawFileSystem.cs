@@ -780,6 +780,26 @@ internal sealed partial class XfsRawFileSystem
     internal static long GetExtentByteLength(uint blockCount, uint blockSize) =>
         checked((long)checked((ulong)blockCount * blockSize));
 
+    internal static ulong GetDiskBlockFromFileSystemBlock(
+        ulong fileSystemBlock,
+        uint agBlocks,
+        byte agBlockLog)
+    {
+        if (agBlocks == 0 || agBlockLog >= 64)
+        {
+            throw new ArgumentOutOfRangeException(nameof(agBlocks));
+        }
+
+        var allocationGroup = fileSystemBlock >> agBlockLog;
+        var relativeBlock = fileSystemBlock & ((1UL << agBlockLog) - 1);
+        if (relativeBlock >= agBlocks)
+        {
+            throw new InvalidDataException("XFS fsblockがallocation group境界外を指しています。");
+        }
+
+        return checked(allocationGroup * agBlocks + relativeBlock);
+    }
+
     internal static bool IsExtentWithinAllocationGroup(
         ulong fileSystemBlock,
         uint blockCount,
@@ -994,9 +1014,10 @@ internal sealed partial class XfsRawFileSystem
 
     private long ExtentToDiskOffset(ulong fileSystemBlock)
     {
-        var allocationGroup = fileSystemBlock >> _superBlock.AgBlocksLog2;
-        var relativeBlock = fileSystemBlock & ((1UL << _superBlock.AgBlocksLog2) - 1);
-        var diskBlock = checked(checked(allocationGroup * _superBlock.AgBlocks) + relativeBlock);
+        var diskBlock = GetDiskBlockFromFileSystemBlock(
+            fileSystemBlock,
+            _superBlock.AgBlocks,
+            _superBlock.AgBlocksLog2);
         return checked((long)checked(diskBlock * _superBlock.BlockSize));
     }
 
@@ -1015,7 +1036,7 @@ internal sealed partial class XfsRawFileSystem
             return (_hasCleanLog = false).Value;
         }
 
-        var logOffset = checked((long)checked(_superBlock.LogStart * _superBlock.BlockSize));
+        var logOffset = ExtentToDiskOffset(_superBlock.LogStart);
         var logLength = checked((long)checked((ulong)_superBlock.LogBlocks * _superBlock.BlockSize));
         if (logOffset < 0 || logLength < basicBlockSize || logOffset > _reader.Length - logLength)
         {
@@ -1132,7 +1153,7 @@ internal sealed partial class XfsRawFileSystem
         var operationLength = EndianUtilities.ReadUInt32Big(operation, 4);
         var client = operation[8];
         var flags = operation[9];
-        _hasCleanLog = client == 0xaa && flags == 0x20 && operationLength == 0;
+        _hasCleanLog = client == 0xaa && flags == 0x20 && operationLength is 0 or 8;
         return _hasCleanLog.Value;
     }
 

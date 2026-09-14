@@ -1,0 +1,70 @@
+name: Cross-platform core
+
+on:
+  push:
+    branches: [main, feature/cross-platform-core]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  core:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up .NET 10
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Install Linux interoperability tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --yes xfsprogs
+
+      - name: Restore core projects
+        run: dotnet restore src/VirtualDisk.Cli/VirtualDisk.Cli.csproj
+
+      - name: Build core projects
+        run: dotnet build src/VirtualDisk.Cli/VirtualDisk.Cli.csproj --configuration Release --no-restore
+
+      - name: Restore cross-platform GUI
+        run: dotnet restore src/VirtualDisk.Gui/VirtualDisk.Gui.csproj
+
+      - name: Build cross-platform GUI
+        run: dotnet build src/VirtualDisk.Gui/VirtualDisk.Gui.csproj --configuration Release --no-restore
+
+      - name: Restore core tests
+        run: dotnet restore tests/VirtualDisk.Core.Tests/VirtualDisk.Core.Tests.csproj
+
+      - name: Build core tests
+        run: dotnet build tests/VirtualDisk.Core.Tests/VirtualDisk.Core.Tests.csproj --configuration Release --no-restore
+
+      - name: Run core tests
+        run: dotnet run --project tests/VirtualDisk.Core.Tests/VirtualDisk.Core.Tests.csproj --configuration Release --no-build
+
+      - name: Run CLI smoke test
+        run: dotnet run --project src/VirtualDisk.Cli/VirtualDisk.Cli.csproj --configuration Release --no-build -- --help
+
+      - name: Validate managed XFS with xfsprogs
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          dotnet run --project src/VirtualDisk.Cli/VirtualDisk.Cli.csproj --configuration Release --no-build -- \
+            create /tmp/vdt-ci-xfs.raw --size 512MiB --table gpt --partition xfs:320MiB:VDT_XFS
+          dd if=/tmp/vdt-ci-xfs.raw of=/tmp/vdt-ci-xfs.partition bs=512 skip=2048 count=655360 status=none
+          xfs_repair -n /tmp/vdt-ci-xfs.partition
+          dotnet run --project src/VirtualDisk.Cli/VirtualDisk.Cli.csproj --configuration Release --no-build -- \
+            list /tmp/vdt-ci-xfs.raw --partition 1 --path / | grep VDT-README.txt
+          rm -f /tmp/vdt-ci-xfs.raw /tmp/vdt-ci-xfs.partition
+
+      - name: Run GUI entry-point smoke test
+        run: dotnet run --project src/VirtualDisk.Gui/VirtualDisk.Gui.csproj --configuration Release --no-build -- --version

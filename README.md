@@ -1,13 +1,14 @@
 # Virtual Disk Explorer
 
 C# / Windows Forms で作成した、通常は原本を変更しない仮想ディスク解析ツールです。実験的な物理ディスク直接編集だけは、厳格な確認後に選択した媒体へ差分を書き込みます。
-外部アプリは使用せず、商用利用しやすいライブラリだけを使う方針です。
+通常の読み取り・解析、QCOW2生成、XFS／ext4／NTFSの新規作成はC#内部で完結し、外部アプリを必要としません。商用利用しやすいライブラリだけを使う方針です。
 
 次回以降の対応候補と優先順位は、[NEXT_STEPS.md](NEXT_STEPS.md) にまとめています。
 
 ## できること
 
 - 仮想ディスクの概要表示
+- RAW／内製sparse QCOW2、MBR／GPT、XFS／ext4／NTFSを混在できる複数パーティション、初期ファイルを指定した仮想ディスクの新規作成
 - Windows物理ディスク (`\\.\PhysicalDriveN`) の通常時読み取り専用解析と、明示確認・復旧ジャーナル付きの実験的な直接編集
 - ext4／XFS／FAT16／FAT32／NTFS／exFAT内のファイル内容変更（拡大・縮小を含む）／追加／削除、ディレクトリ作成／空ディレクトリ削除、ファイル・ディレクトリの移動／名前変更、属性・更新日時変更を行い、新しいRAWへ保存（実験的）
 - 仮想ディスクデータの Hex 表示
@@ -80,11 +81,11 @@ C# / Windows Forms で作成した、通常は原本を変更しない仮想デ�
 - VDI
 - OVA (`.ova`)
   - tarアーカイブを安全な一時フォルダへ展開し、OVFが参照するVMDKなどを既存の読み取り処理で解析
-  - 複数の仮想ディスクを含む場合は、ツールバーの「OVAディスク」から切り替え
+  - 複数の仮想ディスクを含む場合は、［ファイル］→［イメージ内ディスクの選択］→［OVAディスク］から切り替え
 - Parallels HDD / HDS (`.hdd` フォルダ、`.hds`)
 - Proxmox VMA (`.vma` / `.vma.lzo`)
   - VMAヘッダーとエクステントのMD5を検証
-  - 最大容量の仮想ディスクを初期選択し、ツールバーの「VMAディスク」から格納ディスクを切り替え
+  - 最大容量の仮想ディスクを初期選択し、［ファイル］→［イメージ内ディスクの選択］→［VMAディスク］から格納ディスクを切り替え
   - 疎な4 KiBブロックを元の仮想ディスク位置へ読み取り専用で復元
 - Expert Witness Format / EnCase E01 (`.E01`、連番の`.E02`以降を自動検出)
   - EWF1/EVFのEnCase 6 `volume` / `sectors` / `table`構成を読み取り
@@ -101,9 +102,30 @@ C# / Windows Forms で作成した、通常は原本を変更しない仮想デ�
   - キャッシュ作成または通常RAW保存のキャンセル・失敗時は、作成途中のRAWを再利用せず削除
   - 展開後のMBR/GPT、ext4などを通常のrawディスクと同じ経路で解析
 
+## 新規仮想ディスク作成
+
+［ファイル］→［新規作成］から、空の仮想ディスクを作成してそのまま開けます。
+
+- 出力コンテナーはRAW、または内製C# writerによる64 KiB cluster・16-bit refcountの非圧縮sparse QCOW2 v3です。QCOW2はbacking file、snapshot、暗号化を持たない独立イメージとして作成し、実行時に`qemu-img`を必要としません。
+- パーティション表はMBRまたはGPTを選択できます。MBRは最大4パーティション・2 TiBまで、GPTは最大128パーティションです。
+- パーティションごとにXFS、ext4、NTFSを選択でき、1つのディスク内で混在できます。すべて1 MiB境界・1 MiB単位で、最小容量はXFSが320 MiB、ext4／NTFSが64 MiBです。
+- ラベル上限はXFSがUTF-8で12 bytes、ext4がUTF-8で16 bytes、NTFSが予約文字を含まない32文字です。
+- 「初期ファイル」タブでは、ホスト側の通常ファイルを指定したパーティションのrootへ配置できます。各ファイルシステムには作成元を示す`VDT-README.txt`も入ります。
+- MBRではext4／XFSにLinux type `0x83`、NTFSに`0x07`を設定し、GPTではそれぞれLinux filesystem GUIDとMicrosoft Basic Data GUIDを設定します。
+- 作成後はアプリ自身でコンテナー、MBR/GPT、全パーティション、ファイルシステム、初期ファイルのサイズと全内容、writer対応レイアウトを再検証し、成功した完成ファイルだけを公開します。失敗・キャンセル時は途中ファイルを削除し、既存ファイルは上書きしません。
+- 作成したイメージは［編集］→［編集モードを有効にする］の後、エクスプローラーの「編集操作」からファイル追加・変更・削除でき、変更後は現在の仕様どおり新しいRAWへ保存します。
+
+XFS／ext4／NTFSの初期化と初期ファイル配置はすべてC#内部で行うため、通常の作成にWSL、`mkfs.*`、`qemu-img`は不要です。内蔵XFSはv5 CRC、finobt、rmapbt、sparse inode、cleanな内部logを持つ編集可能レイアウトを生成します。
+
+生成・書き込み・再読込の統合試験は、MBR/RAWでext4＋NTFS、GPT/QCOW2でXFS＋ext4＋NTFSを作成します。独立検証に限りWSLの`util-linux`、`xfsprogs`、`e2fsprogs`、`ntfs-3g`を使用します。`qemu-img`がインストール済みの場合だけ、任意のQCOW2相互検証も追加実行します。
+
+```powershell
+.\tools\Test-VirtualDiskCreation.ps1
+```
+
 ## 物理ディスク
 
-ツールバーの「物理ディスク」から、Windowsが認識しているディスクを選択できます。
+［ファイル］→［その他の開き方］→［物理ディスク］から、Windowsが認識しているディスクを選択できます。
 
 - 物理ディスクは通常時には読み取り専用ハンドルだけで開きます。「物理ディスクへ適用」を明示的に実行した期間だけ、別の書き込み用ハンドルを作成します。
 - Windowsの仕様上、物理ディスクの読み取りには管理者権限が必要です。権限がない場合は、確認後に `runas` で再起動して選択したディスクを引き継ぎます。
@@ -113,7 +135,7 @@ C# / Windows Forms で作成した、通常は原本を変更しない仮想デ�
 
 ## 実験的なext4／XFS／FAT16／FAT32／NTFS／exFAT書き込み
 
-エクスプローラーの「編集（実験）」から、通常ファイルの内容変更（拡大・縮小を含む）／追加／削除、ディレクトリ作成／空ディレクトリ削除、ファイル・ディレクトリの移動／名前変更、属性・更新日時変更を変更予定へ登録できます。「変更予定」タブでは登録順、入力または設定内容、入力サイズを確認し、追加・内容変更予定の内容元差し替えや外部編集、選択項目／最後の操作／全操作の取り消しを行えます。保存時は全操作を上から順に同じコピーオンライト領域へ適用し、新しいRAWイメージを1個生成します。
+［編集］→［編集モードを有効にする］を確認後、エクスプローラーに表示される「編集操作」から、通常ファイルの内容変更（拡大・縮小を含む）／追加／削除、ディレクトリ作成／空ディレクトリ削除、ファイル・ディレクトリの移動／名前変更、属性・更新日時変更を変更予定へ登録できます。「変更予定」タブでは登録順、入力または設定内容、入力サイズを確認し、追加・内容変更予定の内容元差し替えや外部編集、選択項目／最後の操作／全操作の取り消しを行えます。保存時は全操作を上から順に同じコピーオンライト領域へ適用し、新しいRAWイメージを1個生成します。
 
 - 通常の保存では原本、物理ディスク、既存の出力ファイルへは書き込みません。変更はメモリ上のコピーオンライト領域へ保持し、最後に新しいRAWイメージとして保存します。
 - 既存ファイルは「選択ファイルを外部エディターで編集」、新規ファイルは「空ファイルを作成して外部編集」から、Windowsの既定アプリまたはその都度指定したエディターで編集できます。仮想ディスクから一時作業コピーを取り出し、外部エディターで保存後に「保存内容を取り込む」を押した時点のスナップショットだけを変更予定へ登録します。
@@ -125,10 +147,10 @@ C# / Windows Forms で作成した、通常は原本を変更しない仮想デ�
 - FAT16／FAT32／exFAT／NTFSではReadOnly・Hidden・System・Archive属性、ext4／XFSではUnix modeへ対応付けたReadOnly属性を編集できます。ディレクトリ種別そのものは属性変更できません。
 - RAID、LVM、BitLocker／LUKSなどの合成・復号パーティションでは、member、PV、暗号化コンテナーへは書き戻しません。選択した組み立て済み／復号済み論理ボリュームをコピーオンライトで編集し、平坦化した平文の論理RAWとして新規保存します。元のRAID/LVM構成や暗号化形式へ戻す機能ではないため、出力RAWの保管には注意してください。
 - 物理ディスクから直接開いた通常パーティションは、「変更予定」タブの「物理ディスクへ適用」から同じディスクへ差分を直接適用できます。リムーバブル／ホットプラグと固定データディスクの両方に対応しますが、実行中Windowsのシステムディスクは拒否します。別のWindows環境からオフラインディスクとして接続した場合は固定ディスクとして扱えます。
-- 直接適用では、対象の番号・容量・論理セクターサイズ・型番・接続種別・シリアル番号・Storage Device IDを再確認し、対象ディスクに属する全Windowsボリュームを排他ロックしてアンマウントします。シリアル番号とStorage Device IDの両方を取得できない場合、または1個でもボリュームをロックできない場合は書き込みません。
+- 直接適用では、対象の番号・容量・論理セクターサイズ・型番・接続種別・シリアル番号・Storage Device IDを再確認し、対象ディスクに属する全Windowsボリュームを排他ロックしてアンマウントします。USB bridgeがStorage descriptorへ識別情報を返さない場合は、同じ物理ディスク番号の`Win32_DiskDrive`から型番・接続種別・シリアル番号を補完し、シリアル番号とPNP Device IDのSHA-256を再識別値としてロック後にも照合します。どちらの経路でもシリアル番号と識別値の両方を取得できない場合、または1個でもボリュームをロックできない場合は書き込みません。
 - 置換・追加するファイルは、排他ロック前に復旧ジャーナルと同じ安全なディスクへ一時退避します。退避元が書き込み対象ディスク上にあってもロック後に読み直さないためですが、その合計サイズ分の空き容量が必要です。一時退避は処理終了時に削除します。
 - 書き込み前に全変更ページの原本一致を検証し、対象とは別のローカルディスクへ変更前・変更後ページとSHA-256を含む復旧ジャーナルを同期保存します。セクター境界へ揃えた差分だけを書き込み、ディスクへのflush、全差分の読み戻し、ファイルシステム最終状態の再検証後に完了扱いとします。
-- 書き込み・最終検証に失敗した場合は、同じ排他セッション内で変更前ページを自動復旧して読み戻します。プロセス停止や停電で中断した場合は、ツールバーの「物理ディスク復旧」からジャーナルを選択できます。ただし媒体故障や書き込み中の停電に対して完全な原子性を保証するものではありません。
+- 書き込み・最終検証に失敗した場合は、同じ排他セッション内で変更前ページを自動復旧して読み戻します。プロセス停止や停電で中断した場合は、［ファイル］→［物理ディスクを復旧］からジャーナルを選択できます。ただし媒体故障や書き込み中の停電に対して完全な原子性を保証するものではありません。
 - 起動時に既定の復旧フォルダーを確認し、状態が`Prepared`のまま残っているジャーナル、または破損・読取不能なジャーナルがあれば警告します。自動復旧や対象ディスクへの自動書き込みは行いません。
 - qcow2、VHDXなどを開いた場合も、出力はコンテナー形式ではなく展開済みの論理ディスク全体を格納するRAWです。出力先には元の仮想ディスクと同程度の空き容量が必要です。
 - 実験的機能のため、重要なイメージでは使用せず、出力RAWもLinux標準ツールで検査してから利用してください。
@@ -140,6 +162,32 @@ C# / Windows Forms で作成した、通常は原本を変更しない仮想デ�
 ```
 
 このテストは、開いているファイルがある場合のボリュームロック拒否と、実行中Windowsのシステムディスク書き込み拒否も確認します。成功時は一時VHDXを切断して削除し、失敗時は調査用に一時ファイルを`.tmp\physical-vhdx-integration`へ残します。Hyper-V VHDXがシリアル番号とStorage Device IDを公開しない環境では、製品UIの直接適用は設計どおり拒否されますが、統合テストはHyper-Vが返した新規ディスク番号とVHDX内のランダムマーカーを照合して下位の書き込み経路を検証します。実USB機器固有の再識別・取り外し・flush動作は別途、消去してよい試験媒体で確認する必要があります。
+
+消去してよい実USB媒体では、次の管理者向けスクリプトで実機統合テストを実行できます。**指定した物理ディスクの全パーティションと全データを削除します。** 実行直前にもディスク番号・正確な容量・PowerShell上の型番・USB属性・ハードウェアシリアルを照合し、確認文字列が一致しなければ開始しません。64 MiBのFAT32試験領域を作成した後、ボリュームロック拒否、未割り当て領域の書き込み／flush／読み戻し、Committedおよび電源断を模したPreparedジャーナルからの復元、製品経路によるFAT32のディレクトリ／ファイル作成と復元を確認します。
+
+```powershell
+$disk = Get-Disk -Number 1
+.\tools\Test-PhysicalRemovableDiskIntegration.ps1 `
+  -DiskNumber $disk.Number `
+  -ExpectedSize $disk.Size `
+  -ExpectedModel $disk.FriendlyName `
+  -Confirmation "ERASE USB DISK $($disk.Number) $($disk.Size)"
+```
+
+成功時は復旧ジャーナルと一時マウント先を削除しますが、媒体は64 MiB FAT32＋残り未割り当ての試験構成のままです。失敗時は診断と復旧のため`.tmp\physical-removable-integration`を保持します。実際の取り外しや物理的な電源断は自動実行しません。
+
+FAT16／exFAT／NTFS／ext4／XFSの製品書き込み経路も、WSLで生成した実ファイルシステムを使って同じ実USB媒体で検証できます。各形式について、ディレクトリとファイルの作成、内容の縮小更新、同一ディレクトリ内のrename、作成・削除、復旧ジャーナルからの原本完全復元を確認します。WindowsによるNTFSの自動マウントとmetadata更新を避けるため、試験パーティションはLinux filesystem GPT typeで作成します。
+
+```powershell
+$disk = Get-Disk -Number 1
+.\tools\Test-PhysicalRemovableFileSystems.ps1 `
+  -DiskNumber $disk.Number `
+  -ExpectedSize $disk.Size `
+  -ExpectedModel $disk.FriendlyName `
+  -Confirmation "ERASE USB DISK $($disk.Number) $($disk.Size) FOR FAT16 EXFAT NTFS EXT4 XFS"
+```
+
+成功時は一時fixtureと復旧ジャーナルを削除します。媒体には最後に試験したファイルシステムの原本パーティションが残り、残りの領域は未割り当てです。対象形式は`-FileSystems NTFS,ext4,XFS`のように絞り込めますが、確認文字列は常に上記の完全な文字列が必要です。
 
 LZO省容量モードの索引とblock書き出しは、WSL上の公式`lzop`でも相互検証できます。スクリプトは合成LZOから先頭・中間・末尾付近の複数blockを単独`.lzo`へ書き出し、`lzop -d`の出力サイズとSHA-256を組み込みreaderの結果と比較します。成功時は生成物を削除し、失敗時だけ`.tmp\lzop-interop`へ残します。
 
@@ -153,14 +201,33 @@ Linux／WSLで実ext4・XFS・FAT16・FAT32・NTFS・exFATイメージを生成�
 sudo ./tools/new-write-regression-fixtures.sh /path/to/fixtures
 # テストプロジェクトの --batch-edit-smoke で各形式の変更済みRAWを生成
 # ディレクトリ・移動・属性・日時は --metadata-edit-smoke <source.raw> <output.raw> で確認
+# 作成・縮小更新・同一directory内rename・削除の連続操作は --integration-edit-smoke <source.raw> <replacement.bin> <final-content.bin> <output.raw> で確認
 sudo ./tools/validate-write-regression-output.sh /path/to/fixtures
 ```
 
 ## 起動
 
+Windowsの全機能版（WinForms）:
+
 ```powershell
 dotnet run --project src\Qcow2Explorer\Qcow2Explorer.csproj
 ```
+
+Windows／Linux／macOS共通GUI（Avalonia。現在はイメージを開く、パーティション／ディレクトリ閲覧、ファイル抽出に対応）:
+
+```bash
+dotnet run --project src/VirtualDisk.Gui/VirtualDisk.Gui.csproj
+```
+
+クロスプラットフォームCLI（`info`、`list`、`extract`、`create`）:
+
+```bash
+dotnet run --project src/VirtualDisk.Cli/VirtualDisk.Cli.csproj -- --help
+dotnet run --project src/VirtualDisk.Cli/VirtualDisk.Cli.csproj -- info disk.qcow2
+dotnet run --project src/VirtualDisk.Cli/VirtualDisk.Cli.csproj -- create new.raw --size 512MiB --table gpt --partition xfs:320MiB:VDT_XFS
+```
+
+OS非依存のreader、filesystem、partition、作成処理は`VirtualDisk.Core`（`net10.0`）に分離されています。WinForms版は物理ディスク、ProjFSなどWindows固有機能をadapter側に残しつつ、同じ共通コアを利用します。
 
 Visual Studio で開く場合は `Qcow2Explorer.sln` を使ってください。
 
@@ -183,6 +250,12 @@ dotnet restore Qcow2Explorer.sln --runtime win-x64
 ## テスト
 
 テストは qemu-img などを使わず、最小 qcow2/raw イメージを C# で生成して確認します。
+
+OS非依存の回帰テスト（Windows／LinuxのGitHub Actionsでも実行）:
+
+```bash
+dotnet run --project tests/VirtualDisk.Core.Tests/VirtualDisk.Core.Tests.csproj -c Release
+```
 
 ```powershell
 dotnet run --project tests\Qcow2Explorer.Tests\Qcow2Explorer.Tests.csproj
@@ -209,7 +282,7 @@ dotnet run --project tests\Qcow2Explorer.Tests\Qcow2Explorer.Tests.csproj -- "<i
 XFS bigtime、Btrfs、BitLocker、LUKS1/LUKS2、E01、LZOキャッシュなどを実環境由来イメージで回帰確認する場合は、
 [実イメージ回帰テスト手順](tests/REAL_IMAGE_REGRESSION.md)を参照してください。
 イメージとローカルmanifestはGitへ追加せず、SHA-256と期待値を照合して任意実行します。
-BtrfsやLinux mdの複数デバイス構成はツールバーの「複数ディスク」から同じ構成に属するイメージをすべて選択します。先頭の選択ファイルを画面表示用ディスクとし、BtrfsはFSID・devid・device UUID、Linux mdはarray UUID・role・event・device UUIDを照合したcompanionを読み取り時に自動使用します。
+BtrfsやLinux mdの複数デバイス構成は［ファイル］→［その他の開き方］→［複数ディスク］から同じ構成に属するイメージをすべて選択します。先頭の選択ファイルを画面表示用ディスクとし、BtrfsはFSID・devid・device UUID、Linux mdはarray UUID・role・event・device UUIDを照合したcompanionを読み取り時に自動使用します。
 
 ## ProjFS マウント
 
@@ -239,7 +312,7 @@ ProjFS マウントは Windows の Client-ProjFS 機能を使い、選択した�
 - 暗号化されたswtpm状態は、暗号方式と必要な鍵長までは判定できます。swtpmで設定されたファイル鍵または移行鍵がない場合、内部状態は復号できません。
 - 平文のTPM状態データは存在と構造を表示できますが、libtpmsのversion依存な内部構造を秘密鍵単位まで展開する機能ではありません。
 - ext4 の journal replay は行いません。
-- Btrfsは単一／複数デバイスのsingle profile、RAID0、2-copy RAID1、3-copy RAID1C3、4-copy RAID1C4、striped mirrorのRAID10を読み取り専用で扱い、DEVICE_ITEM、devid、FSID、device UUIDとstripeを相互検証します。mirror profileではmetadata tree blockのCRC32Cまたはdata checksumが一致するコピーだけを採用し、破損時は検証済みの代替コピーへ切り替えます。RAID0／RAID10はchunkごとの`stripe_length`に従ってdeviceを切り替え、RAID10はさらに`sub_stripes`単位でmirrorを選択します。複数RAWはツールバーから一組として指定でき、実イメージ回帰manifestでも各companionのSHA-256を検証します。RAID0は全stripe deviceが必要です。mirror profileはchunk単位ですべてのmirror組に利用可能なstripeが残る場合だけdegraded読み取りで開き、欠損devidを警告へ表示します。subvolume、snapshot、default subvolumeとzlib・LZO・zstd圧縮extentを読み取れ、snapshot内に残る入れ子subvolume境界は元subvolumeへ誤接続せず空ディレクトリとして表示します。RAID5／6、暗号化extent、書き込みは未対応です。
+- Btrfsは単一／複数デバイスのsingle profile、RAID0、2-copy RAID1、3-copy RAID1C3、4-copy RAID1C4、striped mirrorのRAID10を読み取り専用で扱い、DEVICE_ITEM、devid、FSID、device UUIDとstripeを相互検証します。mirror profileではmetadata tree blockのCRC32Cまたはdata checksumが一致するコピーだけを採用し、破損時は検証済みの代替コピーへ切り替えます。RAID0／RAID10はchunkごとの`stripe_length`に従ってdeviceを切り替え、RAID10はさらに`sub_stripes`単位でmirrorを選択します。複数RAWは［ファイル］メニューから一組として指定でき、実イメージ回帰manifestでも各companionのSHA-256を検証します。RAID0は全stripe deviceが必要です。mirror profileはchunk単位ですべてのmirror組に利用可能なstripeが残る場合だけdegraded読み取りで開き、欠損devidを警告へ表示します。subvolume、snapshot、default subvolumeとzlib・LZO・zstd圧縮extentを読み取れ、snapshot内に残る入れ子subvolume境界は元subvolumeへ誤接続せず空ディレクトリとして表示します。RAID5／6、暗号化extent、書き込みは未対応です。
 - Btrfsのsuperblock、metadata tree block、checksum treeに記録されたdata sectorのCRC32Cを検証し、不一致は読み取りを中止します。primary superblockが壊れている場合だけ、公式mirror位置（64 MiB／256 GiB）の検証済みbackupへ復旧し、primaryが有効なら常にprimaryを優先します。
 - SquashFS はライブラリが対応する圧縮形式のみ読み取れます。
 - Linux mdはmetadata 1.0／1.1／1.2のRAID0／RAID1／RAID5／RAID10を読み取り専用で組み立てます。superblock checksum、array/device UUID、role、event counter、data/super offset、device範囲を検証し、同一eventのactive memberだけを使用します。RAID0はchunk単位のstriping、サイズが異なるmemberのmulti-zone original／alternate layoutに対応し、全active roleが揃わない場合は拒否します。RAID1は1台欠損、RAID10はnear／far／offset layoutとkernelのoriginal／legacy／fixed far-set配置を扱い、各mirror groupに1台以上残る構成をdegraded読み取りします。RAID5は主要6 layout（left/right asymmetric、left/right symmetric、parity-first/last）に対応し、1台欠損時はXORで復元します。複数mirrorの内容が一致しない場合や、RAID5で2台以上が欠損する場合は停止します。RAID4／6、reshape・recovery中、replacement、bad-block log付きarray、metadata 0.90は未対応です。
@@ -277,6 +350,8 @@ ProjFS マウントは Windows の Client-ProjFS 機能を使い、選択した�
 - `ZstdSharp.Port`
 - `Konscious.Security.Cryptography.Argon2`
 - `Konscious.Security.Cryptography.Blake2`
+- `Avalonia.Desktop`
+- `Avalonia.Themes.Fluent`
 
 これらは NuGet メタデータ上で MIT License として公開されています。
 MIT License は著作権表示とライセンス表示の保持が必要なため、再配布時は下記の表示を含めてください。

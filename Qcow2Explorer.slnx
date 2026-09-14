@@ -1,8 +1,12 @@
 <Solution>
   <Folder Name="/src/">
     <Project Path="src/Qcow2Explorer/Qcow2Explorer.csproj" />
+    <Project Path="src/VirtualDisk.Cli/VirtualDisk.Cli.csproj" />
+    <Project Path="src/VirtualDisk.Core/VirtualDisk.Core.csproj" />
+    <Project Path="src/VirtualDisk.Gui/VirtualDisk.Gui.csproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/Qcow2Explorer.Tests/Qcow2Explorer.Tests.csproj" />
+    <Project Path="tests/VirtualDisk.Core.Tests/VirtualDisk.Core.Tests.csproj" />
   </Folder>
 </Solution>

@@ -1,6 +1,6 @@
 # 次回対応予定
 
-- 最終更新: 2026-09-09
+- 最終更新: 2026-09-14
 - 基準ブランチ: `main`
 
 この文書は、次回の開発作業へ引き継ぐための優先順位付きロードマップです。
@@ -25,6 +25,15 @@
 - 物理ディスク直接適用は、シリアル番号またはStorage Device IDを必須とする対象再識別、全所属ボリュームの排他ロック／アンマウント、変更前ページの競合検出、別ディスク上の復旧ジャーナル、flush／読み戻し／最終FS検証、自動ロールバックを実施
 - 状態が`Prepared`のまま残った復旧ジャーナルと、破損・読取不能な復旧ジャーナルを起動時に通知（自動復旧はしない）
 - Windows固定VHDXを使い、ロック拒否、差分書き込み、読み戻し、ジャーナル復旧、システムディスク拒否を確認する管理者向け統合テスト
+- 消去可能な実USB媒体を使い、直接Storage APIで欠落する識別情報の`Win32_DiskDrive`補完、対象再識別、ロック拒否、flush／読み戻し、Committed／Preparedジャーナル復元、製品経路のFAT32編集／復元を確認する管理者向け統合テスト
+- 物理ディスク書き込みセッションの非セクター境界読み取りを整列I/Oへ変換し、実USBでFAT metadataの小さい読み取りを回帰確認
+- 同じ実USB媒体でFAT16／exFAT／NTFS／ext4／XFSの作成・縮小更新・同一directory内rename・削除・ジャーナル完全復元を確認する破壊的統合テスト（NTFS自動マウントをLinux filesystem GPT typeで抑止）
+- XFS short-form directoryの同一directory内renameが古いinode snapshotで新entryを消す問題を修正し、実fixture、`xfs_repair -n`、読み取り専用mount、実USBで回帰確認
+- XFS内部logのfsblockを実LBAへ変換する際、2の累乗でないallocation groupのpaddingを除去し、小容量XFSでもclean unmountを正しく判定
+- ［ファイル］→［新規作成］からRAW／内製非圧縮sparse QCOW2、MBR／GPT、XFS／ext4／NTFS混在パーティションと初期ファイルを作成し、完成後に自動で開くウィザード
+- 新規作成は1 MiB alignment、ファイルシステム別MBR/GPT type、ラベル制約、既存出力拒否、キャンセル時清掃、全初期ファイル内容、writer対応状態を完成前に再検証
+- MBR/RAWでext4＋NTFS、GPT/QCOW2でXFS＋ext4＋NTFSをゼロから生成し、全パーティションへの初期ファイル配置、製品writerによる追加、製品readerによる全内容読込、`sfdisk --verify`、各FS検査、読み取り専用mountを回帰確認（`qemu-img`は任意の相互検証のみ）
+- 上部の操作ボタンを［ファイル］メニューへ整理し、［編集］→［編集モードを有効にする］で確認後に実験的な編集操作を表示
 - C#生成ext4 fixtureの原本不変・保存後再読込テスト
 - Linux生成ext4／XFSで`e2fsck -fn`、`xfs_repair -n`、読み取り専用マウント後の内容一致を検証
 - FAT16／FAT32はclean状態、複数FAT copyの一致、cluster chainの範囲・loop・長さを検証して割り当て済みdataだけを置換
@@ -34,12 +43,22 @@
 - exFATはdirty／media-failure状態とサイズを事前検証し、書き込み可能streamをコピーオンライトだけへ公開
 - 実`exfatprogs 1.2.2`生成fixtureを`fsck.exfat -n`、読み取り専用マウント、内容一致で検証
 
+### 対応済み: Linux・クロスプラットフォーム基盤と内蔵フォーマッター
+
+- OS非依存のimage reader、filesystem、partition、作成処理を`VirtualDisk.Core`（`net10.0`）へ分離
+- Windows全機能版はWinFormsを維持し、物理ディスク／ProjFSなどをWindows adapter側に分離したまま共通コアを利用
+- Linuxを含むCLIで`info`、`list`、`extract`、RAW／QCOW2・MBR／GPT・XFS／ext4／NTFSの新規作成に対応
+- Avalonia共通GUIでイメージを開く、パーティション／ディレクトリ閲覧、ファイル抽出を実装
+- Windows／Ubuntu matrix CIで共通コア、CLI、Avalonia GUI、managed作成回帰をビルド・実行
+- NTFS、ext4、XFSをC#内部で直接初期化し、通常の新規作成からWSL、`mkfs.*`、`qemu-img`依存を除去
+- 内蔵XFSはv5 CRC、finobt、rmapbt、sparse inode、leaf AG btree、short-form root directory、clean内部logを生成し、製品reader／writer、`xfs_repair -n`、Linux読み取り専用mountで相互検証
+
 ### 次段階
 
 1. 現在安全側で拒否する複雑なext4 extent tree／directory layoutの対応範囲を、実fixtureとfsck検証付きで拡張
 2. XFSのdirectory／extent btree、複数allocation group、reflink CoWを、rmap／refcount更新と実fixture検証付きで段階的に拡張
-3. VHDX統合テストに加え、物理ディスク書き込みを実リムーバブル試験媒体とオフライン固定ディスクで検証し、USB固有の再識別・flushと電源断を模したジャーナル復旧手順を継続的に確認
-4. RAW以外のコンテナーを同形式で保存するwriterを追加
+3. 物理ディスク書き込みをオフライン固定ディスクでも検証し、実USBの物理的な取り外し／電源断後の手動ジャーナル復旧を別の消去可能媒体で確認
+4. 既存コンテナーを編集後にRAWへ平坦化せず、元と同じコンテナー形式で保存するwriterを追加
 
 ## 対応済み
 
@@ -161,7 +180,7 @@
 - 2-copy RAID1 chunkの2 stripeを異なるdeviceとして検証し、論理アドレスを各mirrorへ読み取り専用で写像
 - metadata tree blockはCRC32Cとheader、data sectorはchecksum treeのCRC32Cをmirrorごとに検証し、片系不一致時は健全なmirrorへ切替
 - RAID1の片系metadata/data破損からの復旧、両系破損、同一deviceの重複stripeを2デバイス合成fixtureで回帰確認
-- ツールバーの「Btrfs複数RAW」で同一FSIDのRAW一式を選択し、画面上のprimary partitionを複数device readerで開く経路を追加
+- ［ファイル］→［その他の開き方］→［複数ディスク］で同一FSIDのRAW一式を選択し、画面上のprimary partitionを複数device readerで開く経路を追加
 - 実イメージ回帰manifestへ`companionImages`を追加し、各RAWのSHA-256と全入力に共通するFSIDを検証
 - 2台用`mkfs.btrfs -m single -d single`／`-m raid1 -d raid1` fixture生成スクリプトを追加し、両profileを`btrfs check --readonly`と実イメージ回帰で確認
 - 欠損deviceのUUIDをDEVICE_ITEMで検証し、すべてのchunkに利用可能なstripeが残る場合だけdegraded読み取りを許可
@@ -307,11 +326,11 @@
    - striped／通常thin対応を基盤に、thin snapshot、external origin、通常snapshot、cache、mirror、RAID segmentを段階的に対応する
 3. 証拠・暗号化形式の拡張
    - EWF2/Ex01、LUKS detached header／複数segmentを検討する
-4. Linux・クロスプラットフォーム対応
-   - filesystem/image readerのCore層をWindows UIから分離し、`net10.0`のcross-platform libraryとしてLinux上のCLI・自動回帰から利用可能にする
-   - WinForms/ProjFS/物理ディスク列挙はWindows固有adapterとして維持し、LinuxではFUSE、mount helper、またはCLI exportを別実装として検討する
-   - CIへLinux runnerを追加し、RAW、QCOW2、LZO、EWF、LUKS、ext、XFS、Btrfs、md RAID、LVMの読み取り回帰を実行する
-   - 実イメージ検証では`xfs_repair -n`、`btrfs check --readonly`、`e2fsck -fn`、`cryptsetup`、`mdadm`、`lvm`などLinux標準ツールとの相互検証を継続する
+4. クロスプラットフォーム機能の拡張
+   - Avalonia GUIへ検索、プレビュー、編集予定、仮想ディスク作成を段階的に移植する
+   - LinuxではFUSEまたはmount helperを検討し、現在のCLI exportと用途を分ける
+   - RAW、QCOW2、LZO、EWF、LUKS、ext、XFS、Btrfs、md RAID、LVMの実fixture回帰をLinux CIへ段階的に追加する
+   - `xfs_repair -n`、`btrfs check --readonly`、`e2fsck -fn`、`cryptsetup`、`mdadm`、`lvm`などLinux標準ツールとの相互検証を継続する
 
 ## 維持する既存仕様
 

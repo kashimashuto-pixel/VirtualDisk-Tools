@@ -524,7 +524,14 @@ internal sealed partial class XfsRawFileSystem
             }
 
             _ = FindShortFormEntry(sourceParent, sourceName, inode.Number);
-            ValidateShortFormCapacity(destinationParent, destinationName);
+            if (sourceParent.Number == destinationParent.Number)
+            {
+                ValidateShortFormRenameCapacity(sourceParent, sourceName, inode.Number, destinationName);
+            }
+            else
+            {
+                ValidateShortFormCapacity(destinationParent, destinationName);
+            }
             reason = string.Empty;
             return true;
         }
@@ -558,12 +565,24 @@ internal sealed partial class XfsRawFileSystem
         var sourceParent = ReadInode(sourceDirectory.Inode);
         var destinationParent = ReadInode(destinationDirectory.Inode);
         var inode = ReadInode(entry.Inode);
-        AddShortFormEntry(
-            destinationParent,
-            destinationName,
-            inode.Number,
-            inode.IsDirectory ? (byte)2 : (byte)1);
-        RemoveShortFormEntry(sourceParent, sourceName, inode.Number);
+        if (sourceParent.Number == destinationParent.Number)
+        {
+            RenameShortFormEntry(
+                sourceParent,
+                sourceName,
+                destinationName,
+                inode.Number,
+                inode.IsDirectory ? (byte)2 : (byte)1);
+        }
+        else
+        {
+            AddShortFormEntry(
+                destinationParent,
+                destinationName,
+                inode.Number,
+                inode.IsDirectory ? (byte)2 : (byte)1);
+            RemoveShortFormEntry(sourceParent, sourceName, inode.Number);
+        }
         if (inode.IsDirectory && sourceParent.Number != destinationParent.Number)
         {
             UpdateShortFormParent(inode, destinationParent.Number);
@@ -773,6 +792,21 @@ internal sealed partial class XfsRawFileSystem
         }
     }
 
+    private void ValidateShortFormRenameCapacity(
+        XfsInode directory,
+        string oldName,
+        ulong inodeNumber,
+        string newName)
+    {
+        var location = FindShortFormEntry(directory, oldName, inodeNumber);
+        var required = checked(3 + Encoding.UTF8.GetByteCount(newName) + (_superBlock.HasFType ? 1 : 0) + 4);
+        var newSize = checked(directory.Length - (ulong)location.Length + (ulong)required);
+        if (newSize > (ulong)directory.DataFork.Length)
+        {
+            throw new NotSupportedException("short-form directory内に変更後のentryを置く空きがありません。");
+        }
+    }
+
     private (int Offset, int Length) FindShortFormEntry(XfsInode directory, string name, ulong inodeNumber)
     {
         var data = directory.DataFork;
@@ -848,6 +882,45 @@ internal sealed partial class XfsRawFileSystem
         fork.Slice(oldSize - location.Length, location.Length).Clear();
         fork[0]--;
         WriteDirectoryInode(directory, raw, checked(directory.Length - (ulong)location.Length));
+    }
+
+    private void RenameShortFormEntry(
+        XfsInode directory,
+        string oldName,
+        string newName,
+        ulong inodeNumber,
+        byte fileType)
+    {
+        ValidateShortFormRenameCapacity(directory, oldName, inodeNumber, newName);
+        var location = FindShortFormEntry(directory, oldName, inodeNumber);
+        var raw = (byte[])directory.RawData.Clone();
+        var fork = raw.AsSpan(0xb0, directory.DataFork.Length);
+        var nameBytes = Encoding.UTF8.GetBytes(newName);
+        var newLength = checked(3 + nameBytes.Length + (_superBlock.HasFType ? 1 : 0) + 4);
+        var oldSize = checked((int)directory.Length);
+        var tailOffset = checked(location.Offset + location.Length);
+        var tailLength = checked(oldSize - tailOffset);
+        var dataOffset = BinaryPrimitives.ReadUInt16BigEndian(fork.Slice(location.Offset + 1, 2));
+
+        fork.Slice(tailOffset, tailLength)
+            .CopyTo(fork.Slice(location.Offset + newLength));
+        fork[location.Offset] = checked((byte)nameBytes.Length);
+        BinaryPrimitives.WriteUInt16BigEndian(fork.Slice(location.Offset + 1, 2), dataOffset);
+        nameBytes.CopyTo(fork.Slice(location.Offset + 3));
+        var cursor = location.Offset + 3 + nameBytes.Length;
+        if (_superBlock.HasFType)
+        {
+            fork[cursor++] = fileType;
+        }
+
+        BinaryPrimitives.WriteUInt32BigEndian(fork.Slice(cursor, 4), checked((uint)inodeNumber));
+        var newSize = checked(oldSize - location.Length + newLength);
+        if (newSize < oldSize)
+        {
+            fork.Slice(newSize, oldSize - newSize).Clear();
+        }
+
+        WriteDirectoryInode(directory, raw, checked((ulong)newSize));
     }
 
     private void WriteDirectoryInode(XfsInode directory, byte[] raw, ulong size)

@@ -1,6 +1,6 @@
 namespace Qcow2Explorer.FileSystems;
 
-internal static class VirtualPath
+public static class VirtualPath
 {
     public static string Normalize(string path)
     {

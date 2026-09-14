@@ -22,11 +22,6 @@ public static class DiskImageReaderFactory
         bool overwriteSavedRaw = false)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        if (PhysicalDiskReader.IsPhysicalDiskPath(path))
-        {
-            return new PhysicalDiskReader(path);
-        }
-
         if (Directory.Exists(path))
         {
             if (ParallelsHddReader.CanOpenDirectory(path))
@@ -110,7 +105,7 @@ public static class DiskImageReaderFactory
 
     public static bool IsLzopFile(string path)
     {
-        if (PhysicalDiskReader.IsPhysicalDiskPath(path) || Directory.Exists(path))
+        if (Directory.Exists(path))
         {
             return false;
         }

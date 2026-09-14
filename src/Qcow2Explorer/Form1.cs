@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
+using Qcow2Explorer.Creation;
 using Qcow2Explorer.Core;
 using Qcow2Explorer.FileSystems;
 using Qcow2Explorer.Mounting;
@@ -48,6 +49,10 @@ public partial class Form1 : Form
     private readonly Button _pendingMoveDownButton = new() { Text = "下へ", AutoSize = true, Enabled = false };
     private readonly List<PendingFileEdit> _pendingFileEdits = [];
     private readonly TabControl _explorerDetailTabs = new() { Dock = DockStyle.Fill };
+    private ToolStripDropDownButton? _editOperationsButton;
+    private ToolStripMenuItem? _editModeMenuItem;
+    private TabPage? _pendingEditTab;
+    private bool _editModeEnabled;
     private readonly ListView _mountList = new() { Dock = DockStyle.Fill, View = View.Details, FullRowSelect = true, GridLines = true, MultiSelect = true };
     private readonly TextBox _mountText = new() { Dock = DockStyle.Fill, Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical };
 
@@ -206,37 +211,10 @@ public partial class Form1 : Form
         Width = 1180;
         Height = 760;
 
+        var menuStrip = CreateMainMenu();
         var toolStrip = new ToolStrip { GripStyle = ToolStripGripStyle.Hidden };
-        var openButton = new ToolStripButton("開く");
-        openButton.Click += async (_, _) => await OpenImageDialogAsync();
-        var openDeviceSetButton = new ToolStripButton("複数ディスク");
-        openDeviceSetButton.Click += async (_, _) => await OpenDeviceSetDialogAsync();
-        var openFolderButton = new ToolStripButton("フォルダ");
-        openFolderButton.Click += async (_, _) => await OpenImageFolderDialogAsync();
-        var openPhysicalDiskButton = new ToolStripButton("物理ディスク");
-        openPhysicalDiskButton.Click += async (_, _) => await OpenPhysicalDiskDialogAsync();
-        var recoverPhysicalDiskButton = new ToolStripButton("物理ディスク復旧");
-        recoverPhysicalDiskButton.Click += async (_, _) => await RestorePhysicalDiskAsync();
-        var reportButton = new ToolStripButton("解析レポート");
-        reportButton.Click += (_, _) => SaveAnalysisReport();
-        var snapshotButton = new ToolStripButton("スナップショット");
-        snapshotButton.Click += (_, _) => SelectQcow2Snapshot();
-        var vmaDiskButton = new ToolStripButton("VMAディスク");
-        vmaDiskButton.Click += (_, _) => SelectVmaDisk();
-        var ovaDiskButton = new ToolStripButton("OVAディスク");
-        ovaDiskButton.Click += (_, _) => SelectOvaDisk();
-        toolStrip.Items.Add(openButton);
-        toolStrip.Items.Add(openDeviceSetButton);
-        toolStrip.Items.Add(openFolderButton);
-        toolStrip.Items.Add(openPhysicalDiskButton);
-        toolStrip.Items.Add(recoverPhysicalDiskButton);
-        toolStrip.Items.Add(new ToolStripSeparator());
         toolStrip.Items.Add(new ToolStripLabel("ファイル"));
         toolStrip.Items.Add(_pathBox);
-        toolStrip.Items.Add(reportButton);
-        toolStrip.Items.Add(snapshotButton);
-        toolStrip.Items.Add(vmaDiskButton);
-        toolStrip.Items.Add(ovaDiskButton);
         toolStrip.Items.Add(new ToolStripSeparator());
         toolStrip.Items.Add(_statusLabel);
         toolStrip.Items.Add(_loadProgressBar);
@@ -252,10 +230,149 @@ public partial class Form1 : Form
         tabs.TabPages.Add(CreateExplorerTab());
         tabs.TabPages.Add(CreateMountTab());
 
+        var root = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 3,
+            Margin = Padding.Empty,
+            Padding = Padding.Empty,
+        };
+        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        root.Controls.Add(menuStrip, 0, 0);
+        root.Controls.Add(toolStrip, 0, 1);
+        root.Controls.Add(tabs, 0, 2);
+
         Controls.Clear();
-        Controls.Add(tabs);
-        Controls.Add(toolStrip);
-        toolStrip.Dock = DockStyle.Top;
+        Controls.Add(root);
+        MainMenuStrip = menuStrip;
+    }
+
+    private MenuStrip CreateMainMenu()
+    {
+        var menuStrip = new MenuStrip { Dock = DockStyle.Fill };
+        var fileMenu = new ToolStripMenuItem("ファイル(&F)");
+        var createItem = new ToolStripMenuItem("新規作成(&N)...")
+        {
+            ShortcutKeys = Keys.Control | Keys.N,
+        };
+        createItem.Click += async (_, _) => await CreateVirtualDiskAsync();
+        var openItem = new ToolStripMenuItem("開く(&O)...")
+        {
+            ShortcutKeys = Keys.Control | Keys.O,
+        };
+        openItem.Click += async (_, _) => await OpenImageDialogAsync();
+
+        var otherOpenMenu = new ToolStripMenuItem("その他の開き方");
+        var openDeviceSetItem = new ToolStripMenuItem("複数ディスク...");
+        openDeviceSetItem.Click += async (_, _) => await OpenDeviceSetDialogAsync();
+        var openFolderItem = new ToolStripMenuItem("フォルダー...");
+        openFolderItem.Click += async (_, _) => await OpenImageFolderDialogAsync();
+        var openPhysicalDiskItem = new ToolStripMenuItem("物理ディスク...");
+        openPhysicalDiskItem.Click += async (_, _) => await OpenPhysicalDiskDialogAsync();
+        otherOpenMenu.DropDownItems.AddRange([openDeviceSetItem, openFolderItem, openPhysicalDiskItem]);
+
+        var imageSelectionMenu = new ToolStripMenuItem("イメージ内ディスクの選択");
+        var snapshotItem = new ToolStripMenuItem("QCOW2スナップショット...");
+        snapshotItem.Click += (_, _) => SelectQcow2Snapshot();
+        var vmaDiskItem = new ToolStripMenuItem("VMAディスク...");
+        vmaDiskItem.Click += (_, _) => SelectVmaDisk();
+        var ovaDiskItem = new ToolStripMenuItem("OVAディスク...");
+        ovaDiskItem.Click += (_, _) => SelectOvaDisk();
+        imageSelectionMenu.DropDownItems.AddRange([snapshotItem, vmaDiskItem, ovaDiskItem]);
+
+        var reportItem = new ToolStripMenuItem("解析レポートを保存...");
+        reportItem.Click += (_, _) => SaveAnalysisReport();
+        var recoverPhysicalDiskItem = new ToolStripMenuItem("物理ディスクを復旧...");
+        recoverPhysicalDiskItem.Click += async (_, _) => await RestorePhysicalDiskAsync();
+        var exitItem = new ToolStripMenuItem("終了(&X)")
+        {
+            ShortcutKeys = Keys.Alt | Keys.F4,
+        };
+        exitItem.Click += (_, _) => Close();
+        fileMenu.DropDownItems.AddRange([
+            createItem,
+            openItem,
+            otherOpenMenu,
+            imageSelectionMenu,
+            new ToolStripSeparator(),
+            reportItem,
+            recoverPhysicalDiskItem,
+            new ToolStripSeparator(),
+            exitItem,
+        ]);
+
+        var editMenu = new ToolStripMenuItem("編集(&E)");
+        _editModeMenuItem = new ToolStripMenuItem("編集モードを有効にする")
+        {
+            ShortcutKeys = Keys.Control | Keys.E,
+        };
+        _editModeMenuItem.Click += (_, _) => ToggleEditMode();
+        editMenu.DropDownItems.Add(_editModeMenuItem);
+        menuStrip.Items.AddRange([fileMenu, editMenu]);
+        return menuStrip;
+    }
+
+    private void ToggleEditMode()
+    {
+        if (!_editModeEnabled)
+        {
+            var confirmation = MessageBox.Show(
+                this,
+                "編集モードは実験的な機能です。通常は原本を変更せず、新しいRAWへ保存します。"
+                + Environment.NewLine
+                + "物理ディスクへの適用を選んだ場合だけ、確認後に対象ディスクへ書き込みます。"
+                + Environment.NewLine
+                + Environment.NewLine
+                + "編集モードを有効にしますか？",
+                "編集モード",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Warning,
+                MessageBoxDefaultButton.Button2);
+            if (confirmation != DialogResult.Yes)
+            {
+                return;
+            }
+
+            SetEditModeEnabled(true);
+            _statusLabel.Text = "編集モードを有効にしました";
+            return;
+        }
+
+        if (!ConfirmDiscardPendingEdits("編集モードを無効にすると変更予定を破棄します。続行しますか？"))
+        {
+            return;
+        }
+
+        ClearPendingEdits();
+        SetEditModeEnabled(false);
+        _statusLabel.Text = "編集モードを無効にしました";
+    }
+
+    private void SetEditModeEnabled(bool enabled)
+    {
+        _editModeEnabled = enabled;
+        if (_editModeMenuItem is not null)
+        {
+            _editModeMenuItem.Checked = enabled;
+            _editModeMenuItem.Text = enabled ? "編集モードを無効にする" : "編集モードを有効にする";
+        }
+
+        if (_editOperationsButton is not null)
+        {
+            _editOperationsButton.Visible = enabled;
+        }
+
+        if (_pendingEditTab is not null)
+        {
+            _pendingEditTab.Enabled = enabled;
+            if (!enabled && ReferenceEquals(_explorerDetailTabs.SelectedTab, _pendingEditTab))
+            {
+                _explorerDetailTabs.SelectedIndex = 0;
+            }
+        }
     }
 
     private TabPage CreateSummaryTab()
@@ -443,7 +560,8 @@ public partial class Form1 : Form
         copyButton.Click += async (_, _) => await CopySelectedItemsAsync();
         var copyFolderButton = new ToolStripButton("表示フォルダをコピー");
         copyFolderButton.Click += async (_, _) => await CopyCurrentDirectoryAsync();
-        var editButton = new ToolStripDropDownButton("編集（実験）");
+        _editOperationsButton = new ToolStripDropDownButton("編集操作") { Visible = _editModeEnabled };
+        var editButton = _editOperationsButton;
         var queueWriteItem = new ToolStripMenuItem("選択ファイルの内容を変更...");
         queueWriteItem.Click += (_, _) => QueueSelectedFileWrite();
         var queueCreateItem = new ToolStripMenuItem("表示フォルダーへファイルを追加...");
@@ -539,7 +657,12 @@ public partial class Form1 : Form
         var right = new SplitContainer { Dock = DockStyle.Fill, Orientation = Orientation.Horizontal, FixedPanel = FixedPanel.Panel2 };
         right.Panel1.Controls.Add(_fileList);
         _explorerDetailTabs.TabPages.Add(new TabPage("プレビュー") { Controls = { _previewText } });
-        _explorerDetailTabs.TabPages.Add(new TabPage("変更予定") { Controls = { CreatePendingEditPanel() } });
+        _pendingEditTab = new TabPage("変更予定")
+        {
+            Enabled = _editModeEnabled,
+            Controls = { CreatePendingEditPanel() },
+        };
+        _explorerDetailTabs.TabPages.Add(_pendingEditTab);
         right.Panel2.Controls.Add(_explorerDetailTabs);
 
         var split = new SplitContainer { Dock = DockStyle.Fill, FixedPanel = FixedPanel.Panel1 };
@@ -1205,6 +1328,16 @@ public partial class Form1 : Form
         };
     }
 
+    private async Task CreateVirtualDiskAsync()
+    {
+        using var dialog = new VirtualDiskCreationDialog();
+        if (dialog.ShowDialog(this) == DialogResult.OK
+            && !string.IsNullOrWhiteSpace(dialog.CreatedPath))
+        {
+            await LoadImageAsync(dialog.CreatedPath);
+        }
+    }
+
     private async Task LoadImageAsync(string path, IReadOnlyList<string>? companionPaths = null)
     {
         if (_isWritingImage)
@@ -1404,13 +1537,15 @@ public partial class Form1 : Form
         try
         {
             cancellationToken.ThrowIfCancellationRequested();
-            reader = DiskImageReaderFactory.Open(
-                path,
-                progress,
-                lzopOpenMode,
-                lzopTemporaryDirectory,
-                cancellationToken,
-                overwriteSavedRaw);
+            reader = PhysicalDiskReader.IsPhysicalDiskPath(path)
+                ? new PhysicalDiskReader(path)
+                : DiskImageReaderFactory.Open(
+                    path,
+                    progress,
+                    lzopOpenMode,
+                    lzopTemporaryDirectory,
+                    cancellationToken,
+                    overwriteSavedRaw);
             foreach (var companionPath in companionPaths)
             {
                 cancellationToken.ThrowIfCancellationRequested();
@@ -1418,10 +1553,12 @@ public partial class Form1 : Form
                     $"companion diskを開いています: {companionReaders.Count + 1:N0} / {companionPaths.Count:N0}",
                     companionReaders.Count + 1,
                     companionPaths.Count));
-                companionReaders.Add(DiskImageReaderFactory.Open(
-                    companionPath,
-                    progress,
-                    cancellationToken: cancellationToken));
+                companionReaders.Add(PhysicalDiskReader.IsPhysicalDiskPath(companionPath)
+                    ? new PhysicalDiskReader(companionPath)
+                    : DiskImageReaderFactory.Open(
+                        companionPath,
+                        progress,
+                        cancellationToken: cancellationToken));
             }
 
             var disks = new List<IBlockReader> { reader };
@@ -4207,6 +4344,12 @@ public partial class Form1 : Form
 
     private bool CanQueuePendingEdit()
     {
+        if (!_editModeEnabled)
+        {
+            _statusLabel.Text = "［編集］メニューから編集モードを有効にしてください";
+            return false;
+        }
+
         if (!_isWritingImage && !_isLoadingImage)
         {
             return true;
