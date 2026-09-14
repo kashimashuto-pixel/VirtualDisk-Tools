@@ -12,6 +12,7 @@ internal static class PartitionTableRobustnessTests
     {
         TestTruncatedTables(directory);
         TestMbrBounds(directory);
+        TestExtendedMbrIntegrity(directory);
         TestGptRecoveryAndChecksums(directory);
         TestGptOverlap(directory);
         TestCancellation(directory);
@@ -93,6 +94,81 @@ internal static class PartitionTableRobustnessTests
         FlipByte(path, primaryEntryByte);
         FlipByte(path, backupEntryByte);
         AssertSingleGptPartition(reader, "restored GPT entry arrays");
+    }
+
+    private static void TestExtendedMbrIntegrity(string directory)
+    {
+        var path = Path.Combine(directory, "partition-extended-mbr.raw");
+        var image = new byte[8 * SectorSize];
+        WriteMbrSignature(image.AsSpan(0, SectorSize));
+        var extended = image.AsSpan(446, 16);
+        extended[4] = 0x0f;
+        BinaryPrimitives.WriteUInt32LittleEndian(extended[8..], 1);
+        BinaryPrimitives.WriteUInt32LittleEndian(extended[12..], 7);
+
+        var firstEbr = image.AsSpan(SectorSize, SectorSize);
+        WriteMbrSignature(firstEbr);
+        var firstLogical = firstEbr.Slice(446, 16);
+        firstLogical[4] = 0x83;
+        BinaryPrimitives.WriteUInt32LittleEndian(firstLogical[8..], 1);
+        BinaryPrimitives.WriteUInt32LittleEndian(firstLogical[12..], 1);
+        var link = firstEbr.Slice(462, 16);
+        link[4] = 0x0f;
+        BinaryPrimitives.WriteUInt32LittleEndian(link[8..], 0);
+        BinaryPrimitives.WriteUInt32LittleEndian(link[12..], 7);
+        File.WriteAllBytes(path, image);
+        using (var reader = new RawDiskImageReader(path))
+        {
+            Assert(PartitionTableReader.ReadPartitions(reader).Count == 0, "cyclic EBR chain rejected without partial results");
+        }
+
+        link.Clear();
+        BinaryPrimitives.WriteUInt32LittleEndian(extended[12..], 4);
+        BinaryPrimitives.WriteUInt32LittleEndian(firstLogical[8..], 3);
+        BinaryPrimitives.WriteUInt32LittleEndian(firstLogical[12..], 2);
+        File.WriteAllBytes(path, image);
+        using (var reader = new RawDiskImageReader(path))
+        {
+            Assert(PartitionTableReader.ReadPartitions(reader).Count == 0,
+                "logical partition outside extended container rejected");
+        }
+
+        image.AsSpan().Clear();
+        WriteMbrSignature(image.AsSpan(0, SectorSize));
+        extended = image.AsSpan(446, 16);
+        extended[4] = 0x0f;
+        BinaryPrimitives.WriteUInt32LittleEndian(extended[8..], 1);
+        BinaryPrimitives.WriteUInt32LittleEndian(extended[12..], 7);
+        firstEbr = image.AsSpan(SectorSize, SectorSize);
+        WriteMbrSignature(firstEbr);
+        firstLogical = firstEbr.Slice(446, 16);
+        firstLogical[4] = 0x83;
+        BinaryPrimitives.WriteUInt32LittleEndian(firstLogical[8..], 1);
+        BinaryPrimitives.WriteUInt32LittleEndian(firstLogical[12..], 1);
+        link = firstEbr.Slice(462, 16);
+        link[4] = 0x0f;
+        BinaryPrimitives.WriteUInt32LittleEndian(link[8..], 3);
+        BinaryPrimitives.WriteUInt32LittleEndian(link[12..], 4);
+        var secondEbr = image.AsSpan(4 * SectorSize, SectorSize);
+        WriteMbrSignature(secondEbr);
+        var secondLogical = secondEbr.Slice(446, 16);
+        secondLogical[4] = 0x83;
+        BinaryPrimitives.WriteUInt32LittleEndian(secondLogical[8..], 1);
+        BinaryPrimitives.WriteUInt32LittleEndian(secondLogical[12..], 1);
+        File.WriteAllBytes(path, image);
+        using (var reader = new RawDiskImageReader(path))
+        {
+            var partitions = PartitionTableReader.ReadPartitions(reader);
+            Assert(partitions.Count == 2, "valid EBR chain partition count");
+            Assert(partitions[0].StartLba == 2 && partitions[1].StartLba == 5,
+                "valid EBR chain partition offsets");
+        }
+    }
+
+    private static void WriteMbrSignature(Span<byte> sector)
+    {
+        sector[510] = 0x55;
+        sector[511] = 0xaa;
     }
 
     private static void TestCancellation(string directory)

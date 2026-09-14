@@ -99,6 +99,7 @@ public static class PartitionTableReader
         var partitions = new List<PartitionInfo>();
         var number = 1;
         ulong? extendedBase = null;
+        ulong extendedEnd = 0;
         var totalSectors = (ulong)(disk.Length / sectorSize);
 
         for (var i = 0; i < 4; i++)
@@ -108,13 +109,29 @@ public static class PartitionTableReader
             var type = mbr[entryOffset + 4];
             var start = EndianUtilities.ReadUInt32Little(mbr, entryOffset + 8);
             var count = EndianUtilities.ReadUInt32Little(mbr, entryOffset + 12);
-            if (type == 0 || count == 0)
+            if (type == 0 && count == 0)
             {
                 continue;
             }
 
+            if (type == 0
+                || count == 0
+                || (mbr[entryOffset] != 0 && mbr[entryOffset] != 0x80))
+            {
+                return [];
+            }
+
             if (ExtendedTypes.Contains(type))
             {
+                if (extendedBase.HasValue
+                    || start == 0
+                    || start >= totalSectors
+                    || !TryAdd(start, count, out extendedEnd)
+                    || extendedEnd > totalSectors)
+                {
+                    return [];
+                }
+
                 extendedBase = start;
                 continue;
             }
@@ -132,19 +149,40 @@ public static class PartitionTableReader
                 partitions.Add(partition);
                 number++;
             }
+            else
+            {
+                return [];
+            }
         }
 
         if (extendedBase.HasValue)
         {
-            ReadExtendedPartitions(disk, extendedBase.Value, partitions, ref number, sectorSize, cancellationToken);
+            if (partitions.Any(partition =>
+                    RangesOverlap(
+                        partition.StartLba,
+                        checked(partition.StartLba + partition.SectorCount),
+                        extendedBase.Value,
+                        extendedEnd))
+                || !ReadExtendedPartitions(
+                    disk,
+                    extendedBase.Value,
+                    extendedEnd,
+                    partitions,
+                    ref number,
+                    sectorSize,
+                    cancellationToken))
+            {
+                return [];
+            }
         }
 
         return partitions;
     }
 
-    private static void ReadExtendedPartitions(
+    private static bool ReadExtendedPartitions(
         IBlockReader disk,
         ulong extendedBase,
+        ulong extendedEnd,
         List<PartitionInfo> partitions,
         ref int number,
         uint sectorSize,
@@ -154,39 +192,65 @@ public static class PartitionTableReader
         var visited = new HashSet<ulong>();
 
         var totalSectors = (ulong)(disk.Length / sectorSize);
-        while (currentEbr != 0
-            && visited.Count < MaxExtendedPartitionCount
-            && visited.Add(currentEbr)
-            && currentEbr < totalSectors)
+        while (currentEbr != 0)
         {
             cancellationToken.ThrowIfCancellationRequested();
+            if (visited.Count >= MaxExtendedPartitionCount
+                || !visited.Add(currentEbr)
+                || currentEbr < extendedBase
+                || currentEbr >= extendedEnd
+                || currentEbr >= totalSectors)
+            {
+                return false;
+            }
+
             var sector = EndianUtilities.ReadBytes(disk, checked((long)(currentEbr * sectorSize)), 512);
             if (sector[510] != 0x55 || sector[511] != 0xaa)
             {
-                return;
+                return false;
             }
 
             ulong nextEbr = 0;
+            var hasNextEbr = false;
             for (var i = 0; i < 4; i++)
             {
                 var entryOffset = 446 + i * 16;
                 var type = sector[entryOffset + 4];
                 var relStart = EndianUtilities.ReadUInt32Little(sector, entryOffset + 8);
                 var count = EndianUtilities.ReadUInt32Little(sector, entryOffset + 12);
-                if (type == 0 || count == 0)
+                if (type == 0 && count == 0)
                 {
                     continue;
                 }
 
+                if (type == 0
+                    || count == 0
+                    || (sector[entryOffset] != 0 && sector[entryOffset] != 0x80))
+                {
+                    return false;
+                }
+
                 if (ExtendedTypes.Contains(type))
                 {
-                    if (!TryAdd(extendedBase, relStart, out nextEbr) || nextEbr >= totalSectors)
+                    if (hasNextEbr
+                        || !TryAdd(extendedBase, relStart, out nextEbr)
+                        || nextEbr <= currentEbr
+                        || nextEbr >= extendedEnd
+                        || !TryAdd(nextEbr, count, out var linkEnd)
+                        || linkEnd > extendedEnd)
                     {
-                        nextEbr = 0;
+                        return false;
                     }
+
+                    hasNextEbr = true;
                 }
-                else if (TryAdd(currentEbr, relStart, out var start)
-                    && TryCreateMbrPartition(
+                else
+                {
+                    if (!TryAdd(currentEbr, relStart, out var start)
+                        || start <= currentEbr
+                        || !TryAdd(start, count, out var end)
+                        || end > extendedEnd
+                        || !TryCreateMbrPartition(
                         number,
                         sector,
                         entryOffset,
@@ -195,7 +259,10 @@ public static class PartitionTableReader
                         sectorSize,
                         totalSectors,
                         out var partition))
-                {
+                    {
+                        return false;
+                    }
+
                     partitions.Add(partition);
                     number++;
                 }
@@ -203,6 +270,8 @@ public static class PartitionTableReader
 
             currentEbr = nextEbr;
         }
+
+        return true;
     }
 
     private static bool TryCreateMbrPartition(
@@ -392,6 +461,9 @@ public static class PartitionTableReader
 
         return false;
     }
+
+    private static bool RangesOverlap(ulong firstStart, ulong firstEnd, ulong secondStart, ulong secondEnd) =>
+        firstStart < secondEnd && secondStart < firstEnd;
 
     private static ulong ReadUInt64Little(ReadOnlySpan<byte> buffer, int offset) =>
         System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(buffer[offset..]);
