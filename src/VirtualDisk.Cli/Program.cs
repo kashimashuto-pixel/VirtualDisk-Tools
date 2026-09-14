@@ -12,6 +12,13 @@ internal static class Cli
 
     public static async Task<int> RunAsync(string[] args)
     {
+        using var cancellationSource = new CancellationTokenSource();
+        ConsoleCancelEventHandler cancelHandler = (_, eventArgs) =>
+        {
+            eventArgs.Cancel = true;
+            cancellationSource.Cancel();
+        };
+        Console.CancelKeyPress += cancelHandler;
         try
         {
             if (args.Length == 0 || IsHelp(args[0]))
@@ -28,10 +35,10 @@ internal static class Cli
 
             return args[0].ToLowerInvariant() switch
             {
-                "info" => RunInfo(args[1..]),
-                "list" => RunList(args[1..]),
-                "extract" => await RunExtractAsync(args[1..]),
-                "create" => await RunCreateAsync(args[1..]),
+                "info" => RunInfo(args[1..], cancellationSource.Token),
+                "list" => RunList(args[1..], cancellationSource.Token),
+                "extract" => await RunExtractAsync(args[1..], cancellationSource.Token),
+                "create" => await RunCreateAsync(args[1..], cancellationSource.Token),
                 _ => throw new CliUsageException($"不明なコマンドです: {args[0]}"),
             };
         }
@@ -56,24 +63,29 @@ internal static class Cli
             Console.Error.WriteLine($"エラー: {ex.Message}");
             return 1;
         }
+        finally
+        {
+            Console.CancelKeyPress -= cancelHandler;
+        }
     }
 
-    private static int RunInfo(string[] args)
+    private static int RunInfo(string[] args, CancellationToken cancellationToken)
     {
         if (args.Length != 1)
         {
             throw new CliUsageException("infoにはディスクイメージを1つ指定してください。");
         }
 
-        using var reader = DiskImageReaderFactory.Open(args[0]);
+        using var reader = DiskImageReaderFactory.Open(args[0], cancellationToken: cancellationToken);
         Console.WriteLine($"Path: {reader.Path}");
         Console.WriteLine($"Format: {reader.FormatName}");
         Console.WriteLine($"Size: {reader.Length} bytes");
-        var partitions = PartitionTableReader.ReadPartitions(reader);
+        var partitions = PartitionTableReader.ReadPartitions(reader, cancellationToken);
         Console.WriteLine($"Partitions: {partitions.Count}");
         foreach (var partition in partitions)
         {
-            partition.FileSystem = FileSystemDetector.Detect(reader, partition);
+            cancellationToken.ThrowIfCancellationRequested();
+            partition.FileSystem = FileSystemDetector.Detect(reader, partition, cancellationToken);
             Console.WriteLine(
                 $"  #{partition.Number} {partition.Scheme} offset={partition.StartOffset} "
                 + $"size={partition.LengthBytes} fs={partition.FileSystem}");
@@ -82,11 +94,11 @@ internal static class Cli
         return 0;
     }
 
-    private static int RunList(string[] args)
+    private static int RunList(string[] args, CancellationToken cancellationToken)
     {
         var options = ParsedOptions.Parse(args, ["partition", "path"]);
-        using var context = OpenFileSystem(options);
-        var directory = ResolvePath(context.FileSystem, options.Get("path") ?? "/");
+        using var context = OpenFileSystem(options, cancellationToken);
+        var directory = ResolvePath(context.FileSystem, options.Get("path") ?? "/", cancellationToken);
         if (!directory.IsDirectory)
         {
             throw new CliUsageException("listの対象はディレクトリである必要があります。");
@@ -94,6 +106,7 @@ internal static class Cli
 
         foreach (var entry in context.FileSystem.ListDirectory(directory))
         {
+            cancellationToken.ThrowIfCancellationRequested();
             Console.WriteLine(
                 $"{(entry.IsDirectory ? "d" : "-")} {entry.Size,14} "
                 + $"{entry.ModifiedUtc?.ToString("u", CultureInfo.InvariantCulture) ?? "-",20} {entry.Name}");
@@ -102,7 +115,7 @@ internal static class Cli
         return 0;
     }
 
-    private static async Task<int> RunExtractAsync(string[] args)
+    private static async Task<int> RunExtractAsync(string[] args, CancellationToken cancellationToken)
     {
         var options = ParsedOptions.Parse(args, ["partition", "path", "output"]);
         var virtualPath = options.Require("path");
@@ -112,9 +125,9 @@ internal static class Cli
             throw new IOException($"抽出先は既に存在します: {outputPath}");
         }
 
-        using var context = OpenFileSystem(options);
-        var file = ResolvePath(context.FileSystem, virtualPath);
-        if (file.IsDirectory)
+        using var context = OpenFileSystem(options, cancellationToken);
+        var file = ResolvePath(context.FileSystem, virtualPath, cancellationToken);
+        if (file.IsDirectory || file.Size < 0)
         {
             throw new CliUsageException("extractは現在、通常ファイルを1つ指定してください。");
         }
@@ -122,32 +135,51 @@ internal static class Cli
         var parent = Path.GetDirectoryName(outputPath)
             ?? throw new CliUsageException("抽出先ディレクトリを取得できません。");
         Directory.CreateDirectory(parent);
-        await using var destination = new FileStream(
-            outputPath,
-            FileMode.CreateNew,
-            FileAccess.Write,
-            FileShare.None,
-            CopyBufferSize,
-            FileOptions.Asynchronous | FileOptions.SequentialScan);
-        long offset = 0;
-        while (offset < file.Size)
+        var partialPath = Path.Combine(
+            parent,
+            $".{Path.GetFileName(outputPath)}.{Guid.NewGuid():N}.vdt-partial");
+        try
         {
-            var count = checked((int)Math.Min(CopyBufferSize, file.Size - offset));
-            var content = context.FileSystem.ReadFile(file, offset, count);
-            if (content.Length != count)
+            await using (var destination = new FileStream(
+                partialPath,
+                FileMode.CreateNew,
+                FileAccess.Write,
+                FileShare.None,
+                CopyBufferSize,
+                FileOptions.Asynchronous | FileOptions.SequentialScan))
             {
-                throw new EndOfStreamException($"ファイル読み取りが途中で終了しました: offset={offset}");
+                long offset = 0;
+                while (offset < file.Size)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    var count = checked((int)Math.Min(CopyBufferSize, file.Size - offset));
+                    var content = context.FileSystem.ReadFile(file, offset, count);
+                    if (content.Length != count)
+                    {
+                        throw new EndOfStreamException($"ファイル読み取りが途中で終了しました: offset={offset}");
+                    }
+
+                    await destination.WriteAsync(content, cancellationToken);
+                    offset += count;
+                }
+
+                await destination.FlushAsync(cancellationToken);
             }
 
-            await destination.WriteAsync(content);
-            offset += count;
+            cancellationToken.ThrowIfCancellationRequested();
+            File.Move(partialPath, outputPath);
+        }
+        catch
+        {
+            TryDelete(partialPath);
+            throw;
         }
 
         Console.WriteLine($"Extracted {file.Size} bytes to {outputPath}");
         return 0;
     }
 
-    private static async Task<int> RunCreateAsync(string[] args)
+    private static async Task<int> RunCreateAsync(string[] args, CancellationToken cancellationToken)
     {
         var options = ParsedOptions.Parse(args, ["size", "container", "table", "partition"], "partition");
         var outputPath = Path.GetFullPath(options.Positional);
@@ -172,26 +204,29 @@ internal static class Cli
 
         var partitions = specifications.Select((specification, index) =>
             ParsePartition(specification, index + 1)).ToArray();
-        var progress = new Progress<DiskImageProgress>(update =>
+        var progress = new CallbackProgress<DiskImageProgress>(update =>
         {
             var suffix = update.Percentage is int percentage ? $" ({percentage}%)" : string.Empty;
             Console.Error.WriteLine(update.Message + suffix);
         });
         var result = await VirtualDiskCreationService.CreateAsync(
             new VirtualDiskCreationRequest(outputPath, size, container, table, partitions),
-            progress);
+            progress,
+            cancellationToken);
         Console.WriteLine(
             $"Created {result.ContainerFormat} disk: {result.DestinationPath} "
             + $"({result.CapacityBytes} bytes, {result.Partitions.Count} partition(s))");
         return 0;
     }
 
-    private static FileSystemContext OpenFileSystem(ParsedOptions options)
+    private static FileSystemContext OpenFileSystem(
+        ParsedOptions options,
+        CancellationToken cancellationToken)
     {
-        var reader = DiskImageReaderFactory.Open(options.Positional);
+        var reader = DiskImageReaderFactory.Open(options.Positional, cancellationToken: cancellationToken);
         try
         {
-            var partitions = PartitionTableReader.ReadPartitions(reader);
+            var partitions = PartitionTableReader.ReadPartitions(reader, cancellationToken);
             var partitionNumber = options.GetInt32("partition");
             var partition = partitionNumber is null
                 ? partitions.Count == 1
@@ -199,7 +234,7 @@ internal static class Cli
                     : throw new CliUsageException("複数パーティションがあるため--partitionを指定してください。")
                 : partitions.SingleOrDefault(candidate => candidate.Number == partitionNumber.Value)
                     ?? throw new CliUsageException($"パーティション#{partitionNumber}が見つかりません。");
-            partition.FileSystem = FileSystemDetector.Detect(reader, partition);
+            partition.FileSystem = FileSystemDetector.Detect(reader, partition, cancellationToken);
             var fileSystem = FileSystemDetector.TryOpen(reader, partition, out var error)
                 ?? throw new InvalidDataException(error);
             return new FileSystemContext(reader, fileSystem);
@@ -211,11 +246,15 @@ internal static class Cli
         }
     }
 
-    private static VfsNode ResolvePath(IReadOnlyFileSystem fileSystem, string virtualPath)
+    private static VfsNode ResolvePath(
+        IReadOnlyFileSystem fileSystem,
+        string virtualPath,
+        CancellationToken cancellationToken)
     {
         var current = fileSystem.Root;
         foreach (var component in VirtualPath.Split(virtualPath))
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var comparison = fileSystem.Name is "FAT16" or "FAT32" or "exFAT" or "NTFS"
                 ? StringComparison.OrdinalIgnoreCase
                 : StringComparison.Ordinal;
@@ -271,11 +310,29 @@ internal static class Cli
             if (value.EndsWith(suffix, StringComparison.OrdinalIgnoreCase))
             {
                 var number = value[..^suffix.Length].Trim();
-                return checked(long.Parse(number, NumberStyles.Integer, CultureInfo.InvariantCulture) * multiplier);
+                return ParsePositiveSize(number, multiplier);
             }
         }
 
-        return long.Parse(value, NumberStyles.Integer, CultureInfo.InvariantCulture);
+        return ParsePositiveSize(value, 1);
+    }
+
+    private static long ParsePositiveSize(string value, long multiplier)
+    {
+        if (!long.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed)
+            || parsed <= 0)
+        {
+            throw new CliUsageException("サイズには正の整数を指定してください。");
+        }
+
+        try
+        {
+            return checked(parsed * multiplier);
+        }
+        catch (OverflowException)
+        {
+            throw new CliUsageException("指定されたサイズが大きすぎます。");
+        }
     }
 
     private static string InferContainer(string path) =>
@@ -284,6 +341,18 @@ internal static class Cli
             : "raw";
 
     private static bool IsHelp(string value) => value is "-h" or "--help" or "help";
+
+    private static void TryDelete(string path)
+    {
+        try
+        {
+            File.Delete(path);
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+            // Preserve the extraction or cancellation error.
+        }
+    }
 
     private static void PrintHelp()
     {
@@ -300,6 +369,7 @@ internal static class Cli
 
             Size suffixes: KiB, MiB, GiB, TiB (or decimal KB, MB, GB, TB).
             NTFS, ext4, and XFS creation are fully managed and do not require WSL or native mkfs tools.
+            Press Ctrl+C to cancel long-running operations safely.
             """);
     }
 
@@ -315,6 +385,11 @@ internal static class Cli
     }
 
     private sealed class CliUsageException(string message) : Exception(message);
+
+    private sealed class CallbackProgress<T>(Action<T> callback) : IProgress<T>
+    {
+        public void Report(T value) => callback(value);
+    }
 
     private sealed class ParsedOptions
     {
