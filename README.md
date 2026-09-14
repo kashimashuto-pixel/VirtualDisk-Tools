@@ -227,7 +227,7 @@ dotnet run --project src/VirtualDisk.Gui/VirtualDisk.Gui.csproj
 dotnet run --project src/VirtualDisk.Cli/VirtualDisk.Cli.csproj -- --help
 dotnet run --project src/VirtualDisk.Cli/VirtualDisk.Cli.csproj -- info disk.qcow2
 dotnet run --project src/VirtualDisk.Cli/VirtualDisk.Cli.csproj -- extract disk.qcow2 --partition 1 --path /etc --output extracted-etc
-dotnet run --project src/VirtualDisk.Cli/VirtualDisk.Cli.csproj -- create new.raw --size 512MiB --table gpt --partition xfs:320MiB:VDT_XFS
+dotnet run --project src/VirtualDisk.Cli/VirtualDisk.Cli.csproj -- create new.raw --size 512MiB --table gpt --partition xfs:320MiB:VDT_XFS --initial-file 1=README.md
 ```
 
 `extract`には通常ファイルまたはディレクトリを指定でき、ディレクトリは安全上限付きで再帰抽出します。読めない項目がある場合は可能な範囲を継続し、出力先の`VirtualDiskExplorer-copy-errors*.json`へ一覧を保存して終了コード3を返します。

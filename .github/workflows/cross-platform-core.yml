@@ -63,8 +63,10 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash
         run: |
+          printf 'Cross-platform initial file\n' > /tmp/vdt-ci-seed.txt
           dotnet run --project src/VirtualDisk.Cli/VirtualDisk.Cli.csproj --configuration Release --no-build -- \
-            create /tmp/vdt-ci-xfs.raw --size 512MiB --table gpt --partition xfs:320MiB:VDT_XFS
+            create /tmp/vdt-ci-xfs.raw --size 512MiB --table gpt --partition xfs:320MiB:VDT_XFS \
+            --initial-file 1=/tmp/vdt-ci-seed.txt
           dd if=/tmp/vdt-ci-xfs.raw of=/tmp/vdt-ci-xfs.partition bs=512 skip=2048 count=655360 status=none
           xfs_repair -n /tmp/vdt-ci-xfs.partition
           dotnet run --project src/VirtualDisk.Cli/VirtualDisk.Cli.csproj --configuration Release --no-build -- \
@@ -77,6 +79,7 @@ jobs:
           dotnet run --project src/VirtualDisk.Cli/VirtualDisk.Cli.csproj --configuration Release --no-build -- \
             extract /tmp/vdt-ci-xfs.raw --partition 1 --path / --output /tmp/vdt-ci-root
           grep -q "Created by Virtual Disk Explorer" /tmp/vdt-ci-root/VDT-README.txt
+          cmp /tmp/vdt-ci-seed.txt /tmp/vdt-ci-root/vdt-ci-seed.txt
           if dotnet run --project src/VirtualDisk.Cli/VirtualDisk.Cli.csproj --configuration Release --no-build -- \
             create /tmp/vdt-invalid.raw --size invalid --partition ext4:64MiB; then
             echo "Invalid CLI size was unexpectedly accepted."
@@ -84,7 +87,7 @@ jobs:
           fi
           test ! -e /tmp/vdt-invalid.raw
           rm -rf /tmp/vdt-ci-root
-          rm -f /tmp/vdt-ci-xfs.raw /tmp/vdt-ci-xfs.partition /tmp/vdt-ci-readme.txt
+          rm -f /tmp/vdt-ci-xfs.raw /tmp/vdt-ci-xfs.partition /tmp/vdt-ci-readme.txt /tmp/vdt-ci-seed.txt
 
       - name: Run GUI entry-point smoke test
         run: dotnet run --project src/VirtualDisk.Gui/VirtualDisk.Gui.csproj --configuration Release --no-build -- --version

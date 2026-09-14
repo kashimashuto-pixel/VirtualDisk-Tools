@@ -226,7 +226,11 @@ internal static class Cli
 
     private static async Task<int> RunCreateAsync(string[] args, CancellationToken cancellationToken)
     {
-        var options = ParsedOptions.Parse(args, ["size", "container", "table", "partition"], "partition");
+        var options = ParsedOptions.Parse(
+            args,
+            ["size", "container", "table", "partition", "initial-file"],
+            "partition",
+            "initial-file");
         var outputPath = Path.GetFullPath(options.Positional);
         var size = ParseSize(options.Require("size"));
         var container = (options.Get("container") ?? InferContainer(outputPath)).ToLowerInvariant() switch
@@ -249,13 +253,22 @@ internal static class Cli
 
         var partitions = specifications.Select((specification, index) =>
             ParsePartition(specification, index + 1)).ToArray();
+        var initialFiles = options.GetMany("initial-file")
+            .Select(ParseInitialFile)
+            .ToArray();
         var progress = new CallbackProgress<DiskImageProgress>(update =>
         {
             var suffix = update.Percentage is int percentage ? $" ({percentage}%)" : string.Empty;
             Console.Error.WriteLine(update.Message + suffix);
         });
         var result = await VirtualDiskCreationService.CreateAsync(
-            new VirtualDiskCreationRequest(outputPath, size, container, table, partitions),
+            new VirtualDiskCreationRequest(
+                outputPath,
+                size,
+                container,
+                table,
+                partitions,
+                initialFiles),
             progress,
             cancellationToken);
         Console.WriteLine(
@@ -335,6 +348,31 @@ internal static class Cli
         return new VirtualDiskPartitionDefinition(ParseSize(parts[1]), name, label, fileSystem);
     }
 
+    private static VirtualDiskInitialFile ParseInitialFile(string specification)
+    {
+        var separator = specification.IndexOf('=');
+        if (separator <= 0 || separator == specification.Length - 1
+            || !int.TryParse(
+                specification.AsSpan(0, separator),
+                NumberStyles.None,
+                CultureInfo.InvariantCulture,
+                out var partitionNumber)
+            || partitionNumber <= 0)
+        {
+            throw new CliUsageException(
+                "--initial-fileは PARTITION_NUMBER=HOST_FILE の形式で指定してください。");
+        }
+
+        var sourcePath = Path.GetFullPath(specification[(separator + 1)..]);
+        var destinationName = Path.GetFileName(sourcePath);
+        if (string.IsNullOrWhiteSpace(destinationName))
+        {
+            throw new CliUsageException("--initial-fileのホスト側ファイル名を取得できません。");
+        }
+
+        return new VirtualDiskInitialFile(partitionNumber, sourcePath, destinationName);
+    }
+
     private static long ParseSize(string text)
     {
         var value = text.Trim();
@@ -400,6 +438,7 @@ internal static class Cli
               vdt extract IMAGE [--partition NUMBER] --path VIRTUAL_PATH --output FILE_OR_DIRECTORY
               vdt create OUTPUT --size SIZE [--container raw|qcow2] [--table mbr|gpt]
                          --partition xfs|ext4|ntfs:SIZE[:LABEL[:NAME]] [--partition ...]
+                         [--initial-file PARTITION_NUMBER=HOST_FILE] [...]
 
             Size suffixes: KiB, MiB, GiB, TiB (or decimal KB, MB, GB, TB).
             NTFS, ext4, and XFS creation are fully managed and do not require WSL or native mkfs tools.
