@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using Qcow2Explorer.Core;
@@ -424,8 +425,14 @@ public static class FileSystemExporter
 
     private static bool CanContinueAfter(Exception exception, CopyOptions options) =>
         options.ContinueOnError
-        && exception is not OperationCanceledException
-        && exception is not TraversalLimitException;
+        && exception is not TraversalLimitException
+        && exception is IOException
+            or InvalidDataException
+            or NotSupportedException
+            or UnauthorizedAccessException
+            or ArgumentException
+            or OverflowException
+            or CryptographicException;
 
     private static void ValidateOptions(CopyOptions options)
     {

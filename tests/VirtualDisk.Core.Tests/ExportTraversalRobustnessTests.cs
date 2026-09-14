@@ -10,6 +10,7 @@ internal static class ExportTraversalRobustnessTests
         TestEntryLimit(directory);
         TestTopLevelEnumerationLimit(directory);
         TestErrorLimit(directory);
+        TestUnexpectedFailuresPropagate(directory);
         TestErrorReportDoesNotOverwriteExtractedFile(directory);
     }
 
@@ -69,6 +70,15 @@ internal static class ExportTraversalRobustnessTests
             Path.Combine(directory, "error-limit-export"),
             options: new CopyOptions(MaximumEntries: 100, MaximumErrors: 3)));
         Assert(exception.Message.Contains("エラー数", StringComparison.Ordinal), "export error-limit diagnostic");
+    }
+
+    private static void TestUnexpectedFailuresPropagate(string directory)
+    {
+        var fileSystem = new UnexpectedFailureFileSystem();
+        AssertThrows<InvalidOperationException>(() => FileSystemExporter.CopyNodes(
+            fileSystem,
+            [fileSystem.Root],
+            Path.Combine(directory, "unexpected-failure-export")));
     }
 
     private static void TestErrorReportDoesNotOverwriteExtractedFile(string directory)
@@ -220,5 +230,18 @@ internal static class ExportTraversalRobustnessTests
         };
 
         public override IReadOnlyList<VfsNode> ListDirectory(VfsNode directory) => _entries;
+    }
+
+    private sealed class UnexpectedFailureFileSystem : TestFileSystem
+    {
+        public override VfsNode Root { get; } = new()
+        {
+            Name = "root",
+            VirtualPath = "/",
+            IsDirectory = true
+        };
+
+        public override IReadOnlyList<VfsNode> ListDirectory(VfsNode directory) =>
+            throw new InvalidOperationException("simulated implementation failure");
     }
 }
