@@ -32,15 +32,19 @@ public static class FilePreviewReader
             || extension.Equals(".xlsm", StringComparison.OrdinalIgnoreCase);
     }
 
-    public static FilePreviewContent Read(string fileName, byte[] data)
+    public static FilePreviewContent Read(
+        string fileName,
+        byte[] data,
+        CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(data);
+        cancellationToken.ThrowIfCancellationRequested();
         if (data.Length > MaximumFileSize)
         {
             throw new InvalidDataException($"別窓表示の上限は{MaximumFileSize / 1024 / 1024:N0} MBです。");
         }
 
-        if (TryRead(fileName, data, out var content))
+        if (TryRead(fileName, data, out var content, cancellationToken))
         {
             return content;
         }
@@ -49,9 +53,14 @@ public static class FilePreviewReader
             "対応する文書形式ではなく、内容もテキストとして安全に判定できませんでした。");
     }
 
-    public static bool TryRead(string fileName, byte[] data, out FilePreviewContent content)
+    public static bool TryRead(
+        string fileName,
+        byte[] data,
+        out FilePreviewContent content,
+        CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(data);
+        cancellationToken.ThrowIfCancellationRequested();
         if (data.Length > MaximumFileSize)
         {
             content = null!;
@@ -61,27 +70,29 @@ public static class FilePreviewReader
         var extension = Path.GetExtension(fileName);
         if (TextExtensions.Contains(extension))
         {
+            var decodedText = DecodeText(data);
+            cancellationToken.ThrowIfCancellationRequested();
             content = new FilePreviewContent(
                 "テキスト（読み取り専用）",
-                DecodeText(data),
+                decodedText,
                 []);
             return true;
         }
 
         if (extension.Equals(".docx", StringComparison.OrdinalIgnoreCase))
         {
-            content = ReadDocx(data);
+            content = ReadDocx(data, cancellationToken);
             return true;
         }
 
         if (extension.Equals(".xlsx", StringComparison.OrdinalIgnoreCase)
             || extension.Equals(".xlsm", StringComparison.OrdinalIgnoreCase))
         {
-            content = ReadWorkbook(data);
+            content = ReadWorkbook(data, cancellationToken);
             return true;
         }
 
-        if (TryDecodeProbableText(data, out var text))
+        if (TryDecodeProbableText(data, out var text, cancellationToken))
         {
             content = new FilePreviewContent(
                 "内容からテキストと判定（読み取り専用）",
@@ -94,28 +105,35 @@ public static class FilePreviewReader
         return false;
     }
 
-    private static FilePreviewContent ReadDocx(byte[] data)
+    private static FilePreviewContent ReadDocx(byte[] data, CancellationToken cancellationToken)
     {
-        using var archive = OpenArchive(data);
+        using var archive = OpenArchive(data, cancellationToken);
         long totalXmlSize = 0;
-        var document = LoadXmlEntry(archive, "word/document.xml", ref totalXmlSize);
+        var document = LoadXmlEntry(
+            archive,
+            "word/document.xml",
+            ref totalXmlSize,
+            cancellationToken);
         XNamespace word = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
         var output = new StringBuilder();
 
         foreach (var element in document.Descendants(word + "body").Elements())
         {
+            cancellationToken.ThrowIfCancellationRequested();
             if (element.Name == word + "p")
             {
-                AppendParagraph(output, element, word);
+                AppendParagraph(output, element, word, cancellationToken);
             }
             else if (element.Name == word + "tbl")
             {
                 foreach (var row in element.Elements(word + "tr"))
                 {
+                    cancellationToken.ThrowIfCancellationRequested();
                     var cells = row.Elements(word + "tc")
                         .Select(cell => string.Join(
                             " ",
-                            cell.Descendants(word + "p").Select(paragraph => ReadParagraph(paragraph, word))))
+                            cell.Descendants(word + "p").Select(paragraph =>
+                                ReadParagraph(paragraph, word, cancellationToken))))
                         .ToArray();
                     output.AppendLine(string.Join('\t', cells));
                 }
@@ -130,12 +148,20 @@ public static class FilePreviewReader
             []);
     }
 
-    private static FilePreviewContent ReadWorkbook(byte[] data)
+    private static FilePreviewContent ReadWorkbook(byte[] data, CancellationToken cancellationToken)
     {
-        using var archive = OpenArchive(data);
+        using var archive = OpenArchive(data, cancellationToken);
         long totalXmlSize = 0;
-        var workbook = LoadXmlEntry(archive, "xl/workbook.xml", ref totalXmlSize);
-        var relationships = LoadXmlEntry(archive, "xl/_rels/workbook.xml.rels", ref totalXmlSize);
+        var workbook = LoadXmlEntry(
+            archive,
+            "xl/workbook.xml",
+            ref totalXmlSize,
+            cancellationToken);
+        var relationships = LoadXmlEntry(
+            archive,
+            "xl/_rels/workbook.xml.rels",
+            ref totalXmlSize,
+            cancellationToken);
         XNamespace spreadsheet = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
         XNamespace officeRelationships = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
         XNamespace packageRelationships = "http://schemas.openxmlformats.org/package/2006/relationships";
@@ -149,7 +175,7 @@ public static class FilePreviewReader
                 StringComparer.Ordinal)
             ?? new Dictionary<string, string>(StringComparer.Ordinal);
 
-        var sharedStrings = ReadSharedStrings(archive, spreadsheet, ref totalXmlSize);
+        var sharedStrings = ReadSharedStrings(archive, spreadsheet, ref totalXmlSize, cancellationToken);
         var sheets = new List<SpreadsheetPreviewSheet>();
         var sheetElements = workbook.Descendants(spreadsheet + "sheet")
             .Take(MaximumWorkbookSheets + 1)
@@ -162,6 +188,7 @@ public static class FilePreviewReader
 
         foreach (var sheet in sheetElements)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var name = (string?)sheet.Attribute("name") ?? $"Sheet{sheets.Count + 1}";
             var relationshipId = (string?)sheet.Attribute(officeRelationships + "id");
             if (relationshipId is null || !relationshipTargets.TryGetValue(relationshipId, out var target))
@@ -169,8 +196,8 @@ public static class FilePreviewReader
                 continue;
             }
 
-            var worksheet = LoadXmlEntry(archive, target, ref totalXmlSize);
-            sheets.Add(ReadWorksheet(name, worksheet, spreadsheet, sharedStrings));
+            var worksheet = LoadXmlEntry(archive, target, ref totalXmlSize, cancellationToken);
+            sheets.Add(ReadWorksheet(name, worksheet, spreadsheet, sharedStrings, cancellationToken));
         }
 
         if (sheets.Count == 0)
@@ -188,7 +215,8 @@ public static class FilePreviewReader
         string name,
         XDocument worksheet,
         XNamespace spreadsheet,
-        IReadOnlyList<string> sharedStrings)
+        IReadOnlyList<string> sharedStrings,
+        CancellationToken cancellationToken)
     {
         var values = new Dictionary<(int Row, int Column), string>();
         var maxRow = -1;
@@ -196,6 +224,7 @@ public static class FilePreviewReader
         var truncatedByCellCount = false;
         foreach (var cell in worksheet.Descendants(spreadsheet + "c"))
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var reference = (string?)cell.Attribute("r");
             if (!TryParseCellReference(reference, out var row, out var column)
                 || row >= MaximumWorksheetRows
@@ -234,6 +263,7 @@ public static class FilePreviewReader
         var rows = new List<IReadOnlyList<string>>(rowCount);
         for (var row = 0; row < rowCount; row++)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var cells = new string[columnCount];
             for (var column = 0; column < columnCount; column++)
             {
@@ -272,7 +302,8 @@ public static class FilePreviewReader
     private static IReadOnlyList<string> ReadSharedStrings(
         ZipArchive archive,
         XNamespace spreadsheet,
-        ref long totalXmlSize)
+        ref long totalXmlSize,
+        CancellationToken cancellationToken)
     {
         var entry = archive.GetEntry("xl/sharedStrings.xml");
         if (entry is null)
@@ -280,15 +311,18 @@ public static class FilePreviewReader
             return [];
         }
 
-        var document = LoadXmlEntry(entry, ref totalXmlSize);
-        var values = document.Descendants(spreadsheet + "si")
-            .Select(item => string.Concat(item.Descendants(spreadsheet + "t").Select(text => text.Value)))
-            .Take(MaximumSharedStrings + 1)
-            .ToList();
-        if (values.Count > MaximumSharedStrings)
+        var document = LoadXmlEntry(entry, ref totalXmlSize, cancellationToken);
+        var values = new List<string>();
+        foreach (var item in document.Descendants(spreadsheet + "si"))
         {
-            throw new InvalidDataException(
-                $"Excelブックの共有文字列数が表示上限 ({MaximumSharedStrings:N0}) を超えています。");
+            cancellationToken.ThrowIfCancellationRequested();
+            if (values.Count >= MaximumSharedStrings)
+            {
+                throw new InvalidDataException(
+                    $"Excelブックの共有文字列数が表示上限 ({MaximumSharedStrings:N0}) を超えています。");
+            }
+
+            values.Add(string.Concat(item.Descendants(spreadsheet + "t").Select(text => text.Value)));
         }
 
         return values;
@@ -307,16 +341,24 @@ public static class FilePreviewReader
             : $"xl/{normalized}";
     }
 
-    private static void AppendParagraph(StringBuilder output, XElement paragraph, XNamespace word)
+    private static void AppendParagraph(
+        StringBuilder output,
+        XElement paragraph,
+        XNamespace word,
+        CancellationToken cancellationToken)
     {
-        output.AppendLine(ReadParagraph(paragraph, word));
+        output.AppendLine(ReadParagraph(paragraph, word, cancellationToken));
     }
 
-    private static string ReadParagraph(XElement paragraph, XNamespace word)
+    private static string ReadParagraph(
+        XElement paragraph,
+        XNamespace word,
+        CancellationToken cancellationToken)
     {
         var output = new StringBuilder();
         foreach (var element in paragraph.Descendants())
         {
+            cancellationToken.ThrowIfCancellationRequested();
             if (element.Name == word + "t")
             {
                 output.Append(element.Value);
@@ -382,7 +424,10 @@ public static class FilePreviewReader
         }
     }
 
-    private static bool TryDecodeProbableText(byte[] data, out string text)
+    private static bool TryDecodeProbableText(
+        byte[] data,
+        out string text,
+        CancellationToken cancellationToken)
     {
         if (data.Length == 0)
         {
@@ -393,25 +438,35 @@ public static class FilePreviewReader
         if (HasTextBom(data))
         {
             text = DecodeText(data);
-            return IsPlausibleText(text);
+            return IsPlausibleText(text, cancellationToken);
         }
 
         var sampleLength = Math.Min(data.Length, 64 * 1024);
         var sample = data.AsSpan(0, sampleLength).ToArray();
         var strictUtf8 = new UTF8Encoding(false, true);
-        if (TryDecodeCandidate(strictUtf8, sample, data, out text))
+        if (TryDecodeCandidate(strictUtf8, sample, data, out text, cancellationToken))
         {
             return true;
         }
 
         if (LooksLikeUtf16(sample, littleEndian: true)
-            && TryDecodeCandidate(new UnicodeEncoding(false, false, true), sample, data, out text))
+            && TryDecodeCandidate(
+                new UnicodeEncoding(false, false, true),
+                sample,
+                data,
+                out text,
+                cancellationToken))
         {
             return true;
         }
 
         if (LooksLikeUtf16(sample, littleEndian: false)
-            && TryDecodeCandidate(new UnicodeEncoding(true, false, true), sample, data, out text))
+            && TryDecodeCandidate(
+                new UnicodeEncoding(true, false, true),
+                sample,
+                data,
+                out text,
+                cancellationToken))
         {
             return true;
         }
@@ -421,12 +476,12 @@ public static class FilePreviewReader
             932,
             EncoderFallback.ExceptionFallback,
             DecoderFallback.ExceptionFallback);
-        if (TryDecodeCandidate(shiftJis, sample, data, out text))
+        if (TryDecodeCandidate(shiftJis, sample, data, out text, cancellationToken))
         {
             return true;
         }
 
-        if (TryDecodeCandidate(Encoding.Latin1, sample, data, out text))
+        if (TryDecodeCandidate(Encoding.Latin1, sample, data, out text, cancellationToken))
         {
             return true;
         }
@@ -439,7 +494,8 @@ public static class FilePreviewReader
         Encoding encoding,
         byte[] sample,
         byte[] data,
-        out string text)
+        out string text,
+        CancellationToken cancellationToken)
     {
         string? sampleText = null;
         var maximumTrim = sample.Length == data.Length ? 0 : Math.Min(4, sample.Length - 1);
@@ -456,7 +512,7 @@ public static class FilePreviewReader
             }
         }
 
-        if (sampleText is null || !IsPlausibleText(sampleText))
+        if (sampleText is null || !IsPlausibleText(sampleText, cancellationToken))
         {
             text = "";
             return false;
@@ -467,7 +523,7 @@ public static class FilePreviewReader
             text = sample.Length == data.Length
                 ? sampleText
                 : encoding.GetString(data);
-            return IsPlausibleText(text);
+            return IsPlausibleText(text, cancellationToken);
         }
         catch (DecoderFallbackException)
         {
@@ -476,7 +532,7 @@ public static class FilePreviewReader
         }
     }
 
-    private static bool IsPlausibleText(string text)
+    private static bool IsPlausibleText(string text, CancellationToken cancellationToken)
     {
         if (text.Length == 0)
         {
@@ -485,8 +541,14 @@ public static class FilePreviewReader
 
         var controls = 0;
         var visible = 0;
-        foreach (var character in text)
+        for (var index = 0; index < text.Length; index++)
         {
+            if ((index & 0xfff) == 0)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+            }
+
+            var character = text[index];
             if (character == '\0')
             {
                 return false;
@@ -572,8 +634,9 @@ public static class FilePreviewReader
         return true;
     }
 
-    private static ZipArchive OpenArchive(byte[] data)
+    private static ZipArchive OpenArchive(byte[] data, CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         try
         {
             return new ZipArchive(new MemoryStream(data, writable: false), ZipArchiveMode.Read);
@@ -584,14 +647,21 @@ public static class FilePreviewReader
         }
     }
 
-    private static XDocument LoadXmlEntry(ZipArchive archive, string path, ref long totalXmlSize)
+    private static XDocument LoadXmlEntry(
+        ZipArchive archive,
+        string path,
+        ref long totalXmlSize,
+        CancellationToken cancellationToken)
     {
         var entry = archive.GetEntry(path)
             ?? throw new InvalidDataException($"Officeファイル内に必要な項目がありません: {path}");
-        return LoadXmlEntry(entry, ref totalXmlSize);
+        return LoadXmlEntry(entry, ref totalXmlSize, cancellationToken);
     }
 
-    private static XDocument LoadXmlEntry(ZipArchiveEntry entry, ref long totalXmlSize)
+    private static XDocument LoadXmlEntry(
+        ZipArchiveEntry entry,
+        ref long totalXmlSize,
+        CancellationToken cancellationToken)
     {
         if (entry.Length > MaximumXmlEntrySize
             || totalXmlSize > MaximumTotalXmlSize - entry.Length)
@@ -601,13 +671,60 @@ public static class FilePreviewReader
 
         totalXmlSize += entry.Length;
         using var stream = entry.Open();
-        using var reader = XmlReader.Create(stream, new XmlReaderSettings
+        using var cancelableStream = new CancellationCheckingStream(stream, cancellationToken);
+        using var reader = XmlReader.Create(cancelableStream, new XmlReaderSettings
         {
             DtdProcessing = DtdProcessing.Prohibit,
             XmlResolver = null,
             MaxCharactersInDocument = MaximumXmlEntrySize
         });
-        return XDocument.Load(reader, LoadOptions.None);
+        var document = XDocument.Load(reader, LoadOptions.None);
+        cancellationToken.ThrowIfCancellationRequested();
+        return document;
+    }
+
+    private sealed class CancellationCheckingStream(Stream inner, CancellationToken cancellationToken) : Stream
+    {
+        public override bool CanRead => inner.CanRead;
+        public override bool CanSeek => inner.CanSeek;
+        public override bool CanWrite => false;
+        public override long Length => inner.Length;
+
+        public override long Position
+        {
+            get => inner.Position;
+            set => inner.Position = value;
+        }
+
+        public override void Flush() => inner.Flush();
+
+        public override int Read(byte[] buffer, int offset, int count)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            return inner.Read(buffer, offset, count);
+        }
+
+        public override int Read(Span<byte> buffer)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            return inner.Read(buffer);
+        }
+
+        public override long Seek(long offset, SeekOrigin origin) => inner.Seek(offset, origin);
+
+        public override void SetLength(long value) => throw new NotSupportedException();
+
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                inner.Dispose();
+            }
+
+            base.Dispose(disposing);
+        }
     }
 }
 

@@ -616,7 +616,7 @@ public sealed class MainWindow : Window
         }
 
         cancellationToken.ThrowIfCancellationRequested();
-        return FilePreviewReader.Read(file.Name, data);
+        return FilePreviewReader.Read(file.Name, data, cancellationToken);
     }
 
     private async Task ShowPreviewAsync(string fileName, FilePreviewContent preview)
