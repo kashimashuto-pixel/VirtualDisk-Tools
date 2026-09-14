@@ -13,6 +13,7 @@ internal static class PartitionTableRobustnessTests
         TestTruncatedTables(directory);
         TestMbrBounds(directory);
         TestGptRecoveryAndChecksums(directory);
+        TestGptOverlap(directory);
         TestCancellation(directory);
     }
 
@@ -46,6 +47,23 @@ internal static class PartitionTableRobustnessTests
         BinaryPrimitives.WriteUInt32LittleEndian(entry[12..], uint.MaxValue);
         File.WriteAllBytes(path, image);
         Assert(PartitionTableReader.ReadPartitions(reader).Count == 0, "overflowing MBR partition ignored");
+
+        image.AsSpan(446, 64).Clear();
+        entry = image.AsSpan(446, 16);
+        entry[4] = 0x83;
+        BinaryPrimitives.WriteUInt32LittleEndian(entry[8..], 0);
+        BinaryPrimitives.WriteUInt32LittleEndian(entry[12..], 1);
+        File.WriteAllBytes(path, image);
+        Assert(PartitionTableReader.ReadPartitions(reader).Count == 0, "LBA zero MBR partition rejected");
+
+        BinaryPrimitives.WriteUInt32LittleEndian(entry[8..], 1);
+        BinaryPrimitives.WriteUInt32LittleEndian(entry[12..], 4);
+        var secondEntry = image.AsSpan(462, 16);
+        secondEntry[4] = 0x83;
+        BinaryPrimitives.WriteUInt32LittleEndian(secondEntry[8..], 3);
+        BinaryPrimitives.WriteUInt32LittleEndian(secondEntry[12..], 4);
+        File.WriteAllBytes(path, image);
+        Assert(PartitionTableReader.ReadPartitions(reader).Count == 0, "overlapping MBR partitions rejected");
     }
 
     private static void TestGptRecoveryAndChecksums(string directory)
@@ -86,6 +104,77 @@ internal static class PartitionTableRobustnessTests
         AssertThrows<OperationCanceledException>(
             () => PartitionTableReader.ReadPartitions(reader, source.Token),
             "partition parsing cancellation");
+    }
+
+    private static void TestGptOverlap(string directory)
+    {
+        var path = Path.Combine(directory, "partition-overlap-gpt.raw");
+        var layouts = VirtualDiskPartitionTableWriter.Plan(
+            DiskLength,
+            VirtualDiskPartitionTableKind.Gpt,
+            [
+                new VirtualDiskPartitionDefinition(
+                    64L * 1024 * 1024,
+                    "First",
+                    "VDT_FIRST",
+                    VirtualDiskFileSystemKind.Ext4),
+                new VirtualDiskPartitionDefinition(
+                    64L * 1024 * 1024,
+                    "Second",
+                    "VDT_SECOND",
+                    VirtualDiskFileSystemKind.Ext4),
+            ]);
+        using (var stream = new FileStream(path, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.ReadWrite))
+        {
+            stream.SetLength(DiskLength);
+            VirtualDiskPartitionTableWriter.Write(stream, DiskLength, VirtualDiskPartitionTableKind.Gpt, layouts);
+        }
+
+        MakeSecondGptEntryOverlap(path, 2L * SectorSize, SectorSize);
+        MakeSecondGptEntryOverlap(path, DiskLength - 33L * SectorSize, DiskLength - SectorSize);
+        using var reader = new RawDiskImageReader(path);
+        Assert(PartitionTableReader.ReadPartitions(reader).Count == 0, "overlapping GPT partitions rejected");
+    }
+
+    private static void MakeSecondGptEntryOverlap(string path, long entriesOffset, long headerOffset)
+    {
+        const int entryArrayBytes = 128 * 128;
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite);
+        stream.Position = entriesOffset + 128 + 32;
+        Span<byte> firstLba = stackalloc byte[8];
+        BinaryPrimitives.WriteUInt64LittleEndian(firstLba, 2049);
+        stream.Write(firstLba);
+
+        var entries = new byte[entryArrayBytes];
+        stream.Position = entriesOffset;
+        stream.ReadExactly(entries);
+        var entriesCrc = ComputeCrc32(entries);
+
+        var header = new byte[SectorSize];
+        stream.Position = headerOffset;
+        stream.ReadExactly(header);
+        BinaryPrimitives.WriteUInt32LittleEndian(header.AsSpan(88), entriesCrc);
+        Array.Clear(header, 16, sizeof(uint));
+        var headerSize = checked((int)BinaryPrimitives.ReadUInt32LittleEndian(header.AsSpan(12)));
+        BinaryPrimitives.WriteUInt32LittleEndian(header.AsSpan(16), ComputeCrc32(header.AsSpan(0, headerSize)));
+        stream.Position = headerOffset;
+        stream.Write(header);
+        stream.Flush();
+    }
+
+    private static uint ComputeCrc32(ReadOnlySpan<byte> data)
+    {
+        var crc = uint.MaxValue;
+        foreach (var value in data)
+        {
+            crc ^= value;
+            for (var bit = 0; bit < 8; bit++)
+            {
+                crc = (crc & 1) != 0 ? (crc >> 1) ^ 0xedb88320U : crc >> 1;
+            }
+        }
+
+        return ~crc;
     }
 
     private static string CreateGptImage(string directory, string name)

@@ -48,7 +48,10 @@ public static class PartitionTableReader
             return Array.Empty<PartitionInfo>();
         }
 
-        return ReadMbrPartitions(disk, mbr, sectorSize, cancellationToken);
+        var mbrPartitions = ReadMbrPartitions(disk, mbr, sectorSize, cancellationToken);
+        return HasOverlappingPartitions(mbrPartitions)
+            ? Array.Empty<PartitionInfo>()
+            : mbrPartitions;
     }
 
     public static IReadOnlyList<PartitionInfo> ReadPartitionsWithWholeDiskFallback(
@@ -213,7 +216,8 @@ public static class PartitionTableReader
         out PartitionInfo partition)
     {
         partition = null!;
-        if (start >= totalSectors
+        if (start == 0
+            || start >= totalSectors
             || count == 0
             || !TryAdd(start, count, out var endExclusive)
             || endExclusive > totalSectors)
@@ -362,8 +366,31 @@ public static class PartitionTableReader
             });
         }
 
+        if (HasOverlappingPartitions(result))
+        {
+            return false;
+        }
+
         partitions = result;
         return true;
+    }
+
+    private static bool HasOverlappingPartitions(IReadOnlyList<PartitionInfo> partitions)
+    {
+        ulong previousEnd = 0;
+        var hasPrevious = false;
+        foreach (var partition in partitions.OrderBy(partition => partition.StartLba))
+        {
+            if (hasPrevious && partition.StartLba < previousEnd)
+            {
+                return true;
+            }
+
+            previousEnd = checked(partition.StartLba + partition.SectorCount);
+            hasPrevious = true;
+        }
+
+        return false;
     }
 
     private static ulong ReadUInt64Little(ReadOnlySpan<byte> buffer, int offset) =>
