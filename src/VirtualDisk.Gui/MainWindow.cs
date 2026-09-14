@@ -16,6 +16,7 @@ namespace VirtualDisk.Gui;
 public sealed class MainWindow : Window
 {
     private const int MaximumDisplayedDirectoryEntries = 250_000;
+    private const int MaximumSearchResults = 5_000;
     private readonly TextBlock _imageSummary = new() { Text = "ディスクイメージを開いてください。" };
     private readonly TextBlock _pathLabel = new() { Text = "/" };
     private readonly TextBlock _status = new() { Text = "準備完了" };
@@ -30,6 +31,7 @@ public sealed class MainWindow : Window
     private readonly MenuItem _exitMenuItem = new() { Header = "終了" };
     private readonly MenuItem _previewMenuItem = new() { Header = "プレビュー", IsEnabled = false };
     private readonly MenuItem _extractMenuItem = new() { Header = "抽出...", IsEnabled = false };
+    private readonly MenuItem _searchMenuItem = new() { Header = "検索...", IsEnabled = false };
     private readonly MenuItem _verifyMenuItem = new() { Header = "全読込検証", IsEnabled = false };
     private readonly MenuItem _cancelMenuItem = new() { Header = "キャンセル", IsEnabled = false };
     private readonly Stack<VfsNode> _directoryHistory = new();
@@ -64,6 +66,7 @@ public sealed class MainWindow : Window
         _exitMenuItem.Click += (_, _) => Close();
         _previewMenuItem.Click += async (_, _) => await PreviewSelectedAsync();
         _extractMenuItem.Click += async (_, _) => await ExtractSelectedAsync();
+        _searchMenuItem.Click += async (_, _) => await SearchFileSystemAsync();
         _verifyMenuItem.Click += async (_, _) => await VerifyFileSystemAsync();
         _cancelMenuItem.Click += (_, _) => CancelActiveOperation();
 
@@ -95,6 +98,7 @@ public sealed class MainWindow : Window
                     Header = "操作",
                     ItemsSource = new Control[]
                     {
+                        _searchMenuItem,
                         _previewMenuItem,
                         _extractMenuItem,
                         _verifyMenuItem,
@@ -533,6 +537,207 @@ public sealed class MainWindow : Window
         RefreshCommandState();
     }
 
+    private async Task SearchFileSystemAsync()
+    {
+        if (_busy || _fileSystem is null)
+        {
+            return;
+        }
+
+        var query = await PromptSearchQueryAsync();
+        if (query is null || _fileSystem is null)
+        {
+            return;
+        }
+
+        var fileSystem = _fileSystem;
+        var operation = BeginOperation($"「{query}」を検索しています...");
+        IReadOnlyList<SearchMatch>? matches = null;
+        try
+        {
+            var lastReportedDirectories = 0;
+            var progress = new CallbackProgress<int>(directories =>
+            {
+                if (directories - lastReportedDirectories < 500)
+                {
+                    return;
+                }
+
+                lastReportedDirectories = directories;
+                Dispatcher.UIThread.Post(() =>
+                {
+                    if (ReferenceEquals(_activeOperation, operation))
+                    {
+                        _status.Text = $"「{query}」を検索しています... {directories:N0}ディレクトリ";
+                    }
+                });
+            });
+            matches = await Task.Run(
+                () => FileSystemSearch.Search(
+                    fileSystem,
+                    query,
+                    progress,
+                    operation.Token,
+                    MaximumSearchResults),
+                operation.Token);
+            _status.Text = $"「{query}」: {matches.Count:N0}件見つかりました。";
+        }
+        catch (OperationCanceledException)
+        {
+            _status.Text = "検索をキャンセルしました。";
+        }
+        catch (Exception exception)
+        {
+            _status.Text = $"検索に失敗しました: {exception.Message}";
+            await ShowErrorAsync("検索できません", exception.Message);
+        }
+        finally
+        {
+            EndOperation(operation);
+        }
+
+        if (matches is null)
+        {
+            return;
+        }
+
+        if (matches.Count == 0)
+        {
+            await ShowErrorAsync("検索結果", $"「{query}」に一致する項目はありません。");
+            return;
+        }
+
+        var selected = await ShowSearchResultsAsync(query, matches);
+        if (selected is null || !ReferenceEquals(_fileSystem, fileSystem))
+        {
+            return;
+        }
+
+        if (!selected.Node.IsDirectory)
+        {
+            await PreviewFileAsync(selected.Node);
+            return;
+        }
+
+        if (await LoadDirectoryAsync(selected.Node))
+        {
+            _directoryHistory.Clear();
+            if (!ReferenceEquals(selected.Node, fileSystem.Root))
+            {
+                _directoryHistory.Push(fileSystem.Root);
+            }
+
+            RefreshCommandState();
+        }
+    }
+
+    private async Task<string?> PromptSearchQueryAsync()
+    {
+        var query = new TextBox { PlaceholderText = "ファイル名またはディレクトリ名" };
+        var search = new Button
+        {
+            Content = "検索",
+            IsEnabled = false,
+            HorizontalAlignment = HorizontalAlignment.Right,
+        };
+        var cancel = new Button { Content = "キャンセル" };
+        var buttons = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            HorizontalAlignment = HorizontalAlignment.Right,
+            Spacing = 8,
+            Children = { cancel, search },
+        };
+        var dialog = new Window
+        {
+            Title = "ファイルシステムを検索",
+            Width = 520,
+            SizeToContent = SizeToContent.Height,
+            CanResize = false,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+            Content = new StackPanel
+            {
+                Margin = new Thickness(20),
+                Spacing = 12,
+                Children =
+                {
+                    new TextBlock { Text = "名前に含まれる文字列を入力してください。" },
+                    query,
+                    buttons,
+                },
+            },
+        };
+        query.TextChanged += (_, _) => search.IsEnabled = !string.IsNullOrWhiteSpace(query.Text);
+        search.Click += (_, _) => dialog.Close(query.Text?.Trim());
+        cancel.Click += (_, _) => dialog.Close();
+        dialog.Opened += (_, _) => query.Focus();
+        return await dialog.ShowDialog<string?>(this);
+    }
+
+    private async Task<SearchMatch?> ShowSearchResultsAsync(
+        string query,
+        IReadOnlyList<SearchMatch> matches)
+    {
+        var items = matches.Select(match => new SearchResultItem(match)).ToArray();
+        var results = new ListBox { ItemsSource = items };
+        var open = new Button
+        {
+            Content = "開く",
+            IsEnabled = false,
+            HorizontalAlignment = HorizontalAlignment.Right,
+        };
+        var close = new Button { Content = "閉じる" };
+        var buttons = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            HorizontalAlignment = HorizontalAlignment.Right,
+            Spacing = 8,
+            Children = { close, open },
+        };
+        var message = matches.Count == MaximumSearchResults
+            ? $"先頭{MaximumSearchResults:N0}件を表示しています。条件を絞ると残りも検索できます。"
+            : $"{matches.Count:N0}件見つかりました。";
+        var content = new Grid
+        {
+            RowDefinitions = new RowDefinitions("Auto,*,Auto"),
+            RowSpacing = 8,
+            Margin = new Thickness(12),
+        };
+        AddPreviewControl(content, new TextBlock { Text = message }, 0);
+        AddPreviewControl(content, results, 1);
+        AddPreviewControl(content, buttons, 2);
+        var dialog = new Window
+        {
+            Title = $"検索結果 — {query}",
+            Width = 760,
+            Height = 520,
+            MinWidth = 520,
+            MinHeight = 320,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+            Content = content,
+        };
+
+        void OpenSelected()
+        {
+            if (results.SelectedItem is SearchResultItem selected)
+            {
+                dialog.Close(selected.Match);
+            }
+        }
+
+        results.SelectionChanged += (_, _) =>
+        {
+            open.IsEnabled = results.SelectedItem is SearchResultItem;
+            open.Content = results.SelectedItem is SearchResultItem { Match.Node.IsDirectory: true }
+                ? "ディレクトリを開く"
+                : "プレビュー";
+        };
+        results.DoubleTapped += (_, _) => OpenSelected();
+        open.Click += (_, _) => OpenSelected();
+        close.Click += (_, _) => dialog.Close();
+        return await dialog.ShowDialog<SearchMatch?>(this);
+    }
+
     private async Task PreviewSelectedAsync()
     {
         if (_fileSystem is null
@@ -541,8 +746,17 @@ public sealed class MainWindow : Window
             return;
         }
 
+        await PreviewFileAsync(selected.Node);
+    }
+
+    private async Task PreviewFileAsync(VfsNode file)
+    {
+        if (_fileSystem is null || file.IsDirectory)
+        {
+            return;
+        }
+
         var fileSystem = _fileSystem;
-        var file = selected.Node;
         var operation = BeginOperation($"{file.Name}をプレビュー用に読み込んでいます...");
         FilePreviewContent? preview = null;
         try
@@ -984,6 +1198,7 @@ public sealed class MainWindow : Window
         _extractButton.IsEnabled = !_busy && _entries.SelectedItem is EntryItem;
         _previewMenuItem.IsEnabled = _previewButton.IsEnabled;
         _extractMenuItem.IsEnabled = _extractButton.IsEnabled;
+        _searchMenuItem.IsEnabled = !_busy && _fileSystem is not null;
         _verifyMenuItem.IsEnabled = !_busy && _fileSystem is not null;
     }
 
@@ -1022,6 +1237,12 @@ public sealed class MainWindow : Window
     {
         public override string ToString() =>
             $"{(Node.IsDirectory ? "[DIR]" : "     ")} {Node.Name}  {(Node.IsDirectory ? string.Empty : $"{Node.Size:N0} bytes")}";
+    }
+
+    private sealed record SearchResultItem(SearchMatch Match)
+    {
+        public override string ToString() =>
+            $"{(Match.Node.IsDirectory ? "[DIR]" : "     ")} {Match.Path}";
     }
 
     private sealed class CallbackProgress<T>(Action<T> callback) : IProgress<T>

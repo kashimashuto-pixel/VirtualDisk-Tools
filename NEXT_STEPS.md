@@ -1,6 +1,6 @@
 # 次回対応予定
 
-- 最終更新: 2026-09-14
+- 最終更新: 2026-09-15
 - 基準ブランチ: `main`
 
 この文書は、次回の開発作業へ引き継ぐための優先順位付きロードマップです。
@@ -48,7 +48,7 @@
 - OS非依存のimage reader、filesystem、partition、作成処理を`VirtualDisk.Core`（`net10.0`）へ分離
 - Windows全機能版はWinFormsを維持し、物理ディスク／ProjFSなどをWindows adapter側に分離したまま共通コアを利用
 - Linuxを含むCLIで`info`、`list`、`extract`、RAW／QCOW2・MBR／GPT・XFS／ext4／NTFSの新規作成に対応
-- Avalonia共通GUIでイメージを開く、パーティション／ディレクトリ閲覧、ファイル抽出を実装
+- Avalonia共通GUIでイメージ作成／読込、パーティション／ディレクトリ閲覧、名前検索、プレビュー、ファイル／ディレクトリ抽出、全読込検証を実装
 - Windows／Ubuntu matrix CIで共通コア、CLI、Avalonia GUI、managed作成回帰をビルド・実行
 - NTFS、ext4、XFSをC#内部で直接初期化し、通常の新規作成からWSL、`mkfs.*`、`qemu-img`依存を除去
 - 内蔵XFSはv5 CRC、finobt、rmapbt、sparse inode、leaf AG btree、short-form root directory、clean内部logを生成し、製品reader／writer、`xfs_repair -n`、Linux読み取り専用mountで相互検証
@@ -327,7 +327,7 @@
 3. 証拠・暗号化形式の拡張
    - EWF2/Ex01、LUKS detached header／複数segmentを検討する
 4. クロスプラットフォーム機能の拡張
-   - Avalonia GUIへ検索、プレビュー、編集予定、仮想ディスク作成を段階的に移植する
+   - Avalonia GUIへ編集予定と安全な外部エディター連携を段階的に移植する
    - LinuxではFUSEまたはmount helperを検討し、現在のCLI exportと用途を分ける
    - RAW、QCOW2、LZO、EWF、LUKS、ext、XFS、Btrfs、md RAID、LVMの実fixture回帰をLinux CIへ段階的に追加する
    - `xfs_repair -n`、`btrfs check --readonly`、`e2fsck -fn`、`cryptsetup`、`mdadm`、`lvm`などLinux標準ツールとの相互検証を継続する
