@@ -442,7 +442,10 @@ public static class FileSystemExporter
         if (result.Errors.Count > 0)
         {
             var json = JsonSerializer.Serialize(result.Errors, new JsonSerializerOptions { WriteIndented = true });
-            File.WriteAllText(Path.Combine(destinationDirectory, "VirtualDiskExplorer-copy-errors.json"), json, new UTF8Encoding(false));
+            var errorPath = GetAvailablePath(
+                Path.Combine(destinationDirectory, "VirtualDiskExplorer-copy-errors.json"),
+                isDirectory: false);
+            File.WriteAllText(errorPath, json, new UTF8Encoding(false));
         }
     }
 

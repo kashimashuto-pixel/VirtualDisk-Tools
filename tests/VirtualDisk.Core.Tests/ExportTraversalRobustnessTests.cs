@@ -10,6 +10,7 @@ internal static class ExportTraversalRobustnessTests
         TestEntryLimit(directory);
         TestTopLevelEnumerationLimit(directory);
         TestErrorLimit(directory);
+        TestErrorReportDoesNotOverwriteExtractedFile(directory);
     }
 
     private static void TestDirectoryCycleIsReported(string directory)
@@ -68,6 +69,29 @@ internal static class ExportTraversalRobustnessTests
             Path.Combine(directory, "error-limit-export"),
             options: new CopyOptions(MaximumEntries: 100, MaximumErrors: 3)));
         Assert(exception.Message.Contains("エラー数", StringComparison.Ordinal), "export error-limit diagnostic");
+    }
+
+    private static void TestErrorReportDoesNotOverwriteExtractedFile(string directory)
+    {
+        var fileSystem = new WideFileSystem(entryCount: 0);
+        var destination = Path.Combine(directory, "error-report-collision");
+        var reservedName = FileNode("VirtualDiskExplorer-copy-errors.json");
+        var invalid = new VfsNode
+        {
+            Name = "invalid.bin",
+            VirtualPath = "/invalid.bin",
+            Size = -1
+        };
+        var result = FileSystemExporter.CopyNodes(
+            fileSystem,
+            [reservedName, invalid],
+            destination);
+        var extractedPath = Path.Combine(destination, reservedName.Name);
+        Assert(result.Errors.Count == 1, "export collision test records the source error");
+        Assert(File.Exists(extractedPath) && new FileInfo(extractedPath).Length == 0,
+            "export error report preserves the extracted file");
+        Assert(File.Exists(Path.Combine(destination, "VirtualDiskExplorer-copy-errors (2).json")),
+            "export error report uses a collision-free path");
     }
 
     private static IEnumerable<VfsNode> InfiniteFiles()
