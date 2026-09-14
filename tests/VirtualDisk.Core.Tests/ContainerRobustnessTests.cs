@@ -87,6 +87,30 @@ internal static class ContainerRobustnessTests
         AssertThrows<InvalidDataException>(
             () => ParallelsHddReader.Open(oversizedBundle),
             "oversized Parallels descriptor rejected");
+
+        var windowsSeparatorBundle = Path.Combine(directory, "windows-separator.hdd");
+        var nestedDirectory = Path.Combine(windowsSeparatorBundle, "layers");
+        Directory.CreateDirectory(nestedDirectory);
+        var nestedImage = CreateParallelsHeader(batEntryCount: 1, diskSectors: 128, emptyImage: true);
+        Array.Resize(ref nestedImage, 68);
+        File.WriteAllBytes(Path.Combine(nestedDirectory, "disk.hds"), nestedImage);
+        File.WriteAllText(
+            Path.Combine(windowsSeparatorBundle, "DiskDescriptor.xml"),
+            """
+            <Parallels_disk_image>
+              <Disk_size>128</Disk_size>
+              <Storage>
+                <Start>0</Start>
+                <End>128</End>
+                <Image>
+                  <Type>Compressed</Type>
+                  <File>layers\disk.hds</File>
+                </Image>
+              </Storage>
+            </Parallels_disk_image>
+            """);
+        using var reader = ParallelsHddReader.Open(windowsSeparatorBundle);
+        Assert(reader.Length == 64L * 1024, "Windows-style Parallels image path opens cross-platform");
     }
 
     private static void TestVmaHeaderLimit(string directory)

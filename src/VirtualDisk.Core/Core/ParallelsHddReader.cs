@@ -235,7 +235,9 @@ public sealed class ParallelsHddReader : IDiskImageReader
 
     private static string ResolveImagePath(string baseDirectory, string imagePath)
     {
-        imagePath = imagePath.Replace('/', System.IO.Path.DirectorySeparatorChar);
+        imagePath = imagePath
+            .Replace('\\', System.IO.Path.DirectorySeparatorChar)
+            .Replace('/', System.IO.Path.DirectorySeparatorChar);
         return System.IO.Path.IsPathRooted(imagePath)
             ? imagePath
             : System.IO.Path.GetFullPath(System.IO.Path.Combine(baseDirectory, imagePath));
