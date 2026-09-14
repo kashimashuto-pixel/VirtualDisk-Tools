@@ -1630,38 +1630,17 @@ public partial class Form1 : Form
     {
         progress.Report(new DiskImageProgress("パーティションテーブルを解析中..."));
         cancellationToken.ThrowIfCancellationRequested();
-        var discovered = PartitionTableReader.ReadPartitions(reader, cancellationToken).ToList();
-        if (discovered.Count == 0 && reader.Length >= 512)
-        {
-            discovered.Add(new PartitionInfo
-            {
-                Number = 1,
-                Scheme = "WholeDisk",
-                Name = "Whole disk",
-                Type = "Unpartitioned",
-                TypeId = "",
-                StartLba = 0,
-                SectorCount = checked((ulong)(reader.Length / 512))
-            });
-        }
+        var discovered = PartitionTableReader.ReadPartitionsWithWholeDiskFallback(
+            reader,
+            cancellationToken).ToList();
 
         var nextNumber = discovered.Count + 1;
         foreach (var companionDisk in inputDisks.Skip(1))
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var companionPartitions = PartitionTableReader.ReadPartitions(companionDisk, cancellationToken).ToList();
-            if (companionPartitions.Count == 0 && companionDisk.Length >= 512)
-            {
-                companionPartitions.Add(new PartitionInfo
-                {
-                    Number = 1,
-                    Scheme = "WholeDisk",
-                    Name = "Whole companion disk",
-                    Type = "Unpartitioned",
-                    StartLba = 0,
-                    SectorCount = checked((ulong)(companionDisk.Length / 512))
-                });
-            }
+            var companionPartitions = PartitionTableReader.ReadPartitionsWithWholeDiskFallback(
+                companionDisk,
+                cancellationToken);
 
             foreach (var companionPartition in companionPartitions)
             {
@@ -2092,20 +2071,7 @@ public partial class Form1 : Form
             return;
         }
 
-        var discovered = PartitionTableReader.ReadPartitions(_reader).ToList();
-        if (discovered.Count == 0 && _reader.Length >= 512)
-        {
-            discovered.Add(new PartitionInfo
-            {
-                Number = 1,
-                Scheme = "WholeDisk",
-                Name = "Whole disk",
-                Type = "Unpartitioned",
-                TypeId = "",
-                StartLba = 0,
-                SectorCount = checked((ulong)(_reader.Length / 512))
-            });
-        }
+        var discovered = PartitionTableReader.ReadPartitionsWithWholeDiskFallback(_reader);
 
         foreach (var partition in discovered)
         {

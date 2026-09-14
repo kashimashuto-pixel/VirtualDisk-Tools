@@ -51,6 +51,42 @@ public static class PartitionTableReader
         return ReadMbrPartitions(disk, mbr, sectorSize, cancellationToken);
     }
 
+    public static IReadOnlyList<PartitionInfo> ReadPartitionsWithWholeDiskFallback(
+        IBlockReader disk,
+        CancellationToken cancellationToken = default)
+    {
+        var partitions = ReadPartitions(disk, cancellationToken);
+        return partitions.Count > 0 || disk.Length < 512
+            ? partitions
+            : [CreateWholeDiskPartition(disk)];
+    }
+
+    public static PartitionInfo CreateWholeDiskPartition(
+        IBlockReader disk,
+        int number = 1,
+        string name = "Whole disk")
+    {
+        ArgumentNullException.ThrowIfNull(disk);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(number);
+        var sectorSize = disk is ILogicalSectorReader sectorReader
+            && sectorReader.LogicalSectorSize is >= 512 and <= 65_536
+            && (sectorReader.LogicalSectorSize & (sectorReader.LogicalSectorSize - 1)) == 0
+                ? sectorReader.LogicalSectorSize
+                : 512U;
+        return new PartitionInfo
+        {
+            Number = number,
+            Scheme = "WholeDisk",
+            Name = name,
+            Type = "Unpartitioned",
+            TypeId = "",
+            StartLba = 0,
+            SectorCount = checked((ulong)(disk.Length / sectorSize)),
+            SectorSize = sectorSize,
+            LengthOverrideBytes = disk.Length
+        };
+    }
+
     private static IReadOnlyList<PartitionInfo> ReadMbrPartitions(
         IBlockReader disk,
         byte[] mbr,

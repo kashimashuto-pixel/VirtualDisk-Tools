@@ -9,6 +9,7 @@ try
 {
     TestRawAndQcow2RoundTrip(temporaryDirectory);
     TestPartitionTables(temporaryDirectory);
+    TestWholeDiskFileSystem(temporaryDirectory);
     TestReaderFactory(temporaryDirectory);
     TestManagedNtfsCreation(temporaryDirectory);
     TestManagedExt4Creation(temporaryDirectory);
@@ -92,6 +93,49 @@ static void TestReaderFactory(string directory)
     using var reader = DiskImageReaderFactory.Open(path);
     Assert(reader is RawDiskImageReader, "RAW reader factory selection");
     Assert(reader.Length == 4096, "RAW reader factory length");
+}
+
+static void TestWholeDiskFileSystem(string directory)
+{
+    var path = Path.Combine(directory, "whole-disk-ext4.raw");
+    const long length = 64L * 1024 * 1024;
+    using (var stream = new FileStream(path, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None))
+    {
+        stream.SetLength(length);
+    }
+
+    new ManagedExt4FileSystemFormatter().FormatAsync(
+        path,
+        new VirtualDiskPartitionLayout(
+            1,
+            0,
+            length,
+            "Whole disk ext4",
+            "VDT_WHOLE",
+            VirtualDiskFileSystemKind.Ext4),
+        [])
+        .GetAwaiter()
+        .GetResult();
+
+    using var reader = new RawDiskImageReader(path);
+    Assert(PartitionTableReader.ReadPartitions(reader).Count == 0, "whole-disk image has no partition table");
+    var partition = PartitionTableReader.ReadPartitionsWithWholeDiskFallback(reader).Single();
+    Assert(partition.Scheme == "WholeDisk", "whole-disk fallback scheme");
+    Assert(partition.StartOffset == 0 && partition.LengthBytes == length, "whole-disk fallback geometry");
+    partition.FileSystem = FileSystemDetector.Detect(reader, partition);
+    Assert(partition.FileSystem == "ext4", "whole-disk ext4 detection");
+    var fileSystem = FileSystemDetector.TryOpen(reader, partition, out var error)
+        ?? throw new InvalidDataException(error);
+    try
+    {
+        Assert(
+            fileSystem.ListDirectory(fileSystem.Root).Any(entry => entry.Name == "VDT-README.txt"),
+            "whole-disk ext4 content");
+    }
+    finally
+    {
+        (fileSystem as IDisposable)?.Dispose();
+    }
 }
 
 static void TestManagedNtfsCreation(string directory)

@@ -158,7 +158,7 @@ public sealed class MainWindow : Window
         var reader = DiskImageReaderFactory.Open(path);
         try
         {
-            var partitions = PartitionTableReader.ReadPartitions(reader);
+            var partitions = PartitionTableReader.ReadPartitionsWithWholeDiskFallback(reader);
             foreach (var partition in partitions)
             {
                 partition.FileSystem = FileSystemDetector.Detect(reader, partition);

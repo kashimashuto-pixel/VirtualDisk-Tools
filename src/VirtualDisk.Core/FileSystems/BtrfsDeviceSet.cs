@@ -14,11 +14,9 @@ public static class BtrfsDeviceSet
         foreach (var disk in disks)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var partitions = PartitionTableReader.ReadPartitions(disk, cancellationToken).ToList();
-            if (partitions.Count == 0 && disk.Length >= 512)
-            {
-                partitions.Add(CreateWholeDiskPartition(disk));
-            }
+            var partitions = PartitionTableReader.ReadPartitionsWithWholeDiskFallback(
+                disk,
+                cancellationToken);
 
             foreach (var partition in partitions)
             {
@@ -75,19 +73,6 @@ public static class BtrfsDeviceSet
         }
     }
 
-    private static PartitionInfo CreateWholeDiskPartition(IBlockReader disk)
-    {
-        return new PartitionInfo
-        {
-            Number = 1,
-            Scheme = "WholeDisk",
-            Name = "Whole disk",
-            Type = "Unpartitioned",
-            TypeId = "",
-            StartLba = 0,
-            SectorCount = checked((ulong)(disk.Length / 512))
-        };
-    }
 }
 
 public sealed record BtrfsDevicePartition(

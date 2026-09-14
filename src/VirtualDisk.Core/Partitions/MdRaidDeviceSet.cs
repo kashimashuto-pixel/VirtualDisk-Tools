@@ -25,7 +25,7 @@ public static class MdRaidDeviceSet
             var partitions = PartitionTableReader.ReadPartitions(disk, cancellationToken).ToList();
             if (partitions.Count == 0 && disk.Length >= SuperblockSize)
             {
-                partitions.Add(CreateWholeDiskPartition(disk));
+                partitions.Add(PartitionTableReader.CreateWholeDiskPartition(disk));
             }
 
             foreach (var partition in partitions)
@@ -397,18 +397,6 @@ public static class MdRaidDeviceSet
             reader);
     }
 
-    private static PartitionInfo CreateWholeDiskPartition(IBlockReader disk)
-    {
-        return new PartitionInfo
-        {
-            Number = 1,
-            Scheme = "WholeDisk",
-            Name = "Whole disk",
-            Type = "Unpartitioned",
-            StartLba = 0,
-            SectorCount = checked((ulong)(disk.Length / 512))
-        };
-    }
 }
 
 public interface IMdRaidReader : IBlockReader, ILogicalSectorReader

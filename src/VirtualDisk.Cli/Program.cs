@@ -80,7 +80,7 @@ internal static class Cli
         Console.WriteLine($"Path: {reader.Path}");
         Console.WriteLine($"Format: {reader.FormatName}");
         Console.WriteLine($"Size: {reader.Length} bytes");
-        var partitions = PartitionTableReader.ReadPartitions(reader, cancellationToken);
+        var partitions = PartitionTableReader.ReadPartitionsWithWholeDiskFallback(reader, cancellationToken);
         Console.WriteLine($"Partitions: {partitions.Count}");
         foreach (var partition in partitions)
         {
@@ -226,7 +226,7 @@ internal static class Cli
         var reader = DiskImageReaderFactory.Open(options.Positional, cancellationToken: cancellationToken);
         try
         {
-            var partitions = PartitionTableReader.ReadPartitions(reader, cancellationToken);
+            var partitions = PartitionTableReader.ReadPartitionsWithWholeDiskFallback(reader, cancellationToken);
             var partitionNumber = options.GetInt32("partition");
             var partition = partitionNumber is null
                 ? partitions.Count == 1
