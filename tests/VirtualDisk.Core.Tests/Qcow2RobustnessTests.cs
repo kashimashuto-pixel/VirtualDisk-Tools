@@ -10,6 +10,7 @@ internal static class Qcow2RobustnessTests
         TestTruncatedHeaders(directory);
         TestUntrustedHeaderLimits(directory);
         TestDeterministicHeaderMutations(directory);
+        TestBoundedConcurrentMetadataCache(directory);
     }
 
     private static void TestMinimalImage(string directory)
@@ -93,6 +94,70 @@ internal static class Qcow2RobustnessTests
 
         stopwatch.Stop();
         Assert(stopwatch.Elapsed < TimeSpan.FromSeconds(10), "mutated QCOW2 headers finish promptly");
+    }
+
+    private static void TestBoundedConcurrentMetadataCache(string directory)
+    {
+        const int clusterBits = 21;
+        const int clusterSize = 1 << clusterBits;
+        const int l2Entries = clusterSize / 8;
+        const int tableCount = 12;
+        var path = Path.Combine(directory, "many-l2-tables.qcow2");
+        CreateManyL2Image(path, clusterBits, tableCount);
+
+        using var reader = new Qcow2Reader(path);
+        Assert(reader.MaxL2CacheEntries < tableCount, "QCOW2 L2 cache test exceeds configured limit");
+        for (var index = 0; index < tableCount; index++)
+        {
+            var offset = checked((long)index * l2Entries * clusterSize);
+            Assert(reader.ReadByte(offset) == 0, $"QCOW2 sparse data through L2 table {index}");
+            Assert(reader.CachedL2TableCount <= reader.MaxL2CacheEntries, "QCOW2 L2 cache remains bounded");
+        }
+
+        var snapshotSwitcher = Task.Run(() =>
+        {
+            for (var iteration = 0; iteration < 64; iteration++)
+            {
+                reader.SelectSnapshot(null);
+            }
+        });
+        Parallel.For(0, 256, iteration =>
+        {
+            var table = iteration % tableCount;
+            var offset = checked((long)table * l2Entries * clusterSize);
+            Assert(reader.ReadByte(offset) == 0, "concurrent QCOW2 metadata read");
+        });
+        snapshotSwitcher.GetAwaiter().GetResult();
+        Assert(reader.CachedL2TableCount <= reader.MaxL2CacheEntries, "concurrent QCOW2 L2 cache remains bounded");
+    }
+
+    private static void CreateManyL2Image(string path, int clusterBits, int tableCount)
+    {
+        var clusterSize = 1L << clusterBits;
+        var l2Entries = clusterSize / 8;
+        var virtualSize = checked((ulong)(tableCount * l2Entries * clusterSize));
+        var header = new byte[104];
+        BinaryPrimitives.WriteUInt32BigEndian(header.AsSpan(0), Qcow2Header.MagicValue);
+        BinaryPrimitives.WriteUInt32BigEndian(header.AsSpan(4), 3);
+        BinaryPrimitives.WriteUInt32BigEndian(header.AsSpan(20), checked((uint)clusterBits));
+        BinaryPrimitives.WriteUInt64BigEndian(header.AsSpan(24), virtualSize);
+        BinaryPrimitives.WriteUInt32BigEndian(header.AsSpan(36), checked((uint)tableCount));
+        BinaryPrimitives.WriteUInt64BigEndian(header.AsSpan(40), checked((ulong)clusterSize));
+        BinaryPrimitives.WriteUInt32BigEndian(header.AsSpan(96), 4);
+        BinaryPrimitives.WriteUInt32BigEndian(header.AsSpan(100), checked((uint)header.Length));
+
+        using var stream = new FileStream(path, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None);
+        stream.SetLength(checked((tableCount + 2L) * clusterSize));
+        stream.Write(header);
+        stream.Position = clusterSize;
+        Span<byte> entry = stackalloc byte[8];
+        for (var index = 0; index < tableCount; index++)
+        {
+            BinaryPrimitives.WriteUInt64BigEndian(
+                entry,
+                checked((ulong)((index + 2L) * clusterSize)));
+            stream.Write(entry);
+        }
     }
 
     private static void AssertHeaderMutationRejected(

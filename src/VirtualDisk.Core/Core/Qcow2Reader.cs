@@ -8,19 +8,23 @@ public sealed class Qcow2Reader : IDiskImageReader
     private const ulong OffsetMask = 0x00fffffffffffe00UL;
     private const ulong CompressedClusterBit = 1UL << 62;
     private const ulong ZeroClusterBit = 1UL;
-    private const int MaxCompressedClusterCacheEntries = 512;
+    private const int MaxCacheBytesPerKind = 32 * 1024 * 1024;
     private const int MaxL1TableBytes = 64 * 1024 * 1024;
     private const uint MaxSnapshotCount = 65_536;
     private const int MaxSnapshotMetadataBytes = 16 * 1024 * 1024;
 
     private readonly FileStream _stream;
     private readonly object _sync = new();
+    private readonly object _cacheSync = new();
+    private readonly ReaderWriterLockSlim _snapshotLock = new();
     private ulong[] _l1Table;
     private readonly Dictionary<ulong, L2Entry[]> _l2Cache = new();
+    private readonly Queue<ulong> _l2CacheOrder = new();
     private readonly Dictionary<ulong, byte[]> _compressedClusterCache = new();
     private readonly Queue<ulong> _compressedClusterCacheOrder = new();
     private readonly IDiskImageReader? _backingReader;
     private readonly FileStream? _externalDataStream;
+    private int _disposed;
 
     public Qcow2Header Header { get; }
     public IReadOnlyList<Qcow2Snapshot> Snapshots { get; }
@@ -29,6 +33,18 @@ public sealed class Qcow2Reader : IDiskImageReader
     public string FormatName => "qcow2";
     public long Length { get; }
     public int L2Entries { get; }
+    internal int MaxL2CacheEntries { get; }
+    internal int MaxCompressedClusterCacheEntries { get; }
+    internal int CachedL2TableCount
+    {
+        get
+        {
+            lock (_cacheSync)
+            {
+                return _l2Cache.Count;
+            }
+        }
+    }
 
     public Qcow2Reader(string path)
     {
@@ -44,6 +60,12 @@ public sealed class Qcow2Reader : IDiskImageReader
 
             Length = (long)Header.VirtualSize;
             L2Entries = checked((int)(Header.ClusterSize / (Header.UsesExtendedL2Entries ? 16 : 8)));
+            MaxL2CacheEntries = Math.Max(
+                1,
+                MaxCacheBytesPerKind / checked(L2Entries * 16));
+            MaxCompressedClusterCacheEntries = Math.Max(
+                1,
+                checked((int)(MaxCacheBytesPerKind / Header.ClusterSize)));
             _l1Table = ReadL1Table(Header.L1TableOffset, Header.L1Size);
             Snapshots = ReadSnapshots();
             _backingReader = OpenBackingReader(path, Header);
@@ -60,6 +82,7 @@ public sealed class Qcow2Reader : IDiskImageReader
         catch
         {
             _stream.Dispose();
+            _snapshotLock.Dispose();
             throw;
         }
     }
@@ -108,67 +131,83 @@ public sealed class Qcow2Reader : IDiskImageReader
             throw new ArgumentOutOfRangeException(nameof(bufferOffset));
         }
 
-        Array.Clear(buffer, bufferOffset, count);
-        if (count == 0 || offset >= Length)
+        _snapshotLock.EnterReadLock();
+        try
         {
-            return;
-        }
-
-        if (!Header.CanReadStandardClusters)
-        {
-            var reason = string.Join(Environment.NewLine, Header.GetReadWarnings());
-            throw new NotSupportedException(reason.Length == 0 ? "この qcow2 は未対応の機能を使用しています。" : reason);
-        }
-
-        var remaining = Math.Min(count, Length - offset);
-        var outOffset = bufferOffset;
-        var virtualOffset = (ulong)offset;
-        var clusterSize = (ulong)Header.ClusterSize;
-
-        while (remaining > 0)
-        {
-            var clusterOffset = (int)(virtualOffset % clusterSize);
-            var allocationUnit = Header.UsesExtendedL2Entries ? clusterSize / 32UL : clusterSize;
-            var allocationOffset = (int)(virtualOffset % allocationUnit);
-            var chunk = (int)Math.Min(remaining, (long)allocationUnit - allocationOffset);
-            var mapping = ResolveCluster(virtualOffset);
-            if (mapping.Kind == ClusterKind.Standard)
+            Array.Clear(buffer, bufferOffset, count);
+            if (count == 0 || offset >= Length)
             {
-                if (_externalDataStream is not null)
+                return;
+            }
+
+            if (!Header.CanReadStandardClusters)
+            {
+                var reason = string.Join(Environment.NewLine, Header.GetReadWarnings());
+                throw new NotSupportedException(reason.Length == 0 ? "この qcow2 は未対応の機能を使用しています。" : reason);
+            }
+
+            var remaining = Math.Min(count, Length - offset);
+            var outOffset = bufferOffset;
+            var virtualOffset = (ulong)offset;
+            var clusterSize = (ulong)Header.ClusterSize;
+
+            while (remaining > 0)
+            {
+                var clusterOffset = (int)(virtualOffset % clusterSize);
+                var allocationUnit = Header.UsesExtendedL2Entries ? clusterSize / 32UL : clusterSize;
+                var allocationOffset = (int)(virtualOffset % allocationUnit);
+                var chunk = (int)Math.Min(remaining, (long)allocationUnit - allocationOffset);
+                var mapping = ResolveCluster(virtualOffset);
+                if (mapping.Kind == ClusterKind.Standard)
                 {
-                    ReadExactAt(_externalDataStream, (long)(mapping.HostOffset + (ulong)clusterOffset), buffer, outOffset, chunk);
+                    if (_externalDataStream is not null)
+                    {
+                        ReadExactAt(_externalDataStream, (long)(mapping.HostOffset + (ulong)clusterOffset), buffer, outOffset, chunk);
+                    }
+                    else
+                    {
+                        ReadPhysical((long)(mapping.HostOffset + (ulong)clusterOffset), buffer, outOffset, chunk);
+                    }
                 }
-                else
+                else if (mapping.Kind == ClusterKind.Compressed)
                 {
-                    ReadPhysical((long)(mapping.HostOffset + (ulong)clusterOffset), buffer, outOffset, chunk);
+                    var cluster = ReadCompressedCluster(mapping);
+                    Array.Copy(cluster, clusterOffset, buffer, outOffset, chunk);
                 }
-            }
-            else if (mapping.Kind == ClusterKind.Compressed)
-            {
-                var cluster = ReadCompressedCluster(mapping);
-                Array.Copy(cluster, clusterOffset, buffer, outOffset, chunk);
-            }
-            else if (mapping.Kind == ClusterKind.Unallocated && _backingReader is not null)
-            {
-                _backingReader.ReadAt((long)virtualOffset, buffer, outOffset, chunk);
-            }
+                else if (mapping.Kind == ClusterKind.Unallocated && _backingReader is not null)
+                {
+                    _backingReader.ReadAt((long)virtualOffset, buffer, outOffset, chunk);
+                }
 
-            remaining -= chunk;
-            virtualOffset += (ulong)chunk;
-            outOffset += chunk;
+                remaining -= chunk;
+                virtualOffset += (ulong)chunk;
+                outOffset += chunk;
+            }
+        }
+        finally
+        {
+            _snapshotLock.ExitReadLock();
         }
     }
 
     public ClusterLookupResult LookupCluster(long virtualOffset)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(virtualOffset);
-        var mapping = ResolveCluster((ulong)virtualOffset);
-        return new ClusterLookupResult(
-            virtualOffset / Header.ClusterSize,
-            mapping.HostOffset == 0 ? null : (long)mapping.HostOffset,
-            mapping.Kind == ClusterKind.Zero,
-            mapping.Kind == ClusterKind.Compressed,
-            mapping.CompressedLength);
+        _snapshotLock.EnterReadLock();
+        try
+        {
+            var mapping = ResolveCluster((ulong)virtualOffset);
+            return new ClusterLookupResult(
+                virtualOffset / Header.ClusterSize,
+                mapping.HostOffset == 0 ? null : (long)mapping.HostOffset,
+                mapping.Kind == ClusterKind.Zero,
+                mapping.Kind == ClusterKind.Compressed,
+                mapping.CompressedLength);
+        }
+        finally
+        {
+            _snapshotLock.ExitReadLock();
+        }
     }
 
     public string DescribeOffset(long offset)
@@ -181,33 +220,59 @@ public sealed class Qcow2Reader : IDiskImageReader
 
     public void Dispose()
     {
-        _backingReader?.Dispose();
-        _externalDataStream?.Dispose();
-        _stream.Dispose();
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+        {
+            return;
+        }
+
+        _snapshotLock.EnterWriteLock();
+        try
+        {
+            _backingReader?.Dispose();
+            _externalDataStream?.Dispose();
+            _stream.Dispose();
+        }
+        finally
+        {
+            _snapshotLock.ExitWriteLock();
+            _snapshotLock.Dispose();
+        }
     }
 
     public void SelectSnapshot(int? index)
     {
-        if (index is null)
+        _snapshotLock.EnterWriteLock();
+        try
         {
-            _l1Table = ReadL1Table(Header.L1TableOffset, Header.L1Size);
-            ActiveSnapshotIndex = null;
-        }
-        else
-        {
-            if (index < 0 || index >= Snapshots.Count)
+            if (index is null)
             {
-                throw new ArgumentOutOfRangeException(nameof(index));
+                _l1Table = ReadL1Table(Header.L1TableOffset, Header.L1Size);
+                ActiveSnapshotIndex = null;
+            }
+            else
+            {
+                if (index < 0 || index >= Snapshots.Count)
+                {
+                    throw new ArgumentOutOfRangeException(nameof(index));
+                }
+
+                var snapshot = Snapshots[index.Value];
+                _l1Table = ReadL1Table(snapshot.L1TableOffset, snapshot.L1Size);
+                ActiveSnapshotIndex = index;
             }
 
-            var snapshot = Snapshots[index.Value];
-            _l1Table = ReadL1Table(snapshot.L1TableOffset, snapshot.L1Size);
-            ActiveSnapshotIndex = index;
+            lock (_cacheSync)
+            {
+                _l2Cache.Clear();
+                _l2CacheOrder.Clear();
+                _compressedClusterCache.Clear();
+                _compressedClusterCacheOrder.Clear();
+            }
         }
-
-        _l2Cache.Clear();
-        _compressedClusterCache.Clear();
-        _compressedClusterCacheOrder.Clear();
+        finally
+        {
+            _snapshotLock.ExitWriteLock();
+        }
     }
 
     private ulong[] ReadL1Table(ulong tableOffset, uint tableSize)
@@ -363,9 +428,12 @@ public sealed class Qcow2Reader : IDiskImageReader
 
     private byte[] ReadCompressedCluster(ClusterMapping mapping)
     {
-        if (_compressedClusterCache.TryGetValue(mapping.GuestCluster, out var cached))
+        lock (_cacheSync)
         {
-            return cached;
+            if (_compressedClusterCache.TryGetValue(mapping.GuestCluster, out var cached))
+            {
+                return cached;
+            }
         }
 
         var compressed = new byte[mapping.CompressedLength];
@@ -401,12 +469,20 @@ public sealed class Qcow2Reader : IDiskImageReader
             throw new InvalidDataException($"圧縮クラスタの展開サイズが不足しています: {total:N0}/{output.Length:N0} bytes");
         }
 
-        _compressedClusterCache[mapping.GuestCluster] = output;
-        _compressedClusterCacheOrder.Enqueue(mapping.GuestCluster);
-        while (_compressedClusterCacheOrder.Count > MaxCompressedClusterCacheEntries)
+        lock (_cacheSync)
         {
-            var oldKey = _compressedClusterCacheOrder.Dequeue();
-            _compressedClusterCache.Remove(oldKey);
+            if (_compressedClusterCache.TryGetValue(mapping.GuestCluster, out var cached))
+            {
+                return cached;
+            }
+
+            _compressedClusterCache[mapping.GuestCluster] = output;
+            _compressedClusterCacheOrder.Enqueue(mapping.GuestCluster);
+            while (_compressedClusterCacheOrder.Count > MaxCompressedClusterCacheEntries)
+            {
+                var oldKey = _compressedClusterCacheOrder.Dequeue();
+                _compressedClusterCache.Remove(oldKey);
+            }
         }
 
         return output;
@@ -414,9 +490,12 @@ public sealed class Qcow2Reader : IDiskImageReader
 
     private L2Entry[] GetL2Table(ulong l2Offset)
     {
-        if (_l2Cache.TryGetValue(l2Offset, out var cached))
+        lock (_cacheSync)
         {
-            return cached;
+            if (_l2Cache.TryGetValue(l2Offset, out var cached))
+            {
+                return cached;
+            }
         }
 
         var buffer = new byte[Header.ClusterSize];
@@ -431,8 +510,23 @@ public sealed class Qcow2Reader : IDiskImageReader
                 Header.UsesExtendedL2Entries ? EndianUtilities.ReadUInt64Big(buffer, offset + 8) : 0);
         }
 
-        _l2Cache[l2Offset] = entries;
-        return entries;
+        lock (_cacheSync)
+        {
+            if (_l2Cache.TryGetValue(l2Offset, out var cached))
+            {
+                return cached;
+            }
+
+            _l2Cache[l2Offset] = entries;
+            _l2CacheOrder.Enqueue(l2Offset);
+            while (_l2CacheOrder.Count > MaxL2CacheEntries)
+            {
+                var oldKey = _l2CacheOrder.Dequeue();
+                _l2Cache.Remove(oldKey);
+            }
+
+            return entries;
+        }
     }
 
     private static IDiskImageReader? OpenBackingReader(string imagePath, Qcow2Header header)
