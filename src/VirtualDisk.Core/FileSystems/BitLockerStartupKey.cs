@@ -34,20 +34,22 @@ public sealed class BitLockerStartupKey : IDisposable
                 return false;
             }
 
-            var fileInfo = new FileInfo(path);
-            if (!fileInfo.Exists)
+            if (!File.Exists(path))
             {
                 error = "BitLockerスタートアップキーファイルが見つかりません。";
                 return false;
             }
 
-            if (fileInfo.Length < HeaderSize + EntryHeaderSize || fileInfo.Length > MaximumFileSize)
+            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+            var fileLength = stream.Length;
+            if (fileLength < HeaderSize + EntryHeaderSize || fileLength > MaximumFileSize)
             {
-                error = $"BitLockerスタートアップキーファイルのサイズが不正です: {fileInfo.Length} bytes";
+                error = $"BitLockerスタートアップキーファイルのサイズが不正です: {fileLength} bytes";
                 return false;
             }
 
-            fileBytes = File.ReadAllBytes(path);
+            fileBytes = new byte[checked((int)fileLength)];
+            stream.ReadExactly(fileBytes);
             return TryParse(fileBytes, out startupKey, out error);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidDataException or ArgumentException)
