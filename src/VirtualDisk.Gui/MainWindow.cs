@@ -21,13 +21,17 @@ public sealed class MainWindow : Window
     private readonly TextBlock _status = new() { Text = "準備完了" };
     private readonly ListBox _partitions = new();
     private readonly ListBox _entries = new();
-    private readonly Button _createButton = new() { Content = "新規作成..." };
-    private readonly Button _openButton = new() { Content = "開く..." };
     private readonly Button _backButton = new() { Content = "上へ", IsEnabled = false };
     private readonly Button _previewButton = new() { Content = "プレビュー", IsEnabled = false };
     private readonly Button _extractButton = new() { Content = "抽出...", IsEnabled = false };
-    private readonly Button _verifyButton = new() { Content = "全読込検証", IsEnabled = false };
     private readonly Button _cancelButton = new() { Content = "キャンセル", IsEnabled = false };
+    private readonly MenuItem _createMenuItem = new() { Header = "新規作成..." };
+    private readonly MenuItem _openMenuItem = new() { Header = "開く..." };
+    private readonly MenuItem _exitMenuItem = new() { Header = "終了" };
+    private readonly MenuItem _previewMenuItem = new() { Header = "プレビュー", IsEnabled = false };
+    private readonly MenuItem _extractMenuItem = new() { Header = "抽出...", IsEnabled = false };
+    private readonly MenuItem _verifyMenuItem = new() { Header = "全読込検証", IsEnabled = false };
+    private readonly MenuItem _cancelMenuItem = new() { Header = "キャンセル", IsEnabled = false };
     private readonly Stack<VfsNode> _directoryHistory = new();
     private IDiskImageReader? _reader;
     private IReadOnlyFileSystem? _fileSystem;
@@ -52,11 +56,16 @@ public sealed class MainWindow : Window
         _entries.SelectionChanged += (_, _) => RefreshCommandState();
         _entries.DoubleTapped += async (_, _) => await ActivateSelectedEntryAsync();
         _backButton.Click += async (_, _) => await NavigateUpAsync();
-        _createButton.Click += async (_, _) => await CreateDiskAsync();
         _previewButton.Click += async (_, _) => await PreviewSelectedAsync();
         _extractButton.Click += async (_, _) => await ExtractSelectedAsync();
-        _verifyButton.Click += async (_, _) => await VerifyFileSystemAsync();
         _cancelButton.Click += (_, _) => CancelActiveOperation();
+        _createMenuItem.Click += async (_, _) => await CreateDiskAsync();
+        _openMenuItem.Click += async (_, _) => await ChooseAndOpenImageAsync();
+        _exitMenuItem.Click += (_, _) => Close();
+        _previewMenuItem.Click += async (_, _) => await PreviewSelectedAsync();
+        _extractMenuItem.Click += async (_, _) => await ExtractSelectedAsync();
+        _verifyMenuItem.Click += async (_, _) => await VerifyFileSystemAsync();
+        _cancelMenuItem.Click += (_, _) => CancelActiveOperation();
 
         if (!string.IsNullOrWhiteSpace(initialPath))
         {
@@ -66,7 +75,35 @@ public sealed class MainWindow : Window
 
     private Control BuildContent()
     {
-        _openButton.Click += async (_, _) => await ChooseAndOpenImageAsync();
+        var menu = new Menu
+        {
+            ItemsSource = new MenuItem[]
+            {
+                new MenuItem
+                {
+                    Header = "ファイル",
+                    ItemsSource = new Control[]
+                    {
+                        _createMenuItem,
+                        _openMenuItem,
+                        new Separator(),
+                        _exitMenuItem,
+                    },
+                },
+                new MenuItem
+                {
+                    Header = "操作",
+                    ItemsSource = new Control[]
+                    {
+                        _previewMenuItem,
+                        _extractMenuItem,
+                        _verifyMenuItem,
+                        new Separator(),
+                        _cancelMenuItem,
+                    },
+                },
+            },
+        };
         var toolbar = new StackPanel
         {
             Orientation = Orientation.Horizontal,
@@ -74,12 +111,9 @@ public sealed class MainWindow : Window
             Margin = new Thickness(12),
             Children =
             {
-                _createButton,
-                _openButton,
                 _backButton,
                 _previewButton,
                 _extractButton,
-                _verifyButton,
                 _cancelButton,
             },
         };
@@ -117,9 +151,11 @@ public sealed class MainWindow : Window
             Child = _status,
         };
         var root = new DockPanel();
+        DockPanel.SetDock(menu, Dock.Top);
         DockPanel.SetDock(toolbar, Dock.Top);
         DockPanel.SetDock(header, Dock.Top);
         DockPanel.SetDock(statusBorder, Dock.Bottom);
+        root.Children.Add(menu);
         root.Children.Add(toolbar);
         root.Children.Add(header);
         root.Children.Add(statusBorder);
@@ -892,9 +928,11 @@ public sealed class MainWindow : Window
         Cursor = busy ? new Cursor(StandardCursorType.Wait) : Cursor.Default;
         _partitions.IsEnabled = !busy;
         _entries.IsEnabled = !busy;
-        _createButton.IsEnabled = !busy;
-        _openButton.IsEnabled = !busy;
+        _createMenuItem.IsEnabled = !busy;
+        _openMenuItem.IsEnabled = !busy;
+        _exitMenuItem.IsEnabled = !busy;
         _cancelButton.IsEnabled = busy;
+        _cancelMenuItem.IsEnabled = busy;
         RefreshCommandState();
         if (status is not null)
         {
@@ -934,6 +972,7 @@ public sealed class MainWindow : Window
 
         _activeOperation.Cancel();
         _cancelButton.IsEnabled = false;
+        _cancelMenuItem.IsEnabled = false;
         _status.Text = "キャンセルを要求しました。安全に中断するまでお待ちください...";
     }
 
@@ -943,7 +982,9 @@ public sealed class MainWindow : Window
         _previewButton.IsEnabled = !_busy
             && _entries.SelectedItem is EntryItem { Node.IsDirectory: false };
         _extractButton.IsEnabled = !_busy && _entries.SelectedItem is EntryItem;
-        _verifyButton.IsEnabled = !_busy && _fileSystem is not null;
+        _previewMenuItem.IsEnabled = _previewButton.IsEnabled;
+        _extractMenuItem.IsEnabled = _extractButton.IsEnabled;
+        _verifyMenuItem.IsEnabled = !_busy && _fileSystem is not null;
     }
 
     private void DisposeImage()
