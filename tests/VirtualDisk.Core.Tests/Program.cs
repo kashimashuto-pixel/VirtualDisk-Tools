@@ -17,6 +17,7 @@ try
     ContainerRobustnessTests.Run(temporaryDirectory);
     PartitionTableRobustnessTests.Run(temporaryDirectory);
     FileSystemRobustnessTests.Run(temporaryDirectory);
+    OverlayRobustnessTests.Run(temporaryDirectory);
     CreationRobustnessTests.Run(temporaryDirectory);
     Console.WriteLine("All cross-platform core checks passed.");
 }

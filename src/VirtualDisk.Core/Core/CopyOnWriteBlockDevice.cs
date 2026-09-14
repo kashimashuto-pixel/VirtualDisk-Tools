@@ -149,6 +149,7 @@ public sealed class CopyOnWriteBlockDevice : IBlockDevice
         var temporaryPath = Path.Combine(
             destinationDirectory,
             $".{Path.GetFileName(destinationPath)}.{Guid.NewGuid():N}.partial");
+        var pageSnapshot = CapturePageSnapshot();
 
         try
         {
@@ -166,7 +167,7 @@ public sealed class CopyOnWriteBlockDevice : IBlockDevice
                 {
                     cancellationToken.ThrowIfCancellationRequested();
                     var count = checked((int)Math.Min(buffer.Length, Length - offset));
-                    ReadAt(offset, buffer, 0, count);
+                    ReadSnapshotAt(pageSnapshot, offset, buffer, count);
                     await output.WriteAsync(buffer.AsMemory(0, count), cancellationToken);
                     offset += count;
                     progress?.Report(new DiskImageProgress("変更済みRAWを保存", offset, Length));
@@ -206,6 +207,46 @@ public sealed class CopyOnWriteBlockDevice : IBlockDevice
         _originalPages.Add(pageIndex, original);
         _pages.Add(pageIndex, page);
         return page;
+    }
+
+    private IReadOnlyDictionary<long, byte[]> CapturePageSnapshot()
+    {
+        lock (_sync)
+        {
+            return _pages.ToDictionary(
+                entry => entry.Key,
+                entry => (byte[])entry.Value.Clone());
+        }
+    }
+
+    private void ReadSnapshotAt(
+        IReadOnlyDictionary<long, byte[]> pages,
+        long offset,
+        byte[] buffer,
+        int count)
+    {
+        var remaining = count;
+        var currentOffset = offset;
+        var destinationOffset = 0;
+        while (remaining > 0)
+        {
+            var pageIndex = currentOffset / _pageSize;
+            var pageOffset = checked((int)(currentOffset % _pageSize));
+            var pageLength = GetPageLength(pageIndex);
+            var copyLength = Math.Min(remaining, pageLength - pageOffset);
+            if (pages.TryGetValue(pageIndex, out var page))
+            {
+                Array.Copy(page, pageOffset, buffer, destinationOffset, copyLength);
+            }
+            else
+            {
+                _source.ReadAt(currentOffset, buffer, destinationOffset, copyLength);
+            }
+
+            remaining -= copyLength;
+            currentOffset += copyLength;
+            destinationOffset += copyLength;
+        }
     }
 
     private int GetPageLength(long pageIndex)
