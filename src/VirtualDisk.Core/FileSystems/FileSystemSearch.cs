@@ -26,6 +26,8 @@ public static class FileSystemSearch
         var results = new List<SearchMatch>();
         var pending = new Stack<(VfsNode Directory, string Path)>();
         pending.Push((fileSystem.Root, "/"));
+        var visitedDirectories = new HashSet<VfsNode>(ReferenceEqualityComparer.Instance);
+        var visitedDirectoryPaths = new HashSet<string>(StringComparer.Ordinal);
         var visited = 0;
 
         while (pending.Count > 0 && results.Count < maximumResults)
@@ -38,6 +40,14 @@ public static class FileSystemSearch
             }
 
             var (directory, path) = pending.Pop();
+            if (!visitedDirectories.Add(directory)
+                || (!string.IsNullOrEmpty(directory.VirtualPath)
+                    && !visitedDirectoryPaths.Add(directory.VirtualPath)))
+            {
+                throw new InvalidDataException(
+                    $"ファイルシステムのディレクトリ構造に重複または循環参照があります: {path}");
+            }
+
             IReadOnlyList<VfsNode> children;
             try
             {
@@ -46,6 +56,11 @@ public static class FileSystemSearch
             catch (Exception ex) when (IsRecoverableDirectoryError(ex))
             {
                 continue;
+            }
+
+            if (children is null)
+            {
+                throw new InvalidDataException("ファイルシステムがnullの一覧を返しました。");
             }
 
             if (children.Count > MaximumEntriesPerDirectory)
@@ -57,6 +72,11 @@ public static class FileSystemSearch
             foreach (var child in children)
             {
                 cancellationToken.ThrowIfCancellationRequested();
+                if (child is null)
+                {
+                    throw new InvalidDataException("ファイルシステムがnullノードを返しました。");
+                }
+
                 var childPath = path == "/" ? $"/{child.DisplayName}" : $"{path}/{child.DisplayName}";
                 if (child.DisplayName.Contains(query, StringComparison.OrdinalIgnoreCase))
                 {

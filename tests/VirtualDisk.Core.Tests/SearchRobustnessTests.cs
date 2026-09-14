@@ -17,12 +17,17 @@ internal static class SearchRobustnessTests
             "item");
         Assert(recoverable.Count == 0, "search skips a damaged directory");
 
+        var cyclic = new CyclicFileSystem();
         AssertThrows<InvalidDataException>(
-            () => FileSystemSearch.Search(
-                new CyclicFileSystem(),
-                "never-matches",
-                maximumDirectories: 4),
-            "search bounds cyclic directory traversal");
+            () => FileSystemSearch.Search(cyclic, "never-matches"),
+            "search rejects cyclic directory traversal");
+        Assert(cyclic.ListDirectoryCalls == 1, "search detects a direct cycle before reading it again");
+        AssertThrows<InvalidDataException>(
+            () => FileSystemSearch.Search(new NullListFileSystem(), "item"),
+            "search rejects null directory listings");
+        AssertThrows<InvalidDataException>(
+            () => FileSystemSearch.Search(new NullNodeFileSystem(), "item"),
+            "search rejects null directory entries");
         AssertThrows<ArgumentOutOfRangeException>(
             () => FileSystemSearch.Search(new CyclicFileSystem(), "item", maximumResults: 0),
             "search validates result limit");
@@ -79,6 +84,22 @@ internal static class SearchRobustnessTests
 
     private sealed class CyclicFileSystem : TestFileSystem
     {
-        public override IReadOnlyList<VfsNode> ListDirectory(VfsNode directory) => [Root];
+        public int ListDirectoryCalls { get; private set; }
+
+        public override IReadOnlyList<VfsNode> ListDirectory(VfsNode directory)
+        {
+            ListDirectoryCalls++;
+            return [Root];
+        }
+    }
+
+    private sealed class NullListFileSystem : TestFileSystem
+    {
+        public override IReadOnlyList<VfsNode> ListDirectory(VfsNode directory) => null!;
+    }
+
+    private sealed class NullNodeFileSystem : TestFileSystem
+    {
+        public override IReadOnlyList<VfsNode> ListDirectory(VfsNode directory) => [null!];
     }
 }
