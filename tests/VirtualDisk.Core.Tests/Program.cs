@@ -15,6 +15,7 @@ try
     TestManagedExt4Creation(temporaryDirectory);
     TestManagedXfsCreation(temporaryDirectory);
     BlockStreamRobustnessTests.Run();
+    DiagnosticLogRobustnessTests.Run();
     FilePreviewRobustnessTests.Run();
     ExternalEditorSafetyTests.Run();
     BoundedLruCacheTests.Run();
