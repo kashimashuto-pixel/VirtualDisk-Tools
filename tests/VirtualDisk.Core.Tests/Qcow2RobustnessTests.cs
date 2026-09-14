@@ -9,6 +9,7 @@ internal static class Qcow2RobustnessTests
     public static void Run(string directory)
     {
         TestMinimalImage(directory);
+        TestOpenCancellation(directory);
         TestTruncatedHeaders(directory);
         TestUntrustedHeaderLimits(directory);
         TestDeterministicHeaderMutations(directory);
@@ -17,6 +18,17 @@ internal static class Qcow2RobustnessTests
         TestSparseL2Allocation(directory);
         TestWriterKeepsSourceOpen(directory);
         TestWriterCancellationCleanup(directory);
+    }
+
+    private static void TestOpenCancellation(string directory)
+    {
+        var path = Path.Combine(directory, "canceled-open.qcow2");
+        File.WriteAllBytes(path, CreateMinimalImage());
+        AssertThrows<OperationCanceledException>(
+            () => _ = new Qcow2Reader(path, new CancellationToken(canceled: true)),
+            "canceled QCOW2 open");
+        File.Delete(path);
+        Assert(!File.Exists(path), "canceled QCOW2 open releases source handle");
     }
 
     private static void TestMinimalImage(string directory)
@@ -415,6 +427,21 @@ internal static class Qcow2RobustnessTests
         {
             throw new InvalidOperationException($"Assertion failed: {message}");
         }
+    }
+
+    private static void AssertThrows<TException>(Action action, string message)
+        where TException : Exception
+    {
+        try
+        {
+            action();
+        }
+        catch (TException)
+        {
+            return;
+        }
+
+        throw new InvalidOperationException($"Assertion failed: {message}");
     }
 
     private static byte ReadByte(this IBlockReader reader, long offset)

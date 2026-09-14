@@ -47,13 +47,18 @@ public sealed class Qcow2Reader : IDiskImageReader
         }
     }
 
-    public Qcow2Reader(string path)
-        : this(path, new HashSet<string>(PathSemantics.Comparer), 0)
+    public Qcow2Reader(string path, CancellationToken cancellationToken = default)
+        : this(path, new HashSet<string>(PathSemantics.Comparer), 0, cancellationToken)
     {
     }
 
-    private Qcow2Reader(string path, HashSet<string> backingChain, int backingDepth)
+    private Qcow2Reader(
+        string path,
+        HashSet<string> backingChain,
+        int backingDepth,
+        CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         if (backingDepth >= MaxBackingChainDepth)
         {
             throw new NotSupportedException(
@@ -72,7 +77,7 @@ public sealed class Qcow2Reader : IDiskImageReader
             _stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
             try
             {
-                Header = Qcow2Header.Parse(_stream);
+                Header = Qcow2Header.Parse(_stream, cancellationToken);
                 if (Header.VirtualSize > long.MaxValue)
                 {
                     throw new NotSupportedException("この qcow2 の仮想サイズは .NET の long 範囲を超えています。");
@@ -86,9 +91,14 @@ public sealed class Qcow2Reader : IDiskImageReader
                 MaxCompressedClusterCacheEntries = Math.Max(
                     1,
                     checked((int)(MaxCacheBytesPerKind / Header.ClusterSize)));
-                _l1Table = ReadL1Table(Header.L1TableOffset, Header.L1Size);
-                Snapshots = ReadSnapshots();
-                _backingReader = OpenBackingReader(path, Header, backingChain, backingDepth + 1);
+                _l1Table = ReadL1Table(Header.L1TableOffset, Header.L1Size, cancellationToken);
+                Snapshots = ReadSnapshots(cancellationToken);
+                _backingReader = OpenBackingReader(
+                    path,
+                    Header,
+                    backingChain,
+                    backingDepth + 1,
+                    cancellationToken);
                 try
                 {
                     _externalDataStream = OpenExternalDataFile(path, Header);
@@ -300,8 +310,12 @@ public sealed class Qcow2Reader : IDiskImageReader
         }
     }
 
-    private ulong[] ReadL1Table(ulong tableOffset, uint tableSize)
+    private ulong[] ReadL1Table(
+        ulong tableOffset,
+        uint tableSize,
+        CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         var byteLength = checked((long)tableSize * sizeof(ulong));
         if (byteLength > MaxL1TableBytes)
         {
@@ -315,14 +329,20 @@ public sealed class Qcow2Reader : IDiskImageReader
         ReadPhysical(checked((long)tableOffset), buffer, 0, buffer.Length);
         for (var i = 0; i < entries.Length; i++)
         {
+            if ((i & 0xfff) == 0)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+            }
+
             entries[i] = EndianUtilities.ReadUInt64Big(buffer, i * 8);
         }
 
         return entries;
     }
 
-    private IReadOnlyList<Qcow2Snapshot> ReadSnapshots()
+    private IReadOnlyList<Qcow2Snapshot> ReadSnapshots(CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         if (Header.SnapshotCount == 0 || Header.SnapshotsOffset == 0)
         {
             return Array.Empty<Qcow2Snapshot>();
@@ -338,6 +358,7 @@ public sealed class Qcow2Reader : IDiskImageReader
         var offset = checked((long)Header.SnapshotsOffset);
         for (var index = 0; index < Header.SnapshotCount; index++)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var fixedPart = new byte[40];
             ReadPhysical(offset, fixedPart, 0, fixedPart.Length);
             var l1Offset = EndianUtilities.ReadUInt64Big(fixedPart, 0);
@@ -558,8 +579,10 @@ public sealed class Qcow2Reader : IDiskImageReader
         string imagePath,
         Qcow2Header header,
         HashSet<string> backingChain,
-        int backingDepth)
+        int backingDepth,
+        CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         if (!header.HasBackingFile || string.IsNullOrWhiteSpace(header.BackingFileName))
         {
             return null;
@@ -575,8 +598,8 @@ public sealed class Qcow2Reader : IDiskImageReader
         }
 
         return IsQcow2File(backingPath)
-            ? new Qcow2Reader(backingPath, backingChain, backingDepth)
-            : DiskImageReaderFactory.Open(backingPath);
+            ? new Qcow2Reader(backingPath, backingChain, backingDepth, cancellationToken)
+            : DiskImageReaderFactory.Open(backingPath, cancellationToken: cancellationToken);
     }
 
     private static bool IsQcow2File(string path)

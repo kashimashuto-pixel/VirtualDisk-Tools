@@ -85,7 +85,7 @@ public static class DiskImageReaderFactory
 
         if (IsQcow2(path))
         {
-            return new Qcow2Reader(path);
+            return new Qcow2Reader(path, cancellationToken);
         }
 
         if (path.EndsWith(".E01", StringComparison.OrdinalIgnoreCase) || EwfDiskImageReader.HasMagic(path))

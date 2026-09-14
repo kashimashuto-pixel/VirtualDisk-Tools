@@ -36,8 +36,10 @@ public sealed class Qcow2Header
     public bool UsesExtendedL2Entries => (IncompatibleFeatures & 0x10) != 0;
     public ulong UnknownIncompatibleFeatures => IncompatibleFeatures & ~0x1fUL;
 
-    public static Qcow2Header Parse(FileStream stream)
+    public static Qcow2Header Parse(FileStream stream, CancellationToken cancellationToken = default)
     {
+        ArgumentNullException.ThrowIfNull(stream);
+        cancellationToken.ThrowIfCancellationRequested();
         var headerBuffer = new byte[112];
         stream.Position = 0;
         ReadExact(stream, headerBuffer, 0, 104);
@@ -104,6 +106,7 @@ public sealed class Qcow2Header
                 : Math.Min(clusterSize, stream.Length);
             while (extensionOffset + 8 <= extensionLimit)
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 var extensionHeader = new byte[8];
                 stream.Position = extensionOffset;
                 ReadExact(stream, extensionHeader, 0, extensionHeader.Length);
