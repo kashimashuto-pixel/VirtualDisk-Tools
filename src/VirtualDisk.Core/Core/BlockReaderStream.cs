@@ -8,6 +8,12 @@ public sealed class BlockReaderStream : Stream
 
     public BlockReaderStream(IBlockReader reader)
     {
+        ArgumentNullException.ThrowIfNull(reader);
+        if (reader.Length < 0)
+        {
+            throw new ArgumentException("ブロックリーダーの長さが不正です。", nameof(reader));
+        }
+
         _reader = reader;
         _writer = reader as IBlockWriter;
     }
@@ -34,6 +40,7 @@ public sealed class BlockReaderStream : Stream
 
     public override int Read(byte[] buffer, int offset, int count)
     {
+        ValidateArrayRange(buffer, offset, count);
         if (_position >= Length || count == 0)
         {
             return 0;
@@ -47,13 +54,21 @@ public sealed class BlockReaderStream : Stream
 
     public override long Seek(long offset, SeekOrigin origin)
     {
-        var newPosition = origin switch
+        long newPosition;
+        try
         {
-            SeekOrigin.Begin => offset,
-            SeekOrigin.Current => _position + offset,
-            SeekOrigin.End => Length + offset,
-            _ => throw new ArgumentOutOfRangeException(nameof(origin))
-        };
+            newPosition = origin switch
+            {
+                SeekOrigin.Begin => offset,
+                SeekOrigin.Current => checked(_position + offset),
+                SeekOrigin.End => checked(Length + offset),
+                _ => throw new ArgumentOutOfRangeException(nameof(origin))
+            };
+        }
+        catch (OverflowException exception)
+        {
+            throw new IOException("ブロックストリームのseek位置が表現可能な範囲を超えています。", exception);
+        }
 
         ArgumentOutOfRangeException.ThrowIfNegative(newPosition);
         _position = newPosition;
@@ -67,13 +82,7 @@ public sealed class BlockReaderStream : Stream
 
     public override void Write(byte[] buffer, int offset, int count)
     {
-        ArgumentNullException.ThrowIfNull(buffer);
-        ArgumentOutOfRangeException.ThrowIfNegative(offset);
-        ArgumentOutOfRangeException.ThrowIfNegative(count);
-        if (offset > buffer.Length - count)
-        {
-            throw new ArgumentException("バッファー範囲が不正です。", nameof(offset));
-        }
+        ValidateArrayRange(buffer, offset, count);
 
         if (_writer is null)
         {
@@ -87,5 +96,16 @@ public sealed class BlockReaderStream : Stream
 
         _writer.WriteAt(_position, buffer, offset, count);
         _position += count;
+    }
+
+    private static void ValidateArrayRange(byte[] buffer, int offset, int count)
+    {
+        ArgumentNullException.ThrowIfNull(buffer);
+        ArgumentOutOfRangeException.ThrowIfNegative(offset);
+        ArgumentOutOfRangeException.ThrowIfNegative(count);
+        if (offset > buffer.Length - count)
+        {
+            throw new ArgumentException("バッファー範囲が不正です。", nameof(offset));
+        }
     }
 }

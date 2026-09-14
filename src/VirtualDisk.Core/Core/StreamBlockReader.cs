@@ -8,6 +8,12 @@ public sealed class StreamBlockReader : IBlockReader, IDisposable
 
     public StreamBlockReader(Stream stream, bool leaveOpen = false)
     {
+        ArgumentNullException.ThrowIfNull(stream);
+        if (!stream.CanRead || !stream.CanSeek)
+        {
+            throw new ArgumentException("読み取り可能なseekable streamが必要です。", nameof(stream));
+        }
+
         _stream = stream;
         _leaveOpen = leaveOpen;
     }

@@ -14,6 +14,7 @@ try
     TestManagedNtfsCreation(temporaryDirectory);
     TestManagedExt4Creation(temporaryDirectory);
     TestManagedXfsCreation(temporaryDirectory);
+    BlockStreamRobustnessTests.Run();
     BoundedLruCacheTests.Run();
     ExtractionRobustnessTests.Run(temporaryDirectory);
     ExportTraversalRobustnessTests.Run(temporaryDirectory);
