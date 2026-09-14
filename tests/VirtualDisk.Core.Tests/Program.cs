@@ -15,6 +15,7 @@ try
     TestManagedExt4Creation(temporaryDirectory);
     TestManagedXfsCreation(temporaryDirectory);
     BoundedLruCacheTests.Run();
+    ExtractionRobustnessTests.Run(temporaryDirectory);
     Qcow2RobustnessTests.Run(temporaryDirectory);
     ContainerRobustnessTests.Run(temporaryDirectory);
     PartitionTableRobustnessTests.Run(temporaryDirectory);

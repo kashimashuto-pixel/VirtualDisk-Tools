@@ -39,6 +39,95 @@ public static class FileSystemExporter
 {
     private const int CopyBufferSize = 1024 * 1024;
 
+    public static async Task ExtractFileAsync(
+        IReadOnlyFileSystem fileSystem,
+        VfsNode file,
+        string destinationPath,
+        bool overwrite = false,
+        IProgress<CopyProgress>? progress = null,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(fileSystem);
+        ArgumentNullException.ThrowIfNull(file);
+        ArgumentException.ThrowIfNullOrWhiteSpace(destinationPath);
+        if (file.IsDirectory || file.Size < 0)
+        {
+            throw new ArgumentException("抽出対象はサイズが確定した通常ファイルである必要があります。", nameof(file));
+        }
+
+        var fullDestinationPath = Path.GetFullPath(destinationPath);
+        if (Directory.Exists(fullDestinationPath)
+            || (!overwrite && File.Exists(fullDestinationPath)))
+        {
+            throw new IOException($"抽出先は既に存在します: {fullDestinationPath}");
+        }
+
+        var parent = Path.GetDirectoryName(fullDestinationPath)
+            ?? throw new IOException("抽出先ディレクトリを取得できません。");
+        Directory.CreateDirectory(parent);
+        var partialPath = Path.Combine(
+            parent,
+            $".{Path.GetFileName(fullDestinationPath)}.{Guid.NewGuid():N}.vdt-partial");
+        var stopwatch = Stopwatch.StartNew();
+        long offset = 0;
+        try
+        {
+            await using (var output = new FileStream(
+                partialPath,
+                FileMode.CreateNew,
+                FileAccess.Write,
+                FileShare.None,
+                CopyBufferSize,
+                FileOptions.Asynchronous | FileOptions.SequentialScan))
+            {
+                while (offset < file.Size)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    var chunkSize = checked((int)Math.Min(CopyBufferSize, file.Size - offset));
+                    var chunk = fileSystem.ReadFile(file, offset, chunkSize);
+                    if (chunk.Length != chunkSize)
+                    {
+                        var exception = CreateUnexpectedEofException(
+                            fileSystem,
+                            file,
+                            offset,
+                            chunkSize,
+                            chunk.Length);
+                        DiagnosticLog.Write($"File extraction failed: {exception}");
+                        throw exception;
+                    }
+
+                    await output.WriteAsync(chunk, cancellationToken);
+                    offset += chunk.Length;
+                    progress?.Report(new CopyProgress(
+                        fullDestinationPath,
+                        offset,
+                        file.Size,
+                        0,
+                        0,
+                        stopwatch.Elapsed));
+                }
+
+                await output.FlushAsync(cancellationToken);
+            }
+
+            cancellationToken.ThrowIfCancellationRequested();
+            File.Move(partialPath, fullDestinationPath, overwrite);
+            progress?.Report(new CopyProgress(
+                fullDestinationPath,
+                offset,
+                file.Size,
+                1,
+                0,
+                stopwatch.Elapsed));
+        }
+        catch
+        {
+            TryDeletePartialFile(partialPath);
+            throw;
+        }
+    }
+
     public static CopyResult CopyNodes(
         IReadOnlyFileSystem fileSystem,
         IEnumerable<VfsNode> nodes,
@@ -162,9 +251,12 @@ public static class FileSystemExporter
                     var chunk = fileSystem.ReadFile(file, offset, chunkSize);
                     if (chunk.Length == 0)
                     {
-                        var exception = new EndOfStreamException(
-                            $"Unexpected EOF while reading '{file.Name}'. size={file.Size}, offset={offset}, requested={chunkSize}, " +
-                            $"fileSystem={fileSystem.Name}, node={file.Metadata}");
+                        var exception = CreateUnexpectedEofException(
+                            fileSystem,
+                            file,
+                            offset,
+                            chunkSize,
+                            chunk.Length);
                         DiagnosticLog.Write($"File export failed: {exception}");
                         throw exception;
                     }
@@ -253,6 +345,16 @@ public static class FileSystemExporter
         {
         }
     }
+
+    private static EndOfStreamException CreateUnexpectedEofException(
+        IReadOnlyFileSystem fileSystem,
+        VfsNode file,
+        long offset,
+        int requested,
+        int actual) =>
+        new(
+            $"Unexpected EOF while reading '{file.Name}'. size={file.Size}, offset={offset}, "
+            + $"requested={requested}, actual={actual}, fileSystem={fileSystem.Name}, node={file.Metadata}");
 
     private static void TrySetLastWriteTime(string path, DateTime utc, bool isDirectory)
     {

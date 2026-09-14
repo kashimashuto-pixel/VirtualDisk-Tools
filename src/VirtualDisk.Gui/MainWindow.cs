@@ -247,21 +247,25 @@ public sealed class MainWindow : Window
 
         try
         {
-            SetBusy(true, $"{selected.Node.Name}を抽出しています...");
-            await using var output = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None, 1024 * 1024, true);
-            long offset = 0;
-            while (offset < selected.Node.Size)
+            if (_reader is not null && PathsEqual(path, _reader.Path))
             {
-                var count = checked((int)Math.Min(1024 * 1024, selected.Node.Size - offset));
-                var content = _fileSystem.ReadFile(selected.Node, offset, count);
-                if (content.Length != count)
-                {
-                    throw new EndOfStreamException($"offset {offset}で読み取りが終了しました。");
-                }
-
-                await output.WriteAsync(content);
-                offset += count;
+                throw new IOException("開いているディスクイメージ自身には抽出できません。");
             }
+
+            SetBusy(true, $"{selected.Node.Name}を抽出しています...");
+            var progress = new Progress<CopyProgress>(update =>
+            {
+                var percentage = update.TotalBytes == 0
+                    ? 100
+                    : (int)Math.Min(100, update.BytesCopied * 100d / update.TotalBytes);
+                _status.Text = $"{selected.Node.Name}を抽出しています... {percentage}%";
+            });
+            await FileSystemExporter.ExtractFileAsync(
+                _fileSystem,
+                selected.Node,
+                path,
+                overwrite: true,
+                progress: progress);
 
             _status.Text = $"抽出しました: {path}";
         }
@@ -273,6 +277,21 @@ public sealed class MainWindow : Window
         finally
         {
             SetBusy(false);
+        }
+    }
+
+    private static bool PathsEqual(string first, string second)
+    {
+        try
+        {
+            var comparison = OperatingSystem.IsWindows()
+                ? StringComparison.OrdinalIgnoreCase
+                : StringComparison.Ordinal;
+            return string.Equals(Path.GetFullPath(first), Path.GetFullPath(second), comparison);
+        }
+        catch (Exception exception) when (exception is ArgumentException or NotSupportedException)
+        {
+            return false;
         }
     }
 

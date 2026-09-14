@@ -8,8 +8,6 @@ return await Cli.RunAsync(args);
 
 internal static class Cli
 {
-    private const int CopyBufferSize = 1024 * 1024;
-
     public static async Task<int> RunAsync(string[] args)
     {
         using var cancellationSource = new CancellationTokenSource();
@@ -132,48 +130,11 @@ internal static class Cli
             throw new CliUsageException("extractは現在、通常ファイルを1つ指定してください。");
         }
 
-        var parent = Path.GetDirectoryName(outputPath)
-            ?? throw new CliUsageException("抽出先ディレクトリを取得できません。");
-        Directory.CreateDirectory(parent);
-        var partialPath = Path.Combine(
-            parent,
-            $".{Path.GetFileName(outputPath)}.{Guid.NewGuid():N}.vdt-partial");
-        try
-        {
-            await using (var destination = new FileStream(
-                partialPath,
-                FileMode.CreateNew,
-                FileAccess.Write,
-                FileShare.None,
-                CopyBufferSize,
-                FileOptions.Asynchronous | FileOptions.SequentialScan))
-            {
-                long offset = 0;
-                while (offset < file.Size)
-                {
-                    cancellationToken.ThrowIfCancellationRequested();
-                    var count = checked((int)Math.Min(CopyBufferSize, file.Size - offset));
-                    var content = context.FileSystem.ReadFile(file, offset, count);
-                    if (content.Length != count)
-                    {
-                        throw new EndOfStreamException($"ファイル読み取りが途中で終了しました: offset={offset}");
-                    }
-
-                    await destination.WriteAsync(content, cancellationToken);
-                    offset += count;
-                }
-
-                await destination.FlushAsync(cancellationToken);
-            }
-
-            cancellationToken.ThrowIfCancellationRequested();
-            File.Move(partialPath, outputPath);
-        }
-        catch
-        {
-            TryDelete(partialPath);
-            throw;
-        }
+        await FileSystemExporter.ExtractFileAsync(
+            context.FileSystem,
+            file,
+            outputPath,
+            cancellationToken: cancellationToken);
 
         Console.WriteLine($"Extracted {file.Size} bytes to {outputPath}");
         return 0;
@@ -341,18 +302,6 @@ internal static class Cli
             : "raw";
 
     private static bool IsHelp(string value) => value is "-h" or "--help" or "help";
-
-    private static void TryDelete(string path)
-    {
-        try
-        {
-            File.Delete(path);
-        }
-        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
-        {
-            // Preserve the extraction or cancellation error.
-        }
-    }
 
     private static void PrintHelp()
     {
