@@ -10,6 +10,7 @@ on:
       - ".github/workflows/windows-release.yml"
       - "tools/New-WindowsReleasePackage.ps1"
       - "src/Qcow2Explorer/**"
+      - "src/VirtualDisk.Core/**"
       - "README.md"
 
 permissions:
@@ -18,6 +19,7 @@ permissions:
 jobs:
   package:
     runs-on: windows-latest
+    timeout-minutes: 45
 
     steps:
       - name: Check out repository
@@ -68,6 +70,7 @@ jobs:
     if: github.ref_type == 'tag'
     needs: package
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write
 
