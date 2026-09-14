@@ -40,6 +40,7 @@ internal static class Cli
                 "verify" => RunVerify(args[1..], cancellationSource.Token),
                 "extract" => await RunExtractAsync(args[1..], cancellationSource.Token),
                 "create" => await RunCreateAsync(args[1..], cancellationSource.Token),
+                "edit" => await RunEditAsync(args[1..], cancellationSource.Token),
                 _ => throw new CliUsageException($"不明なコマンドです: {args[0]}"),
             };
         }
@@ -268,22 +269,7 @@ internal static class Cli
         var initialFiles = options.GetMany("initial-file")
             .Select(ParseInitialFile)
             .ToArray();
-        string? lastProgressMessage = null;
-        int? lastProgressPercentage = null;
-        var progress = new CallbackProgress<DiskImageProgress>(update =>
-        {
-            var percentage = update.Percentage;
-            if (string.Equals(update.Message, lastProgressMessage, StringComparison.Ordinal)
-                && percentage == lastProgressPercentage)
-            {
-                return;
-            }
-
-            lastProgressMessage = update.Message;
-            lastProgressPercentage = percentage;
-            var suffix = percentage is int value ? $" ({value}%)" : string.Empty;
-            Console.Error.WriteLine(update.Message + suffix);
-        });
+        var progress = CreateThrottledDiskProgress();
         var result = await VirtualDiskCreationService.CreateAsync(
             new VirtualDiskCreationRequest(
                 outputPath,
@@ -298,6 +284,115 @@ internal static class Cli
             $"Created {result.ContainerFormat} disk: {result.DestinationPath} "
             + $"({result.CapacityBytes} bytes, {result.Partitions.Count} partition(s))");
         return 0;
+    }
+
+    private static async Task<int> RunEditAsync(string[] args, CancellationToken cancellationToken)
+    {
+        var options = ParsedOptions.Parse(
+            args,
+            ["partition", "operation", "path", "content", "destination", "output"]);
+        var operationName = options.Require("operation").ToLowerInvariant();
+        var virtualPath = options.Require("path");
+        var outputPath = Path.GetFullPath(options.Require("output"));
+        var outputExtension = Path.GetExtension(outputPath);
+        if (outputExtension.Equals(".qcow2", StringComparison.OrdinalIgnoreCase)
+            || outputExtension.Equals(".qcow", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new CliUsageException("editの出力はRAWイメージです。.rawまたは.img等の名前を指定してください。");
+        }
+
+        var edit = operationName switch
+        {
+            "write" => new PendingFileEdit(
+                FileEditOperationKind.WriteContent,
+                virtualPath,
+                RequireContentPath(options)),
+            "create-file" => new PendingFileEdit(
+                FileEditOperationKind.CreateFile,
+                virtualPath,
+                RequireContentPath(options)),
+            "delete-file" => new PendingFileEdit(FileEditOperationKind.DeleteFile, virtualPath),
+            "create-directory" => new PendingFileEdit(FileEditOperationKind.CreateDirectory, virtualPath),
+            "delete-directory" => new PendingFileEdit(FileEditOperationKind.DeleteDirectory, virtualPath),
+            "move" => new PendingFileEdit(
+                FileEditOperationKind.MoveEntry,
+                virtualPath,
+                DestinationVirtualPath: options.Require("destination")),
+            _ => throw new CliUsageException(
+                "--operationはwrite、create-file、delete-file、create-directory、delete-directory、moveのいずれかです。"),
+        };
+
+        ValidateEditOptionCombination(options, operationName);
+        using var context = OpenFileSystem(options, cancellationToken);
+        if (!FileEditBatchService.CanEdit(
+                context.Reader,
+                context.Partition,
+                context.FileSystem,
+                out var reason))
+        {
+            throw new NotSupportedException(reason);
+        }
+
+        var progress = CreateThrottledDiskProgress();
+        var result = await FileEditBatchService.ApplyToRawAsync(
+            context.Reader,
+            context.Partition,
+            context.FileSystem,
+            [edit],
+            outputPath,
+            progress,
+            cancellationToken);
+        Console.WriteLine(
+            $"Edited RAW created: {result.DestinationPath} "
+            + $"(operation={operationName}, modifiedPages={result.ModifiedPageCount:N0}, "
+            + $"logicalVolumeOutput={result.IsLogicalVolumeOutput})");
+        return 0;
+    }
+
+    private static string RequireContentPath(ParsedOptions options)
+    {
+        var path = Path.GetFullPath(options.Require("content"));
+        if (!File.Exists(path))
+        {
+            throw new FileNotFoundException("編集内容のホスト側ファイルが見つかりません。", path);
+        }
+
+        return path;
+    }
+
+    private static void ValidateEditOptionCombination(ParsedOptions options, string operationName)
+    {
+        var requiresContent = operationName is "write" or "create-file";
+        var requiresDestination = operationName == "move";
+        if (!requiresContent && options.Get("content") is not null)
+        {
+            throw new CliUsageException($"{operationName}では--contentを指定できません。");
+        }
+
+        if (!requiresDestination && options.Get("destination") is not null)
+        {
+            throw new CliUsageException($"{operationName}では--destinationを指定できません。");
+        }
+    }
+
+    private static IProgress<DiskImageProgress> CreateThrottledDiskProgress()
+    {
+        string? lastMessage = null;
+        int? lastPercentage = null;
+        return new CallbackProgress<DiskImageProgress>(update =>
+        {
+            var percentage = update.Percentage;
+            if (string.Equals(update.Message, lastMessage, StringComparison.Ordinal)
+                && percentage == lastPercentage)
+            {
+                return;
+            }
+
+            lastMessage = update.Message;
+            lastPercentage = percentage;
+            var suffix = percentage is int value ? $" ({value}%)" : string.Empty;
+            Console.Error.WriteLine(update.Message + suffix);
+        });
     }
 
     private static FileSystemContext OpenFileSystem(
@@ -318,7 +413,7 @@ internal static class Cli
             partition.FileSystem = FileSystemDetector.Detect(reader, partition, cancellationToken);
             var fileSystem = FileSystemDetector.TryOpen(reader, partition, out var error, cancellationToken)
                 ?? throw new InvalidDataException(error);
-            return new FileSystemContext(reader, fileSystem);
+            return new FileSystemContext(reader, partition, fileSystem);
         }
         catch
         {
@@ -459,22 +554,31 @@ internal static class Cli
               vdt create OUTPUT --size SIZE [--container raw|qcow2] [--table mbr|gpt]
                          --partition xfs|ext4|ntfs:SIZE[:LABEL[:NAME]] [--partition ...]
                          [--initial-file PARTITION_NUMBER=HOST_FILE] [...]
+              vdt edit IMAGE [--partition NUMBER] --operation OPERATION --path VIRTUAL_PATH
+                       [--content HOST_FILE] [--destination VIRTUAL_PATH] --output OUTPUT_RAW
 
             Size suffixes: KiB, MiB, GiB, TiB (or decimal KB, MB, GB, TB).
             NTFS, ext4, and XFS creation are fully managed and do not require WSL or native mkfs tools.
+            Edit operations: write, create-file, delete-file, create-directory, delete-directory, move.
+            edit never changes IMAGE; it writes and verifies a new RAW image.
             list displays at most 100,000 entries unless --max-entries is explicitly specified.
             Press Ctrl+C to cancel long-running operations safely.
             """);
     }
 
-    private sealed class FileSystemContext(IDiskImageReader reader, IReadOnlyFileSystem fileSystem) : IDisposable
+    private sealed class FileSystemContext(
+        IDiskImageReader reader,
+        PartitionInfo partition,
+        IReadOnlyFileSystem fileSystem) : IDisposable
     {
+        public IDiskImageReader Reader { get; } = reader;
+        public PartitionInfo Partition { get; } = partition;
         public IReadOnlyFileSystem FileSystem { get; } = fileSystem;
 
         public void Dispose()
         {
             (FileSystem as IDisposable)?.Dispose();
-            reader.Dispose();
+            Reader.Dispose();
         }
     }
 

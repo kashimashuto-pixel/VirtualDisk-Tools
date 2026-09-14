@@ -221,18 +221,21 @@ dotnet run --project src/VirtualDisk.Gui/VirtualDisk.Gui.csproj
 
 ［新規作成］では外部ツールなしでRAW／QCOW2、MBR／GPT、複数のNTFS／ext4／XFSパーティションと、各rootへ配置する初期ファイルを指定できます。長時間の作成・読込・抽出・検証は画面上からキャンセルできます。
 
-クロスプラットフォームCLI（`info`、`list`、`extract`、`create`）:
+クロスプラットフォームCLI（`info`、`list`、`verify`、`extract`、`create`、`edit`）:
 
 ```bash
 dotnet run --project src/VirtualDisk.Cli/VirtualDisk.Cli.csproj -- --help
 dotnet run --project src/VirtualDisk.Cli/VirtualDisk.Cli.csproj -- info disk.qcow2
 dotnet run --project src/VirtualDisk.Cli/VirtualDisk.Cli.csproj -- extract disk.qcow2 --partition 1 --path /etc --output extracted-etc
 dotnet run --project src/VirtualDisk.Cli/VirtualDisk.Cli.csproj -- create new.raw --size 512MiB --table gpt --partition xfs:320MiB:VDT_XFS --initial-file 1=README.md
+dotnet run --project src/VirtualDisk.Cli/VirtualDisk.Cli.csproj -- edit disk.qcow2 --partition 1 --operation create-file --path /NOTE.txt --content README.md --output edited.raw
 ```
 
 `extract`には通常ファイルまたはディレクトリを指定でき、ディレクトリは安全上限付きで再帰抽出します。読めない項目がある場合は可能な範囲を継続し、出力先の`VirtualDiskExplorer-copy-errors*.json`へ一覧を保存して終了コード3を返します。
 
 `list`は端末の応答停止を避けるため既定で100,000項目まで表示します。大規模ディレクトリを意図して全件表示する場合は`--max-entries NUMBER`で上限を明示できます。`create`の進捗は工程または1%の変化時だけ表示します。
+
+`edit`は一度に1操作を安全に適用し、原本とは別のRAWへ保存します。`write`、`create-file`、`delete-file`、`create-directory`、`delete-directory`、`move`に対応し、内容入力には`--content HOST_FILE`、移動先には`--destination VIRTUAL_PATH`を使います。出力は各操作直後と完成後に再読込検証され、失敗・キャンセル時は完成名へ公開されません。複数操作は前回の出力RAWを次の入力に指定してください。
 
 OS非依存のreader、filesystem、partition、作成処理は`VirtualDisk.Core`（`net10.0`）に分離されています。WinForms版は物理ディスク、ProjFSなどWindows固有機能をadapter側に残しつつ、同じ共通コアを利用します。
 
