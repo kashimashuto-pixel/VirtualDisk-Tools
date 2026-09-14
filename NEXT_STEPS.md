@@ -47,7 +47,7 @@
 
 - OS非依存のimage reader、filesystem、partition、作成処理を`VirtualDisk.Core`（`net10.0`）へ分離
 - Windows全機能版はWinFormsを維持し、物理ディスク／ProjFSなどをWindows adapter側に分離したまま共通コアを利用
-- Linuxを含むCLIで`info`、`list`、`extract`、RAW／QCOW2・MBR／GPT・XFS／ext4／NTFSの新規作成に対応
+- Linuxを含むCLIで`info`、`list`、`search`、`verify`、`extract`、実験的`edit`、RAW／QCOW2・MBR／GPT・XFS／ext4／NTFSの新規作成に対応
 - Avalonia共通GUIでイメージ作成／読込、パーティション／ディレクトリ閲覧、名前検索、プレビュー、ファイル／ディレクトリ抽出、全読込検証を実装
 - Windows／Ubuntu matrix CIで共通コア、CLI、Avalonia GUI、managed作成回帰をビルド・実行
 - NTFS、ext4、XFSをC#内部で直接初期化し、通常の新規作成からWSL、`mkfs.*`、`qemu-img`依存を除去

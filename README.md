@@ -226,6 +226,7 @@ dotnet run --project src/VirtualDisk.Gui/VirtualDisk.Gui.csproj
 ```bash
 dotnet run --project src/VirtualDisk.Cli/VirtualDisk.Cli.csproj -- --help
 dotnet run --project src/VirtualDisk.Cli/VirtualDisk.Cli.csproj -- info disk.qcow2
+dotnet run --project src/VirtualDisk.Cli/VirtualDisk.Cli.csproj -- search disk.qcow2 --partition 1 --query README
 dotnet run --project src/VirtualDisk.Cli/VirtualDisk.Cli.csproj -- extract disk.qcow2 --partition 1 --path /etc --output extracted-etc
 dotnet run --project src/VirtualDisk.Cli/VirtualDisk.Cli.csproj -- create new.raw --size 512MiB --table gpt --partition xfs:320MiB:VDT_XFS --initial-file 1=README.md
 dotnet run --project src/VirtualDisk.Cli/VirtualDisk.Cli.csproj -- edit disk.qcow2 --partition 1 --operation create-file --path /NOTE.txt --content README.md --output edited.raw

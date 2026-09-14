@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Text;
 using Qcow2Explorer.Core;
 using Qcow2Explorer.Creation;
 using Qcow2Explorer.FileSystems;
@@ -9,6 +10,8 @@ return await Cli.RunAsync(args);
 internal static class Cli
 {
     private const int DefaultMaximumListedEntries = 100_000;
+    private const int DefaultMaximumSearchResults = 5_000;
+    private const int MaximumSearchResults = 1_000_000;
 
     public static async Task<int> RunAsync(string[] args)
     {
@@ -37,6 +40,7 @@ internal static class Cli
             {
                 "info" => RunInfo(args[1..], cancellationSource.Token),
                 "list" => RunList(args[1..], cancellationSource.Token),
+                "search" => RunSearch(args[1..], cancellationSource.Token),
                 "verify" => RunVerify(args[1..], cancellationSource.Token),
                 "extract" => await RunExtractAsync(args[1..], cancellationSource.Token),
                 "create" => await RunCreateAsync(args[1..], cancellationSource.Token),
@@ -96,6 +100,57 @@ internal static class Cli
         return 0;
     }
 
+    private static int RunSearch(string[] args, CancellationToken cancellationToken)
+    {
+        var options = ParsedOptions.Parse(args, ["partition", "query", "max-results"]);
+        var query = options.Require("query");
+        if (string.IsNullOrWhiteSpace(query))
+        {
+            throw new CliUsageException("--queryには空白以外の検索文字列を指定してください。");
+        }
+
+        var maximumResults = options.GetInt32("max-results") ?? DefaultMaximumSearchResults;
+        if (maximumResults > MaximumSearchResults)
+        {
+            throw new CliUsageException($"--max-resultsには{MaximumSearchResults:N0}以下を指定してください。");
+        }
+
+        using var context = OpenFileSystem(options, cancellationToken);
+        var lastReportedDirectories = 0;
+        var progress = new CallbackProgress<int>(directories =>
+        {
+            if (directories - lastReportedDirectories < 1_000)
+            {
+                return;
+            }
+
+            lastReportedDirectories = directories;
+            Console.Error.WriteLine($"Searching: directories={directories:N0}");
+        });
+        var matches = FileSystemSearch.Search(
+            context.FileSystem,
+            query,
+            progress,
+            cancellationToken,
+            maximumResults);
+        foreach (var match in matches)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            Console.WriteLine(
+                $"{(match.Node.IsDirectory ? "d" : "-")} {match.Node.Size,14} "
+                + EscapeTerminalText(match.Path));
+        }
+
+        Console.Error.WriteLine($"Matches: {matches.Count:N0}");
+        if (matches.Count == maximumResults)
+        {
+            Console.Error.WriteLine(
+                $"Result limit reached ({maximumResults:N0}); use --max-results or a narrower query if needed.");
+        }
+
+        return 0;
+    }
+
     private static int RunList(string[] args, CancellationToken cancellationToken)
     {
         var options = ParsedOptions.Parse(args, ["partition", "path", "max-entries"]);
@@ -121,7 +176,8 @@ internal static class Cli
             cancellationToken.ThrowIfCancellationRequested();
             Console.WriteLine(
                 $"{(entry.IsDirectory ? "d" : "-")} {entry.Size,14} "
-                + $"{entry.ModifiedUtc?.ToString("u", CultureInfo.InvariantCulture) ?? "-",20} {entry.Name}");
+                + $"{entry.ModifiedUtc?.ToString("u", CultureInfo.InvariantCulture) ?? "-",20} "
+                + EscapeTerminalText(entry.Name));
         }
 
         return 0;
@@ -156,7 +212,7 @@ internal static class Cli
             }
 
             lastPercentage = percentage;
-            Console.Error.WriteLine($"Extracting: {percentage}% — {update.CurrentPath}");
+            Console.Error.WriteLine($"Extracting: {percentage}% — {EscapeTerminalText(update.CurrentPath)}");
         });
         if (file.IsDirectory)
         {
@@ -210,7 +266,7 @@ internal static class Cli
             lastReportedEntries = update.EntriesChecked;
             Console.Error.WriteLine(
                 $"Verifying: entries={update.EntriesChecked:N0}, files={update.FilesChecked:N0}, "
-                + $"bytes={update.BytesRead:N0}, path={update.CurrentPath}");
+                + $"bytes={update.BytesRead:N0}, path={EscapeTerminalText(update.CurrentPath)}");
         });
         var result = FileSystemVerifier.Verify(
             context.FileSystem,
@@ -225,7 +281,8 @@ internal static class Cli
         const int maximumDisplayedIssues = 100;
         foreach (var issue in result.Issues.Take(maximumDisplayedIssues))
         {
-            Console.Error.WriteLine($"  {issue.Path}: {issue.ErrorType}: {issue.Message}");
+            Console.Error.WriteLine(
+                $"  {EscapeTerminalText(issue.Path)}: {issue.ErrorType}: {EscapeTerminalText(issue.Message)}");
         }
 
         if (result.Issues.Count > maximumDisplayedIssues)
@@ -540,6 +597,25 @@ internal static class Cli
 
     private static bool IsHelp(string value) => value is "-h" or "--help" or "help";
 
+    private static string EscapeTerminalText(string value)
+    {
+        var output = new StringBuilder(value.Length);
+        foreach (var character in value)
+        {
+            if (char.IsControl(character)
+                || CharUnicodeInfo.GetUnicodeCategory(character) == UnicodeCategory.Format)
+            {
+                output.Append($"\\u{(int)character:X4}");
+            }
+            else
+            {
+                output.Append(character);
+            }
+        }
+
+        return output.ToString();
+    }
+
     private static void PrintHelp()
     {
         Console.WriteLine(
@@ -549,6 +625,7 @@ internal static class Cli
             Usage:
               vdt info IMAGE
               vdt list IMAGE [--partition NUMBER] [--path VIRTUAL_PATH] [--max-entries NUMBER]
+              vdt search IMAGE [--partition NUMBER] --query TEXT [--max-results NUMBER]
               vdt verify IMAGE [--partition NUMBER] [--path VIRTUAL_PATH]
               vdt extract IMAGE [--partition NUMBER] --path VIRTUAL_PATH --output FILE_OR_DIRECTORY
               vdt create OUTPUT --size SIZE [--container raw|qcow2] [--table mbr|gpt]
@@ -562,6 +639,7 @@ internal static class Cli
             Edit operations: write, create-file, delete-file, create-directory, delete-directory, move.
             edit never changes IMAGE; it writes and verifies a new RAW image.
             list displays at most 100,000 entries unless --max-entries is explicitly specified.
+            search displays at most 5,000 matches unless --max-results is explicitly specified.
             Press Ctrl+C to cancel long-running operations safely.
             """);
     }
