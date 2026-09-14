@@ -516,6 +516,7 @@ public sealed class LzopDiskImageReader : IDiskImageReader
 
     private bool TryLoadBlockIndex()
     {
+        _cancellationToken.ThrowIfCancellationRequested();
         var cachePath = GetIndexCachePath();
         if (!File.Exists(cachePath))
         {
@@ -552,11 +553,13 @@ public sealed class LzopDiskImageReader : IDiskImageReader
                 throw new InvalidDataException("LZO index cache has an invalid length or block count.");
             }
 
+            _cancellationToken.ThrowIfCancellationRequested();
             _blocks.Capacity = blockCount;
             long expectedRawOffset = 0;
             long previousCompressedEnd = _firstBlockOffset;
             for (var index = 0; index < blockCount; index++)
             {
+                _cancellationToken.ThrowIfCancellationRequested();
                 var block = new LzopBlock(
                     reader.ReadInt64(), reader.ReadInt32(), reader.ReadInt32(), reader.ReadInt64(),
                     ReadNullableUInt32(reader), ReadNullableUInt32(reader), ReadNullableUInt32(reader), ReadNullableUInt32(reader));
@@ -636,6 +639,7 @@ public sealed class LzopDiskImageReader : IDiskImageReader
                 writer.Write(_blocks.Count);
                 foreach (var block in _blocks)
                 {
+                    _cancellationToken.ThrowIfCancellationRequested();
                     writer.Write(block.UncompressedOffset);
                     writer.Write(block.UncompressedSize);
                     writer.Write(block.CompressedSize);
@@ -647,20 +651,31 @@ public sealed class LzopDiskImageReader : IDiskImageReader
                 }
             }
 
+            _cancellationToken.ThrowIfCancellationRequested();
             File.Move(temporaryPath, cachePath, overwrite: true);
             DiagnosticLog.Write($"LZO index cache saved: path={cachePath}, blocks={_blocks.Count}");
+        }
+        catch (OperationCanceledException)
+        {
+            TryDeletePartialIndex(temporaryPath);
+            throw;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or NotSupportedException)
         {
             DiagnosticLog.Write($"LZO index cache save failed: source={Path}, error={ex}");
-            try
-            {
-                File.Delete(temporaryPath);
-            }
-            catch (Exception cleanupEx) when (cleanupEx is IOException or UnauthorizedAccessException)
-            {
-                DiagnosticLog.Write($"LZO partial index cache cleanup failed: path={temporaryPath}, error={cleanupEx.Message}");
-            }
+            TryDeletePartialIndex(temporaryPath);
+        }
+    }
+
+    private static void TryDeletePartialIndex(string temporaryPath)
+    {
+        try
+        {
+            File.Delete(temporaryPath);
+        }
+        catch (Exception cleanupEx) when (cleanupEx is IOException or UnauthorizedAccessException)
+        {
+            DiagnosticLog.Write($"LZO partial index cache cleanup failed: path={temporaryPath}, error={cleanupEx.Message}");
         }
     }
 
@@ -671,17 +686,20 @@ public sealed class LzopDiskImageReader : IDiskImageReader
 
     private LzopIndexSourceIdentity GetSourceIdentity()
     {
+        _cancellationToken.ThrowIfCancellationRequested();
         var info = new FileInfo(Path);
         using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
         AppendFingerprint(hash, 0, Math.Min(LzopIndexCacheManager.FingerprintLength, _stream.Length));
         if (_stream.Length > LzopIndexCacheManager.FingerprintLength)
         {
+            _cancellationToken.ThrowIfCancellationRequested();
             AppendFingerprint(
                 hash,
                 _stream.Length - LzopIndexCacheManager.FingerprintLength,
                 LzopIndexCacheManager.FingerprintLength);
         }
 
+        _cancellationToken.ThrowIfCancellationRequested();
         return new LzopIndexSourceIdentity(info.FullName, info.Length, info.LastWriteTimeUtc.Ticks, hash.GetHashAndReset());
     }
 
