@@ -1690,6 +1690,33 @@ static void TestGeneratedEwfE01Image()
         Assert(crossing.AsSpan(0, 37).ToArray().All(value => value == 0xcc), "E01 buffer offset prefix");
     }
 
+    try
+    {
+        using var _ = EwfDiskImageReader.Open(firstSegmentPath, new CancellationToken(canceled: true));
+        Assert(false, "E01 segment discovery honors cancellation");
+    }
+    catch (OperationCanceledException)
+    {
+        // Expected.
+    }
+
+    var missingSegmentPath = Path.Combine(directory, "missing-segment.E01");
+    var thirdSegmentPath = Path.Combine(directory, "missing-segment.E03");
+    File.Copy(fixture.SegmentPaths[0], missingSegmentPath, overwrite: true);
+    var thirdSegment = File.ReadAllBytes(fixture.SegmentPaths[1]);
+    thirdSegment[9] = 3;
+    thirdSegment[10] = 0;
+    File.WriteAllBytes(thirdSegmentPath, thirdSegment);
+    try
+    {
+        using var _ = EwfDiskImageReader.Open(missingSegmentPath);
+        Assert(false, "E01 missing segment throws");
+    }
+    catch (InvalidDataException ex)
+    {
+        Assert(ex.Message.Contains("segment 2", StringComparison.Ordinal), "E01 missing segment diagnostic");
+    }
+
     var corruptChunkPath = Path.Combine(directory, "corrupt-chunk.E01");
     File.Copy(fixture.SegmentPaths[0], corruptChunkPath, overwrite: true);
     File.Copy(fixture.SegmentPaths[1], Path.Combine(directory, "corrupt-chunk.E02"), overwrite: true);

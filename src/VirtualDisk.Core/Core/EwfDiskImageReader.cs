@@ -23,7 +23,7 @@ public sealed class EwfDiskImageReader : IDiskImageReader
 
     private EwfDiskImageReader(string path, CancellationToken cancellationToken)
     {
-        var segmentPaths = DiscoverSegmentPaths(path);
+        var segmentPaths = DiscoverSegmentPaths(path, cancellationToken);
         try
         {
             foreach (var segmentPath in segmentPaths)
@@ -404,7 +404,9 @@ public sealed class EwfDiskImageReader : IDiskImageReader
         return result;
     }
 
-    private static IReadOnlyList<string> DiscoverSegmentPaths(string inputPath)
+    private static IReadOnlyList<string> DiscoverSegmentPaths(
+        string inputPath,
+        CancellationToken cancellationToken)
     {
         if (!File.Exists(inputPath))
         {
@@ -416,6 +418,7 @@ public sealed class EwfDiskImageReader : IDiskImageReader
         var header = new byte[FileHeaderSize];
         foreach (var candidate in Directory.EnumerateFiles(directory, $"{stem}.*", SearchOption.TopDirectoryOnly))
         {
+            cancellationToken.ThrowIfCancellationRequested();
             using var stream = new FileStream(candidate, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
             Array.Clear(header);
             if (stream.Read(header) != header.Length || !header[..EwfMagic.Length].SequenceEqual(EwfMagic)
@@ -433,9 +436,9 @@ public sealed class EwfDiskImageReader : IDiskImageReader
         {
             throw new InvalidDataException("EWF segment 1が見つかりません。");
         }
-        for (ushort number = 1; number <= candidates.Count; number++)
+        for (var number = 1; number <= candidates.Count; number++)
         {
-            if (!candidates.ContainsKey(number))
+            if (!candidates.ContainsKey(checked((ushort)number)))
             {
                 throw new InvalidDataException($"EWF segment {number}が欠落しています。");
             }
