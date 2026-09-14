@@ -16,7 +16,8 @@ public sealed record CopyProgress(
 public sealed record CopyOptions(
     bool ContinueOnError = true,
     int MaximumDepth = 256,
-    int MaximumEntries = 1_000_000);
+    int MaximumEntries = 1_000_000,
+    int MaximumErrors = 10_000);
 
 public sealed record CopyError(string SourceName, string DestinationPath, string Message);
 
@@ -153,13 +154,13 @@ public static class FileSystemExporter
                 new TraversalState(options),
                 depth: 0));
         var traversal = new TraversalState(options);
-        var result = CopyResult.Empty;
+        var result = new CopyAccumulator(options.MaximumErrors);
         foreach (var node in nodeList)
         {
             cancellationToken.ThrowIfCancellationRequested();
             try
             {
-                result = result.Add(CopyNodeCore(
+                CopyNodeCore(
                     fileSystem,
                     node,
                     destinationDirectory,
@@ -167,17 +168,19 @@ public static class FileSystemExporter
                     cancellationToken,
                     options,
                     traversal,
-                    depth: 0));
+                    result,
+                    depth: 0);
             }
             catch (Exception ex) when (CanContinueAfter(ex, options))
             {
-                result = result.Add(ErrorResult(node, destinationDirectory, ex));
+                result.AddError(node, destinationDirectory, ex);
             }
         }
 
-        WriteResultFiles(destinationDirectory, result);
+        var copyResult = result.ToResult();
+        WriteResultFiles(destinationDirectory, copyResult);
 
-        return result;
+        return copyResult;
     }
 
     public static CopyResult CopyNode(
@@ -192,7 +195,8 @@ public static class FileSystemExporter
         var progressState = new CopyProgressState(
             progress,
             CalculateTotalBytes(fileSystem, [node], cancellationToken, options, totalTraversal, depth: 0));
-        return CopyNodeCore(
+        var result = new CopyAccumulator(options.MaximumErrors);
+        CopyNodeCore(
             fileSystem,
             node,
             destinationDirectory,
@@ -200,10 +204,12 @@ public static class FileSystemExporter
             cancellationToken,
             options,
             new TraversalState(options),
+            result,
             depth: 0);
+        return result.ToResult();
     }
 
-    private static CopyResult CopyNodeCore(
+    private static void CopyNodeCore(
         IReadOnlyFileSystem fileSystem,
         VfsNode node,
         string destinationDirectory,
@@ -211,10 +217,12 @@ public static class FileSystemExporter
         CancellationToken cancellationToken = default,
         CopyOptions? options = null,
         TraversalState? traversal = null,
+        CopyAccumulator? result = null,
         int depth = 0)
     {
         options ??= new CopyOptions();
         traversal ??= new TraversalState(options);
+        result ??= new CopyAccumulator(options.MaximumErrors);
         traversal.Visit(depth);
         if (!node.IsDirectory && node.Size < 0)
         {
@@ -224,12 +232,17 @@ public static class FileSystemExporter
         Directory.CreateDirectory(destinationDirectory);
         var targetName = string.IsNullOrWhiteSpace(node.Name) ? "root" : SanitizeFileName(node.Name);
         var targetPath = GetAvailablePath(Path.Combine(destinationDirectory, targetName), node.IsDirectory);
-        return node.IsDirectory
-            ? CopyDirectory(fileSystem, node, targetPath, progress, cancellationToken, options, traversal, depth)
-            : CopyFile(fileSystem, node, targetPath, progress, cancellationToken);
+        if (node.IsDirectory)
+        {
+            CopyDirectory(fileSystem, node, targetPath, progress, cancellationToken, options, traversal, result, depth);
+        }
+        else
+        {
+            CopyFile(fileSystem, node, targetPath, progress, cancellationToken, result);
+        }
     }
 
-    private static CopyResult CopyDirectory(
+    private static void CopyDirectory(
         IReadOnlyFileSystem fileSystem,
         VfsNode directory,
         string destinationPath,
@@ -237,11 +250,12 @@ public static class FileSystemExporter
         CancellationToken cancellationToken,
         CopyOptions options,
         TraversalState traversal,
+        CopyAccumulator result,
         int depth)
     {
         using var directoryScope = traversal.EnterDirectory(directory);
         Directory.CreateDirectory(destinationPath);
-        var result = new CopyResult(0, 1, 0, Array.Empty<CopyError>());
+        result.AddDirectory();
         progress.Report(destinationPath, bytesCopied: 0, filesCopied: 0, directoriesCreated: 1);
 
         foreach (var child in fileSystem.ListDirectory(directory))
@@ -254,7 +268,7 @@ public static class FileSystemExporter
 
             try
             {
-                result = result.Add(CopyNodeCore(
+                CopyNodeCore(
                     fileSystem,
                     child,
                     destinationPath,
@@ -262,11 +276,12 @@ public static class FileSystemExporter
                     cancellationToken,
                     options,
                     traversal,
-                    checked(depth + 1)));
+                    result,
+                    checked(depth + 1));
             }
             catch (Exception ex) when (CanContinueAfter(ex, options))
             {
-                result = result.Add(ErrorResult(child, destinationPath, ex));
+                result.AddError(child, destinationPath, ex);
             }
         }
 
@@ -274,16 +289,15 @@ public static class FileSystemExporter
         {
             TrySetLastWriteTime(destinationPath, directory.ModifiedUtc.Value, isDirectory: true);
         }
-
-        return result;
     }
 
-    private static CopyResult CopyFile(
+    private static void CopyFile(
         IReadOnlyFileSystem fileSystem,
         VfsNode file,
         string destinationPath,
         CopyProgressState progress,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        CopyAccumulator result)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(destinationPath) ?? ".");
 
@@ -336,7 +350,7 @@ public static class FileSystemExporter
             progress.Report(destinationPath, bytesCopied: 0, filesCopied: 1, directoriesCreated: 0);
         }
 
-        return new CopyResult(1, 0, file.Size, Array.Empty<CopyError>());
+        result.AddFile(file.Size);
     }
 
     private static long CalculateTotalBytes(
@@ -415,18 +429,12 @@ public static class FileSystemExporter
 
     private static void ValidateOptions(CopyOptions options)
     {
-        if (options.MaximumDepth < 1 || options.MaximumEntries < 1)
+        if (options.MaximumDepth < 1 || options.MaximumEntries < 1 || options.MaximumErrors < 1)
         {
             throw new ArgumentOutOfRangeException(
                 nameof(options),
-                "エクスポートの最大深度と最大項目数には正の整数を指定してください。");
+                "エクスポートの最大深度、最大項目数、最大エラー数には正の整数を指定してください。");
         }
-    }
-
-    private static CopyResult ErrorResult(VfsNode node, string destinationPath, Exception exception)
-    {
-        return new CopyResult(0, 0, 0,
-            new[] { new CopyError(node.DisplayName, destinationPath, exception.Message) });
     }
 
     private static void WriteResultFiles(string destinationDirectory, CopyResult result)
@@ -549,6 +557,36 @@ public static class FileSystemExporter
                 _directoriesCreated,
                 _stopwatch.Elapsed));
         }
+    }
+
+    private sealed class CopyAccumulator(int maximumErrors)
+    {
+        private readonly List<CopyError> _errors = new();
+        private int _filesCopied;
+        private int _directoriesCreated;
+        private long _bytesCopied;
+
+        public void AddDirectory() => _directoriesCreated++;
+
+        public void AddFile(long bytes)
+        {
+            _filesCopied++;
+            _bytesCopied = AddSaturating(_bytesCopied, bytes);
+        }
+
+        public void AddError(VfsNode node, string destinationPath, Exception exception)
+        {
+            if (_errors.Count >= maximumErrors)
+            {
+                throw new TraversalLimitException(
+                    $"エクスポートのエラー数が上限 ({maximumErrors:N0}) を超えています。");
+            }
+
+            _errors.Add(new CopyError(node.DisplayName, destinationPath, exception.Message));
+        }
+
+        public CopyResult ToResult() =>
+            new(_filesCopied, _directoriesCreated, _bytesCopied, _errors.ToArray());
     }
 
     private sealed class TraversalState(CopyOptions options)

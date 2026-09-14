@@ -9,6 +9,7 @@ internal static class ExportTraversalRobustnessTests
         TestDepthLimit(directory);
         TestEntryLimit(directory);
         TestTopLevelEnumerationLimit(directory);
+        TestErrorLimit(directory);
     }
 
     private static void TestDirectoryCycleIsReported(string directory)
@@ -56,6 +57,17 @@ internal static class ExportTraversalRobustnessTests
             Path.Combine(directory, "infinite-export"),
             options: new CopyOptions(MaximumEntries: 3)));
         Assert(exception.Message.Contains("対象数", StringComparison.Ordinal), "top-level enumeration-limit diagnostic");
+    }
+
+    private static void TestErrorLimit(string directory)
+    {
+        var fileSystem = new InvalidFileSystem(entryCount: 16);
+        var exception = AssertThrows<NotSupportedException>(() => FileSystemExporter.CopyNodes(
+            fileSystem,
+            [fileSystem.Root],
+            Path.Combine(directory, "error-limit-export"),
+            options: new CopyOptions(MaximumEntries: 100, MaximumErrors: 3)));
+        Assert(exception.Message.Contains("エラー数", StringComparison.Ordinal), "export error-limit diagnostic");
     }
 
     private static IEnumerable<VfsNode> InfiniteFiles()
@@ -150,6 +162,30 @@ internal static class ExportTraversalRobustnessTests
         public WideFileSystem(int entryCount)
         {
             _entries = Enumerable.Range(0, entryCount).Select(index => FileNode($"wide-{index}")).ToArray();
+        }
+
+        public override VfsNode Root { get; } = new()
+        {
+            Name = "root",
+            VirtualPath = "/",
+            IsDirectory = true
+        };
+
+        public override IReadOnlyList<VfsNode> ListDirectory(VfsNode directory) => _entries;
+    }
+
+    private sealed class InvalidFileSystem : TestFileSystem
+    {
+        private readonly IReadOnlyList<VfsNode> _entries;
+
+        public InvalidFileSystem(int entryCount)
+        {
+            _entries = Enumerable.Range(0, entryCount).Select(index => new VfsNode
+            {
+                Name = $"invalid-{index}",
+                VirtualPath = $"/invalid-{index}",
+                Size = -1
+            }).ToArray();
         }
 
         public override VfsNode Root { get; } = new()
