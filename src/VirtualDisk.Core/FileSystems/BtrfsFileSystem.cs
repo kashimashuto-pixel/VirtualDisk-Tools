@@ -85,14 +85,31 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
     private readonly Dictionary<ulong, uint> _dataChecksums = [];
     private readonly BoundedLruCache<BtrfsCompressedExtentKey, byte[]> _decodedExtentCache =
         new(MaximumDecodedExtentCacheBytes, value => value.LongLength);
+    private readonly CancellationToken _initializationCancellationToken;
     private IReadOnlyList<ulong> _missingDeviceIds = [];
 
     public BtrfsFileSystem(IBlockReader reader, PartitionInfo partition)
-        : this([reader], partition)
+        : this([reader], partition, default)
+    {
+    }
+
+    public BtrfsFileSystem(
+        IBlockReader reader,
+        PartitionInfo partition,
+        CancellationToken cancellationToken)
+        : this([reader], partition, cancellationToken)
     {
     }
 
     public BtrfsFileSystem(IReadOnlyList<IBlockReader> readers, PartitionInfo partition)
+        : this(readers, partition, default)
+    {
+    }
+
+    public BtrfsFileSystem(
+        IReadOnlyList<IBlockReader> readers,
+        PartitionInfo partition,
+        CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(readers);
         if (readers.Count == 0)
@@ -100,9 +117,15 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
             throw new ArgumentException("Btrfs device readerを1個以上指定してください。", nameof(readers));
         }
 
+        _initializationCancellationToken = cancellationToken;
+        cancellationToken.ThrowIfCancellationRequested();
         Partition = partition;
         var selectedSuperblocks = readers
-            .Select(reader => (Reader: reader, Superblock: SelectSuperblock(reader)))
+            .Select(reader =>
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                return (Reader: reader, Superblock: SelectSuperblock(reader));
+            })
             .ToArray();
         var superblock = selectedSuperblocks[0].Superblock;
         _fileSystemId = superblock.AsSpan(0x20, 16).ToArray();
@@ -112,6 +135,7 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
 
         foreach (var candidate in selectedSuperblocks)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             RegisterDevice(candidate.Reader, candidate.Superblock, numberOfDevices);
             if (!ReferenceEquals(candidate.Superblock, superblock)
                 && !HaveMatchingSuperblockState(superblock, candidate.Superblock))
@@ -133,6 +157,7 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
             chunkTreeLevel,
             chunkTreeGeneration))
         {
+            cancellationToken.ThrowIfCancellationRequested();
             if (item.Key.Type == DeviceItemKey)
             {
                 AddDeviceItem(ParseDeviceItem(item));
@@ -163,6 +188,7 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
 
         foreach (var treeId in reachableTreeIds)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var treeRoot = fileSystemRoots[treeId];
             _rootDirectoryIds.Add(treeId, treeRoot.RootDirectoryId);
             var fileSystemItems = ReadTreeItems(
@@ -975,6 +1001,7 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
         pending.Push(new BtrfsTreePointer(rootBytenr, expectedLevel, expectedGeneration));
         while (pending.Count > 0)
         {
+            _initializationCancellationToken.ThrowIfCancellationRequested();
             if (visited.Count >= MaximumTreeBlocks)
             {
                 throw new NotSupportedException("Btrfs tree block数が安全上限を超えています。");
@@ -1010,6 +1037,7 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
                 BtrfsKey? previousKey = null;
                 for (var index = checked((int)itemCount) - 1; index >= 0; index--)
                 {
+                    _initializationCancellationToken.ThrowIfCancellationRequested();
                     var offset = TreeHeaderSize + index * KeyPointerSize;
                     var key = ReadKey(block, offset);
                     if (previousKey is not null && CompareKeys(key, previousKey) >= 0)
@@ -1122,6 +1150,7 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
         BtrfsKey? previousKey = null;
         for (var index = 0; index < itemCount; index++)
         {
+            _initializationCancellationToken.ThrowIfCancellationRequested();
             var offset = TreeHeaderSize + index * LeafItemSize;
             var key = ReadKey(block, offset);
             if (previousKey is not null && CompareKeys(previousKey, key) >= 0)
@@ -1157,6 +1186,7 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
     {
         foreach (var item in items.Where(item => item.Key.Type == InodeItemKey))
         {
+            _initializationCancellationToken.ThrowIfCancellationRequested();
             if (item.Data.Length < 160)
             {
                 throw new InvalidDataException("Btrfs inode itemが短すぎます。");
@@ -1170,6 +1200,7 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
 
         foreach (var item in items.Where(item => item.Key.Type == DirectoryIndexKey))
         {
+            _initializationCancellationToken.ThrowIfCancellationRequested();
             var entries = ParseDirectoryEntries(item.Data, item.Key.Offset);
             var reference = new BtrfsObjectReference(treeId, item.Key.ObjectId);
             if (!_directories.TryGetValue(reference, out var directoryEntries))
@@ -1183,6 +1214,7 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
 
         foreach (var item in items.Where(item => item.Key.Type == ExtentDataKey))
         {
+            _initializationCancellationToken.ThrowIfCancellationRequested();
             var extent = ParseFileExtent(item);
             var reference = new BtrfsObjectReference(treeId, item.Key.ObjectId);
             if (!_fileExtents.TryGetValue(reference, out var extents))
@@ -1196,6 +1228,7 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
 
         foreach (var pair in _fileExtents)
         {
+            _initializationCancellationToken.ThrowIfCancellationRequested();
             pair.Value.Sort((left, right) => left.FileOffset.CompareTo(right.FileOffset));
             ulong previousEnd = 0;
             for (var index = 0; index < pair.Value.Count; index++)
@@ -1360,6 +1393,7 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
         foreach (var item in items.Where(item =>
                      item.Key.ObjectId == ExtentChecksumObjectId && item.Key.Type == ExtentChecksumKey))
         {
+            _initializationCancellationToken.ThrowIfCancellationRequested();
             if (item.Key.Offset % (ulong)_sectorSize != 0 || item.Data.Length == 0 || item.Data.Length % sizeof(uint) != 0)
             {
                 throw new InvalidDataException("Btrfs extent checksum itemの範囲が不正です。");

@@ -243,7 +243,7 @@ internal static class Cli
                 : partitions.SingleOrDefault(candidate => candidate.Number == partitionNumber.Value)
                     ?? throw new CliUsageException($"パーティション#{partitionNumber}が見つかりません。");
             partition.FileSystem = FileSystemDetector.Detect(reader, partition, cancellationToken);
-            var fileSystem = FileSystemDetector.TryOpen(reader, partition, out var error)
+            var fileSystem = FileSystemDetector.TryOpen(reader, partition, out var error, cancellationToken)
                 ?? throw new InvalidDataException(error);
             return new FileSystemContext(reader, fileSystem);
         }

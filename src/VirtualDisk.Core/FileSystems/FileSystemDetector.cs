@@ -261,7 +261,11 @@ public static class FileSystemDetector
         return EndianUtilities.ReadUInt32Little(buffer, 0) == 0xa92b4efc;
     }
 
-    public static IReadOnlyFileSystem? TryOpen(IBlockReader disk, PartitionInfo partition, out string error)
+    public static IReadOnlyFileSystem? TryOpen(
+        IBlockReader disk,
+        PartitionInfo partition,
+        out string error,
+        CancellationToken cancellationToken = default)
     {
         return TryOpenCore(
             disk,
@@ -270,7 +274,8 @@ public static class FileSystemDetector
             ReadOnlySpan<char>.Empty,
             null,
             ReadOnlySpan<char>.Empty,
-            out error);
+            out error,
+            cancellationToken);
     }
 
     public static IReadOnlyFileSystem? TryOpen(
@@ -345,18 +350,20 @@ public static class FileSystemDetector
         ReadOnlySpan<char> password,
         BitLockerStartupKey? startupKey,
         ReadOnlySpan<char> luksPassphrase,
-        out string error)
+        out string error,
+        CancellationToken cancellationToken = default)
     {
         error = "";
         try
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var detected = string.IsNullOrWhiteSpace(partition.FileSystem)
-                ? Detect(disk, partition)
+                ? Detect(disk, partition, cancellationToken)
                 : partition.FileSystem;
             partition.FileSystem = detected;
             var slice = new PartitionSliceReader(disk, partition);
 
-            var fileSystem = OpenSupportedFileSystem(disk, partition, detected);
+            var fileSystem = OpenSupportedFileSystem(disk, partition, detected, cancellationToken);
             if (fileSystem is not null)
             {
                 return fileSystem;
@@ -419,7 +426,11 @@ public static class FileSystemDetector
                                 LengthOverrideBytes = decryptedReader.Length
                             };
                             innerPartition.FileSystem = Detect(decryptedReader, innerPartition);
-                            var innerFileSystem = OpenSupportedFileSystem(decryptedReader, innerPartition, innerPartition.FileSystem);
+                            var innerFileSystem = OpenSupportedFileSystem(
+                                decryptedReader,
+                                innerPartition,
+                                innerPartition.FileSystem,
+                                cancellationToken);
                             if (innerFileSystem is not null)
                             {
                                 partition.FileSystem = $"BitLocker/FVE -> {innerPartition.FileSystem}";
@@ -508,7 +519,11 @@ public static class FileSystemDetector
                         LengthOverrideBytes = decryptedReader.Length
                     };
                     innerPartition.FileSystem = Detect(decryptedReader, innerPartition);
-                    var innerFileSystem = OpenSupportedFileSystem(decryptedReader, innerPartition, innerPartition.FileSystem);
+                    var innerFileSystem = OpenSupportedFileSystem(
+                        decryptedReader,
+                        innerPartition,
+                        innerPartition.FileSystem,
+                        cancellationToken);
                     if (innerFileSystem is null)
                     {
                         error = $"LUKS1の解除は成功しましたが、内部ファイルシステムを開けませんでした: {innerPartition.FileSystem}";
@@ -587,7 +602,11 @@ public static class FileSystemDetector
                         LengthOverrideBytes = decryptedReader.Length
                     };
                     innerPartition.FileSystem = Detect(decryptedReader, innerPartition);
-                    var innerFileSystem = OpenSupportedFileSystem(decryptedReader, innerPartition, innerPartition.FileSystem);
+                    var innerFileSystem = OpenSupportedFileSystem(
+                        decryptedReader,
+                        innerPartition,
+                        innerPartition.FileSystem,
+                        cancellationToken);
                     if (innerFileSystem is null)
                     {
                         error = $"LUKS2の解除は成功しましたが、内部ファイルシステムを開けませんでした: {innerPartition.FileSystem}";
@@ -625,7 +644,11 @@ public static class FileSystemDetector
         }
     }
 
-    private static IReadOnlyFileSystem? OpenSupportedFileSystem(IBlockReader disk, PartitionInfo partition, string detected)
+    private static IReadOnlyFileSystem? OpenSupportedFileSystem(
+        IBlockReader disk,
+        PartitionInfo partition,
+        string detected,
+        CancellationToken cancellationToken)
     {
         var slice = new PartitionSliceReader(disk, partition);
 
@@ -675,7 +698,7 @@ public static class FileSystemDetector
 
         if (detected == "Btrfs")
         {
-            return new BtrfsFileSystem(slice, partition);
+            return new BtrfsFileSystem(slice, partition, cancellationToken);
         }
 
         return null;

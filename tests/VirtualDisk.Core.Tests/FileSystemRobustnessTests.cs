@@ -10,6 +10,7 @@ internal static class FileSystemRobustnessTests
         TestNtfsResidentLengthBounds();
         TestExtGeometryBounds(directory);
         TestXfsGeometryBounds(directory);
+        TestBtrfsInitializationCancellation(directory);
     }
 
     private static void TestNtfsResidentLengthBounds()
@@ -65,6 +66,34 @@ internal static class FileSystemRobustnessTests
         var lengthPath = Path.Combine(directory, "xfs-out-of-range-blocks.raw");
         WriteXfsSuperblock(lengthPath, blockSize: 4096, blockSizeLog2: 12, dataBlocks: 257);
         AssertXfsRejected<InvalidDataException>(lengthPath, "XFS data blocks beyond input");
+    }
+
+    private static void TestBtrfsInitializationCancellation(string directory)
+    {
+        var path = Path.Combine(directory, "btrfs-cancel-initialization.raw");
+        using (var stream = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+        {
+            stream.SetLength(128 * 1024);
+        }
+
+        using var reader = new RawDiskImageReader(path);
+        var partition = new PartitionInfo
+        {
+            Number = 1,
+            Scheme = "RAW",
+            Name = "cancel",
+            SectorCount = checked((ulong)(reader.Length / 512)),
+            FileSystem = "Btrfs",
+        };
+        using var cancellationSource = new CancellationTokenSource();
+        cancellationSource.Cancel();
+        AssertThrows<OperationCanceledException>(
+            () => _ = FileSystemDetector.TryOpen(
+                reader,
+                partition,
+                out _,
+                cancellationSource.Token),
+            "Btrfs initialization cancellation propagated");
     }
 
     private static void WriteExtSuperblock(

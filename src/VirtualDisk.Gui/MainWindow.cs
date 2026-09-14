@@ -315,7 +315,11 @@ public sealed class MainWindow : Window
             var opened = await Task.Run(() =>
             {
                 operation.Token.ThrowIfCancellationRequested();
-                var fileSystem = FileSystemDetector.TryOpen(reader, selected.Partition, out var error);
+                var fileSystem = FileSystemDetector.TryOpen(
+                    reader,
+                    selected.Partition,
+                    out var error,
+                    operation.Token);
                 if (operation.Token.IsCancellationRequested)
                 {
                     (fileSystem as IDisposable)?.Dispose();

@@ -356,7 +356,7 @@ public static class VirtualDiskCreationService
                     + $" 検出結果: {actual.FileSystem}");
             }
 
-            var readable = FileSystemDetector.TryOpen(reader, actual, out var error);
+            var readable = FileSystemDetector.TryOpen(reader, actual, out var error, cancellationToken);
             if (readable is null)
             {
                 throw new InvalidDataException(
