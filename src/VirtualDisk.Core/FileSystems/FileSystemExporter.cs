@@ -155,6 +155,7 @@ public static class FileSystemExporter
                 new TraversalState(options),
                 depth: 0));
         var traversal = new TraversalState(options);
+        var pathAllocator = new DestinationPathAllocator();
         var result = new CopyAccumulator(options.MaximumErrors);
         foreach (var node in nodeList)
         {
@@ -169,6 +170,7 @@ public static class FileSystemExporter
                     cancellationToken,
                     options,
                     traversal,
+                    pathAllocator,
                     result,
                     depth: 0);
             }
@@ -197,6 +199,7 @@ public static class FileSystemExporter
             progress,
             CalculateTotalBytes(fileSystem, [node], cancellationToken, options, totalTraversal, depth: 0));
         var result = new CopyAccumulator(options.MaximumErrors);
+        var pathAllocator = new DestinationPathAllocator();
         CopyNodeCore(
             fileSystem,
             node,
@@ -205,6 +208,7 @@ public static class FileSystemExporter
             cancellationToken,
             options,
             new TraversalState(options),
+            pathAllocator,
             result,
             depth: 0);
         return result.ToResult();
@@ -218,11 +222,13 @@ public static class FileSystemExporter
         CancellationToken cancellationToken = default,
         CopyOptions? options = null,
         TraversalState? traversal = null,
+        DestinationPathAllocator? pathAllocator = null,
         CopyAccumulator? result = null,
         int depth = 0)
     {
         options ??= new CopyOptions();
         traversal ??= new TraversalState(options);
+        pathAllocator ??= new DestinationPathAllocator();
         result ??= new CopyAccumulator(options.MaximumErrors);
         traversal.Visit(depth);
         if (!node.IsDirectory && node.Size < 0)
@@ -232,10 +238,23 @@ public static class FileSystemExporter
 
         Directory.CreateDirectory(destinationDirectory);
         var targetName = string.IsNullOrWhiteSpace(node.Name) ? "root" : SanitizeFileName(node.Name);
-        var targetPath = GetAvailablePath(Path.Combine(destinationDirectory, targetName), node.IsDirectory);
+        var targetPath = pathAllocator.Allocate(
+            Path.Combine(destinationDirectory, targetName),
+            node.IsDirectory,
+            cancellationToken);
         if (node.IsDirectory)
         {
-            CopyDirectory(fileSystem, node, targetPath, progress, cancellationToken, options, traversal, result, depth);
+            CopyDirectory(
+                fileSystem,
+                node,
+                targetPath,
+                progress,
+                cancellationToken,
+                options,
+                traversal,
+                pathAllocator,
+                result,
+                depth);
         }
         else
         {
@@ -251,6 +270,7 @@ public static class FileSystemExporter
         CancellationToken cancellationToken,
         CopyOptions options,
         TraversalState traversal,
+        DestinationPathAllocator pathAllocator,
         CopyAccumulator result,
         int depth)
     {
@@ -277,6 +297,7 @@ public static class FileSystemExporter
                     cancellationToken,
                     options,
                     traversal,
+                    pathAllocator,
                     result,
                     checked(depth + 1));
             }
@@ -449,9 +470,10 @@ public static class FileSystemExporter
         if (result.Errors.Count > 0)
         {
             var json = JsonSerializer.Serialize(result.Errors, new JsonSerializerOptions { WriteIndented = true });
-            var errorPath = GetAvailablePath(
+            var errorPath = new DestinationPathAllocator().Allocate(
                 Path.Combine(destinationDirectory, "VirtualDiskExplorer-copy-errors.json"),
-                isDirectory: false);
+                isDirectory: false,
+                CancellationToken.None);
             File.WriteAllText(errorPath, json, new UTF8Encoding(false));
         }
     }
@@ -496,29 +518,47 @@ public static class FileSystemExporter
         }
     }
 
-    private static string GetAvailablePath(string path, bool isDirectory)
+    private sealed class DestinationPathAllocator
     {
-        if (!Exists(path, isDirectory))
-        {
-            return path;
-        }
+        private readonly Dictionary<string, int> _nextSuffixByPath = new(
+            OperatingSystem.IsLinux() ? StringComparer.Ordinal : StringComparer.OrdinalIgnoreCase);
 
-        var directory = Path.GetDirectoryName(path) ?? "";
-        var fileName = Path.GetFileNameWithoutExtension(path);
-        var extension = isDirectory ? "" : Path.GetExtension(path);
-        for (var i = 2; ; i++)
+        public string Allocate(string path, bool isDirectory, CancellationToken cancellationToken)
         {
-            var candidate = Path.Combine(directory, $"{fileName} ({i}){extension}");
-            if (!Exists(candidate, isDirectory))
+            cancellationToken.ThrowIfCancellationRequested();
+            var key = $"{(isDirectory ? 'D' : 'F')}\0{path}";
+            if (!Exists(path))
             {
-                return candidate;
+                return path;
+            }
+
+            var directory = Path.GetDirectoryName(path) ?? "";
+            var fileName = Path.GetFileNameWithoutExtension(path);
+            var extension = isDirectory ? "" : Path.GetExtension(path);
+            var index = _nextSuffixByPath.TryGetValue(key, out var nextIndex) ? nextIndex : 2;
+            while (true)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var candidate = Path.Combine(directory, $"{fileName} ({index}){extension}");
+                if (!Exists(candidate))
+                {
+                    _nextSuffixByPath[key] = index == int.MaxValue
+                        ? int.MaxValue
+                        : index + 1;
+                    return candidate;
+                }
+
+                if (index == int.MaxValue)
+                {
+                    throw new NotSupportedException("同名出力の連番が対応上限を超えています。");
+                }
+
+                index++;
             }
         }
 
-        static bool Exists(string candidate, bool directory)
-        {
-            return directory ? Directory.Exists(candidate) || File.Exists(candidate) : File.Exists(candidate) || Directory.Exists(candidate);
-        }
+        private static bool Exists(string candidate) =>
+            File.Exists(candidate) || Directory.Exists(candidate);
     }
 
     private static string SanitizeFileName(string name)

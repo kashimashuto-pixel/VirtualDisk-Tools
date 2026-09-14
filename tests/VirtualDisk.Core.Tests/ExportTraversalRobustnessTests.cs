@@ -11,6 +11,7 @@ internal static class ExportTraversalRobustnessTests
         TestTopLevelEnumerationLimit(directory);
         TestErrorLimit(directory);
         TestUnexpectedFailuresPropagate(directory);
+        TestDuplicateNamesUseStableSuffixes(directory);
         TestErrorReportDoesNotOverwriteExtractedFile(directory);
     }
 
@@ -79,6 +80,21 @@ internal static class ExportTraversalRobustnessTests
             fileSystem,
             [fileSystem.Root],
             Path.Combine(directory, "unexpected-failure-export")));
+    }
+
+    private static void TestDuplicateNamesUseStableSuffixes(string directory)
+    {
+        const int count = 128;
+        var fileSystem = new DuplicateNameFileSystem(count);
+        var destination = Path.Combine(directory, "duplicate-name-export");
+        var result = FileSystemExporter.CopyNodes(
+            fileSystem,
+            fileSystem.ListDirectory(fileSystem.Root),
+            destination);
+        Assert(result.FilesCopied == count, "duplicate-name export copies every entry");
+        Assert(Directory.EnumerateFiles(destination).Count() == count, "duplicate-name export creates unique files");
+        Assert(File.Exists(Path.Combine(destination, "duplicate.bin")), "duplicate-name export keeps base name");
+        Assert(File.Exists(Path.Combine(destination, $"duplicate ({count}).bin")), "duplicate-name export increments suffix");
     }
 
     private static void TestErrorReportDoesNotOverwriteExtractedFile(string directory)
@@ -243,5 +259,26 @@ internal static class ExportTraversalRobustnessTests
 
         public override IReadOnlyList<VfsNode> ListDirectory(VfsNode directory) =>
             throw new InvalidOperationException("simulated implementation failure");
+    }
+
+    private sealed class DuplicateNameFileSystem : TestFileSystem
+    {
+        private readonly IReadOnlyList<VfsNode> _entries;
+
+        public DuplicateNameFileSystem(int count)
+        {
+            _entries = Enumerable.Range(0, count)
+                .Select(_ => FileNode("duplicate.bin"))
+                .ToArray();
+        }
+
+        public override VfsNode Root { get; } = new()
+        {
+            Name = "root",
+            VirtualPath = "/",
+            IsDirectory = true
+        };
+
+        public override IReadOnlyList<VfsNode> ListDirectory(VfsNode directory) => _entries;
     }
 }
