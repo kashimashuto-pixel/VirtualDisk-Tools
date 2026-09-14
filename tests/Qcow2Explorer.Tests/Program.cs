@@ -4202,6 +4202,12 @@ static void Test4KnGptParsing()
 
     var header = data.AsSpan(sectorSize, 512);
     Encoding.ASCII.GetBytes("EFI PART").CopyTo(header);
+    BinaryPrimitives.WriteUInt32LittleEndian(header[8..12], 0x00010000);
+    BinaryPrimitives.WriteUInt32LittleEndian(header[12..16], 92);
+    BinaryPrimitives.WriteUInt64LittleEndian(header[24..32], 1);
+    BinaryPrimitives.WriteUInt64LittleEndian(header[32..40], 31);
+    BinaryPrimitives.WriteUInt64LittleEndian(header[40..48], 3);
+    BinaryPrimitives.WriteUInt64LittleEndian(header[48..56], 30);
     BinaryPrimitives.WriteUInt64LittleEndian(header[72..80], 2);
     BinaryPrimitives.WriteUInt32LittleEndian(header[80..84], 1);
     BinaryPrimitives.WriteUInt32LittleEndian(header[84..88], 128);
@@ -4211,11 +4217,28 @@ static void Test4KnGptParsing()
     BinaryPrimitives.WriteUInt64LittleEndian(entry[32..40], 10);
     BinaryPrimitives.WriteUInt64LittleEndian(entry[40..48], 20);
     Encoding.Unicode.GetBytes("Linux").CopyTo(entry[56..]);
+    BinaryPrimitives.WriteUInt32LittleEndian(header[88..92], ComputeTestGptCrc32(entry));
+    BinaryPrimitives.WriteUInt32LittleEndian(header[16..20], ComputeTestGptCrc32(header[..92]));
 
     var partitions = PartitionTableReader.ReadPartitions(new MemorySectorReader(data, sectorSize));
     Assert(partitions.Count == 1, "4Kn GPT partition count");
     Assert(partitions[0].SectorSize == sectorSize, "4Kn GPT sector size");
     Assert(partitions[0].StartOffset == sectorSize * 10L, "4Kn GPT partition offset");
+}
+
+static uint ComputeTestGptCrc32(ReadOnlySpan<byte> data)
+{
+    var crc = uint.MaxValue;
+    foreach (var value in data)
+    {
+        crc ^= value;
+        for (var bit = 0; bit < 8; bit++)
+        {
+            crc = (crc & 1) != 0 ? 0xedb88320u ^ (crc >> 1) : crc >> 1;
+        }
+    }
+
+    return ~crc;
 }
 
 static void TestGeneratedMdRaid1Image()

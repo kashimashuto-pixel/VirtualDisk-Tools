@@ -60,21 +60,39 @@ public sealed class Qcow2Header
             ReadExact(stream, headerBuffer, 104, 8);
         }
 
+        var clusterBits = EndianUtilities.ReadUInt32Big(headerBuffer, 20);
+        if (clusterBits is < 9 or > 21)
+        {
+            throw new NotSupportedException($"cluster_bits={clusterBits} は未対応です。");
+        }
+
+        var clusterSize = 1L << (int)clusterBits;
+        if (version == 3 && (headerLength < 104 || headerLength > clusterSize))
+        {
+            throw new InvalidDataException(
+                $"qcow2 header_length={headerLength} が有効範囲 (104～{clusterSize:N0}) 外です。");
+        }
+
         var backingOffset = EndianUtilities.ReadUInt64Big(headerBuffer, 8);
         var backingSize = EndianUtilities.ReadUInt32Big(headerBuffer, 16);
         string? backingName = null;
-        if (backingOffset > 0 && backingSize > 0 && backingSize <= 1023)
+        if ((backingOffset == 0) != (backingSize == 0))
         {
-            var nameBuffer = new byte[backingSize];
-            stream.Position = (long)backingOffset;
-            ReadExact(stream, nameBuffer, 0, nameBuffer.Length);
-            backingName = System.Text.Encoding.UTF8.GetString(nameBuffer);
+            throw new InvalidDataException("qcow2 backing file のoffsetとsizeが一致していません。");
         }
 
-        var clusterBits = EndianUtilities.ReadUInt32Big(headerBuffer, 20);
-        if (clusterBits is < 9 or > 31)
+        if (backingOffset > 0)
         {
-            throw new NotSupportedException($"cluster_bits={clusterBits} は未対応です。");
+            if (backingSize > clusterSize)
+            {
+                throw new InvalidDataException("qcow2 backing file名がクラスタサイズを超えています。");
+            }
+
+            ValidateRegion(stream, backingOffset, backingSize, "backing file名");
+            var nameBuffer = new byte[checked((int)backingSize)];
+            stream.Position = checked((long)backingOffset);
+            ReadExact(stream, nameBuffer, 0, nameBuffer.Length);
+            backingName = System.Text.Encoding.UTF8.GetString(nameBuffer);
         }
 
         string? externalDataFileName = null;
@@ -82,8 +100,8 @@ public sealed class Qcow2Header
         {
             var extensionOffset = (long)headerLength;
             var extensionLimit = backingOffset > (ulong)extensionOffset
-                ? (long)backingOffset
-                : Math.Min(1L << (int)clusterBits, stream.Length);
+                ? checked((long)backingOffset)
+                : Math.Min(clusterSize, stream.Length);
             while (extensionOffset + 8 <= extensionLimit)
             {
                 var extensionHeader = new byte[8];
@@ -206,6 +224,20 @@ public sealed class Qcow2Header
             }
 
             readTotal += read;
+        }
+    }
+
+    private static void ValidateRegion(FileStream stream, ulong offset, uint length, string description)
+    {
+        if (offset > long.MaxValue)
+        {
+            throw new InvalidDataException($"qcow2 {description} のoffsetが対応範囲を超えています。");
+        }
+
+        var signedOffset = (long)offset;
+        if (signedOffset > stream.Length || length > (ulong)(stream.Length - signedOffset))
+        {
+            throw new EndOfStreamException($"qcow2 {description} がファイル範囲外を参照しています。");
         }
     }
 }

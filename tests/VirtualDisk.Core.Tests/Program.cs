@@ -13,6 +13,9 @@ try
     TestManagedNtfsCreation(temporaryDirectory);
     TestManagedExt4Creation(temporaryDirectory);
     TestManagedXfsCreation(temporaryDirectory);
+    Qcow2RobustnessTests.Run(temporaryDirectory);
+    PartitionTableRobustnessTests.Run(temporaryDirectory);
+    CreationRobustnessTests.Run(temporaryDirectory);
     Console.WriteLine("All cross-platform core checks passed.");
 }
 finally

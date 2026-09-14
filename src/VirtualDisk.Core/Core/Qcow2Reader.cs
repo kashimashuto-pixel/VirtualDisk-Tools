@@ -9,6 +9,9 @@ public sealed class Qcow2Reader : IDiskImageReader
     private const ulong CompressedClusterBit = 1UL << 62;
     private const ulong ZeroClusterBit = 1UL;
     private const int MaxCompressedClusterCacheEntries = 512;
+    private const int MaxL1TableBytes = 64 * 1024 * 1024;
+    private const uint MaxSnapshotCount = 65_536;
+    private const int MaxSnapshotMetadataBytes = 16 * 1024 * 1024;
 
     private readonly FileStream _stream;
     private readonly object _sync = new();
@@ -31,18 +34,34 @@ public sealed class Qcow2Reader : IDiskImageReader
     {
         Path = path;
         _stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-        Header = Qcow2Header.Parse(_stream);
-        if (Header.VirtualSize > long.MaxValue)
+        try
         {
-            throw new NotSupportedException("この qcow2 の仮想サイズは .NET の long 範囲を超えています。");
-        }
+            Header = Qcow2Header.Parse(_stream);
+            if (Header.VirtualSize > long.MaxValue)
+            {
+                throw new NotSupportedException("この qcow2 の仮想サイズは .NET の long 範囲を超えています。");
+            }
 
-        Length = (long)Header.VirtualSize;
-        L2Entries = checked((int)(Header.ClusterSize / (Header.UsesExtendedL2Entries ? 16 : 8)));
-        _l1Table = ReadL1Table(Header.L1TableOffset, Header.L1Size);
-        Snapshots = ReadSnapshots();
-        _backingReader = OpenBackingReader(path, Header);
-        _externalDataStream = OpenExternalDataFile(path, Header);
+            Length = (long)Header.VirtualSize;
+            L2Entries = checked((int)(Header.ClusterSize / (Header.UsesExtendedL2Entries ? 16 : 8)));
+            _l1Table = ReadL1Table(Header.L1TableOffset, Header.L1Size);
+            Snapshots = ReadSnapshots();
+            _backingReader = OpenBackingReader(path, Header);
+            try
+            {
+                _externalDataStream = OpenExternalDataFile(path, Header);
+            }
+            catch
+            {
+                _backingReader?.Dispose();
+                throw;
+            }
+        }
+        catch
+        {
+            _stream.Dispose();
+            throw;
+        }
     }
 
     public IReadOnlyList<string> GetWarnings() => Header.GetReadWarnings();
@@ -193,9 +212,17 @@ public sealed class Qcow2Reader : IDiskImageReader
 
     private ulong[] ReadL1Table(ulong tableOffset, uint tableSize)
     {
-        var entries = new ulong[tableSize];
-        var buffer = new byte[checked((int)tableSize * 8)];
-        ReadPhysical((long)tableOffset, buffer, 0, buffer.Length);
+        var byteLength = checked((long)tableSize * sizeof(ulong));
+        if (byteLength > MaxL1TableBytes)
+        {
+            throw new NotSupportedException(
+                $"qcow2 L1 tableが対応上限 ({MaxL1TableBytes:N0} bytes) を超えています。");
+        }
+
+        ValidateFileRegion(tableOffset, byteLength, "L1 table");
+        var entries = new ulong[checked((int)tableSize)];
+        var buffer = new byte[checked((int)byteLength)];
+        ReadPhysical(checked((long)tableOffset), buffer, 0, buffer.Length);
         for (var i = 0; i < entries.Length; i++)
         {
             entries[i] = EndianUtilities.ReadUInt64Big(buffer, i * 8);
@@ -211,6 +238,12 @@ public sealed class Qcow2Reader : IDiskImageReader
             return Array.Empty<Qcow2Snapshot>();
         }
 
+        if (Header.SnapshotCount > MaxSnapshotCount)
+        {
+            throw new NotSupportedException(
+                $"qcow2 snapshot数が対応上限 ({MaxSnapshotCount:N0}) を超えています。");
+        }
+
         var result = new List<Qcow2Snapshot>();
         var offset = checked((long)Header.SnapshotsOffset);
         for (var index = 0; index < Header.SnapshotCount; index++)
@@ -224,7 +257,18 @@ public sealed class Qcow2Reader : IDiskImageReader
             var seconds = EndianUtilities.ReadUInt32Big(fixedPart, 16);
             var nanoseconds = EndianUtilities.ReadUInt32Big(fixedPart, 20);
             var extraSize = EndianUtilities.ReadUInt32Big(fixedPart, 36);
-            var variableSize = checked((int)extraSize + idSize + nameSize);
+            var variableSize64 = checked((long)extraSize + idSize + nameSize);
+            if (variableSize64 > MaxSnapshotMetadataBytes)
+            {
+                throw new NotSupportedException(
+                    $"qcow2 snapshot metadataが対応上限 ({MaxSnapshotMetadataBytes:N0} bytes) を超えています。");
+            }
+
+            ValidateFileRegion(
+                checked((ulong)(offset + fixedPart.Length)),
+                variableSize64,
+                "snapshot metadata");
+            var variableSize = checked((int)variableSize64);
             var variable = new byte[variableSize];
             ReadPhysical(offset + fixedPart.Length, variable, 0, variable.Length);
             var id = System.Text.Encoding.UTF8.GetString(variable, (int)extraSize, idSize);
@@ -444,6 +488,11 @@ public sealed class Qcow2Reader : IDiskImageReader
 
     private void ReadPhysical(long offset, byte[] buffer, int bufferOffset, int count)
     {
+        if (offset < 0 || offset > _stream.Length || count > _stream.Length - offset)
+        {
+            throw new EndOfStreamException("qcow2 ファイルの物理領域がファイル範囲外を参照しています。");
+        }
+
         lock (_sync)
         {
             _stream.Position = offset;
@@ -458,6 +507,20 @@ public sealed class Qcow2Reader : IDiskImageReader
 
                 total += read;
             }
+        }
+    }
+
+    private void ValidateFileRegion(ulong offset, long length, string description)
+    {
+        if (offset > long.MaxValue || length < 0)
+        {
+            throw new InvalidDataException($"qcow2 {description} の範囲が不正です。");
+        }
+
+        var signedOffset = (long)offset;
+        if (signedOffset > _stream.Length || length > _stream.Length - signedOffset)
+        {
+            throw new EndOfStreamException($"qcow2 {description} がファイル範囲外を参照しています。");
         }
     }
 
