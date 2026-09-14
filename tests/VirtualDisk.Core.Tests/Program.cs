@@ -21,6 +21,7 @@ try
     ExportTraversalRobustnessTests.Run(temporaryDirectory);
     VerificationRobustnessTests.Run();
     SearchRobustnessTests.Run();
+    PathSemanticsTests.Run(temporaryDirectory);
     Qcow2RobustnessTests.Run(temporaryDirectory);
     ContainerRobustnessTests.Run(temporaryDirectory);
     PartitionTableRobustnessTests.Run(temporaryDirectory);

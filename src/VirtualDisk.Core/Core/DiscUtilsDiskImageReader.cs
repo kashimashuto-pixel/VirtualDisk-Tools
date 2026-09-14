@@ -188,7 +188,7 @@ public sealed class DiscUtilsDiskImageReader : IDiskImageReader
         }
 
         var ids = new HashSet<Guid>();
-        var paths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var paths = new HashSet<string>(PathSemantics.Comparer);
         var capacity = layers[0].Capacity;
         var logicalSectorSize = layers[0].LogicalSectorSize;
         for (var index = 0; index < layers.Count; index++)

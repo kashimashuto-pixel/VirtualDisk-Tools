@@ -206,9 +206,8 @@ public static class LzopRawCacheManager
 
     internal static string GetCacheDirectory(string root, string sourcePath)
     {
-        var normalizedPath = Path.GetFullPath(sourcePath)
-            .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
-            .ToUpperInvariant();
+        var normalizedPath = PathSemantics.NormalizeIdentity(sourcePath)
+            .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
         var cacheId = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(normalizedPath))).ToLowerInvariant();
         return Path.Combine(root, cacheId);
     }
@@ -219,7 +218,7 @@ public static class LzopRawCacheManager
         if (metadata is null
             || metadata.Version != MetadataVersion
             || !metadata.Completed
-            || !string.Equals(metadata.SourcePath, source.Path, StringComparison.OrdinalIgnoreCase)
+            || !string.Equals(metadata.SourcePath, source.Path, PathSemantics.Comparison)
             || metadata.SourceLength != source.Length
             || metadata.SourceLastWriteUtcTicks != source.LastWriteUtcTicks
             || !string.Equals(metadata.SourceSha256, source.Sha256, StringComparison.OrdinalIgnoreCase))

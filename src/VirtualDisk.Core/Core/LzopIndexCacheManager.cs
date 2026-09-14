@@ -133,7 +133,7 @@ public static class LzopIndexCacheManager
 
     internal static string GetCachePath(string sourcePath)
     {
-        var normalizedPath = Path.GetFullPath(sourcePath).ToUpperInvariant();
+        var normalizedPath = PathSemantics.NormalizeIdentity(sourcePath);
         var cacheId = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(normalizedPath))).ToLowerInvariant();
         return Path.Combine(DefaultIndexRoot, cacheId + FileSuffix);
     }

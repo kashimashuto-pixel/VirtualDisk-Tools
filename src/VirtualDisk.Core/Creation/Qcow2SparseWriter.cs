@@ -31,7 +31,7 @@ public static class Qcow2SparseWriter
             throw new IOException($"出力先は既に存在します: {destinationPath}");
         }
 
-        if (string.Equals(rawPath, destinationPath, StringComparison.OrdinalIgnoreCase))
+        if (string.Equals(rawPath, destinationPath, PathSemantics.Comparison))
         {
             throw new IOException("RAW原本と同じパスにはQCOW2を作成できません。");
         }

@@ -48,7 +48,7 @@ public sealed class Qcow2Reader : IDiskImageReader
     }
 
     public Qcow2Reader(string path)
-        : this(path, new HashSet<string>(GetPathComparer()), 0)
+        : this(path, new HashSet<string>(PathSemantics.Comparer), 0)
     {
     }
 
@@ -596,9 +596,6 @@ public sealed class Qcow2Reader : IDiskImageReader
             && magic[2] == 0x49
             && magic[3] == 0xfb;
     }
-
-    private static StringComparer GetPathComparer() =>
-        OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
 
     private static FileStream? OpenExternalDataFile(string imagePath, Qcow2Header header)
     {

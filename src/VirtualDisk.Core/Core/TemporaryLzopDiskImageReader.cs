@@ -175,7 +175,7 @@ public sealed class TemporaryLzopDiskImageReader : IDiskImageReader
     {
         var sourcePath = System.IO.Path.GetFullPath(path);
         var rawPath = System.IO.Path.GetFullPath(outputPath);
-        if (string.Equals(sourcePath, rawPath, StringComparison.OrdinalIgnoreCase))
+        if (string.Equals(sourcePath, rawPath, PathSemantics.Comparison))
         {
             throw new IOException("元LZOファイルと同じ場所へRAWを保存できません。");
         }
