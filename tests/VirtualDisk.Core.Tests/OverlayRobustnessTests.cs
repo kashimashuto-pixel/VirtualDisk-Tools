@@ -8,6 +8,8 @@ internal static class OverlayRobustnessTests
     {
         TestExportUsesStableSnapshot(directory);
         TestCancelledExportCleanup(directory);
+        TestChangedSourceRejected(directory);
+        TestSourceChangedDuringExportRejected(directory);
     }
 
     private static void TestExportUsesStableSnapshot(string directory)
@@ -64,6 +66,71 @@ internal static class OverlayRobustnessTests
             !Directory.EnumerateFiles(directory)
                 .Any(path => Path.GetFileName(path).StartsWith(prefix, StringComparison.Ordinal)),
             "cancelled overlay partial file removed");
+    }
+
+    private static void TestChangedSourceRejected(string directory)
+    {
+        var sourcePath = Path.Combine(directory, "overlay-changing-source.raw");
+        var destination = Path.Combine(directory, "overlay-changing-source-output.raw");
+        File.WriteAllBytes(sourcePath, new byte[128 * 1024]);
+        var originalWriteTime = File.GetLastWriteTimeUtc(sourcePath);
+        using var reader = new RawDiskImageReader(sourcePath);
+        var overlay = new CopyOnWriteBlockDevice(reader, 4096);
+        overlay.WriteAt(0, new byte[] { 0x55 }, 0, 1);
+
+        using (var writer = new FileStream(sourcePath, FileMode.Open, FileAccess.Write, FileShare.ReadWrite))
+        {
+            writer.Position = 64 * 1024;
+            writer.WriteByte(0x77);
+            writer.Flush(flushToDisk: true);
+        }
+
+        File.SetLastWriteTimeUtc(sourcePath, originalWriteTime.AddSeconds(2));
+        AssertThrows<IOException>(
+            () => overlay.ExportRawAsync(destination).GetAwaiter().GetResult(),
+            "overlay export rejects a changed file source");
+        Assert(!File.Exists(destination), "changed-source overlay destination absent");
+        var prefix = $".{Path.GetFileName(destination)}.";
+        Assert(
+            !Directory.EnumerateFiles(directory)
+                .Any(path => Path.GetFileName(path).StartsWith(prefix, StringComparison.Ordinal)),
+            "changed-source overlay partial file absent");
+    }
+
+    private static void TestSourceChangedDuringExportRejected(string directory)
+    {
+        var sourcePath = Path.Combine(directory, "overlay-concurrent-source.raw");
+        var destination = Path.Combine(directory, "overlay-concurrent-source-output.raw");
+        File.WriteAllBytes(sourcePath, new byte[ExportChunkSize * 2]);
+        var originalWriteTime = File.GetLastWriteTimeUtc(sourcePath);
+        using var reader = new RawDiskImageReader(sourcePath);
+        var overlay = new CopyOnWriteBlockDevice(reader, 4096);
+        var changed = false;
+        var progress = new CallbackProgress(value =>
+        {
+            if (changed || value.Completed < ExportChunkSize)
+            {
+                return;
+            }
+
+            using var writer = new FileStream(sourcePath, FileMode.Open, FileAccess.Write, FileShare.ReadWrite);
+            writer.Position = ExportChunkSize + 4096;
+            writer.WriteByte(0x66);
+            writer.Flush(flushToDisk: true);
+            File.SetLastWriteTimeUtc(sourcePath, originalWriteTime.AddSeconds(2));
+            changed = true;
+        });
+
+        AssertThrows<IOException>(
+            () => overlay.ExportRawAsync(destination, progress).GetAwaiter().GetResult(),
+            "overlay export rejects a source changed during export");
+        Assert(changed, "source mutation injected during overlay export");
+        Assert(!File.Exists(destination), "concurrent-source overlay destination absent");
+        var prefix = $".{Path.GetFileName(destination)}.";
+        Assert(
+            !Directory.EnumerateFiles(directory)
+                .Any(path => Path.GetFileName(path).StartsWith(prefix, StringComparison.Ordinal)),
+            "concurrent-source overlay partial file removed");
     }
 
     private static void AssertThrows<TException>(Action action, string message)

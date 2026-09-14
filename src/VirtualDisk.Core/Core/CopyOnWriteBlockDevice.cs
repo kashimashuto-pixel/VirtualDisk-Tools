@@ -11,6 +11,7 @@ public sealed class CopyOnWriteBlockDevice : IBlockDevice
     private const int ExportBufferSize = 4 * 1024 * 1024;
 
     private readonly IBlockReader _source;
+    private readonly SourceFileStamp? _sourceFileStamp;
     private readonly int _pageSize;
     private readonly Dictionary<long, byte[]> _pages = [];
     private readonly Dictionary<long, byte[]> _originalPages = [];
@@ -31,6 +32,7 @@ public sealed class CopyOnWriteBlockDevice : IBlockDevice
 
         _source = source;
         _pageSize = pageSize;
+        _sourceFileStamp = TryCaptureSourceFileStamp(source);
     }
 
     public long Length => _source.Length;
@@ -143,6 +145,8 @@ public sealed class CopyOnWriteBlockDevice : IBlockDevice
             throw new IOException($"出力先は既に存在します: {destinationPath}");
         }
 
+        EnsureSourceFileUnchanged();
+
         var destinationDirectory = Path.GetDirectoryName(destinationPath)
             ?? throw new ArgumentException("出力先フォルダーを取得できません。", nameof(destinationPath));
         Directory.CreateDirectory(destinationDirectory);
@@ -176,6 +180,7 @@ public sealed class CopyOnWriteBlockDevice : IBlockDevice
                 await output.FlushAsync(cancellationToken);
             }
 
+            EnsureSourceFileUnchanged();
             File.Move(temporaryPath, destinationPath);
         }
         catch
@@ -271,4 +276,59 @@ public sealed class CopyOnWriteBlockDevice : IBlockDevice
             throw new ArgumentOutOfRangeException(nameof(count), "ブロックデバイスの末尾を超えています。");
         }
     }
+
+    private static SourceFileStamp? TryCaptureSourceFileStamp(IBlockReader source)
+    {
+        if (source is not IDiskImageReader diskImage
+            || string.IsNullOrWhiteSpace(diskImage.Path))
+        {
+            return null;
+        }
+
+        try
+        {
+            var file = new FileInfo(Path.GetFullPath(diskImage.Path));
+            return file.Exists
+                ? new SourceFileStamp(file.FullName, file.Length, file.LastWriteTimeUtc.Ticks)
+                : null;
+        }
+        catch (Exception exception) when (exception is ArgumentException
+                                           or IOException
+                                           or UnauthorizedAccessException
+                                           or NotSupportedException)
+        {
+            return null;
+        }
+    }
+
+    private void EnsureSourceFileUnchanged()
+    {
+        if (_sourceFileStamp is not { } expected)
+        {
+            return;
+        }
+
+        try
+        {
+            var current = new FileInfo(expected.Path);
+            if (!current.Exists
+                || current.Length != expected.Length
+                || current.LastWriteTimeUtc.Ticks != expected.LastWriteUtcTicks)
+            {
+                throw new IOException(
+                    "コピーオンライト処理中に元ディスクイメージが変更されました。"
+                    + " 出力を破棄したため、元イメージを開き直して再実行してください。");
+            }
+        }
+        catch (Exception exception) when (exception is ArgumentException
+                                           or UnauthorizedAccessException
+                                           or NotSupportedException)
+        {
+            throw new IOException(
+                "コピーオンライト処理中に元ディスクイメージの状態を再確認できませんでした。",
+                exception);
+        }
+    }
+
+    private sealed record SourceFileStamp(string Path, long Length, long LastWriteUtcTicks);
 }
