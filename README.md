@@ -213,11 +213,13 @@ Windowsの全機能版（WinForms）:
 dotnet run --project src\Qcow2Explorer\Qcow2Explorer.csproj
 ```
 
-Windows／Linux／macOS共通GUI（Avalonia。現在はイメージを開く、パーティション／ディレクトリ閲覧、ファイル抽出に対応）:
+Windows／Linux／macOS共通GUI（Avalonia。イメージの新規作成と読込、パーティション／ディレクトリ閲覧、ファイル抽出、全読込検証に対応）:
 
 ```bash
 dotnet run --project src/VirtualDisk.Gui/VirtualDisk.Gui.csproj
 ```
+
+［新規作成］では外部ツールなしでRAW／QCOW2、MBR／GPT、複数のNTFS／ext4／XFSパーティションを指定できます。長時間の作成・読込・抽出・検証は画面上からキャンセルできます。
 
 クロスプラットフォームCLI（`info`、`list`、`extract`、`create`）:
 

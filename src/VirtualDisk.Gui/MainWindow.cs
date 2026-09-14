@@ -5,6 +5,7 @@ using Avalonia.Layout;
 using Avalonia.Platform.Storage;
 using Avalonia.Threading;
 using Qcow2Explorer.Core;
+using Qcow2Explorer.Creation;
 using Qcow2Explorer.FileSystems;
 using Qcow2Explorer.Partitions;
 
@@ -17,6 +18,7 @@ public sealed class MainWindow : Window
     private readonly TextBlock _status = new() { Text = "準備完了" };
     private readonly ListBox _partitions = new();
     private readonly ListBox _entries = new();
+    private readonly Button _createButton = new() { Content = "新規作成..." };
     private readonly Button _openButton = new() { Content = "開く..." };
     private readonly Button _backButton = new() { Content = "上へ", IsEnabled = false };
     private readonly Button _extractButton = new() { Content = "抽出...", IsEnabled = false };
@@ -46,6 +48,7 @@ public sealed class MainWindow : Window
         _entries.SelectionChanged += (_, _) => RefreshCommandState();
         _entries.DoubleTapped += (_, _) => NavigateSelectedEntry();
         _backButton.Click += (_, _) => NavigateUp();
+        _createButton.Click += async (_, _) => await CreateDiskAsync();
         _extractButton.Click += async (_, _) => await ExtractSelectedAsync();
         _verifyButton.Click += async (_, _) => await VerifyFileSystemAsync();
         _cancelButton.Click += (_, _) => CancelActiveOperation();
@@ -64,7 +67,7 @@ public sealed class MainWindow : Window
             Orientation = Orientation.Horizontal,
             Spacing = 8,
             Margin = new Thickness(12),
-            Children = { _openButton, _backButton, _extractButton, _verifyButton, _cancelButton },
+            Children = { _createButton, _openButton, _backButton, _extractButton, _verifyButton, _cancelButton },
         };
         var header = new StackPanel
         {
@@ -134,6 +137,103 @@ public sealed class MainWindow : Window
         {
             await OpenImageAsync(path);
         }
+    }
+
+    private async Task CreateDiskAsync()
+    {
+        var dialog = new VirtualDiskCreationDialog();
+        var accepted = await dialog.ShowDialog<bool>(this);
+        if (!accepted || dialog.Options is null)
+        {
+            return;
+        }
+
+        var options = dialog.Options;
+        var destination = await StorageProvider.SaveFilePickerAsync(new FilePickerSaveOptions
+        {
+            Title = "新規仮想ディスクの保存先",
+            SuggestedFileName = options.ContainerFormat == VirtualDiskContainerFormat.Qcow2
+                ? "disk.qcow2"
+                : "disk.raw",
+        });
+        var path = destination?.TryGetLocalPath();
+        if (path is null)
+        {
+            return;
+        }
+
+        path = EnsureContainerExtension(path, options.ContainerFormat);
+        if (File.Exists(path) || Directory.Exists(path))
+        {
+            await ShowErrorAsync("仮想ディスクを作成できません", $"出力先は既に存在します: {path}");
+            return;
+        }
+
+        var request = new VirtualDiskCreationRequest(
+            path,
+            options.CapacityBytes,
+            options.ContainerFormat,
+            options.PartitionTable,
+            options.Partitions);
+        var operation = BeginOperation("仮想ディスクを作成しています...");
+        string? createdPath = null;
+        try
+        {
+            string? lastMessage = null;
+            int? lastPercentage = null;
+            var progress = new CallbackProgress<DiskImageProgress>(update =>
+            {
+                if (string.Equals(lastMessage, update.Message, StringComparison.Ordinal)
+                    && lastPercentage == update.Percentage)
+                {
+                    return;
+                }
+
+                lastMessage = update.Message;
+                lastPercentage = update.Percentage;
+                Dispatcher.UIThread.Post(() =>
+                {
+                    if (ReferenceEquals(_activeOperation, operation))
+                    {
+                        var suffix = update.Percentage is int percentage ? $" ({percentage}%)" : string.Empty;
+                        _status.Text = update.Message + suffix;
+                    }
+                });
+            });
+            var result = await Task.Run(
+                () => VirtualDiskCreationService.CreateAsync(request, progress, operation.Token),
+                operation.Token);
+            createdPath = result.DestinationPath;
+            _status.Text = $"仮想ディスクを作成しました: {createdPath}";
+        }
+        catch (OperationCanceledException)
+        {
+            _status.Text = "作成をキャンセルしました。途中ファイルは削除されています。";
+        }
+        catch (Exception exception)
+        {
+            _status.Text = $"作成に失敗しました: {exception.Message}";
+            await ShowErrorAsync("仮想ディスクを作成できません", exception.Message);
+        }
+        finally
+        {
+            EndOperation(operation);
+        }
+
+        if (createdPath is not null)
+        {
+            await OpenImageAsync(createdPath);
+        }
+    }
+
+    private static string EnsureContainerExtension(string path, VirtualDiskContainerFormat format)
+    {
+        if (!string.IsNullOrEmpty(Path.GetExtension(path)))
+        {
+            return path;
+        }
+
+        return path + (format == VirtualDiskContainerFormat.Qcow2 ? ".qcow2" : ".raw");
     }
 
     private async Task OpenImageAsync(string path)
@@ -430,6 +530,7 @@ public sealed class MainWindow : Window
         Cursor = busy ? new Cursor(StandardCursorType.Wait) : Cursor.Default;
         _partitions.IsEnabled = !busy;
         _entries.IsEnabled = !busy;
+        _createButton.IsEnabled = !busy;
         _openButton.IsEnabled = !busy;
         _cancelButton.IsEnabled = busy;
         RefreshCommandState();
