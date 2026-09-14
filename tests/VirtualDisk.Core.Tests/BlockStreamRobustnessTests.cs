@@ -7,6 +7,7 @@ internal static class BlockStreamRobustnessTests
         TestReadArgumentsValidatedAtEndOfStream();
         TestSeekOverflowRejected();
         TestInvalidAdaptersRejected();
+        TestPrematureStreamEndRejected();
     }
 
     private static void TestReadArgumentsValidatedAtEndOfStream()
@@ -45,6 +46,15 @@ internal static class BlockStreamRobustnessTests
         AssertThrows<ArgumentException>(
             () => _ = new StreamBlockReader(source),
             "non-seekable source stream rejected");
+    }
+
+    private static void TestPrematureStreamEndRejected()
+    {
+        using var source = new PrematureEndStream();
+        using var reader = new StreamBlockReader(source);
+        AssertThrows<EndOfStreamException>(
+            () => reader.ReadAt(0, new byte[8], 0, 8),
+            "premature stream end is not returned as zero data");
     }
 
     private static void AssertThrows<TException>(Action action, string message)
@@ -88,5 +98,10 @@ internal static class BlockStreamRobustnessTests
     private sealed class NonSeekableStream : MemoryStream
     {
         public override bool CanSeek => false;
+    }
+
+    private sealed class PrematureEndStream() : MemoryStream(new byte[8])
+    {
+        public override int Read(byte[] buffer, int offset, int count) => 0;
     }
 }

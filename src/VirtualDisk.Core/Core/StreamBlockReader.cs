@@ -45,7 +45,8 @@ public sealed class StreamBlockReader : IBlockReader, IDisposable
                 var read = _stream.Read(buffer, bufferOffset + total, remaining - total);
                 if (read == 0)
                 {
-                    break;
+                    throw new EndOfStreamException(
+                        $"ブロックストリームが読込中に途中で終了しました: offset={offset + total:N0}");
                 }
 
                 total += read;

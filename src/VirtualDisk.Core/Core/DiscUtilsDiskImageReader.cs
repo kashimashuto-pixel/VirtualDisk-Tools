@@ -135,7 +135,8 @@ public sealed class DiscUtilsDiskImageReader : IDiskImageReader
                 var read = _content.Read(buffer, bufferOffset + total, remaining - total);
                 if (read == 0)
                 {
-                    break;
+                    throw new EndOfStreamException(
+                        $"仮想ディスク内容が読込中に途中で終了しました: offset={offset + total:N0}");
                 }
 
                 total += read;
