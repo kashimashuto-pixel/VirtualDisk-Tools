@@ -232,6 +232,8 @@ dotnet run --project src/VirtualDisk.Cli/VirtualDisk.Cli.csproj -- create new.ra
 
 `extract`には通常ファイルまたはディレクトリを指定でき、ディレクトリは安全上限付きで再帰抽出します。読めない項目がある場合は可能な範囲を継続し、出力先の`VirtualDiskExplorer-copy-errors*.json`へ一覧を保存して終了コード3を返します。
 
+`list`は端末の応答停止を避けるため既定で100,000項目まで表示します。大規模ディレクトリを意図して全件表示する場合は`--max-entries NUMBER`で上限を明示できます。`create`の進捗は工程または1%の変化時だけ表示します。
+
 OS非依存のreader、filesystem、partition、作成処理は`VirtualDisk.Core`（`net10.0`）に分離されています。WinForms版は物理ディスク、ProjFSなどWindows固有機能をadapter側に残しつつ、同じ共通コアを利用します。
 
 Visual Studio で開く場合は `Qcow2Explorer.sln` を使ってください。

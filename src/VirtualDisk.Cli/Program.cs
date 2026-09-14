@@ -8,6 +8,8 @@ return await Cli.RunAsync(args);
 
 internal static class Cli
 {
+    private const int DefaultMaximumListedEntries = 100_000;
+
     public static async Task<int> RunAsync(string[] args)
     {
         using var cancellationSource = new CancellationTokenSource();
@@ -95,7 +97,7 @@ internal static class Cli
 
     private static int RunList(string[] args, CancellationToken cancellationToken)
     {
-        var options = ParsedOptions.Parse(args, ["partition", "path"]);
+        var options = ParsedOptions.Parse(args, ["partition", "path", "max-entries"]);
         using var context = OpenFileSystem(options, cancellationToken);
         var directory = ResolvePath(context.FileSystem, options.Get("path") ?? "/", cancellationToken);
         if (!directory.IsDirectory)
@@ -103,7 +105,17 @@ internal static class Cli
             throw new CliUsageException("listの対象はディレクトリである必要があります。");
         }
 
-        foreach (var entry in context.FileSystem.ListDirectory(directory))
+        var entries = context.FileSystem.ListDirectory(directory)
+            ?? throw new InvalidDataException("ファイルシステムがnullの一覧を返しました。");
+        var maximumEntries = options.GetInt32("max-entries") ?? DefaultMaximumListedEntries;
+        if (entries.Count > maximumEntries)
+        {
+            throw new NotSupportedException(
+                $"ディレクトリ項目数 ({entries.Count:N0}) が表示上限 ({maximumEntries:N0}) を超えています。"
+                + " 必要な場合は--max-entriesを明示的に指定してください。");
+        }
+
+        foreach (var entry in entries)
         {
             cancellationToken.ThrowIfCancellationRequested();
             Console.WriteLine(
@@ -256,9 +268,20 @@ internal static class Cli
         var initialFiles = options.GetMany("initial-file")
             .Select(ParseInitialFile)
             .ToArray();
+        string? lastProgressMessage = null;
+        int? lastProgressPercentage = null;
         var progress = new CallbackProgress<DiskImageProgress>(update =>
         {
-            var suffix = update.Percentage is int percentage ? $" ({percentage}%)" : string.Empty;
+            var percentage = update.Percentage;
+            if (string.Equals(update.Message, lastProgressMessage, StringComparison.Ordinal)
+                && percentage == lastProgressPercentage)
+            {
+                return;
+            }
+
+            lastProgressMessage = update.Message;
+            lastProgressPercentage = percentage;
+            var suffix = percentage is int value ? $" ({value}%)" : string.Empty;
             Console.Error.WriteLine(update.Message + suffix);
         });
         var result = await VirtualDiskCreationService.CreateAsync(
@@ -430,7 +453,7 @@ internal static class Cli
 
             Usage:
               vdt info IMAGE
-              vdt list IMAGE [--partition NUMBER] [--path VIRTUAL_PATH]
+              vdt list IMAGE [--partition NUMBER] [--path VIRTUAL_PATH] [--max-entries NUMBER]
               vdt verify IMAGE [--partition NUMBER] [--path VIRTUAL_PATH]
               vdt extract IMAGE [--partition NUMBER] --path VIRTUAL_PATH --output FILE_OR_DIRECTORY
               vdt create OUTPUT --size SIZE [--container raw|qcow2] [--table mbr|gpt]
@@ -439,6 +462,7 @@ internal static class Cli
 
             Size suffixes: KiB, MiB, GiB, TiB (or decimal KB, MB, GB, TB).
             NTFS, ext4, and XFS creation are fully managed and do not require WSL or native mkfs tools.
+            list displays at most 100,000 entries unless --max-entries is explicitly specified.
             Press Ctrl+C to cancel long-running operations safely.
             """);
     }
