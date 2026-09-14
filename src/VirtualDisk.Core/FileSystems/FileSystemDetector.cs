@@ -282,7 +282,8 @@ public static class FileSystemDetector
         IBlockReader disk,
         PartitionInfo partition,
         ReadOnlySpan<byte> recoveryPasswordKey,
-        out string error)
+        out string error,
+        CancellationToken cancellationToken = default)
     {
         return TryOpenCore(
             disk,
@@ -291,14 +292,16 @@ public static class FileSystemDetector
             ReadOnlySpan<char>.Empty,
             null,
             ReadOnlySpan<char>.Empty,
-            out error);
+            out error,
+            cancellationToken);
     }
 
     public static IReadOnlyFileSystem? TryOpenWithBitLockerPassword(
         IBlockReader disk,
         PartitionInfo partition,
         ReadOnlySpan<char> password,
-        out string error)
+        out string error,
+        CancellationToken cancellationToken = default)
     {
         return TryOpenCore(
             disk,
@@ -307,14 +310,16 @@ public static class FileSystemDetector
             password,
             null,
             ReadOnlySpan<char>.Empty,
-            out error);
+            out error,
+            cancellationToken);
     }
 
     public static IReadOnlyFileSystem? TryOpenWithBitLockerStartupKey(
         IBlockReader disk,
         PartitionInfo partition,
         BitLockerStartupKey startupKey,
-        out string error)
+        out string error,
+        CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(startupKey);
         return TryOpenCore(
@@ -324,14 +329,16 @@ public static class FileSystemDetector
             ReadOnlySpan<char>.Empty,
             startupKey,
             ReadOnlySpan<char>.Empty,
-            out error);
+            out error,
+            cancellationToken);
     }
 
     public static IReadOnlyFileSystem? TryOpenWithLuksPassphrase(
         IBlockReader disk,
         PartitionInfo partition,
         ReadOnlySpan<char> passphrase,
-        out string error)
+        out string error,
+        CancellationToken cancellationToken = default)
     {
         return TryOpenCore(
             disk,
@@ -340,7 +347,8 @@ public static class FileSystemDetector
             ReadOnlySpan<char>.Empty,
             null,
             passphrase,
-            out error);
+            out error,
+            cancellationToken);
     }
 
     private static IReadOnlyFileSystem? TryOpenCore(
@@ -385,7 +393,8 @@ public static class FileSystemDetector
                             metadata,
                             recoveryPasswordKey,
                             out decryptedReader,
-                            out unlockError);
+                            out unlockError,
+                            cancellationToken);
                     }
 
                     if (!unlocked && !password.IsEmpty)
@@ -395,7 +404,8 @@ public static class FileSystemDetector
                             metadata,
                             password,
                             out decryptedReader,
-                            out unlockError);
+                            out unlockError,
+                            cancellationToken);
                     }
 
                     if (!unlocked && startupKey is not null)
@@ -425,7 +435,7 @@ public static class FileSystemDetector
                                 ReaderOverride = decryptedReader,
                                 LengthOverrideBytes = decryptedReader.Length
                             };
-                            innerPartition.FileSystem = Detect(decryptedReader, innerPartition);
+                            innerPartition.FileSystem = Detect(decryptedReader, innerPartition, cancellationToken);
                             var innerFileSystem = OpenSupportedFileSystem(
                                 decryptedReader,
                                 innerPartition,
@@ -496,7 +506,8 @@ public static class FileSystemDetector
                     metadata,
                     luksPassphrase,
                     out var decryptedReader,
-                    out var unlockError)
+                    out var unlockError,
+                    cancellationToken)
                     || decryptedReader is null)
                 {
                     error = unlockError;
@@ -518,7 +529,7 @@ public static class FileSystemDetector
                         ReaderOverride = decryptedReader,
                         LengthOverrideBytes = decryptedReader.Length
                     };
-                    innerPartition.FileSystem = Detect(decryptedReader, innerPartition);
+                    innerPartition.FileSystem = Detect(decryptedReader, innerPartition, cancellationToken);
                     var innerFileSystem = OpenSupportedFileSystem(
                         decryptedReader,
                         innerPartition,
@@ -579,7 +590,8 @@ public static class FileSystemDetector
                     metadata,
                     luksPassphrase,
                     out var decryptedReader,
-                    out var unlockError)
+                    out var unlockError,
+                    cancellationToken)
                     || decryptedReader is null)
                 {
                     error = unlockError;
@@ -601,7 +613,7 @@ public static class FileSystemDetector
                         ReaderOverride = decryptedReader,
                         LengthOverrideBytes = decryptedReader.Length
                     };
-                    innerPartition.FileSystem = Detect(decryptedReader, innerPartition);
+                    innerPartition.FileSystem = Detect(decryptedReader, innerPartition, cancellationToken);
                     var innerFileSystem = OpenSupportedFileSystem(
                         decryptedReader,
                         innerPartition,
