@@ -13,6 +13,8 @@ public static class FilePreviewReader
     private const int MaximumWorksheetRows = 10_000;
     private const int MaximumWorksheetColumns = 256;
     private const int MaximumWorksheetCells = 500_000;
+    private const int MaximumWorkbookSheets = 256;
+    private const int MaximumSharedStrings = 500_000;
 
     private static readonly HashSet<string> TextExtensions = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -149,7 +151,16 @@ public static class FilePreviewReader
 
         var sharedStrings = ReadSharedStrings(archive, spreadsheet, ref totalXmlSize);
         var sheets = new List<SpreadsheetPreviewSheet>();
-        foreach (var sheet in workbook.Descendants(spreadsheet + "sheet"))
+        var sheetElements = workbook.Descendants(spreadsheet + "sheet")
+            .Take(MaximumWorkbookSheets + 1)
+            .ToArray();
+        if (sheetElements.Length > MaximumWorkbookSheets)
+        {
+            throw new InvalidDataException(
+                $"Excelブックのシート数が表示上限 ({MaximumWorkbookSheets:N0}) を超えています。");
+        }
+
+        foreach (var sheet in sheetElements)
         {
             var name = (string?)sheet.Attribute("name") ?? $"Sheet{sheets.Count + 1}";
             var relationshipId = (string?)sheet.Attribute(officeRelationships + "id");
@@ -182,6 +193,7 @@ public static class FilePreviewReader
         var values = new Dictionary<(int Row, int Column), string>();
         var maxRow = -1;
         var maxColumn = -1;
+        var truncatedByCellCount = false;
         foreach (var cell in worksheet.Descendants(spreadsheet + "c"))
         {
             var reference = (string?)cell.Attribute("r");
@@ -200,6 +212,12 @@ public static class FilePreviewReader
                 value = $"={formula}";
             }
 
+            if (!values.ContainsKey((row, column)) && values.Count >= MaximumWorksheetCells)
+            {
+                truncatedByCellCount = true;
+                break;
+            }
+
             values[(row, column)] = value;
             maxRow = Math.Max(maxRow, row);
             maxColumn = Math.Max(maxColumn, column);
@@ -212,7 +230,7 @@ public static class FilePreviewReader
 
         var columnCount = maxColumn + 1;
         var rowCount = Math.Min(maxRow + 1, Math.Max(1, MaximumWorksheetCells / columnCount));
-        var truncated = rowCount < maxRow + 1;
+        var truncated = truncatedByCellCount || rowCount < maxRow + 1;
         var rows = new List<IReadOnlyList<string>>(rowCount);
         for (var row = 0; row < rowCount; row++)
         {
@@ -263,9 +281,17 @@ public static class FilePreviewReader
         }
 
         var document = LoadXmlEntry(entry, ref totalXmlSize);
-        return document.Descendants(spreadsheet + "si")
+        var values = document.Descendants(spreadsheet + "si")
             .Select(item => string.Concat(item.Descendants(spreadsheet + "t").Select(text => text.Value)))
+            .Take(MaximumSharedStrings + 1)
             .ToList();
+        if (values.Count > MaximumSharedStrings)
+        {
+            throw new InvalidDataException(
+                $"Excelブックの共有文字列数が表示上限 ({MaximumSharedStrings:N0}) を超えています。");
+        }
+
+        return values;
     }
 
     private static string NormalizeWorkbookTarget(string target)

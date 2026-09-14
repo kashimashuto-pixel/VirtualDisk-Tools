@@ -6066,6 +6066,33 @@ static void TestFilePreviews()
     Assert(excelPreview.Sheets.Count == 1 && excelPreview.Sheets[0].Name == "一覧", "xlsx sheet preview");
     Assert(excelPreview.Sheets[0].Rows[0][0] == "見出し", "xlsx shared string preview");
     Assert(excelPreview.Sheets[0].Rows[1][0] == "=SUM(B1:B1)", "xlsx formula preview");
+
+    var excessiveSheetElements = string.Concat(Enumerable.Range(1, 257).Select(index =>
+        $"<sheet name=\"Sheet{index}\" sheetId=\"{index}\" r:id=\"rId{index}\"/>"));
+    var excessiveRelationships = string.Concat(Enumerable.Range(1, 257).Select(index =>
+        $"<Relationship Id=\"rId{index}\" Target=\"worksheets/sheet.xml\"/>"));
+    var excessiveSheets = CreateZip(
+        ("xl/workbook.xml",
+            $"<workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" "
+            + $"xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">"
+            + $"<sheets>{excessiveSheetElements}</sheets></workbook>"),
+        ("xl/_rels/workbook.xml.rels",
+            "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
+            + excessiveRelationships
+            + "</Relationships>"),
+        ("xl/worksheets/sheet.xml",
+            "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"/>"));
+    var excessiveSheetsRejected = false;
+    try
+    {
+        _ = FilePreviewReader.Read("too-many-sheets.xlsx", excessiveSheets);
+    }
+    catch (InvalidDataException exception)
+    {
+        excessiveSheetsRejected = exception.Message.Contains("シート数", StringComparison.Ordinal);
+    }
+
+    Assert(excessiveSheetsRejected, "xlsx excessive sheet count rejection");
 }
 
 static void TestNavigationHistory()
