@@ -16,6 +16,7 @@ try
     TestManagedXfsCreation(temporaryDirectory);
     BlockStreamRobustnessTests.Run();
     FilePreviewRobustnessTests.Run();
+    ExternalEditorSafetyTests.Run();
     BoundedLruCacheTests.Run();
     ExtractionRobustnessTests.Run(temporaryDirectory);
     ExportTraversalRobustnessTests.Run(temporaryDirectory);
