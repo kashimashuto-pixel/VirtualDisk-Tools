@@ -174,7 +174,8 @@ public sealed class MainWindow : Window
             options.CapacityBytes,
             options.ContainerFormat,
             options.PartitionTable,
-            options.Partitions);
+            options.Partitions,
+            options.InitialFiles);
         var operation = BeginOperation("仮想ディスクを作成しています...");
         string? createdPath = null;
         try

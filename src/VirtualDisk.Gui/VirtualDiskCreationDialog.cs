@@ -2,6 +2,7 @@ using System.Globalization;
 using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Layout;
+using Avalonia.Platform.Storage;
 using Qcow2Explorer.Creation;
 
 namespace VirtualDisk.Gui;
@@ -23,14 +24,16 @@ internal sealed class VirtualDiskCreationDialog : Window
         Width = 130,
     };
     private readonly StackPanel _partitionRows = new() { Spacing = 6 };
+    private readonly StackPanel _initialFileRows = new() { Spacing = 6 };
     private readonly TextBlock _message = new() { TextWrapping = Avalonia.Media.TextWrapping.Wrap };
     private readonly List<PartitionRow> _rows = new();
+    private readonly List<InitialFileRow> _initialFiles = new();
 
     public VirtualDiskCreationDialog()
     {
         Title = "新規仮想ディスク";
         Width = 900;
-        Height = 620;
+        Height = 680;
         MinWidth = 720;
         MinHeight = 500;
         WindowStartupLocation = WindowStartupLocation.CenterOwner;
@@ -74,6 +77,41 @@ internal sealed class VirtualDiskCreationDialog : Window
             Children = { partitionHeader, _partitionRows },
         };
 
+        var addInitialFilesButton = new Button { Content = "初期ファイル追加..." };
+        addInitialFilesButton.Click += async (_, _) => await AddInitialFilesAsync();
+        var initialFileHeader = new Grid
+        {
+            ColumnDefinitions = new ColumnDefinitions("100,*,*,Auto"),
+            ColumnSpacing = 8,
+            Children =
+            {
+                Header("パーティション #", 0),
+                Header("ホスト側ファイル", 1),
+                Header("作成先ファイル名", 2),
+            },
+        };
+        var initialFileEditor = new StackPanel
+        {
+            Spacing = 8,
+            Children = { addInitialFilesButton, initialFileHeader, _initialFileRows },
+        };
+        var definitionTabs = new TabControl
+        {
+            ItemsSource = new[]
+            {
+                new TabItem
+                {
+                    Header = "パーティション",
+                    Content = new ScrollViewer { Content = partitionEditor },
+                },
+                new TabItem
+                {
+                    Header = "初期ファイル",
+                    Content = new ScrollViewer { Content = initialFileEditor },
+                },
+            },
+        };
+
         var createButton = new Button { Content = "保存先を選んで作成", IsDefault = true };
         createButton.Click += (_, _) => Accept();
         var cancelButton = new Button { Content = "キャンセル", IsCancel = true };
@@ -100,7 +138,7 @@ internal sealed class VirtualDiskCreationDialog : Window
         }, 0);
         AddAt(content, settings, 1);
         AddAt(content, addButton, 2);
-        AddAt(content, new ScrollViewer { Content = partitionEditor }, 3);
+        AddAt(content, definitionTabs, 3);
         AddAt(content, _message, 4);
         AddAt(content, buttons, 5);
         return content;
@@ -158,6 +196,36 @@ internal sealed class VirtualDiskCreationDialog : Window
         _message.Text = string.Empty;
     }
 
+    private async Task AddInitialFilesAsync()
+    {
+        var files = await StorageProvider.OpenFilePickerAsync(new FilePickerOpenOptions
+        {
+            Title = "新規ファイルシステムへ初期配置するファイル",
+            AllowMultiple = true,
+            FileTypeFilter = [FilePickerFileTypes.All],
+        });
+        foreach (var file in files)
+        {
+            var path = file.TryGetLocalPath();
+            if (path is null)
+            {
+                continue;
+            }
+
+            var row = new InitialFileRow(path, RemoveInitialFile);
+            _initialFiles.Add(row);
+            _initialFileRows.Children.Add(row.Control);
+        }
+
+        _message.Text = string.Empty;
+    }
+
+    private void RemoveInitialFile(InitialFileRow row)
+    {
+        _initialFiles.Remove(row);
+        _initialFileRows.Children.Remove(row.Control);
+    }
+
     private void Accept()
     {
         try
@@ -188,6 +256,7 @@ internal sealed class VirtualDiskCreationDialog : Window
         }
 
         var partitions = _rows.Select((row, index) => row.ReadDefinition(index + 1)).ToArray();
+        var initialFiles = _initialFiles.Select(row => row.ReadDefinition(partitions.Length)).ToArray();
         var capacityBytes = checked(capacityMiB * MiB);
         var partitionBytes = partitions.Aggregate(0L, (total, partition) => checked(total + partition.SizeBytes));
         var trailingMetadataBytes = table == VirtualDiskPartitionTableKind.Gpt ? 33L * 512 : 0;
@@ -202,7 +271,8 @@ internal sealed class VirtualDiskCreationDialog : Window
                 ? VirtualDiskContainerFormat.Raw
                 : VirtualDiskContainerFormat.Qcow2,
             table,
-            partitions);
+            partitions,
+            initialFiles);
     }
 
     private static long ParsePositiveInteger(string? text, string field)
@@ -271,10 +341,65 @@ internal sealed class VirtualDiskCreationDialog : Window
                 fileSystem);
         }
     }
+
+    private sealed class InitialFileRow
+    {
+        private readonly TextBox _partitionBox = new() { Text = "1" };
+        private readonly TextBox _sourceBox;
+        private readonly TextBox _destinationBox;
+
+        public InitialFileRow(string sourcePath, Action<InitialFileRow> remove)
+        {
+            _sourceBox = new TextBox { Text = sourcePath, IsReadOnly = true };
+            _destinationBox = new TextBox { Text = Path.GetFileName(sourcePath) };
+            var removeButton = new Button { Content = "削除" };
+            removeButton.Click += (_, _) => remove(this);
+            Control = new Grid
+            {
+                ColumnDefinitions = new ColumnDefinitions("100,*,*,Auto"),
+                ColumnSpacing = 8,
+                Children = { _partitionBox, _sourceBox, _destinationBox, removeButton },
+            };
+            for (var column = 0; column < Control.Children.Count; column++)
+            {
+                Grid.SetColumn(Control.Children[column], column);
+            }
+        }
+
+        public Grid Control { get; }
+
+        public VirtualDiskInitialFile ReadDefinition(int partitionCount)
+        {
+            if (!int.TryParse(
+                    _partitionBox.Text,
+                    NumberStyles.None,
+                    CultureInfo.InvariantCulture,
+                    out var partitionNumber)
+                || partitionNumber < 1
+                || partitionNumber > partitionCount)
+            {
+                throw new ArgumentException($"初期ファイルのパーティション番号は1～{partitionCount:N0}で指定してください。");
+            }
+
+            var sourcePath = _sourceBox.Text ?? string.Empty;
+            if (!File.Exists(sourcePath))
+            {
+                throw new ArgumentException($"初期配置するファイルが見つかりません: {sourcePath}");
+            }
+
+            if (string.IsNullOrWhiteSpace(_destinationBox.Text))
+            {
+                throw new ArgumentException("初期ファイルの作成先名を指定してください。");
+            }
+
+            return new VirtualDiskInitialFile(partitionNumber, sourcePath, _destinationBox.Text);
+        }
+    }
 }
 
 internal sealed record VirtualDiskCreationOptions(
     long CapacityBytes,
     VirtualDiskContainerFormat ContainerFormat,
     VirtualDiskPartitionTableKind PartitionTable,
-    IReadOnlyList<VirtualDiskPartitionDefinition> Partitions);
+    IReadOnlyList<VirtualDiskPartitionDefinition> Partitions,
+    IReadOnlyList<VirtualDiskInitialFile> InitialFiles);

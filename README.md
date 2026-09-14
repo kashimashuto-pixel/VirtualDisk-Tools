@@ -219,7 +219,7 @@ Windows／Linux／macOS共通GUI（Avalonia。イメージの新規作成と読�
 dotnet run --project src/VirtualDisk.Gui/VirtualDisk.Gui.csproj
 ```
 
-［新規作成］では外部ツールなしでRAW／QCOW2、MBR／GPT、複数のNTFS／ext4／XFSパーティションを指定できます。長時間の作成・読込・抽出・検証は画面上からキャンセルできます。
+［新規作成］では外部ツールなしでRAW／QCOW2、MBR／GPT、複数のNTFS／ext4／XFSパーティションと、各rootへ配置する初期ファイルを指定できます。長時間の作成・読込・抽出・検証は画面上からキャンセルできます。
 
 クロスプラットフォームCLI（`info`、`list`、`extract`、`create`）:
 
