@@ -13,7 +13,10 @@ public sealed record CopyProgress(
     int DirectoriesCreated,
     TimeSpan Elapsed);
 
-public sealed record CopyOptions(bool ContinueOnError = true);
+public sealed record CopyOptions(
+    bool ContinueOnError = true,
+    int MaximumDepth = 256,
+    int MaximumEntries = 1_000_000);
 
 public sealed record CopyError(string SourceName, string DestinationPath, string Message);
 
@@ -137,20 +140,36 @@ public static class FileSystemExporter
         CopyOptions? options = null)
     {
         options ??= new CopyOptions();
-        var nodeList = nodes.ToList();
+        ValidateOptions(options);
+        var nodeList = MaterializeNodes(nodes, options.MaximumEntries, cancellationToken);
         Directory.CreateDirectory(destinationDirectory);
         var progressState = new CopyProgressState(
             progress,
-            CalculateTotalBytes(fileSystem, nodeList, cancellationToken, options));
+            CalculateTotalBytes(
+                fileSystem,
+                nodeList,
+                cancellationToken,
+                options,
+                new TraversalState(options),
+                depth: 0));
+        var traversal = new TraversalState(options);
         var result = CopyResult.Empty;
         foreach (var node in nodeList)
         {
             cancellationToken.ThrowIfCancellationRequested();
             try
             {
-                result = result.Add(CopyNodeCore(fileSystem, node, destinationDirectory, progressState, cancellationToken, options));
+                result = result.Add(CopyNodeCore(
+                    fileSystem,
+                    node,
+                    destinationDirectory,
+                    progressState,
+                    cancellationToken,
+                    options,
+                    traversal,
+                    depth: 0));
             }
-            catch (Exception ex) when (options.ContinueOnError && ex is not OperationCanceledException)
+            catch (Exception ex) when (CanContinueAfter(ex, options))
             {
                 result = result.Add(ErrorResult(node, destinationDirectory, ex));
             }
@@ -169,10 +188,19 @@ public static class FileSystemExporter
         CancellationToken cancellationToken = default)
     {
         var options = new CopyOptions();
+        var totalTraversal = new TraversalState(options);
         var progressState = new CopyProgressState(
             progress,
-            CalculateTotalBytes(fileSystem, [node], cancellationToken, options));
-        return CopyNodeCore(fileSystem, node, destinationDirectory, progressState, cancellationToken, options);
+            CalculateTotalBytes(fileSystem, [node], cancellationToken, options, totalTraversal, depth: 0));
+        return CopyNodeCore(
+            fileSystem,
+            node,
+            destinationDirectory,
+            progressState,
+            cancellationToken,
+            options,
+            new TraversalState(options),
+            depth: 0);
     }
 
     private static CopyResult CopyNodeCore(
@@ -181,14 +209,23 @@ public static class FileSystemExporter
         string destinationDirectory,
         CopyProgressState progress,
         CancellationToken cancellationToken = default,
-        CopyOptions? options = null)
+        CopyOptions? options = null,
+        TraversalState? traversal = null,
+        int depth = 0)
     {
         options ??= new CopyOptions();
+        traversal ??= new TraversalState(options);
+        traversal.Visit(depth);
+        if (!node.IsDirectory && node.Size < 0)
+        {
+            throw new InvalidDataException($"ファイルサイズが不正です: {node.DisplayName} ({node.Size:N0} bytes)");
+        }
+
         Directory.CreateDirectory(destinationDirectory);
         var targetName = string.IsNullOrWhiteSpace(node.Name) ? "root" : SanitizeFileName(node.Name);
         var targetPath = GetAvailablePath(Path.Combine(destinationDirectory, targetName), node.IsDirectory);
         return node.IsDirectory
-            ? CopyDirectory(fileSystem, node, targetPath, progress, cancellationToken, options)
+            ? CopyDirectory(fileSystem, node, targetPath, progress, cancellationToken, options, traversal, depth)
             : CopyFile(fileSystem, node, targetPath, progress, cancellationToken);
     }
 
@@ -198,8 +235,11 @@ public static class FileSystemExporter
         string destinationPath,
         CopyProgressState progress,
         CancellationToken cancellationToken,
-        CopyOptions options)
+        CopyOptions options,
+        TraversalState traversal,
+        int depth)
     {
+        using var directoryScope = traversal.EnterDirectory(directory);
         Directory.CreateDirectory(destinationPath);
         var result = new CopyResult(0, 1, 0, Array.Empty<CopyError>());
         progress.Report(destinationPath, bytesCopied: 0, filesCopied: 0, directoriesCreated: 1);
@@ -207,11 +247,24 @@ public static class FileSystemExporter
         foreach (var child in fileSystem.ListDirectory(directory))
         {
             cancellationToken.ThrowIfCancellationRequested();
+            if (child is null)
+            {
+                throw new InvalidDataException("ファイルシステムがnullノードを返しました。");
+            }
+
             try
             {
-                result = result.Add(CopyNodeCore(fileSystem, child, destinationPath, progress, cancellationToken, options));
+                result = result.Add(CopyNodeCore(
+                    fileSystem,
+                    child,
+                    destinationPath,
+                    progress,
+                    cancellationToken,
+                    options,
+                    traversal,
+                    checked(depth + 1)));
             }
-            catch (Exception ex) when (options.ContinueOnError && ex is not OperationCanceledException)
+            catch (Exception ex) when (CanContinueAfter(ex, options))
             {
                 result = result.Add(ErrorResult(child, destinationPath, ex));
             }
@@ -249,7 +302,7 @@ public static class FileSystemExporter
                     cancellationToken.ThrowIfCancellationRequested();
                     var chunkSize = (int)Math.Min(CopyBufferSize, file.Size - offset);
                     var chunk = fileSystem.ReadFile(file, offset, chunkSize);
-                    if (chunk.Length == 0)
+                    if (chunk.Length != chunkSize)
                     {
                         var exception = CreateUnexpectedEofException(
                             fileSystem,
@@ -290,12 +343,20 @@ public static class FileSystemExporter
         IReadOnlyFileSystem fileSystem,
         IEnumerable<VfsNode> nodes,
         CancellationToken cancellationToken,
-        CopyOptions options)
+        CopyOptions options,
+        TraversalState traversal,
+        int depth)
     {
         long totalBytes = 0;
         foreach (var node in nodes)
         {
             cancellationToken.ThrowIfCancellationRequested();
+            if (node is null)
+            {
+                throw new InvalidDataException("ファイルシステムがnullノードを返しました。");
+            }
+
+            traversal.Visit(depth);
             if (!node.IsDirectory)
             {
                 totalBytes = AddSaturating(totalBytes, Math.Max(0, node.Size));
@@ -304,11 +365,16 @@ public static class FileSystemExporter
 
             try
             {
-                totalBytes = AddSaturating(
-                    totalBytes,
-                    CalculateTotalBytes(fileSystem, fileSystem.ListDirectory(node), cancellationToken, options));
+                using var directoryScope = traversal.EnterDirectory(node);
+                totalBytes = AddSaturating(totalBytes, CalculateTotalBytes(
+                    fileSystem,
+                    fileSystem.ListDirectory(node),
+                    cancellationToken,
+                    options,
+                    traversal,
+                    checked(depth + 1)));
             }
-            catch (Exception ex) when (options.ContinueOnError && ex is not OperationCanceledException)
+            catch (Exception ex) when (CanContinueAfter(ex, options))
             {
                 // The copy pass records the directory error; an unreadable subtree contributes no known bytes.
             }
@@ -319,6 +385,43 @@ public static class FileSystemExporter
 
     private static long AddSaturating(long left, long right) =>
         right > long.MaxValue - left ? long.MaxValue : left + right;
+
+    private static List<VfsNode> MaterializeNodes(
+        IEnumerable<VfsNode> nodes,
+        int maximumEntries,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(nodes);
+        var result = new List<VfsNode>();
+        foreach (var node in nodes)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (result.Count >= maximumEntries)
+            {
+                throw new TraversalLimitException(
+                    $"エクスポート対象数が上限 ({maximumEntries:N0}) を超えています。");
+            }
+
+            result.Add(node ?? throw new InvalidDataException("ファイルシステムがnullノードを返しました。"));
+        }
+
+        return result;
+    }
+
+    private static bool CanContinueAfter(Exception exception, CopyOptions options) =>
+        options.ContinueOnError
+        && exception is not OperationCanceledException
+        && exception is not TraversalLimitException;
+
+    private static void ValidateOptions(CopyOptions options)
+    {
+        if (options.MaximumDepth < 1 || options.MaximumEntries < 1)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(options),
+                "エクスポートの最大深度と最大項目数には正の整数を指定してください。");
+        }
+    }
 
     private static CopyResult ErrorResult(VfsNode node, string destinationPath, Exception exception)
     {
@@ -447,4 +550,65 @@ public static class FileSystemExporter
                 _stopwatch.Elapsed));
         }
     }
+
+    private sealed class TraversalState(CopyOptions options)
+    {
+        private readonly HashSet<VfsNode> _activeNodes = new(ReferenceEqualityComparer.Instance);
+        private readonly HashSet<string> _activePaths = new(StringComparer.Ordinal);
+        private int _entries;
+
+        public void Visit(int depth)
+        {
+            if (depth > options.MaximumDepth)
+            {
+                throw new TraversalLimitException(
+                    $"ファイルシステムのディレクトリ深度が上限 ({options.MaximumDepth:N0}) を超えています。");
+            }
+
+            _entries++;
+            if (_entries > options.MaximumEntries)
+            {
+                throw new TraversalLimitException(
+                    $"ファイルシステムの項目数が上限 ({options.MaximumEntries:N0}) を超えています。");
+            }
+        }
+
+        public IDisposable EnterDirectory(VfsNode directory)
+        {
+            var path = directory.VirtualPath;
+            if (!_activeNodes.Add(directory))
+            {
+                throw new InvalidDataException(
+                    $"ファイルシステムのディレクトリ構造に循環参照があります: {directory.VirtualPath}");
+            }
+
+            if (!string.IsNullOrEmpty(path) && !_activePaths.Add(path))
+            {
+                _activeNodes.Remove(directory);
+                throw new InvalidDataException(
+                    $"ファイルシステムのディレクトリ構造に循環参照があります: {directory.VirtualPath}");
+            }
+
+            return new DirectoryScope(this, directory, path);
+        }
+
+        private void ExitDirectory(VfsNode directory, string path)
+        {
+            _activeNodes.Remove(directory);
+            if (!string.IsNullOrEmpty(path))
+            {
+                _activePaths.Remove(path);
+            }
+        }
+
+        private sealed class DirectoryScope(
+            TraversalState owner,
+            VfsNode directory,
+            string path) : IDisposable
+        {
+            public void Dispose() => owner.ExitDirectory(directory, path);
+        }
+    }
+
+    private sealed class TraversalLimitException(string message) : NotSupportedException(message);
 }
