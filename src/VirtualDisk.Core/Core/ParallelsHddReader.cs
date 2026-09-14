@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Text;
+using System.Xml;
 using System.Xml.Linq;
 
 namespace Qcow2Explorer.Core;
@@ -10,6 +11,7 @@ public sealed class ParallelsHddReader : IDiskImageReader
     private const string DescriptorFileName = "DiskDescriptor.xml";
     private const string ZeroGuid = "{00000000-0000-0000-0000-000000000000}";
     private const string DefaultTopGuid = "{5fbaabe3-6958-40ff-92a7-860e329aab41}";
+    private const long MaximumDescriptorBytes = 16L * 1024 * 1024;
 
     private readonly IReadOnlyList<ParallelsLayer> _layers;
     private readonly IReadOnlyList<string> _warnings;
@@ -145,9 +147,30 @@ public sealed class ParallelsHddReader : IDiskImageReader
             throw new FileNotFoundException("Parallels HDD の DiskDescriptor.xml が見つかりません。", descriptorPath);
         }
 
-        var document = XDocument.Load(descriptorPath);
+        var descriptorLength = new FileInfo(descriptorPath).Length;
+        if (descriptorLength <= 0 || descriptorLength > MaximumDescriptorBytes)
+        {
+            throw new InvalidDataException(
+                $"Parallels HDD のDiskDescriptor.xmlが対応上限 ({MaximumDescriptorBytes:N0} bytes) を超えているか空です。");
+        }
+
+        using var descriptorReader = XmlReader.Create(
+            descriptorPath,
+            new XmlReaderSettings
+            {
+                DtdProcessing = DtdProcessing.Prohibit,
+                MaxCharactersInDocument = MaximumDescriptorBytes,
+                XmlResolver = null,
+            });
+        var document = XDocument.Load(descriptorReader, LoadOptions.None);
         var warnings = new List<string>();
         var diskSectors = ParseRequiredInt64(DescendantValue(document, "Disk_size"), "Disk_size");
+        if (diskSectors <= 0 || diskSectors > long.MaxValue / SectorSize)
+        {
+            throw new InvalidDataException("Parallels HDD のDisk_sizeが対応範囲外です。");
+        }
+
+        var diskLength = checked(diskSectors * SectorSize);
         var storages = Descendants(document, "Storage").ToList();
         if (storages.Count != 1)
         {
@@ -192,7 +215,7 @@ public sealed class ParallelsHddReader : IDiskImageReader
             throw;
         }
 
-        return new ParallelsHddReader(path, "Parallels HDD (.hdd)", checked(diskSectors * SectorSize), layers, warnings);
+        return new ParallelsHddReader(path, "Parallels HDD (.hdd)", diskLength, layers, warnings);
     }
 
     private static ParallelsLayer OpenLayer(string path, string type, List<string> warnings)
@@ -391,6 +414,7 @@ public sealed class ParallelsHddReader : IDiskImageReader
     {
         private const string Magic = "WithoutFreeSpace";
         private const string ExtMagic = "WithouFreSpacExt";
+        private const int MaximumBatBytes = 64 * 1024 * 1024;
 
         private readonly FileStream _stream;
         private readonly object _sync = new();
@@ -442,9 +466,11 @@ public sealed class ParallelsHddReader : IDiskImageReader
                 }
 
                 var batEntryCount = EndianUtilities.ReadUInt32Little(header, 32);
-                if (batEntryCount > int.MaxValue)
+                var batBytes64 = checked((long)batEntryCount * sizeof(uint));
+                if (batBytes64 > MaximumBatBytes)
                 {
-                    throw new NotSupportedException("Parallels expandable image の BAT が大きすぎます。");
+                    throw new NotSupportedException(
+                        $"Parallels expandable image のBATが対応上限 ({MaximumBatBytes:N0} bytes) を超えています。");
                 }
 
                 var diskSectors = magic == ExtMagic
@@ -452,15 +478,25 @@ public sealed class ParallelsHddReader : IDiskImageReader
                     : EndianUtilities.ReadUInt32Little(header, 36);
                 var inUse = EndianUtilities.ReadUInt32Little(header, 44);
                 var flags = EndianUtilities.ReadUInt32Little(header, 52);
+                if (diskSectors == 0 || diskSectors > long.MaxValue / SectorSize)
+                {
+                    throw new InvalidDataException("Parallels expandable image の仮想容量が不正です。");
+                }
+
+                if (batBytes64 > stream.Length - stream.Position)
+                {
+                    throw new EndOfStreamException("Parallels expandable image のBATがファイル範囲外を参照しています。");
+                }
+
                 if (inUse is not 0 and not 0x746F6E59 and not 0x312e3276)
                 {
                     warnings.Add($"{System.IO.Path.GetFileName(path)}: in_use=0x{inUse:X8} は仕様外の値です。読み取りは継続します。");
                 }
 
-                var bat = new uint[batEntryCount];
-                var batBytes = checked((int)batEntryCount * 4);
+                var batBytes = checked((int)batBytes64);
                 var batBuffer = new byte[batBytes];
                 ReadExact(stream, batBuffer, 0, batBuffer.Length);
+                var bat = new uint[checked((int)batEntryCount)];
                 for (var i = 0; i < bat.Length; i++)
                 {
                     bat[i] = EndianUtilities.ReadUInt32Little(batBuffer, i * 4);

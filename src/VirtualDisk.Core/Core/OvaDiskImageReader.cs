@@ -1,4 +1,5 @@
 using System.Formats.Tar;
+using System.Xml;
 using System.Xml.Linq;
 
 namespace Qcow2Explorer.Core;
@@ -19,6 +20,12 @@ public sealed record OvaDiskInfo(string ArchivePath, string ExtractedPath, long?
 /// </summary>
 public sealed class OvaDiskImageReader : IDiskImageReader
 {
+    private const int MaximumArchiveEntries = 4096;
+    private const long MaximumOvfBytes = 16L * 1024 * 1024;
+    private const long SparseExpansionAllowance = 64L * 1024 * 1024;
+    private const int MaximumSparseExpansionRatio = 16;
+    private const long MinimumFreeSpaceReserve = 256L * 1024 * 1024;
+
     private readonly string _temporaryDirectory;
     private readonly List<string> _warnings = [];
     private IDiskImageReader _activeReader;
@@ -156,19 +163,40 @@ public sealed class OvaDiskImageReader : IDiskImageReader
         using var archive = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
         using var reader = new TarReader(archive, leaveOpen: false);
         TarEntry? entry;
+        var entryCount = 0;
+        long totalDeclaredBytes = 0;
+        var maximumExpandedBytes = archive.Length > (long.MaxValue - SparseExpansionAllowance) / MaximumSparseExpansionRatio
+            ? long.MaxValue
+            : archive.Length * MaximumSparseExpansionRatio + SparseExpansionAllowance;
         while ((entry = reader.GetNextEntry()) is not null)
         {
             cancellationToken.ThrowIfCancellationRequested();
+            entryCount++;
+            if (entryCount > MaximumArchiveEntries)
+            {
+                throw new InvalidDataException(
+                    $"OVA内のentry数が対応上限 ({MaximumArchiveEntries:N0}) を超えています。");
+            }
+
             if (entry.EntryType is not (TarEntryType.RegularFile or TarEntryType.V7RegularFile or TarEntryType.ContiguousFile))
             {
                 continue;
             }
 
-            var archivePath = NormalizeArchivePath(entry.Name);
+            var archivePath = ValidateArchivePath(entry.Name);
             if (string.IsNullOrWhiteSpace(archivePath))
             {
                 continue;
             }
+
+            totalDeclaredBytes = checked(totalDeclaredBytes + entry.Length);
+            if (totalDeclaredBytes > maximumExpandedBytes)
+            {
+                throw new InvalidDataException(
+                    $"OVAの展開予定量 ({totalDeclaredBytes:N0} bytes) がarchive容量に対して大きすぎます。");
+            }
+
+            EnsureExtractionSpace(destination, entry.Length);
 
             var extractedPath = System.IO.Path.GetFullPath(
                 System.IO.Path.Combine(destination, archivePath.Replace('/', System.IO.Path.DirectorySeparatorChar)));
@@ -188,14 +216,27 @@ public sealed class OvaDiskImageReader : IDiskImageReader
             {
                 var buffer = new byte[1024 * 1024];
                 int count;
+                long written = 0;
                 while ((count = entry.DataStream.Read(buffer, 0, buffer.Length)) > 0)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
+                    written = checked(written + count);
+                    if (written > entry.Length)
+                    {
+                        throw new InvalidDataException($"OVA entryの展開量が宣言サイズを超えています: {archivePath}");
+                    }
+
                     output.Write(buffer, 0, count);
                     progress?.Report(new DiskImageProgress(
                         $"OVAを展開中: {archivePath}",
                         Math.Min(archive.Position, archive.Length),
                         archive.Length));
+                }
+
+                if (written != entry.Length)
+                {
+                    throw new EndOfStreamException(
+                        $"OVA entryが途中で終了しています: {archivePath} ({written:N0}/{entry.Length:N0} bytes)");
                 }
             }
 
@@ -221,7 +262,22 @@ public sealed class OvaDiskImageReader : IDiskImageReader
         {
             try
             {
-                var document = XDocument.Load(ovf.Value, LoadOptions.None);
+                var ovfLength = new FileInfo(ovf.Value).Length;
+                if (ovfLength <= 0 || ovfLength > MaximumOvfBytes)
+                {
+                    throw new InvalidDataException(
+                        $"OVF記述が対応上限 ({MaximumOvfBytes:N0} bytes) を超えているか空です。");
+                }
+
+                using var xmlReader = XmlReader.Create(
+                    ovf.Value,
+                    new XmlReaderSettings
+                    {
+                        DtdProcessing = DtdProcessing.Prohibit,
+                        MaxCharactersInDocument = MaximumOvfBytes,
+                        XmlResolver = null,
+                    });
+                var document = XDocument.Load(xmlReader, LoadOptions.None);
                 cancellationToken.ThrowIfCancellationRequested();
                 var fileReferences = new Dictionary<string, string>(StringComparer.Ordinal);
                 foreach (var element in document.Descendants().Where(element => element.Name.LocalName == "File"))
@@ -305,6 +361,79 @@ public sealed class OvaDiskImageReader : IDiskImageReader
         }
 
         return normalized;
+    }
+
+    private static string ValidateArchivePath(string path)
+    {
+        var normalized = NormalizeArchivePath(path);
+        if (string.IsNullOrWhiteSpace(normalized)
+            || normalized.StartsWith("/", StringComparison.Ordinal)
+            || normalized.Contains(":", StringComparison.Ordinal))
+        {
+            throw new InvalidDataException($"OVA内の危険なパスを拒否しました: {path}");
+        }
+
+        var segments = normalized.Split('/');
+        if (segments.Any(IsUnsafeArchivePathSegment))
+        {
+            throw new InvalidDataException($"OVA内の危険なパスを拒否しました: {path}");
+        }
+
+        return normalized;
+    }
+
+    private static bool IsUnsafeArchivePathSegment(string segment)
+    {
+        if (string.IsNullOrWhiteSpace(segment)
+            || segment is "." or ".."
+            || segment.EndsWith(' ')
+            || segment.EndsWith('.')
+            || segment.IndexOfAny(System.IO.Path.GetInvalidFileNameChars()) >= 0)
+        {
+            return true;
+        }
+
+        var baseName = segment.Split('.')[0];
+        return baseName.Equals("CON", StringComparison.OrdinalIgnoreCase)
+            || baseName.Equals("PRN", StringComparison.OrdinalIgnoreCase)
+            || baseName.Equals("AUX", StringComparison.OrdinalIgnoreCase)
+            || baseName.Equals("NUL", StringComparison.OrdinalIgnoreCase)
+            || (baseName.Length == 4
+                && (baseName.StartsWith("COM", StringComparison.OrdinalIgnoreCase)
+                    || baseName.StartsWith("LPT", StringComparison.OrdinalIgnoreCase))
+                && baseName[3] is >= '1' and <= '9');
+    }
+
+    private static void EnsureExtractionSpace(string destination, long requiredBytes)
+    {
+        if (requiredBytes < 0)
+        {
+            throw new InvalidDataException("OVA entryのサイズが負です。");
+        }
+
+        try
+        {
+            var root = System.IO.Path.GetPathRoot(System.IO.Path.GetFullPath(destination));
+            if (string.IsNullOrWhiteSpace(root))
+            {
+                return;
+            }
+
+            var available = new DriveInfo(root).AvailableFreeSpace;
+            if (requiredBytes > Math.Max(0, available - MinimumFreeSpaceReserve))
+            {
+                throw new IOException(
+                    $"OVAを安全に展開する空き容量が不足しています。"
+                    + $" 必要={requiredBytes:N0} bytes, 空き={available:N0} bytes");
+            }
+        }
+        catch (Exception exception) when (exception is ArgumentException
+                                           or DriveNotFoundException
+                                           or NotSupportedException
+                                           or UnauthorizedAccessException)
+        {
+            // Some virtual filesystems do not expose drive capacity; extraction still has bounded archive expansion.
+        }
     }
 
     private static void TryDeleteDirectory(string path)

@@ -15,6 +15,7 @@ public sealed class VmaDiskImageReader : IDiskImageReader
     private const int BlocksPerExtent = 59;
     private const int BlockSize = 4 * 1024;
     private const int ClusterSize = 64 * 1024;
+    private const uint MaximumHeaderSize = 64U * 1024 * 1024;
 
     private readonly IDiskImageReader _source;
     private readonly IProgress<DiskImageProgress>? _progress;
@@ -199,9 +200,14 @@ public sealed class VmaDiskImageReader : IDiskImageReader
         var blobBufferSize = BinaryPrimitives.ReadUInt32BigEndian(prefix.AsSpan(52, 4));
         HeaderSize = BinaryPrimitives.ReadUInt32BigEndian(prefix.AsSpan(56, 4));
 
-        if (HeaderSize < FixedHeaderSize || HeaderSize > _source.Length || HeaderSize % 512 != 0)
+        if (HeaderSize < FixedHeaderSize
+            || HeaderSize > MaximumHeaderSize
+            || HeaderSize > _source.Length
+            || HeaderSize % 512 != 0)
         {
-            throw new InvalidDataException($"VMAヘッダーサイズが不正です: {HeaderSize:N0} bytes");
+            throw new InvalidDataException(
+                $"VMAヘッダーサイズが不正です: {HeaderSize:N0} bytes"
+                + $" (対応上限: {MaximumHeaderSize:N0} bytes)");
         }
 
         if (blobBufferOffset < FixedHeaderSize
