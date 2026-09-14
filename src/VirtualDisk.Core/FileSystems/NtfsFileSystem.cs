@@ -396,7 +396,11 @@ public sealed class NtfsFileSystem : IReadOnlyFileSystem, IFileContentWriter
 
                 _entries[entry.Id] = entry;
             }
-            catch
+            catch (Exception ex) when (ex is ArgumentException
+                                       or IOException
+                                       or InvalidDataException
+                                       or NotSupportedException
+                                       or OverflowException)
             {
                 // NTFS images often contain unused or partially overwritten MFT records.
             }
@@ -525,7 +529,7 @@ public sealed class NtfsFileSystem : IReadOnlyFileSystem, IFileContentWriter
         return entry;
     }
 
-    private static byte[]? GetResidentValue(byte[] record, int attrOffset, int attrLength)
+    internal static byte[]? GetResidentValue(byte[] record, int attrOffset, int attrLength)
     {
         if (attrLength < 24)
         {
@@ -534,12 +538,12 @@ public sealed class NtfsFileSystem : IReadOnlyFileSystem, IFileContentWriter
 
         var valueLength = EndianUtilities.ReadUInt32Little(record, attrOffset + 16);
         var valueOffset = EndianUtilities.ReadUInt16Little(record, attrOffset + 20);
-        if (valueOffset + valueLength > attrLength)
+        if (valueOffset > attrLength || valueLength > (uint)(attrLength - valueOffset))
         {
             return null;
         }
 
-        var value = new byte[valueLength];
+        var value = new byte[checked((int)valueLength)];
         Array.Copy(record, attrOffset + valueOffset, value, 0, value.Length);
         return value;
     }
@@ -604,7 +608,7 @@ public sealed class NtfsFileSystem : IReadOnlyFileSystem, IFileContentWriter
             if (offsetSize > 0)
             {
                 var delta = EndianUtilities.SignExtend(ReadVariableUInt(runData, offset, offsetSize), offsetSize);
-                currentLcn += delta;
+                currentLcn = checked(currentLcn + delta);
                 lcn = currentLcn;
             }
 
@@ -682,10 +686,11 @@ public sealed class NtfsFileSystem : IReadOnlyFileSystem, IFileContentWriter
 
         foreach (var run in runs)
         {
-            var runBytes = run.ClusterCount * _clusterSize;
-            if (offset >= logical + runBytes)
+            var runBytes = checked(run.ClusterCount * _clusterSize);
+            var logicalEnd = checked(logical + runBytes);
+            if (offset >= logicalEnd)
             {
-                logical += runBytes;
+                logical = logicalEnd;
                 continue;
             }
 
@@ -693,13 +698,17 @@ public sealed class NtfsFileSystem : IReadOnlyFileSystem, IFileContentWriter
             var chunk = checked((int)Math.Min(remaining, runBytes - inRun));
             if (run.Lcn >= 0)
             {
-                _reader.ReadAt(run.Lcn * _clusterSize + inRun, buffer, bufferOffset + written, chunk);
+                _reader.ReadAt(
+                    checked(checked(run.Lcn * _clusterSize) + inRun),
+                    buffer,
+                    bufferOffset + written,
+                    chunk);
             }
 
             written += chunk;
             remaining -= chunk;
             offset += chunk;
-            logical += runBytes;
+            logical = logicalEnd;
             if (remaining <= 0)
             {
                 break;

@@ -16,6 +16,7 @@ try
     Qcow2RobustnessTests.Run(temporaryDirectory);
     ContainerRobustnessTests.Run(temporaryDirectory);
     PartitionTableRobustnessTests.Run(temporaryDirectory);
+    FileSystemRobustnessTests.Run(temporaryDirectory);
     CreationRobustnessTests.Run(temporaryDirectory);
     Console.WriteLine("All cross-platform core checks passed.");
 }

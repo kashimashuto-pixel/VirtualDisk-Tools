@@ -7,6 +7,8 @@ namespace Qcow2Explorer.FileSystems;
 
 public sealed class FatFileSystem : IReadOnlyFileSystem, IFileContentWriter
 {
+    private const int MaxDirectoryBytes = 64 * 1024 * 1024;
+
     private readonly IBlockReader _reader;
     private readonly IBlockWriter? _writer;
     private readonly int _bytesPerSector;
@@ -108,7 +110,7 @@ public sealed class FatFileSystem : IReadOnlyFileSystem, IFileContentWriter
         }
         else
         {
-            data = ReadClusterChain(meta.FirstCluster, null);
+            data = ReadClusterChain(meta.FirstCluster, MaxDirectoryBytes);
         }
 
         return ParseDirectory(data, meta.Path);
@@ -548,7 +550,7 @@ public sealed class FatFileSystem : IReadOnlyFileSystem, IFileContentWriter
 
             var clusters = GetValidatedDirectoryClusters(directory.FirstCluster);
             ClaimClusters(clusters, directory.Path, owners);
-            data = ReadClusterChain(directory.FirstCluster, null);
+            data = ReadClusterChain(directory.FirstCluster, MaxDirectoryBytes);
         }
 
         foreach (var node in ParseDirectory(data, directory.Path))

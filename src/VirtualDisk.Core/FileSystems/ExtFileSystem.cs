@@ -67,7 +67,12 @@ public sealed class ExtFileSystem : IReadOnlyFileSystem, IFileContentWriter, IFi
         _blockCount = blocksLo | ((ulong)blocksHi << 32);
         _firstDataBlock = EndianUtilities.ReadUInt32Little(super, 0x14);
         var logBlockSize = EndianUtilities.ReadUInt32Little(super, 0x18);
-        _blockSize = 1024 << (int)logBlockSize;
+        if (logBlockSize > 6)
+        {
+            throw new NotSupportedException($"ext block size exponentが未対応です: {logBlockSize}");
+        }
+
+        _blockSize = checked(1024 << (int)logBlockSize);
         _blocksPerGroup = EndianUtilities.ReadUInt32Little(super, 0x20);
         _inodesPerGroup = EndianUtilities.ReadUInt32Little(super, 0x28);
         _firstInode = EndianUtilities.ReadUInt32Little(super, 0x54);
@@ -75,7 +80,7 @@ public sealed class ExtFileSystem : IReadOnlyFileSystem, IFileContentWriter, IFi
         _inodeSize = inodeSize == 0 ? 128 : inodeSize;
         var descSize = EndianUtilities.ReadUInt16Little(super, 0xfe);
         _groupDescriptorSize = Math.Max(32, descSize == 0 ? 32 : descSize);
-        _groupDescriptorOffset = (long)(_firstDataBlock + 1) * _blockSize;
+        _groupDescriptorOffset = checked(((long)_firstDataBlock + 1) * _blockSize);
 
         _incompatibleFeatures = EndianUtilities.ReadUInt32Little(super, 0x60);
         _readOnlyCompatibleFeatures = EndianUtilities.ReadUInt32Little(super, 0x64);
@@ -85,12 +90,29 @@ public sealed class ExtFileSystem : IReadOnlyFileSystem, IFileContentWriter, IFi
         _checksumSeed = (_incompatibleFeatures & ChecksumSeedIncompatFlag) != 0
             ? EndianUtilities.ReadUInt32Little(super, 0x270)
             : ComputeCrc32C(uint.MaxValue, _uuid);
-        if (_blockCount <= _firstDataBlock || _blocksPerGroup == 0 || _inodesPerGroup == 0)
+        if (_blockCount <= _firstDataBlock
+            || _inodeCount == 0
+            || _blocksPerGroup == 0
+            || _inodesPerGroup == 0
+            || _inodeSize < 128
+            || _inodeSize > _blockSize
+            || (_inodeSize & 3) != 0
+            || _groupDescriptorSize > _blockSize
+            || (_groupDescriptorSize & 7) != 0
+            || _blockCount > (ulong)reader.Length / (uint)_blockSize)
         {
             throw new InvalidDataException("ext block group geometryが不正です。");
         }
 
         _groupCount = checked((uint)((_blockCount - _firstDataBlock + _blocksPerGroup - 1) / _blocksPerGroup));
+        var descriptorBytes = checked((ulong)_groupCount * (uint)_groupDescriptorSize);
+        if ((ulong)_groupDescriptorOffset > (ulong)reader.Length
+            || descriptorBytes > (ulong)reader.Length - (ulong)_groupDescriptorOffset
+            || (ulong)_groupCount * _inodesPerGroup < _inodeCount)
+        {
+            throw new InvalidDataException("ext group descriptorまたはinode geometryが入力範囲外です。");
+        }
+
         Name = (_incompatibleFeatures & 0x40) != 0 ? "ext4" : "ext2/ext3";
         Root = new VfsNode { Name = "", VirtualPath = @"\", IsDirectory = true, Metadata = 2U };
     }
