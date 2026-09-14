@@ -13,6 +13,7 @@ try
     TestManagedNtfsCreation(temporaryDirectory);
     TestManagedExt4Creation(temporaryDirectory);
     TestManagedXfsCreation(temporaryDirectory);
+    BoundedLruCacheTests.Run();
     Qcow2RobustnessTests.Run(temporaryDirectory);
     ContainerRobustnessTests.Run(temporaryDirectory);
     PartitionTableRobustnessTests.Run(temporaryDirectory);

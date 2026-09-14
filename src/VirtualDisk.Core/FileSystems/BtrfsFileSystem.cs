@@ -21,6 +21,7 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
     private const int MaximumTreeBlocks = 100_000;
     private const int MaximumTreeItems = 1_000_000;
     private const int MaximumDecodedExtentSize = 128 * 1024;
+    private const int MaximumDecodedExtentCacheBytes = 64 * 1024 * 1024;
 
     private const ulong RootTreeObjectId = 1;
     private const ulong ChunkTreeObjectId = 3;
@@ -82,8 +83,8 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
     private readonly Dictionary<ulong, ulong> _rootDirectoryIds = [];
     private readonly HashSet<BtrfsSubvolumeLink> _subvolumeLinks = [];
     private readonly Dictionary<ulong, uint> _dataChecksums = [];
-    private readonly Dictionary<BtrfsCompressedExtentKey, byte[]> _decodedExtentCache = [];
-    private readonly object _decodedExtentCacheLock = new();
+    private readonly BoundedLruCache<BtrfsCompressedExtentKey, byte[]> _decodedExtentCache =
+        new(MaximumDecodedExtentCacheBytes, value => value.LongLength);
     private IReadOnlyList<ulong> _missingDeviceIds = [];
 
     public BtrfsFileSystem(IBlockReader reader, PartitionInfo partition)
@@ -1450,12 +1451,9 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
             extent.DiskBytes,
             extent.RamBytes,
             extent.Compression);
-        lock (_decodedExtentCacheLock)
+        if (_decodedExtentCache.TryGetValue(key, out var cached))
         {
-            if (_decodedExtentCache.TryGetValue(key, out var cached))
-            {
-                return cached;
-            }
+            return cached;
         }
 
         var compressed = new byte[checked((int)extent.DiskBytes)];
@@ -1467,16 +1465,7 @@ public sealed class BtrfsFileSystem : IReadOnlyFileSystem
             3 => DecodeZstd(compressed, extent.RamBytes, "Btrfs zstd extent", allowSectorPadding: true),
             _ => throw new NotSupportedException($"未対応のBtrfs圧縮方式です: {extent.Compression}")
         };
-        lock (_decodedExtentCacheLock)
-        {
-            if (_decodedExtentCache.TryGetValue(key, out var cached))
-            {
-                return cached;
-            }
-
-            _decodedExtentCache.Add(key, decoded);
-            return decoded;
-        }
+        return _decodedExtentCache.AddOrGetExisting(key, decoded);
     }
 
     private static byte[] DecodeZlib(byte[] compressed, ulong decodedLength, string label)
