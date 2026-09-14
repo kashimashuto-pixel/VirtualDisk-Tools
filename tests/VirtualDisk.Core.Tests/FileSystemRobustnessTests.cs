@@ -9,6 +9,7 @@ internal static class FileSystemRobustnessTests
     {
         TestNtfsResidentLengthBounds();
         TestExtGeometryBounds(directory);
+        TestXfsGeometryBounds(directory);
     }
 
     private static void TestNtfsResidentLengthBounds()
@@ -44,6 +45,28 @@ internal static class FileSystemRobustnessTests
         AssertExtRejected<InvalidDataException>(inodePath, "ext inode count beyond groups");
     }
 
+    private static void TestXfsGeometryBounds(string directory)
+    {
+        var validPath = Path.Combine(directory, "xfs-minimal-geometry.raw");
+        WriteXfsSuperblock(validPath, blockSize: 4096, blockSizeLog2: 12, dataBlocks: 256);
+        using (var reader = new RawDiskImageReader(validPath))
+        {
+            Assert(XfsRawFileSystem.TryOpen(reader) is not null, "bounded XFS geometry accepted");
+        }
+
+        var blockPath = Path.Combine(directory, "xfs-invalid-block-size.raw");
+        WriteXfsSuperblock(blockPath, blockSize: 3, blockSizeLog2: 0, dataBlocks: 256);
+        AssertXfsRejected<InvalidDataException>(blockPath, "XFS invalid block size");
+
+        var logarithmPath = Path.Combine(directory, "xfs-invalid-block-log.raw");
+        WriteXfsSuperblock(logarithmPath, blockSize: 4096, blockSizeLog2: 31, dataBlocks: 256);
+        AssertXfsRejected<InvalidDataException>(logarithmPath, "XFS inconsistent block logarithm");
+
+        var lengthPath = Path.Combine(directory, "xfs-out-of-range-blocks.raw");
+        WriteXfsSuperblock(lengthPath, blockSize: 4096, blockSizeLog2: 12, dataBlocks: 257);
+        AssertXfsRejected<InvalidDataException>(lengthPath, "XFS data blocks beyond input");
+    }
+
     private static void WriteExtSuperblock(
         string path,
         uint logBlockSize,
@@ -65,6 +88,36 @@ internal static class FileSystemRobustnessTests
         File.WriteAllBytes(path, image);
     }
 
+    private static void WriteXfsSuperblock(
+        string path,
+        uint blockSize,
+        byte blockSizeLog2,
+        ulong dataBlocks)
+    {
+        const int imageLength = 1024 * 1024;
+        using var stream = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None);
+        stream.SetLength(imageLength);
+        var super = new byte[512];
+        BinaryPrimitives.WriteUInt32BigEndian(super.AsSpan(0x00), 0x58465342);
+        BinaryPrimitives.WriteUInt32BigEndian(super.AsSpan(0x04), blockSize);
+        BinaryPrimitives.WriteUInt64BigEndian(super.AsSpan(0x08), dataBlocks);
+        new Guid("5f1c4201-a39f-410b-9203-f0ea4a57ac27").TryWriteBytes(super.AsSpan(0x20), bigEndian: true, out _);
+        BinaryPrimitives.WriteUInt64BigEndian(super.AsSpan(0x38), 128);
+        BinaryPrimitives.WriteUInt32BigEndian(super.AsSpan(0x54), 256);
+        BinaryPrimitives.WriteUInt32BigEndian(super.AsSpan(0x58), 1);
+        BinaryPrimitives.WriteUInt16BigEndian(super.AsSpan(0x64), 5);
+        BinaryPrimitives.WriteUInt16BigEndian(super.AsSpan(0x66), 512);
+        BinaryPrimitives.WriteUInt16BigEndian(super.AsSpan(0x68), 512);
+        BinaryPrimitives.WriteUInt16BigEndian(super.AsSpan(0x6a), 8);
+        super[0x78] = blockSizeLog2;
+        super[0x7a] = 9;
+        super[0x7b] = 3;
+        super[0x7c] = 8;
+        super[0xc0] = 0;
+        stream.Position = 0;
+        stream.Write(super);
+    }
+
     private static void AssertExtRejected<TException>(string path, string message)
         where TException : Exception
     {
@@ -77,6 +130,13 @@ internal static class FileSystemRobustnessTests
             SectorCount = checked((ulong)(reader.Length / 512)),
         };
         AssertThrows<TException>(() => _ = new ExtFileSystem(reader, partition), message);
+    }
+
+    private static void AssertXfsRejected<TException>(string path, string message)
+        where TException : Exception
+    {
+        using var reader = new RawDiskImageReader(path);
+        AssertThrows<TException>(() => _ = XfsRawFileSystem.TryOpen(reader), message);
     }
 
     private static void AssertThrows<TException>(Action action, string message)

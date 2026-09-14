@@ -2,6 +2,7 @@ using System.Text;
 using System.Globalization;
 using System.Diagnostics;
 using System.Buffers.Binary;
+using System.Numerics;
 using Qcow2Explorer.Core;
 
 namespace Qcow2Explorer.FileSystems;
@@ -18,6 +19,7 @@ internal sealed partial class XfsRawFileSystem
     private const uint BmapMagicV5 = 0x424d4133;
     private const ulong DirectoryLeafOffsetBytes = 1UL << 35;
     private const int MaxSymlinkDepth = 12;
+    private const int MaxLogBasicBlocks = 4_194_304;
 
     private readonly IBlockReader _reader;
     private readonly IBlockWriter? _writer;
@@ -318,6 +320,57 @@ internal sealed partial class XfsRawFileSystem
         var logIncompatibleFeatures = sbVersion >= 5 ? EndianUtilities.ReadUInt32Big(buffer, 0xdc) : 0;
         var logStart = EndianUtilities.ReadUInt64Big(buffer, 0x30);
         var logBlocks = EndianUtilities.ReadUInt32Big(buffer, 0x60);
+        var dataBlocks = EndianUtilities.ReadUInt64Big(buffer, 0x08);
+        var rootInode = EndianUtilities.ReadUInt64Big(buffer, 0x38);
+        var agBlocks = EndianUtilities.ReadUInt32Big(buffer, 0x54);
+        var agCount = EndianUtilities.ReadUInt32Big(buffer, 0x58);
+        var sectorSize = ReadUInt16Big(buffer, 0x66);
+        if (sbVersion is not (4 or 5))
+        {
+            throw new NotSupportedException($"Unsupported XFS superblock version: {sbVersion}.");
+        }
+
+        if (!BitOperations.IsPow2(blockSize)
+            || blockSize is < 512 or > 64 * 1024
+            || blockSizeLog2 != BitOperations.Log2(blockSize)
+            || !BitOperations.IsPow2((uint)inodeSize)
+            || inodeSize is < 256 or > 2048
+            || inodeSize > blockSize
+            || inodesPerBlock != blockSize / inodeSize
+            || inodeSizeLog2 != BitOperations.Log2((uint)inodeSize)
+            || inodesPerBlockLog2 != BitOperations.Log2((uint)inodesPerBlock)
+            || !BitOperations.IsPow2((uint)sectorSize)
+            || sectorSize is < 512 or > 32 * 1024
+            || sectorSize > blockSize)
+        {
+            throw new InvalidDataException("XFS block, inode, or sector geometry is invalid.");
+        }
+
+        if (dataBlocks == 0
+            || dataBlocks > (ulong)reader.Length / blockSize
+            || rootInode == 0
+            || agBlocks == 0
+            || agCount == 0)
+        {
+            throw new InvalidDataException("XFS data or allocation-group geometry is outside the input.");
+        }
+
+        var expectedAgBlocksLog2 = agBlocks <= 1 ? 0 : BitOperations.Log2(agBlocks - 1) + 1;
+        var minimumAgCapacity = checked((ulong)(agCount - 1) * agBlocks);
+        var maximumAgCapacity = checked((ulong)agCount * agBlocks);
+        if (agBlocksLog2 != expectedAgBlocksLog2
+            || dataBlocks <= minimumAgCapacity
+            || dataBlocks > maximumAgCapacity)
+        {
+            throw new InvalidDataException("XFS allocation-group count or logarithm is inconsistent.");
+        }
+
+        if (dirBlockLog2 > 7 || blockSize > (64U * 1024 >> dirBlockLog2))
+        {
+            throw new NotSupportedException("XFS directory block size exceeds 64 KiB.");
+        }
+
+        var directoryBlockSize = checked(blockSize << dirBlockLog2);
         var agOffsetBits = agBlocksLog2 + inodesPerBlockLog2;
         if (agOffsetBits <= 0 || agOffsetBits >= 63)
         {
@@ -326,11 +379,11 @@ internal sealed partial class XfsRawFileSystem
 
         return new XfsSuperBlock(
             blockSize,
-            EndianUtilities.ReadUInt64Big(buffer, 0x08),
+            dataBlocks,
             EndianUtilities.ReadUInt64Big(buffer, 0x10),
-            EndianUtilities.ReadUInt64Big(buffer, 0x38),
-            EndianUtilities.ReadUInt32Big(buffer, 0x54),
-            EndianUtilities.ReadUInt32Big(buffer, 0x58),
+            rootInode,
+            agBlocks,
+            agCount,
             sbVersion,
             inodeSize,
             inodesPerBlock,
@@ -340,7 +393,7 @@ internal sealed partial class XfsRawFileSystem
             agBlocksLog2,
             dirBlockLog2,
             ((ulong)1 << agOffsetBits) - 1,
-            blockSize << dirBlockLog2,
+            directoryBlockSize,
             sbVersion == 5 && (incompatibleFeatures & 0x1) != 0 || (version & 0x8000) != 0 && (features2 & 0x0200) != 0,
             sbVersion == 5 && (incompatibleFeatures & 0x08) != 0,
             sbVersion == 5 && (incompatibleFeatures & 0x20) != 0,
@@ -348,7 +401,7 @@ internal sealed partial class XfsRawFileSystem
             logStart,
             logBlocks,
             buffer.AsSpan(0x20, 16).ToArray(),
-            ReadUInt16Big(buffer, 0x66),
+            sectorSize,
             compatibleFeatures,
             readOnlyCompatibleFeatures,
             incompatibleFeatures,
@@ -1043,7 +1096,7 @@ internal sealed partial class XfsRawFileSystem
             return (_hasCleanLog = false).Value;
         }
 
-        if ((logLength % basicBlockSize) != 0 || logLength / basicBlockSize > int.MaxValue)
+        if ((logLength % basicBlockSize) != 0 || logLength / basicBlockSize > MaxLogBasicBlocks)
         {
             return (_hasCleanLog = false).Value;
         }
