@@ -70,6 +70,8 @@ jobs:
           dotnet run --project src/VirtualDisk.Cli/VirtualDisk.Cli.csproj --configuration Release --no-build -- \
             list /tmp/vdt-ci-xfs.raw --partition 1 --path / | grep VDT-README.txt
           dotnet run --project src/VirtualDisk.Cli/VirtualDisk.Cli.csproj --configuration Release --no-build -- \
+            verify /tmp/vdt-ci-xfs.raw --partition 1 --path / | grep "Verification passed"
+          dotnet run --project src/VirtualDisk.Cli/VirtualDisk.Cli.csproj --configuration Release --no-build -- \
             extract /tmp/vdt-ci-xfs.raw --partition 1 --path /VDT-README.txt --output /tmp/vdt-ci-readme.txt
           grep -q "Created by Virtual Disk Explorer" /tmp/vdt-ci-readme.txt
           if dotnet run --project src/VirtualDisk.Cli/VirtualDisk.Cli.csproj --configuration Release --no-build -- \

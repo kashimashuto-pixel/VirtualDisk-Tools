@@ -17,6 +17,7 @@ try
     BoundedLruCacheTests.Run();
     ExtractionRobustnessTests.Run(temporaryDirectory);
     ExportTraversalRobustnessTests.Run(temporaryDirectory);
+    VerificationRobustnessTests.Run();
     Qcow2RobustnessTests.Run(temporaryDirectory);
     ContainerRobustnessTests.Run(temporaryDirectory);
     PartitionTableRobustnessTests.Run(temporaryDirectory);

@@ -35,6 +35,7 @@ internal static class Cli
             {
                 "info" => RunInfo(args[1..], cancellationSource.Token),
                 "list" => RunList(args[1..], cancellationSource.Token),
+                "verify" => RunVerify(args[1..], cancellationSource.Token),
                 "extract" => await RunExtractAsync(args[1..], cancellationSource.Token),
                 "create" => await RunCreateAsync(args[1..], cancellationSource.Token),
                 _ => throw new CliUsageException($"不明なコマンドです: {args[0]}"),
@@ -138,6 +139,52 @@ internal static class Cli
 
         Console.WriteLine($"Extracted {file.Size} bytes to {outputPath}");
         return 0;
+    }
+
+    private static int RunVerify(string[] args, CancellationToken cancellationToken)
+    {
+        var options = ParsedOptions.Parse(args, ["partition", "path"]);
+        using var context = OpenFileSystem(options, cancellationToken);
+        var start = ResolvePath(context.FileSystem, options.Get("path") ?? "/", cancellationToken);
+        long lastReportedBytes = 0;
+        var lastReportedEntries = 0;
+        var progress = new CallbackProgress<FileSystemVerificationProgress>(update =>
+        {
+            if (update.BytesRead - lastReportedBytes < 256L * 1024 * 1024
+                && update.EntriesChecked - lastReportedEntries < 1_000)
+            {
+                return;
+            }
+
+            lastReportedBytes = update.BytesRead;
+            lastReportedEntries = update.EntriesChecked;
+            Console.Error.WriteLine(
+                $"Verifying: entries={update.EntriesChecked:N0}, files={update.FilesChecked:N0}, "
+                + $"bytes={update.BytesRead:N0}, path={update.CurrentPath}");
+        });
+        var result = FileSystemVerifier.Verify(
+            context.FileSystem,
+            start,
+            progress,
+            cancellationToken);
+        Console.WriteLine(
+            $"Verification {(result.IsValid ? "passed" : "failed")}: "
+            + $"entries={result.EntriesChecked:N0}, files={result.FilesChecked:N0}, "
+            + $"directories={result.DirectoriesChecked:N0}, bytes={result.BytesRead:N0}, "
+            + $"issues={result.Issues.Count:N0}, completed={result.Completed}");
+        const int maximumDisplayedIssues = 100;
+        foreach (var issue in result.Issues.Take(maximumDisplayedIssues))
+        {
+            Console.Error.WriteLine($"  {issue.Path}: {issue.ErrorType}: {issue.Message}");
+        }
+
+        if (result.Issues.Count > maximumDisplayedIssues)
+        {
+            Console.Error.WriteLine(
+                $"  ... {result.Issues.Count - maximumDisplayedIssues:N0} additional issue(s) omitted");
+        }
+
+        return result.IsValid ? 0 : 3;
     }
 
     private static async Task<int> RunCreateAsync(string[] args, CancellationToken cancellationToken)
@@ -312,6 +359,7 @@ internal static class Cli
             Usage:
               vdt info IMAGE
               vdt list IMAGE [--partition NUMBER] [--path VIRTUAL_PATH]
+              vdt verify IMAGE [--partition NUMBER] [--path VIRTUAL_PATH]
               vdt extract IMAGE [--partition NUMBER] --path VIRTUAL_PATH --output FILE
               vdt create OUTPUT --size SIZE [--container raw|qcow2] [--table mbr|gpt]
                          --partition xfs|ext4|ntfs:SIZE[:LABEL[:NAME]] [--partition ...]
