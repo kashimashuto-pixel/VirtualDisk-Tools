@@ -1,5 +1,6 @@
 using System.Buffers.Binary;
 using System.Diagnostics;
+using System.Text;
 using Qcow2Explorer.Core;
 
 internal static class Qcow2RobustnessTests
@@ -11,6 +12,7 @@ internal static class Qcow2RobustnessTests
         TestUntrustedHeaderLimits(directory);
         TestDeterministicHeaderMutations(directory);
         TestBoundedConcurrentMetadataCache(directory);
+        TestBackingChains(directory);
     }
 
     private static void TestMinimalImage(string directory)
@@ -131,6 +133,74 @@ internal static class Qcow2RobustnessTests
         Assert(reader.CachedL2TableCount <= reader.MaxL2CacheEntries, "concurrent QCOW2 L2 cache remains bounded");
     }
 
+    private static void TestBackingChains(string directory)
+    {
+        var rawPath = Path.Combine(directory, "backing-base.raw");
+        var middlePath = Path.Combine(directory, "backing-middle.qcow2");
+        var topPath = Path.Combine(directory, "backing-top.qcow2");
+        File.WriteAllBytes(rawPath, [0x5a]);
+        File.WriteAllBytes(middlePath, CreateBackedImage(Path.GetFileName(rawPath)));
+        File.WriteAllBytes(topPath, CreateBackedImage(Path.GetFileName(middlePath)));
+        using (var reader = new Qcow2Reader(topPath))
+        {
+            Assert(reader.ReadByte(0) == 0x5a, "valid QCOW2 backing chain data");
+        }
+
+        var selfPath = Path.Combine(directory, "backing-self.qcow2");
+        File.WriteAllBytes(selfPath, CreateBackedImage(Path.GetFileName(selfPath)));
+        AssertOpenRejected(selfPath, "self-referencing QCOW2 backing chain", "循環参照");
+        File.Delete(selfPath);
+        Assert(!File.Exists(selfPath), "self-referencing QCOW2 handle released");
+
+        var cycleA = Path.Combine(directory, "backing-cycle-a.qcow2");
+        var cycleB = Path.Combine(directory, "backing-cycle-b.qcow2");
+        File.WriteAllBytes(cycleA, CreateBackedImage(Path.GetFileName(cycleB)));
+        File.WriteAllBytes(cycleB, CreateBackedImage(Path.GetFileName(cycleA)));
+        AssertOpenRejected(cycleA, "cyclic QCOW2 backing chain", "循環参照");
+        File.Delete(cycleA);
+        File.Delete(cycleB);
+        Assert(!File.Exists(cycleA) && !File.Exists(cycleB), "cyclic QCOW2 handles released");
+
+        const int excessiveDepth = 65;
+        var deepPaths = Enumerable.Range(0, excessiveDepth)
+            .Select(index => Path.Combine(directory, $"backing-deep-{index:D2}.qcow2"))
+            .ToArray();
+        var deepBase = Path.Combine(directory, "backing-deep-base.raw");
+        File.WriteAllBytes(deepBase, [0]);
+        for (var index = 0; index < deepPaths.Length; index++)
+        {
+            var backingName = index + 1 < deepPaths.Length
+                ? Path.GetFileName(deepPaths[index + 1])
+                : Path.GetFileName(deepBase);
+            File.WriteAllBytes(deepPaths[index], CreateBackedImage(backingName));
+        }
+
+        AssertOpenRejected(deepPaths[0], "excessively deep QCOW2 backing chain", "対応上限");
+        foreach (var path in deepPaths)
+        {
+            File.Delete(path);
+            Assert(!File.Exists(path), "deep QCOW2 backing handle released");
+        }
+    }
+
+    private static void AssertOpenRejected(string path, string description, string expectedMessage)
+    {
+        var rejected = false;
+        try
+        {
+            using var reader = new Qcow2Reader(path);
+        }
+        catch (Exception exception) when (IsExpectedMalformedInputException(exception))
+        {
+            rejected = true;
+            Assert(
+                exception.Message.Contains(expectedMessage, StringComparison.Ordinal),
+                $"{description} diagnostic");
+        }
+
+        Assert(rejected, $"{description} rejected");
+    }
+
     private static void CreateManyL2Image(string path, int clusterBits, int tableCount)
     {
         var clusterSize = 1L << clusterBits;
@@ -212,6 +282,16 @@ internal static class Qcow2RobustnessTests
         BinaryPrimitives.WriteUInt64BigEndian(image.AsSpan(40), 512);
         BinaryPrimitives.WriteUInt32BigEndian(image.AsSpan(96), 4);
         BinaryPrimitives.WriteUInt32BigEndian(image.AsSpan(100), 104);
+        return image;
+    }
+
+    private static byte[] CreateBackedImage(string backingName)
+    {
+        var image = CreateMinimalImage();
+        var name = Encoding.UTF8.GetBytes(backingName);
+        BinaryPrimitives.WriteUInt64BigEndian(image.AsSpan(8), 104);
+        BinaryPrimitives.WriteUInt32BigEndian(image.AsSpan(16), checked((uint)name.Length));
+        name.CopyTo(image.AsSpan(104));
         return image;
     }
 

@@ -12,6 +12,7 @@ public sealed class Qcow2Reader : IDiskImageReader
     private const int MaxL1TableBytes = 64 * 1024 * 1024;
     private const uint MaxSnapshotCount = 65_536;
     private const int MaxSnapshotMetadataBytes = 16 * 1024 * 1024;
+    private const int MaxBackingChainDepth = 64;
 
     private readonly FileStream _stream;
     private readonly object _sync = new();
@@ -47,43 +48,67 @@ public sealed class Qcow2Reader : IDiskImageReader
     }
 
     public Qcow2Reader(string path)
+        : this(path, new HashSet<string>(GetPathComparer()), 0)
     {
-        Path = path;
-        _stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+    }
+
+    private Qcow2Reader(string path, HashSet<string> backingChain, int backingDepth)
+    {
+        if (backingDepth >= MaxBackingChainDepth)
+        {
+            throw new NotSupportedException(
+                $"qcow2 backing fileチェーンが対応上限 ({MaxBackingChainDepth:N0}層) を超えています。");
+        }
+
+        var canonicalPath = System.IO.Path.GetFullPath(path);
+        if (!backingChain.Add(canonicalPath))
+        {
+            throw new InvalidDataException($"qcow2 backing fileチェーンに循環参照があります: {canonicalPath}");
+        }
+
         try
         {
-            Header = Qcow2Header.Parse(_stream);
-            if (Header.VirtualSize > long.MaxValue)
-            {
-                throw new NotSupportedException("この qcow2 の仮想サイズは .NET の long 範囲を超えています。");
-            }
-
-            Length = (long)Header.VirtualSize;
-            L2Entries = checked((int)(Header.ClusterSize / (Header.UsesExtendedL2Entries ? 16 : 8)));
-            MaxL2CacheEntries = Math.Max(
-                1,
-                MaxCacheBytesPerKind / checked(L2Entries * 16));
-            MaxCompressedClusterCacheEntries = Math.Max(
-                1,
-                checked((int)(MaxCacheBytesPerKind / Header.ClusterSize)));
-            _l1Table = ReadL1Table(Header.L1TableOffset, Header.L1Size);
-            Snapshots = ReadSnapshots();
-            _backingReader = OpenBackingReader(path, Header);
+            Path = path;
+            _stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
             try
             {
-                _externalDataStream = OpenExternalDataFile(path, Header);
+                Header = Qcow2Header.Parse(_stream);
+                if (Header.VirtualSize > long.MaxValue)
+                {
+                    throw new NotSupportedException("この qcow2 の仮想サイズは .NET の long 範囲を超えています。");
+                }
+
+                Length = (long)Header.VirtualSize;
+                L2Entries = checked((int)(Header.ClusterSize / (Header.UsesExtendedL2Entries ? 16 : 8)));
+                MaxL2CacheEntries = Math.Max(
+                    1,
+                    MaxCacheBytesPerKind / checked(L2Entries * 16));
+                MaxCompressedClusterCacheEntries = Math.Max(
+                    1,
+                    checked((int)(MaxCacheBytesPerKind / Header.ClusterSize)));
+                _l1Table = ReadL1Table(Header.L1TableOffset, Header.L1Size);
+                Snapshots = ReadSnapshots();
+                _backingReader = OpenBackingReader(path, Header, backingChain, backingDepth + 1);
+                try
+                {
+                    _externalDataStream = OpenExternalDataFile(path, Header);
+                }
+                catch
+                {
+                    _backingReader?.Dispose();
+                    throw;
+                }
             }
             catch
             {
-                _backingReader?.Dispose();
+                _stream.Dispose();
+                _snapshotLock.Dispose();
                 throw;
             }
         }
-        catch
+        finally
         {
-            _stream.Dispose();
-            _snapshotLock.Dispose();
-            throw;
+            backingChain.Remove(canonicalPath);
         }
     }
 
@@ -529,7 +554,11 @@ public sealed class Qcow2Reader : IDiskImageReader
         }
     }
 
-    private static IDiskImageReader? OpenBackingReader(string imagePath, Qcow2Header header)
+    private static IDiskImageReader? OpenBackingReader(
+        string imagePath,
+        Qcow2Header header,
+        HashSet<string> backingChain,
+        int backingDepth)
     {
         if (!header.HasBackingFile || string.IsNullOrWhiteSpace(header.BackingFileName))
         {
@@ -545,8 +574,31 @@ public sealed class Qcow2Reader : IDiskImageReader
             throw new FileNotFoundException("qcow2 の backing file が見つかりません。", backingPath);
         }
 
-        return DiskImageReaderFactory.Open(backingPath);
+        return IsQcow2File(backingPath)
+            ? new Qcow2Reader(backingPath, backingChain, backingDepth)
+            : DiskImageReaderFactory.Open(backingPath);
     }
+
+    private static bool IsQcow2File(string path)
+    {
+        var extension = System.IO.Path.GetExtension(path);
+        if (extension.Equals(".qcow2", StringComparison.OrdinalIgnoreCase)
+            || extension.Equals(".qcow", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        Span<byte> magic = stackalloc byte[4];
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        return stream.Read(magic) == magic.Length
+            && magic[0] == 0x51
+            && magic[1] == 0x46
+            && magic[2] == 0x49
+            && magic[3] == 0xfb;
+    }
+
+    private static StringComparer GetPathComparer() =>
+        OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
 
     private static FileStream? OpenExternalDataFile(string imagePath, Qcow2Header header)
     {
