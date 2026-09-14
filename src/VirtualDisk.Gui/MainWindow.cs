@@ -395,17 +395,31 @@ public sealed class MainWindow : Window
 
     private async Task ExtractSelectedAsync()
     {
-        if (_fileSystem is null || _entries.SelectedItem is not EntryItem { Node.IsDirectory: false } selected)
+        if (_fileSystem is null || _entries.SelectedItem is not EntryItem selected)
         {
             return;
         }
 
-        var destination = await StorageProvider.SaveFilePickerAsync(new FilePickerSaveOptions
+        string? path;
+        if (selected.Node.IsDirectory)
         {
-            Title = "ファイルを抽出",
-            SuggestedFileName = selected.Node.Name,
-        });
-        var path = destination?.TryGetLocalPath();
+            var destinations = await StorageProvider.OpenFolderPickerAsync(new FolderPickerOpenOptions
+            {
+                Title = "抽出先フォルダーを選択",
+                AllowMultiple = false,
+            });
+            path = destinations.SingleOrDefault()?.TryGetLocalPath();
+        }
+        else
+        {
+            var destination = await StorageProvider.SaveFilePickerAsync(new FilePickerSaveOptions
+            {
+                Title = "ファイルを抽出",
+                SuggestedFileName = selected.Node.Name,
+            });
+            path = destination?.TryGetLocalPath();
+        }
+
         if (path is null)
         {
             return;
@@ -416,7 +430,7 @@ public sealed class MainWindow : Window
         var operation = BeginOperation($"{file.Name}を抽出しています...");
         try
         {
-            if (_reader is not null && PathsEqual(path, _reader.Path))
+            if (!file.IsDirectory && _reader is not null && PathsEqual(path, _reader.Path))
             {
                 throw new IOException("開いているディスクイメージ自身には抽出できません。");
             }
@@ -441,21 +455,52 @@ public sealed class MainWindow : Window
                     }
                 });
             });
-            await Task.Run(
-                () => FileSystemExporter.ExtractFileAsync(
-                    fileSystem,
-                    file,
-                    path,
-                    overwrite: true,
-                    progress: progress,
-                    cancellationToken: operation.Token),
-                operation.Token);
+            if (file.IsDirectory)
+            {
+                var result = await Task.Run(
+                    () => FileSystemExporter.CopyNode(
+                        fileSystem,
+                        file,
+                        path,
+                        progress,
+                        operation.Token),
+                    operation.Token);
+                _status.Text = $"抽出しました: {result.FilesCopied:N0}ファイル / {result.BytesCopied:N0} bytes";
+                if (result.Errors.Count > 0)
+                {
+                    var details = string.Join(
+                        Environment.NewLine,
+                        result.Errors.Take(50).Select(error =>
+                            $"{error.SourceName}: {error.Message}"));
+                    if (result.Errors.Count > 50)
+                    {
+                        details += $"{Environment.NewLine}... 他{result.Errors.Count - 50:N0}件";
+                    }
 
-            _status.Text = $"抽出しました: {path}";
+                    await ShowErrorAsync(
+                        $"{result.Errors.Count:N0}件を抽出できませんでした",
+                        details);
+                }
+            }
+            else
+            {
+                await Task.Run(
+                    () => FileSystemExporter.ExtractFileAsync(
+                        fileSystem,
+                        file,
+                        path,
+                        overwrite: true,
+                        progress: progress,
+                        cancellationToken: operation.Token),
+                    operation.Token);
+                _status.Text = $"抽出しました: {path}";
+            }
         }
         catch (OperationCanceledException)
         {
-            _status.Text = "抽出をキャンセルしました。抽出先は変更されていません。";
+            _status.Text = file.IsDirectory
+                ? "抽出をキャンセルしました。抽出済みの項目は抽出先に残っています。"
+                : "抽出をキャンセルしました。抽出先は変更されていません。";
         }
         catch (Exception ex)
         {
@@ -629,8 +674,7 @@ public sealed class MainWindow : Window
     private void RefreshCommandState()
     {
         _backButton.IsEnabled = !_busy && _directoryHistory.Count > 0;
-        _extractButton.IsEnabled = !_busy
-            && _entries.SelectedItem is EntryItem { Node.IsDirectory: false };
+        _extractButton.IsEnabled = !_busy && _entries.SelectedItem is EntryItem;
         _verifyButton.IsEnabled = !_busy && _fileSystem is not null;
     }
 

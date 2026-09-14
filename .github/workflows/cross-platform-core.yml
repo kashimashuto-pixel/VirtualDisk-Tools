@@ -74,12 +74,16 @@ jobs:
           dotnet run --project src/VirtualDisk.Cli/VirtualDisk.Cli.csproj --configuration Release --no-build -- \
             extract /tmp/vdt-ci-xfs.raw --partition 1 --path /VDT-README.txt --output /tmp/vdt-ci-readme.txt
           grep -q "Created by Virtual Disk Explorer" /tmp/vdt-ci-readme.txt
+          dotnet run --project src/VirtualDisk.Cli/VirtualDisk.Cli.csproj --configuration Release --no-build -- \
+            extract /tmp/vdt-ci-xfs.raw --partition 1 --path / --output /tmp/vdt-ci-root
+          grep -q "Created by Virtual Disk Explorer" /tmp/vdt-ci-root/VDT-README.txt
           if dotnet run --project src/VirtualDisk.Cli/VirtualDisk.Cli.csproj --configuration Release --no-build -- \
             create /tmp/vdt-invalid.raw --size invalid --partition ext4:64MiB; then
             echo "Invalid CLI size was unexpectedly accepted."
             exit 1
           fi
           test ! -e /tmp/vdt-invalid.raw
+          rm -rf /tmp/vdt-ci-root
           rm -f /tmp/vdt-ci-xfs.raw /tmp/vdt-ci-xfs.partition /tmp/vdt-ci-readme.txt
 
       - name: Run GUI entry-point smoke test

@@ -126,15 +126,52 @@ internal static class Cli
 
         using var context = OpenFileSystem(options, cancellationToken);
         var file = ResolvePath(context.FileSystem, virtualPath, cancellationToken);
-        if (file.IsDirectory || file.Size < 0)
+        if (!file.IsDirectory && file.Size < 0)
         {
-            throw new CliUsageException("extractは現在、通常ファイルを1つ指定してください。");
+            throw new CliUsageException("サイズが不正なファイルは抽出できません。");
+        }
+
+        var lastPercentage = -1;
+        var progress = new CallbackProgress<CopyProgress>(update =>
+        {
+            var percentage = update.TotalBytes == 0
+                ? 100
+                : (int)Math.Min(100, update.BytesCopied * 100d / update.TotalBytes);
+            if (percentage == lastPercentage)
+            {
+                return;
+            }
+
+            lastPercentage = percentage;
+            Console.Error.WriteLine($"Extracting: {percentage}% — {update.CurrentPath}");
+        });
+        if (file.IsDirectory)
+        {
+            Directory.CreateDirectory(outputPath);
+            var result = FileSystemExporter.CopyNodes(
+                context.FileSystem,
+                context.FileSystem.ListDirectory(file),
+                outputPath,
+                progress,
+                cancellationToken);
+            Console.WriteLine(
+                $"Extracted directory to {outputPath}: files={result.FilesCopied:N0}, "
+                + $"directories={result.DirectoriesCreated:N0}, bytes={result.BytesCopied:N0}, "
+                + $"errors={result.Errors.Count:N0}");
+            if (result.Errors.Count > 0)
+            {
+                Console.Error.WriteLine("Some entries failed. See VirtualDiskExplorer-copy-errors*.json in the output directory.");
+                return 3;
+            }
+
+            return 0;
         }
 
         await FileSystemExporter.ExtractFileAsync(
             context.FileSystem,
             file,
             outputPath,
+            progress: progress,
             cancellationToken: cancellationToken);
 
         Console.WriteLine($"Extracted {file.Size} bytes to {outputPath}");
@@ -360,7 +397,7 @@ internal static class Cli
               vdt info IMAGE
               vdt list IMAGE [--partition NUMBER] [--path VIRTUAL_PATH]
               vdt verify IMAGE [--partition NUMBER] [--path VIRTUAL_PATH]
-              vdt extract IMAGE [--partition NUMBER] --path VIRTUAL_PATH --output FILE
+              vdt extract IMAGE [--partition NUMBER] --path VIRTUAL_PATH --output FILE_OR_DIRECTORY
               vdt create OUTPUT --size SIZE [--container raw|qcow2] [--table mbr|gpt]
                          --partition xfs|ext4|ntfs:SIZE[:LABEL[:NAME]] [--partition ...]
 
