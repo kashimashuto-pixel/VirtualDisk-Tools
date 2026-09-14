@@ -20,6 +20,7 @@ try
     ExtractionRobustnessTests.Run(temporaryDirectory);
     ExportTraversalRobustnessTests.Run(temporaryDirectory);
     VerificationRobustnessTests.Run();
+    SearchRobustnessTests.Run();
     Qcow2RobustnessTests.Run(temporaryDirectory);
     ContainerRobustnessTests.Run(temporaryDirectory);
     PartitionTableRobustnessTests.Run(temporaryDirectory);
