@@ -14,7 +14,9 @@ internal static class PartitionTableRobustnessTests
         TestMbrBounds(directory);
         TestExtendedMbrIntegrity(directory);
         TestGptRecoveryAndChecksums(directory);
+        TestGptCopiesMustAgree(directory);
         TestGptOverlap(directory);
+        TestInvalidGptEntryRejectsTable(directory);
         TestCancellation(directory);
     }
 
@@ -165,6 +167,22 @@ internal static class PartitionTableRobustnessTests
         }
     }
 
+    private static void TestGptCopiesMustAgree(string directory)
+    {
+        var path = CreateGptImage(directory, "partition-gpt-mismatch.raw");
+        var primaryEntriesOffset = 2L * SectorSize;
+        var backupEntriesOffset = DiskLength - 33L * SectorSize;
+        var primaryHeaderOffset = SectorSize;
+        var backupHeaderOffset = DiskLength - SectorSize;
+
+        FlipGptEntryByteAndRepair(path, backupEntriesOffset, backupHeaderOffset, 56);
+        using var reader = new RawDiskImageReader(path);
+        Assert(PartitionTableReader.ReadPartitions(reader).Count == 0, "mismatched valid GPT copies rejected");
+
+        FlipGptEntryByteAndRepair(path, primaryEntriesOffset, primaryHeaderOffset, 56);
+        AssertSingleGptPartition(reader, "matching repaired GPT copies");
+    }
+
     private static void WriteMbrSignature(Span<byte> sector)
     {
         sector[510] = 0x55;
@@ -212,14 +230,65 @@ internal static class PartitionTableRobustnessTests
         Assert(PartitionTableReader.ReadPartitions(reader).Count == 0, "overlapping GPT partitions rejected");
     }
 
+    private static void TestInvalidGptEntryRejectsTable(string directory)
+    {
+        var path = CreateGptImage(directory, "partition-invalid-entry-gpt.raw");
+        SetGptEntryUInt64AndRepair(path, 2L * SectorSize, SectorSize, 40, (ulong)(DiskLength / SectorSize));
+        SetGptEntryUInt64AndRepair(
+            path,
+            DiskLength - 33L * SectorSize,
+            DiskLength - SectorSize,
+            40,
+            (ulong)(DiskLength / SectorSize));
+
+        using var reader = new RawDiskImageReader(path);
+        Assert(PartitionTableReader.ReadPartitions(reader).Count == 0, "invalid populated GPT entry rejects whole table");
+    }
+
+    private static void FlipGptEntryByteAndRepair(
+        string path,
+        long entriesOffset,
+        long headerOffset,
+        int relativeOffset)
+    {
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite);
+        stream.Position = entriesOffset + relativeOffset;
+        var value = stream.ReadByte();
+        Assert(value >= 0, "GPT entry mutation source byte exists");
+        stream.Position = entriesOffset + relativeOffset;
+        stream.WriteByte(checked((byte)(value ^ 0x01)));
+        RepairGptChecksums(stream, entriesOffset, headerOffset);
+    }
+
+    private static void SetGptEntryUInt64AndRepair(
+        string path,
+        long entriesOffset,
+        long headerOffset,
+        int relativeOffset,
+        ulong value)
+    {
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite);
+        stream.Position = entriesOffset + relativeOffset;
+        Span<byte> bytes = stackalloc byte[sizeof(ulong)];
+        BinaryPrimitives.WriteUInt64LittleEndian(bytes, value);
+        stream.Write(bytes);
+        RepairGptChecksums(stream, entriesOffset, headerOffset);
+    }
+
     private static void MakeSecondGptEntryOverlap(string path, long entriesOffset, long headerOffset)
     {
-        const int entryArrayBytes = 128 * 128;
         using var stream = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite);
         stream.Position = entriesOffset + 128 + 32;
         Span<byte> firstLba = stackalloc byte[8];
         BinaryPrimitives.WriteUInt64LittleEndian(firstLba, 2049);
         stream.Write(firstLba);
+
+        RepairGptChecksums(stream, entriesOffset, headerOffset);
+    }
+
+    private static void RepairGptChecksums(FileStream stream, long entriesOffset, long headerOffset)
+    {
+        const int entryArrayBytes = 128 * 128;
 
         var entries = new byte[entryArrayBytes];
         stream.Position = entriesOffset;

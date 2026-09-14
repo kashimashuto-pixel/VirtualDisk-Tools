@@ -33,19 +33,23 @@ public static class PartitionTableReader
 
         if (HasProtectiveMbr(mbr))
         {
-            if (TryReadGpt(disk, sectorSize, 1, cancellationToken, out var gptPartitions))
-            {
-                return gptPartitions;
-            }
-
             var totalSectors = (ulong)(disk.Length / sectorSize);
-            if (totalSectors > 1
-                && TryReadGpt(disk, sectorSize, totalSectors - 1, cancellationToken, out gptPartitions))
+            var hasPrimary = TryReadGpt(disk, sectorSize, 1, cancellationToken, out var primaryGpt);
+            GptTable? backupGpt = null;
+            var hasBackup = totalSectors > 1
+                && TryReadGpt(disk, sectorSize, totalSectors - 1, cancellationToken, out backupGpt);
+            if (hasPrimary && hasBackup)
             {
-                return gptPartitions;
+                return GptTablesAgree(primaryGpt!, backupGpt!)
+                    ? primaryGpt!.Partitions
+                    : Array.Empty<PartitionInfo>();
             }
 
-            return Array.Empty<PartitionInfo>();
+            return hasPrimary
+                ? primaryGpt!.Partitions
+                : hasBackup
+                    ? backupGpt!.Partitions
+                    : Array.Empty<PartitionInfo>();
         }
 
         var mbrPartitions = ReadMbrPartitions(disk, mbr, sectorSize, cancellationToken);
@@ -328,9 +332,9 @@ public static class PartitionTableReader
         uint sectorSize,
         ulong headerLba,
         CancellationToken cancellationToken,
-        out IReadOnlyList<PartitionInfo> partitions)
+        out GptTable? table)
     {
-        partitions = Array.Empty<PartitionInfo>();
+        table = null;
         var totalSectors = (ulong)(disk.Length / sectorSize);
         if (totalSectors < 2
             || headerLba >= totalSectors
@@ -363,6 +367,7 @@ public static class PartitionTableReader
         var alternateLba = EndianUtilities.ReadUInt64Little(header, 32);
         var firstUsableLba = EndianUtilities.ReadUInt64Little(header, 40);
         var lastUsableLba = EndianUtilities.ReadUInt64Little(header, 48);
+        var diskId = new Guid(header.AsSpan(56, 16));
         var entryLba = EndianUtilities.ReadUInt64Little(header, 72);
         var entryCount = EndianUtilities.ReadUInt32Little(header, 80);
         var entrySize = EndianUtilities.ReadUInt32Little(header, 84);
@@ -379,7 +384,15 @@ public static class PartitionTableReader
             || !TryMultiply(entryCount, entrySize, out var entryBytes)
             || !TryMultiply(entryLba, sectorSize, out var entryOffset)
             || entryOffset > (ulong)disk.Length
-            || entryBytes > (ulong)disk.Length - entryOffset)
+            || entryBytes > (ulong)disk.Length - entryOffset
+            || !TryAdd(entryBytes, sectorSize - 1, out var roundedEntryBytes)
+            || !TryAdd(entryLba, roundedEntryBytes / sectorSize, out var entryEndLba)
+            || entryEndLba > totalSectors
+            || RangesOverlap(entryLba, entryEndLba, firstUsableLba, lastUsableLba + 1)
+            || (currentLba >= firstUsableLba && currentLba <= lastUsableLba)
+            || (alternateLba >= firstUsableLba && alternateLba <= lastUsableLba)
+            || (currentLba >= entryLba && currentLba < entryEndLba)
+            || (alternateLba >= entryLba && alternateLba < entryEndLba))
         {
             return false;
         }
@@ -416,7 +429,7 @@ public static class PartitionTableReader
                 || lastLba > lastUsableLba
                 || lastLba >= totalSectors)
             {
-                continue;
+                return false;
             }
 
             var nameBytes = Math.Min(72, entry.Length - 56);
@@ -440,9 +453,28 @@ public static class PartitionTableReader
             return false;
         }
 
-        partitions = result;
+        table = new GptTable(
+            result,
+            diskId,
+            firstUsableLba,
+            lastUsableLba,
+            entryCount,
+            entrySize,
+            currentLba,
+            alternateLba,
+            entries);
         return true;
     }
+
+    private static bool GptTablesAgree(GptTable primary, GptTable backup) =>
+        primary.DiskId == backup.DiskId
+        && primary.FirstUsableLba == backup.FirstUsableLba
+        && primary.LastUsableLba == backup.LastUsableLba
+        && primary.EntryCount == backup.EntryCount
+        && primary.EntrySize == backup.EntrySize
+        && primary.AlternateLba == backup.HeaderLba
+        && backup.AlternateLba == primary.HeaderLba
+        && primary.Entries.AsSpan().SequenceEqual(backup.Entries);
 
     private static bool HasOverlappingPartitions(IReadOnlyList<PartitionInfo> partitions)
     {
@@ -554,4 +586,15 @@ public static class PartitionTableReader
             _ => "Unknown GPT type"
         };
     }
+
+    private sealed record GptTable(
+        IReadOnlyList<PartitionInfo> Partitions,
+        Guid DiskId,
+        ulong FirstUsableLba,
+        ulong LastUsableLba,
+        uint EntryCount,
+        uint EntrySize,
+        ulong HeaderLba,
+        ulong AlternateLba,
+        byte[] Entries);
 }
