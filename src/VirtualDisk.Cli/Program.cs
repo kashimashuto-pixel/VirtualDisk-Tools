@@ -309,19 +309,16 @@ internal static class Cli
         string virtualPath,
         CancellationToken cancellationToken)
     {
-        var current = fileSystem.Root;
-        foreach (var component in VirtualPath.Split(virtualPath))
+        if (!FileEditService.TryResolvePath(
+                fileSystem,
+                virtualPath,
+                out var node,
+                cancellationToken))
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            var comparison = fileSystem.Name is "FAT16" or "FAT32" or "exFAT" or "NTFS"
-                ? StringComparison.OrdinalIgnoreCase
-                : StringComparison.Ordinal;
-            current = fileSystem.ListDirectory(current)
-                .SingleOrDefault(entry => string.Equals(entry.Name, component, comparison))
-                ?? throw new FileNotFoundException($"仮想パスが見つかりません: {virtualPath}");
+            throw new FileNotFoundException($"仮想パスが見つかりません: {virtualPath}");
         }
 
-        return current;
+        return node;
     }
 
     private static VirtualDiskPartitionDefinition ParsePartition(string specification, int number)

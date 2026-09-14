@@ -466,16 +466,40 @@ public static class FileEditService
         }
     }
 
-    internal static bool TryResolvePath(IReadOnlyFileSystem fileSystem, string path, out VfsNode node)
+    public static bool TryResolvePath(
+        IReadOnlyFileSystem fileSystem,
+        string path,
+        out VfsNode node,
+        CancellationToken cancellationToken = default)
     {
+        ArgumentNullException.ThrowIfNull(fileSystem);
+        ArgumentNullException.ThrowIfNull(path);
+        cancellationToken.ThrowIfCancellationRequested();
         node = fileSystem.Root;
         var comparison = fileSystem.Name is "FAT16" or "FAT32" or "exFAT" or "NTFS"
             ? StringComparison.OrdinalIgnoreCase
             : StringComparison.Ordinal;
         foreach (var part in path.Replace('\\', '/').Split('/', StringSplitOptions.RemoveEmptyEntries))
         {
-            var next = fileSystem.ListDirectory(node)
-                .SingleOrDefault(candidate => string.Equals(candidate.Name, part, comparison));
+            cancellationToken.ThrowIfCancellationRequested();
+            VfsNode? next = null;
+            foreach (var candidate in fileSystem.ListDirectory(node))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (!string.Equals(candidate.Name, part, comparison))
+                {
+                    continue;
+                }
+
+                if (next is not null)
+                {
+                    throw new InvalidDataException(
+                        $"同じ名前の項目が複数あるため仮想パスを一意に解決できません: {path}");
+                }
+
+                next = candidate;
+            }
+
             if (next is null)
             {
                 node = null!;

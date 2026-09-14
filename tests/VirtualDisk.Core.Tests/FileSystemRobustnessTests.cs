@@ -11,6 +11,7 @@ internal static class FileSystemRobustnessTests
         TestExtGeometryBounds(directory);
         TestXfsGeometryBounds(directory);
         TestBtrfsInitializationCancellation(directory);
+        TestAmbiguousVirtualPathsRejected();
     }
 
     private static void TestNtfsResidentLengthBounds()
@@ -94,6 +95,20 @@ internal static class FileSystemRobustnessTests
                 out _,
                 cancellationSource.Token),
             "Btrfs initialization cancellation propagated");
+    }
+
+    private static void TestAmbiguousVirtualPathsRejected()
+    {
+        var fileSystem = new DuplicateNameFileSystem();
+        AssertThrows<InvalidDataException>(
+            () => FileEditService.TryResolvePath(fileSystem, "/duplicate.txt", out _),
+            "duplicate case-insensitive virtual path rejected");
+
+        using var cancellationSource = new CancellationTokenSource();
+        cancellationSource.Cancel();
+        AssertThrows<OperationCanceledException>(
+            () => FileEditService.TryResolvePath(fileSystem, "/", out _, cancellationSource.Token),
+            "virtual path resolution cancellation propagated");
     }
 
     private static void WriteExtSuperblock(
@@ -189,5 +204,22 @@ internal static class FileSystemRobustnessTests
         {
             throw new InvalidOperationException($"Assertion failed: {message}");
         }
+    }
+
+    private sealed class DuplicateNameFileSystem : IReadOnlyFileSystem
+    {
+        public string Name => "NTFS";
+
+        public PartitionInfo Partition { get; } = new();
+
+        public VfsNode Root { get; } = new() { Name = "", VirtualPath = "/", IsDirectory = true };
+
+        public IReadOnlyList<VfsNode> ListDirectory(VfsNode directory) =>
+            [
+                new VfsNode { Name = "duplicate.txt", VirtualPath = "/duplicate.txt" },
+                new VfsNode { Name = "DUPLICATE.TXT", VirtualPath = "/DUPLICATE.TXT" },
+            ];
+
+        public byte[] ReadFile(VfsNode file, long offset, int count) => throw new NotSupportedException();
     }
 }
