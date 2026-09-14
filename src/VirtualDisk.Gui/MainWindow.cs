@@ -13,6 +13,7 @@ namespace VirtualDisk.Gui;
 
 public sealed class MainWindow : Window
 {
+    private const int MaximumDisplayedDirectoryEntries = 250_000;
     private readonly TextBlock _imageSummary = new() { Text = "ディスクイメージを開いてください。" };
     private readonly TextBlock _pathLabel = new() { Text = "/" };
     private readonly TextBlock _status = new() { Text = "準備完了" };
@@ -46,8 +47,8 @@ public sealed class MainWindow : Window
         };
         _partitions.SelectionChanged += async (_, _) => await OpenSelectedPartitionAsync();
         _entries.SelectionChanged += (_, _) => RefreshCommandState();
-        _entries.DoubleTapped += (_, _) => NavigateSelectedEntry();
-        _backButton.Click += (_, _) => NavigateUp();
+        _entries.DoubleTapped += async (_, _) => await NavigateSelectedEntryAsync();
+        _backButton.Click += async (_, _) => await NavigateUpAsync();
         _createButton.Click += async (_, _) => await CreateDiskAsync();
         _extractButton.Click += async (_, _) => await ExtractSelectedAsync();
         _verifyButton.Click += async (_, _) => await VerifyFileSystemAsync();
@@ -321,13 +322,21 @@ public sealed class MainWindow : Window
                     selected.Partition,
                     out var error,
                     operation.Token);
-                if (operation.Token.IsCancellationRequested)
+                if (fileSystem is null)
                 {
-                    (fileSystem as IDisposable)?.Dispose();
-                    operation.Token.ThrowIfCancellationRequested();
+                    return new OpenedFileSystem(null, error, []);
                 }
 
-                return new OpenedFileSystem(fileSystem, error);
+                try
+                {
+                    var entries = ReadDirectoryEntries(fileSystem, fileSystem.Root, operation.Token);
+                    return new OpenedFileSystem(fileSystem, error, entries);
+                }
+                catch
+                {
+                    (fileSystem as IDisposable)?.Dispose();
+                    throw;
+                }
             }, operation.Token);
             if (!ReferenceEquals(_reader, reader)
                 || !ReferenceEquals(_partitions.SelectedItem, selected))
@@ -344,7 +353,7 @@ public sealed class MainWindow : Window
 
             _fileSystem = opened.FileSystem;
             _directoryHistory.Clear();
-            ShowDirectory(opened.FileSystem.Root);
+            ApplyDirectory(opened.FileSystem.Root, opened.Entries);
             _status.Text = $"{opened.FileSystem.Name}を開きました。";
         }
         catch (OperationCanceledException)
@@ -362,35 +371,109 @@ public sealed class MainWindow : Window
         }
     }
 
-    private void NavigateSelectedEntry()
+    private async Task NavigateSelectedEntryAsync()
     {
-        if (_entries.SelectedItem is not EntryItem { Node.IsDirectory: true } selected || _currentDirectory is null)
+        if (_busy
+            || _entries.SelectedItem is not EntryItem { Node.IsDirectory: true } selected
+            || _currentDirectory is null)
         {
             return;
         }
 
-        _directoryHistory.Push(_currentDirectory);
-        ShowDirectory(selected.Node);
-    }
-
-    private void NavigateUp()
-    {
-        if (_directoryHistory.TryPop(out var directory))
+        var previous = _currentDirectory;
+        if (await LoadDirectoryAsync(selected.Node))
         {
-            ShowDirectory(directory);
+            _directoryHistory.Push(previous);
+            RefreshCommandState();
         }
     }
 
-    private void ShowDirectory(VfsNode directory)
+    private async Task NavigateUpAsync()
+    {
+        if (_busy || !_directoryHistory.TryPeek(out var directory))
+        {
+            return;
+        }
+
+        if (await LoadDirectoryAsync(directory))
+        {
+            _directoryHistory.Pop();
+            RefreshCommandState();
+        }
+    }
+
+    private async Task<bool> LoadDirectoryAsync(VfsNode directory)
     {
         if (_fileSystem is null)
         {
-            return;
+            return false;
         }
 
+        var fileSystem = _fileSystem;
+        var operation = BeginOperation($"{directory.DisplayName}を読み込んでいます...");
+        try
+        {
+            var entries = await Task.Run(
+                () => ReadDirectoryEntries(fileSystem, directory, operation.Token),
+                operation.Token);
+            if (!ReferenceEquals(_fileSystem, fileSystem))
+            {
+                return false;
+            }
+
+            ApplyDirectory(directory, entries);
+            _status.Text = $"{entries.Count:N0}項目を表示しています。";
+            return true;
+        }
+        catch (OperationCanceledException)
+        {
+            _status.Text = "ディレクトリの読込をキャンセルしました。";
+            return false;
+        }
+        catch (Exception exception)
+        {
+            _status.Text = $"ディレクトリを開けませんでした: {exception.Message}";
+            await ShowErrorAsync("ディレクトリを開けません", exception.Message);
+            return false;
+        }
+        finally
+        {
+            EndOperation(operation);
+        }
+    }
+
+    private static IReadOnlyList<EntryItem> ReadDirectoryEntries(
+        IReadOnlyFileSystem fileSystem,
+        VfsNode directory,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var nodes = fileSystem.ListDirectory(directory)
+            ?? throw new InvalidDataException("ファイルシステムがnullの一覧を返しました。");
+        if (nodes.Count > MaximumDisplayedDirectoryEntries)
+        {
+            throw new NotSupportedException(
+                $"ディレクトリ項目数が画面表示上限 ({MaximumDisplayedDirectoryEntries:N0}) を超えています。"
+                + " CLIのextractまたはverifyを使用してください。");
+        }
+
+        var entries = new EntryItem[nodes.Count];
+        for (var index = 0; index < nodes.Count; index++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            entries[index] = new EntryItem(
+                nodes[index] ?? throw new InvalidDataException("ファイルシステムがnullノードを返しました。"));
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+        return entries;
+    }
+
+    private void ApplyDirectory(VfsNode directory, IReadOnlyList<EntryItem> entries)
+    {
         _currentDirectory = directory;
         _pathLabel.Text = string.IsNullOrWhiteSpace(directory.VirtualPath) ? "/" : directory.VirtualPath;
-        _entries.ItemsSource = _fileSystem.ListDirectory(directory).Select(node => new EntryItem(node)).ToArray();
+        _entries.ItemsSource = entries;
         RefreshCommandState();
     }
 
@@ -699,7 +782,10 @@ public sealed class MainWindow : Window
 
     private sealed record OpenedImage(IDiskImageReader Reader, IReadOnlyList<PartitionItem> Partitions);
 
-    private sealed record OpenedFileSystem(IReadOnlyFileSystem? FileSystem, string Error);
+    private sealed record OpenedFileSystem(
+        IReadOnlyFileSystem? FileSystem,
+        string Error,
+        IReadOnlyList<EntryItem> Entries);
 
     private sealed record PartitionItem(PartitionInfo Partition)
     {
