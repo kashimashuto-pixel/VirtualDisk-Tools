@@ -32,6 +32,8 @@ public sealed record FileEditResult(
 public static class FileEditService
 {
     private const int BufferSize = 1024 * 1024;
+    private const int MaximumPathDepth = 256;
+    private const int MaximumDirectoryEntries = 1_000_000;
 
     public static Task<FileEditResult> WriteFileToRawAsync(
         IDiskImageReader source,
@@ -475,17 +477,44 @@ public static class FileEditService
         ArgumentNullException.ThrowIfNull(fileSystem);
         ArgumentNullException.ThrowIfNull(path);
         cancellationToken.ThrowIfCancellationRequested();
-        node = fileSystem.Root;
+        node = fileSystem.Root
+            ?? throw new InvalidDataException("ファイルシステムがnullのルートを返しました。");
         var comparison = fileSystem.Name is "FAT16" or "FAT32" or "exFAT" or "NTFS"
             ? StringComparison.OrdinalIgnoreCase
             : StringComparison.Ordinal;
-        foreach (var part in path.Replace('\\', '/').Split('/', StringSplitOptions.RemoveEmptyEntries))
+        var parts = path.Replace('\\', '/').Split('/', StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length > MaximumPathDepth)
+        {
+            throw new NotSupportedException(
+                $"仮想パスの深度が対応上限 ({MaximumPathDepth:N0}) を超えています。");
+        }
+
+        foreach (var part in parts)
         {
             cancellationToken.ThrowIfCancellationRequested();
+            if (!node.IsDirectory)
+            {
+                node = null!;
+                return false;
+            }
+
+            var children = fileSystem.ListDirectory(node)
+                ?? throw new InvalidDataException("ファイルシステムがnullの一覧を返しました。");
+            if (children.Count > MaximumDirectoryEntries)
+            {
+                throw new InvalidDataException(
+                    $"仮想パス解決中のディレクトリ項目数が対応上限 ({MaximumDirectoryEntries:N0}) を超えています。");
+            }
+
             VfsNode? next = null;
-            foreach (var candidate in fileSystem.ListDirectory(node))
+            foreach (var candidate in children)
             {
                 cancellationToken.ThrowIfCancellationRequested();
+                if (candidate is null)
+                {
+                    throw new InvalidDataException("ファイルシステムがnullノードを返しました。");
+                }
+
                 if (!string.Equals(candidate.Name, part, comparison))
                 {
                     continue;

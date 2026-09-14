@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Collections;
 using Qcow2Explorer.Core;
 using Qcow2Explorer.FileSystems;
 using Qcow2Explorer.Partitions;
@@ -109,6 +110,19 @@ internal static class FileSystemRobustnessTests
         AssertThrows<OperationCanceledException>(
             () => FileEditService.TryResolvePath(fileSystem, "/", out _, cancellationSource.Token),
             "virtual path resolution cancellation propagated");
+        AssertThrows<InvalidDataException>(
+            () => FileEditService.TryResolvePath(new NullListFileSystem(), "/item", out _),
+            "null virtual directory listing rejected");
+        AssertThrows<InvalidDataException>(
+            () => FileEditService.TryResolvePath(new NullNodeFileSystem(), "/item", out _),
+            "null virtual directory node rejected");
+        AssertThrows<InvalidDataException>(
+            () => FileEditService.TryResolvePath(new OversizedDirectoryFileSystem(), "/item", out _),
+            "oversized virtual directory rejected");
+        var deepPath = "/" + string.Join('/', Enumerable.Repeat("directory", 257));
+        AssertThrows<NotSupportedException>(
+            () => FileEditService.TryResolvePath(fileSystem, deepPath, out _),
+            "overly deep virtual path rejected");
     }
 
     private static void WriteExtSuperblock(
@@ -221,5 +235,37 @@ internal static class FileSystemRobustnessTests
             ];
 
         public byte[] ReadFile(VfsNode file, long offset, int count) => throw new NotSupportedException();
+    }
+
+    private abstract class MalformedPathFileSystem : IReadOnlyFileSystem
+    {
+        public string Name => "test";
+        public PartitionInfo Partition { get; } = new();
+        public VfsNode Root { get; } = new() { Name = "", VirtualPath = "/", IsDirectory = true };
+        public abstract IReadOnlyList<VfsNode> ListDirectory(VfsNode directory);
+        public byte[] ReadFile(VfsNode file, long offset, int count) => throw new NotSupportedException();
+    }
+
+    private sealed class NullListFileSystem : MalformedPathFileSystem
+    {
+        public override IReadOnlyList<VfsNode> ListDirectory(VfsNode directory) => null!;
+    }
+
+    private sealed class NullNodeFileSystem : MalformedPathFileSystem
+    {
+        public override IReadOnlyList<VfsNode> ListDirectory(VfsNode directory) => [null!];
+    }
+
+    private sealed class OversizedDirectoryFileSystem : MalformedPathFileSystem
+    {
+        public override IReadOnlyList<VfsNode> ListDirectory(VfsNode directory) => new OversizedNodeList();
+    }
+
+    private sealed class OversizedNodeList : IReadOnlyList<VfsNode>
+    {
+        public int Count => 1_000_001;
+        public VfsNode this[int index] => throw new NotSupportedException();
+        public IEnumerator<VfsNode> GetEnumerator() => throw new NotSupportedException();
+        IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
     }
 }
