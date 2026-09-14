@@ -10,6 +10,7 @@ internal static class ContainerRobustnessTests
     {
         TestRawTruncationDetected(directory);
         TestLzopIndexPathBounds();
+        TestLzopRawMetadataBounds(directory);
         TestMinimalParallelsImage(directory);
         TestParallelsBatLimits(directory);
         TestParallelsDescriptorLimits(directory);
@@ -59,6 +60,22 @@ internal static class ContainerRobustnessTests
         AssertThrows<InvalidDataException>(
             () => LzopIndexCacheManager.ReadSourcePath(oversizedReader),
             "oversized LZO index source path rejected before allocation");
+    }
+
+    private static void TestLzopRawMetadataBounds(string directory)
+    {
+        var cacheRoot = Path.Combine(directory, "oversized-lzo-raw-metadata");
+        var entryDirectory = Path.Combine(cacheRoot, "entry");
+        Directory.CreateDirectory(entryDirectory);
+        var metadataPath = Path.Combine(entryDirectory, LzopRawCacheManager.MetadataFileName);
+        using (var stream = new FileStream(metadataPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+        {
+            stream.SetLength(LzopRawCacheManager.MaximumMetadataBytes + 1L);
+        }
+
+        var entry = LzopRawCacheManager.GetEntries(cacheRoot).Single();
+        Assert(!entry.IsUsable, "oversized LZO raw metadata treated as unusable");
+        Assert(entry.SourcePath == "(メタデータなし)", "oversized LZO raw metadata not deserialized");
     }
 
     private static void TestMinimalParallelsImage(string directory)

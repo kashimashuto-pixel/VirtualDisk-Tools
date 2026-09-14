@@ -33,6 +33,7 @@ public static class LzopRawCacheManager
     internal const string PartialRawFileName = "disk.raw.partial";
 
     private const int MetadataVersion = 1;
+    internal const int MaximumMetadataBytes = 1024 * 1024;
     private const int HashBufferSize = 4 * 1024 * 1024;
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
 
@@ -284,9 +285,18 @@ public static class LzopRawCacheManager
         try
         {
             var path = Path.Combine(directory, MetadataFileName);
-            return File.Exists(path)
-                ? JsonSerializer.Deserialize<LzopCacheMetadata>(File.ReadAllText(path))
-                : null;
+            if (!File.Exists(path))
+            {
+                return null;
+            }
+
+            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+            if (stream.Length <= 0 || stream.Length > MaximumMetadataBytes)
+            {
+                return null;
+            }
+
+            return JsonSerializer.Deserialize<LzopCacheMetadata>(stream);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
         {
