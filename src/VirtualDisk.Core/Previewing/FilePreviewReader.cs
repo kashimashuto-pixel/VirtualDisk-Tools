@@ -15,6 +15,8 @@ public static class FilePreviewReader
     private const int MaximumWorksheetCells = 500_000;
     private const int MaximumWorkbookSheets = 256;
     private const int MaximumSharedStrings = 500_000;
+    private const int MaximumOfficeRelationships = 10_000;
+    private const int MaximumOfficePartPathLength = 4096;
 
     private static readonly HashSet<string> TextExtensions = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -166,14 +168,35 @@ public static class FilePreviewReader
         XNamespace officeRelationships = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
         XNamespace packageRelationships = "http://schemas.openxmlformats.org/package/2006/relationships";
 
-        var relationshipTargets = relationships.Root?
+        var relationshipTargets = new Dictionary<string, string>(StringComparer.Ordinal);
+        var relationshipElements = relationships.Root?
             .Elements(packageRelationships + "Relationship")
-            .Where(item => item.Attribute("Id") is not null && item.Attribute("Target") is not null)
-            .ToDictionary(
-                item => (string)item.Attribute("Id")!,
-                item => NormalizeWorkbookTarget((string)item.Attribute("Target")!),
-                StringComparer.Ordinal)
-            ?? new Dictionary<string, string>(StringComparer.Ordinal);
+            .Take(MaximumOfficeRelationships + 1)
+            .ToArray() ?? [];
+        if (relationshipElements.Length > MaximumOfficeRelationships)
+        {
+            throw new InvalidDataException(
+                $"Excelブックのrelationship数が表示上限 ({MaximumOfficeRelationships:N0}) を超えています。");
+        }
+
+        foreach (var relationship in relationshipElements)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var id = (string?)relationship.Attribute("Id");
+            var target = (string?)relationship.Attribute("Target");
+            var targetMode = (string?)relationship.Attribute("TargetMode");
+            if (id is null
+                || target is null
+                || string.Equals(targetMode, "External", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            if (!relationshipTargets.TryAdd(id, NormalizeWorkbookTarget(target)))
+            {
+                throw new InvalidDataException($"Excelブックのrelationship IDが重複しています: {id}");
+            }
+        }
 
         var sharedStrings = ReadSharedStrings(archive, spreadsheet, ref totalXmlSize, cancellationToken);
         var sheets = new List<SpreadsheetPreviewSheet>();
@@ -330,15 +353,50 @@ public static class FilePreviewReader
 
     private static string NormalizeWorkbookTarget(string target)
     {
-        var normalized = target.Replace('\\', '/').TrimStart('/');
-        while (normalized.StartsWith("../", StringComparison.Ordinal))
+        if (string.IsNullOrWhiteSpace(target) || target.Length > MaximumOfficePartPathLength)
         {
-            normalized = normalized[3..];
+            throw new InvalidDataException("Excelブックのrelationship targetが空か長すぎます。");
         }
 
-        return normalized.StartsWith("xl/", StringComparison.OrdinalIgnoreCase)
-            ? normalized
-            : $"xl/{normalized}";
+        var normalized = target.Replace('\\', '/');
+        var packageAbsolute = normalized.StartsWith("/", StringComparison.Ordinal)
+            || normalized.StartsWith("xl/", StringComparison.OrdinalIgnoreCase);
+        var segments = packageAbsolute
+            ? new List<string>()
+            : ["xl"];
+        foreach (var segment in normalized.Split('/', StringSplitOptions.RemoveEmptyEntries))
+        {
+            if (segment == ".")
+            {
+                continue;
+            }
+
+            if (segment == "..")
+            {
+                if (segments.Count == 0)
+                {
+                    throw new InvalidDataException(
+                        $"Excelブックのrelationship targetがarchive外を参照しています: {target}");
+                }
+
+                segments.RemoveAt(segments.Count - 1);
+                continue;
+            }
+
+            if (segment.IndexOf('\0') >= 0)
+            {
+                throw new InvalidDataException("Excelブックのrelationship targetにNUL文字があります。");
+            }
+
+            segments.Add(segment);
+        }
+
+        if (segments.Count == 0)
+        {
+            throw new InvalidDataException("Excelブックのrelationship targetがファイルを指していません。");
+        }
+
+        return string.Join('/', segments);
     }
 
     private static void AppendParagraph(

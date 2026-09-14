@@ -9,6 +9,7 @@ internal static class FilePreviewRobustnessTests
     {
         TestTextAndOfficePreviews();
         TestUnsafeXmlRejected();
+        TestWorkbookRelationshipPaths();
         TestCancellation();
     }
 
@@ -59,6 +60,45 @@ internal static class FilePreviewRobustnessTests
         AssertThrows<XmlException>(
             () => FilePreviewReader.Read("unsafe.docx", docx),
             "Office DTD rejected");
+    }
+
+    private static void TestWorkbookRelationshipPaths()
+    {
+        var parentTargetWorkbook = CreateZip(
+            ("xl/workbook.xml", """
+                <workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+                          xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+                  <sheets><sheet name="Parent" sheetId="1" r:id="rId1"/></sheets>
+                </workbook>
+                """),
+            ("xl/_rels/workbook.xml.rels", """
+                <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+                  <Relationship Id="rId1" Target="../worksheets/root-sheet.xml"/>
+                </Relationships>
+                """),
+            ("worksheets/root-sheet.xml", """
+                <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+                  <sheetData><row r="1"><c r="A1"><v>7</v></c></row></sheetData>
+                </worksheet>
+                """));
+        var preview = FilePreviewReader.Read("parent-target.xlsx", parentTargetWorkbook);
+        Assert(preview.Sheets[0].Rows[0][0] == "7", "workbook parent relationship resolved from xl directory");
+
+        var escapingWorkbook = CreateZip(
+            ("xl/workbook.xml", """
+                <workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+                          xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+                  <sheets><sheet name="Unsafe" sheetId="1" r:id="rId1"/></sheets>
+                </workbook>
+                """),
+            ("xl/_rels/workbook.xml.rels", """
+                <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+                  <Relationship Id="rId1" Target="../../outside.xml"/>
+                </Relationships>
+                """));
+        AssertThrows<InvalidDataException>(
+            () => FilePreviewReader.Read("escaping.xlsx", escapingWorkbook),
+            "workbook relationship cannot escape archive root");
     }
 
     private static void TestCancellation()
