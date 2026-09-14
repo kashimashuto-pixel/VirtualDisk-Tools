@@ -44,7 +44,7 @@ public sealed class MainWindow : Window
             _activeOperation?.Cancel();
             DisposeImage();
         };
-        _partitions.SelectionChanged += (_, _) => OpenSelectedPartition();
+        _partitions.SelectionChanged += async (_, _) => await OpenSelectedPartitionAsync();
         _entries.SelectionChanged += (_, _) => RefreshCommandState();
         _entries.DoubleTapped += (_, _) => NavigateSelectedEntry();
         _backButton.Click += (_, _) => NavigateUp();
@@ -239,6 +239,7 @@ public sealed class MainWindow : Window
     private async Task OpenImageAsync(string path)
     {
         var operation = BeginOperation("ディスクイメージを解析しています...");
+        var selectFirstPartition = false;
         try
         {
             var opened = await Task.Run(() => OpenImage(path, operation.Token), operation.Token);
@@ -249,7 +250,7 @@ public sealed class MainWindow : Window
             _status.Text = $"開きました: {opened.Reader.Path}";
             if (opened.Partitions.Count > 0)
             {
-                _partitions.SelectedIndex = 0;
+                selectFirstPartition = true;
             }
         }
         catch (OperationCanceledException)
@@ -264,6 +265,11 @@ public sealed class MainWindow : Window
         finally
         {
             EndOperation(operation);
+        }
+
+        if (selectFirstPartition)
+        {
+            _partitions.SelectedIndex = 0;
         }
     }
 
@@ -288,26 +294,67 @@ public sealed class MainWindow : Window
         }
     }
 
-    private void OpenSelectedPartition()
+    private async Task OpenSelectedPartitionAsync()
     {
+        if (_busy)
+        {
+            return;
+        }
+
         DisposeFileSystem();
         if (_reader is null || _partitions.SelectedItem is not PartitionItem selected)
         {
+            RefreshCommandState();
             return;
         }
 
-        var fileSystem = FileSystemDetector.TryOpen(_reader, selected.Partition, out var error);
-        if (fileSystem is null)
+        var reader = _reader;
+        var operation = BeginOperation($"パーティション#{selected.Partition.Number}を開いています...");
+        try
         {
-            _status.Text = error;
-            return;
-        }
+            var opened = await Task.Run(() =>
+            {
+                operation.Token.ThrowIfCancellationRequested();
+                var fileSystem = FileSystemDetector.TryOpen(reader, selected.Partition, out var error);
+                if (operation.Token.IsCancellationRequested)
+                {
+                    (fileSystem as IDisposable)?.Dispose();
+                    operation.Token.ThrowIfCancellationRequested();
+                }
 
-        _fileSystem = fileSystem;
-        _directoryHistory.Clear();
-        ShowDirectory(fileSystem.Root);
-        _status.Text = $"{fileSystem.Name}を開きました。";
-        RefreshCommandState();
+                return new OpenedFileSystem(fileSystem, error);
+            }, operation.Token);
+            if (!ReferenceEquals(_reader, reader)
+                || !ReferenceEquals(_partitions.SelectedItem, selected))
+            {
+                (opened.FileSystem as IDisposable)?.Dispose();
+                return;
+            }
+
+            if (opened.FileSystem is null)
+            {
+                _status.Text = opened.Error;
+                return;
+            }
+
+            _fileSystem = opened.FileSystem;
+            _directoryHistory.Clear();
+            ShowDirectory(opened.FileSystem.Root);
+            _status.Text = $"{opened.FileSystem.Name}を開きました。";
+        }
+        catch (OperationCanceledException)
+        {
+            _status.Text = "パーティションの読込をキャンセルしました。";
+        }
+        catch (Exception exception)
+        {
+            _status.Text = $"パーティションを開けませんでした: {exception.Message}";
+            await ShowErrorAsync("パーティションを開けません", exception.Message);
+        }
+        finally
+        {
+            EndOperation(operation);
+        }
     }
 
     private void NavigateSelectedEntry()
@@ -602,6 +649,8 @@ public sealed class MainWindow : Window
     }
 
     private sealed record OpenedImage(IDiskImageReader Reader, IReadOnlyList<PartitionItem> Partitions);
+
+    private sealed record OpenedFileSystem(IReadOnlyFileSystem? FileSystem, string Error);
 
     private sealed record PartitionItem(PartitionInfo Partition)
     {
