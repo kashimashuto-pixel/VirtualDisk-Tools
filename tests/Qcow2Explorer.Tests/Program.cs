@@ -5986,6 +5986,18 @@ static void TestGeneratedVmaLzopImage()
     {
         Assert(ex.Message.Contains("クラスタが欠落", StringComparison.Ordinal), "VMA missing cluster diagnostic");
     }
+
+    var reservedFieldPath = Path.Combine(AppContext.BaseDirectory, "sample-fat16-reserved-field.vma.lzo");
+    TestImageFactory.CreateFat16VmaLzop(reservedFieldPath, setExtentReservedField: true);
+    try
+    {
+        using var _ = DiskImageReaderFactory.Open(reservedFieldPath);
+        Assert(false, "VMA nonzero reserved field throws");
+    }
+    catch (InvalidDataException ex)
+    {
+        Assert(ex.Message.Contains("reserved", StringComparison.Ordinal), "VMA reserved field diagnostic");
+    }
 }
 
 static void TestGeneratedUefiVariableStore()
@@ -8836,11 +8848,14 @@ internal static class TestImageFactory
         File.WriteAllBytes(path, CreateMinimalExt4Disk());
     }
 
-    public static void CreateFat16VmaLzop(string path, bool omitLastCluster = false)
+    public static void CreateFat16VmaLzop(
+        string path,
+        bool omitLastCluster = false,
+        bool setExtentReservedField = false)
     {
         WriteLzop(
             path,
-            CreateVma(CreateVirtualDisk(), omitLastCluster),
+            CreateVma(CreateVirtualDisk(), omitLastCluster, setExtentReservedField),
             "sample-fat16.vma",
             corruptHeaderChecksum: false);
     }
@@ -9008,7 +9023,7 @@ internal static class TestImageFactory
         File.WriteAllBytes(path, output.ToArray());
     }
 
-    private static byte[] CreateVma(byte[] disk, bool omitLastCluster)
+    private static byte[] CreateVma(byte[] disk, bool omitLastCluster, bool setExtentReservedField)
     {
         const int headerSize = 13 * 1024;
         const int blobOffset = 12 * 1024;
@@ -9099,6 +9114,10 @@ internal static class TestImageFactory
                 .ToList();
             var extentHeader = new byte[extentHeaderSize];
             Encoding.ASCII.GetBytes("VMAE").CopyTo(extentHeader, 0);
+            if (setExtentReservedField && clusterStart == 0)
+            {
+                extentHeader[4] = 1;
+            }
             var blockCount = extentClusters.Sum(item => item.Blocks.Count);
             WriteU16Be(extentHeader, 6, checked((ushort)blockCount));
             uuid.CopyTo(extentHeader, 8);

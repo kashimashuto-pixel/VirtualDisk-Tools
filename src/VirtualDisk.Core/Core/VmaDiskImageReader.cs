@@ -221,6 +221,12 @@ public sealed class VmaDiskImageReader : IDiskImageReader
 
         var header = ReadExactAt(0, checked((int)HeaderSize));
         VerifyMd5(header, 32, "VMAヘッダー");
+        if (!IsAllZero(header.AsSpan(60, 1984))
+            || !IsAllZero(header.AsSpan(4092, 4))
+            || !IsAllZero(header.AsSpan(4096, 32)))
+        {
+            throw new InvalidDataException("VMAヘッダーのreserved領域が0ではありません。");
+        }
 
         var devices = new List<VmaDevice>();
         for (var deviceId = 1; deviceId < 256; deviceId++)
@@ -229,6 +235,12 @@ public sealed class VmaDiskImageReader : IDiskImageReader
             var infoOffset = 4096 + deviceId * 32;
             var namePointer = BinaryPrimitives.ReadUInt32BigEndian(header.AsSpan(infoOffset, 4));
             var sizeValue = BinaryPrimitives.ReadUInt64BigEndian(header.AsSpan(infoOffset + 8, 8));
+            if (!IsAllZero(header.AsSpan(infoOffset + 4, 4))
+                || !IsAllZero(header.AsSpan(infoOffset + 16, 16)))
+            {
+                throw new InvalidDataException($"VMA device {deviceId} のreserved領域が0ではありません。");
+            }
+
             if (namePointer == 0 && sizeValue == 0)
             {
                 continue;
@@ -284,6 +296,12 @@ public sealed class VmaDiskImageReader : IDiskImageReader
                 throw new InvalidDataException($"VMAエクステントマジックが一致しません: offset=0x{position:X}");
             }
 
+            if (!IsAllZero(header.AsSpan(4, 2)))
+            {
+                throw new InvalidDataException(
+                    $"VMAエクステント #{_extentCount + 1:N0} のreserved領域が0ではありません。");
+            }
+
             if (!header.AsSpan(8, 16).SequenceEqual(ArchiveUuid.ToByteArray(bigEndian: true)))
             {
                 throw new InvalidDataException($"VMAエクステントのUUIDが一致しません: offset=0x{position:X}");
@@ -301,6 +319,12 @@ public sealed class VmaDiskImageReader : IDiskImageReader
                 var mask = BinaryPrimitives.ReadUInt16BigEndian(header.AsSpan(infoOffset, 2));
                 var deviceId = header[infoOffset + 3];
                 var clusterNumber = BinaryPrimitives.ReadUInt32BigEndian(header.AsSpan(infoOffset + 4, 4));
+                if (header[infoOffset + 2] != 0)
+                {
+                    throw new InvalidDataException(
+                        $"VMAエクステント #{_extentCount + 1:N0} のblock info reserved値が0ではありません。");
+                }
+
                 var storedBlocks = BitOperations.PopCount(mask);
 
                 if (deviceId == 0)
@@ -457,6 +481,19 @@ public sealed class VmaDiskImageReader : IDiskImageReader
         {
             throw new InvalidDataException($"{label}のMD5チェックサムが一致しません。");
         }
+    }
+
+    private static bool IsAllZero(ReadOnlySpan<byte> data)
+    {
+        foreach (var value in data)
+        {
+            if (value != 0)
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private string FormatCreationTime()
