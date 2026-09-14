@@ -95,7 +95,15 @@ public static class VirtualDiskCreationService
                 await raw.FlushAsync(cancellationToken);
             }
 
-            VerifyRawBuild(rawBuildPath, request.PartitionTable, layouts, request.InitialFiles ?? []);
+            progress?.Report(new DiskImageProgress("RAW buildの整合性を検証中..."));
+            cancellationToken.ThrowIfCancellationRequested();
+            VerifyRawBuild(
+                rawBuildPath,
+                request.PartitionTable,
+                layouts,
+                request.InitialFiles ?? [],
+                progress,
+                cancellationToken);
             if (request.ContainerFormat == VirtualDiskContainerFormat.Raw)
             {
                 File.Move(rawBuildPath, destinationPath);
@@ -112,7 +120,9 @@ public static class VirtualDiskCreationService
                 TryDelete(rawBuildPath);
             }
 
-            VerifyFinalImage(destinationPath, request, layouts);
+            progress?.Report(new DiskImageProgress("最終イメージの整合性を検証中..."));
+            cancellationToken.ThrowIfCancellationRequested();
+            VerifyFinalImage(destinationPath, request, layouts, progress, cancellationToken);
             completed = true;
             progress?.Report(new DiskImageProgress("仮想ディスクを作成しました", request.CapacityBytes, request.CapacityBytes));
             return new VirtualDiskCreationResult(
@@ -277,33 +287,48 @@ public static class VirtualDiskCreationService
         string rawPath,
         VirtualDiskPartitionTableKind tableKind,
         IReadOnlyList<VirtualDiskPartitionLayout> expectedLayouts,
-        IReadOnlyList<VirtualDiskInitialFile> initialFiles)
+        IReadOnlyList<VirtualDiskInitialFile> initialFiles,
+        IProgress<DiskImageProgress>? progress,
+        CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         using var reader = new RawDiskImageReader(rawPath);
-        VerifyReader(reader, tableKind, expectedLayouts, initialFiles);
+        VerifyReader(reader, tableKind, expectedLayouts, initialFiles, progress, cancellationToken);
     }
 
     private static void VerifyFinalImage(
         string path,
         VirtualDiskCreationRequest request,
-        IReadOnlyList<VirtualDiskPartitionLayout> expectedLayouts)
+        IReadOnlyList<VirtualDiskPartitionLayout> expectedLayouts,
+        IProgress<DiskImageProgress>? progress,
+        CancellationToken cancellationToken)
     {
-        using var reader = DiskImageReaderFactory.Open(path);
+        cancellationToken.ThrowIfCancellationRequested();
+        using var reader = DiskImageReaderFactory.Open(path, cancellationToken: cancellationToken);
         if (reader.Length != request.CapacityBytes)
         {
             throw new InvalidDataException("作成後の仮想ディスク容量が指定値と一致しません。");
         }
 
-        VerifyReader(reader, request.PartitionTable, expectedLayouts, request.InitialFiles ?? []);
+        VerifyReader(
+            reader,
+            request.PartitionTable,
+            expectedLayouts,
+            request.InitialFiles ?? [],
+            progress,
+            cancellationToken);
     }
 
     private static void VerifyReader(
         IDiskImageReader reader,
         VirtualDiskPartitionTableKind tableKind,
         IReadOnlyList<VirtualDiskPartitionLayout> expectedLayouts,
-        IReadOnlyList<VirtualDiskInitialFile> initialFiles)
+        IReadOnlyList<VirtualDiskInitialFile> initialFiles,
+        IProgress<DiskImageProgress>? progress,
+        CancellationToken cancellationToken)
     {
-        var partitions = PartitionTableReader.ReadPartitions(reader);
+        cancellationToken.ThrowIfCancellationRequested();
+        var partitions = PartitionTableReader.ReadPartitions(reader, cancellationToken);
         if (partitions.Count != expectedLayouts.Count)
         {
             throw new InvalidDataException("作成後のパーティション数が指定値と一致しません。");
@@ -311,6 +336,7 @@ public static class VirtualDiskCreationService
 
         for (var index = 0; index < partitions.Count; index++)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var actual = partitions[index];
             var expected = expectedLayouts[index];
             var expectedScheme = tableKind == VirtualDiskPartitionTableKind.Gpt ? "GPT" : "MBR";
@@ -321,7 +347,7 @@ public static class VirtualDiskCreationService
                 throw new InvalidDataException($"作成後のパーティション#{index + 1}レイアウトが指定値と一致しません。");
             }
 
-            actual.FileSystem = FileSystemDetector.Detect(reader, actual);
+            actual.FileSystem = FileSystemDetector.Detect(reader, actual, cancellationToken);
             var expectedFileSystemName = VirtualDiskPartitionTableWriter.GetDisplayName(expected.FileSystem);
             if (!actual.FileSystem.Equals(expectedFileSystemName, StringComparison.OrdinalIgnoreCase))
             {
@@ -339,13 +365,16 @@ public static class VirtualDiskCreationService
 
             try
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 var entries = readable.ListDirectory(readable.Root);
                 VerifyInitialFiles(
                     readable,
                     entries,
                     index + 1,
                     expected.FileSystem,
-                    initialFiles.Where(file => file.PartitionNumber == index + 1));
+                    initialFiles.Where(file => file.PartitionNumber == index + 1),
+                    progress,
+                    cancellationToken);
                 var readmeComparison = expected.FileSystem == VirtualDiskFileSystemKind.Ntfs
                     ? StringComparison.OrdinalIgnoreCase
                     : StringComparison.Ordinal;
@@ -376,12 +405,15 @@ public static class VirtualDiskCreationService
         IReadOnlyList<VfsNode> rootEntries,
         int partitionNumber,
         VirtualDiskFileSystemKind fileSystemKind,
-        IEnumerable<VirtualDiskInitialFile> initialFiles)
+        IEnumerable<VirtualDiskInitialFile> initialFiles,
+        IProgress<DiskImageProgress>? progress,
+        CancellationToken cancellationToken)
     {
         const int bufferSize = 1024 * 1024;
         var expectedBuffer = new byte[bufferSize];
         foreach (var initialFile in initialFiles)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var comparison = fileSystemKind == VirtualDiskFileSystemKind.Ntfs
                 ? StringComparison.OrdinalIgnoreCase
                 : StringComparison.Ordinal;
@@ -409,6 +441,7 @@ public static class VirtualDiskCreationService
             long offset = 0;
             while (offset < expected.Length)
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 var count = checked((int)Math.Min(expectedBuffer.Length, expected.Length - offset));
                 expected.ReadExactly(expectedBuffer.AsSpan(0, count));
                 var actual = fileSystem.ReadFile(node, offset, count);
@@ -420,6 +453,10 @@ public static class VirtualDiskCreationService
                 }
 
                 offset += count;
+                progress?.Report(new DiskImageProgress(
+                    $"初期ファイルを読み戻し検証中: {initialFile.DestinationName}",
+                    offset,
+                    expected.Length));
             }
         }
     }

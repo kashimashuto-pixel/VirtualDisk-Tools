@@ -1,4 +1,5 @@
 using Qcow2Explorer.Creation;
+using Qcow2Explorer.Core;
 
 internal static class CreationRobustnessTests
 {
@@ -8,6 +9,7 @@ internal static class CreationRobustnessTests
         TestCancellationCleanup(directory);
         TestWrongFormatterSizeCleanup(directory);
         TestExistingDestinationPreserved(directory);
+        TestFinalVerificationCancellationCleanup(directory);
     }
 
     private static void TestFormatterFailureCleanup(string directory)
@@ -67,6 +69,39 @@ internal static class CreationRobustnessTests
             "existing destination rejected");
         Assert(File.ReadAllBytes(destination).SequenceEqual(sentinel), "existing destination preserved");
         AssertNoTemporaryArtifacts(destination, "existing destination temporary cleanup");
+    }
+
+    private static void TestFinalVerificationCancellationCleanup(string directory)
+    {
+        var destination = Path.Combine(directory, "final-verification-cancel.raw");
+        using var cancellationSource = new CancellationTokenSource();
+        var progress = new CallbackProgress<DiskImageProgress>(update =>
+        {
+            if (update.Message.StartsWith("最終イメージの整合性を検証", StringComparison.Ordinal))
+            {
+                cancellationSource.Cancel();
+            }
+        });
+        var request = new VirtualDiskCreationRequest(
+            destination,
+            512L * 1024 * 1024,
+            VirtualDiskContainerFormat.Raw,
+            VirtualDiskPartitionTableKind.Gpt,
+            [
+                new VirtualDiskPartitionDefinition(
+                    64L * 1024 * 1024,
+                    "Final verification cancellation",
+                    "VDT_CANCEL",
+                    VirtualDiskFileSystemKind.Ext4),
+            ]);
+
+        AssertThrows<OperationCanceledException>(
+            () => VirtualDiskCreationService.CreateAsync(
+                request,
+                progress,
+                cancellationSource.Token).GetAwaiter().GetResult(),
+            "final verification cancellation propagated");
+        AssertCreationArtifactsAbsent(destination, "final verification cancellation cleanup");
     }
 
     private static void Create(
@@ -154,5 +189,10 @@ internal static class CreationRobustnessTests
             IReadOnlyList<VirtualDiskInitialFile> initialFiles,
             CancellationToken cancellationToken = default) =>
             format(imagePath, layout, initialFiles, cancellationToken);
+    }
+
+    private sealed class CallbackProgress<T>(Action<T> callback) : IProgress<T>
+    {
+        public void Report(T value) => callback(value);
     }
 }
