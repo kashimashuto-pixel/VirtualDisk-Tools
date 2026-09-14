@@ -5932,6 +5932,9 @@ static void TestGeneratedVmaLzopImage()
     Assert(reader is VmaDiskImageReader, "VMA.lzo reader factory");
     var vma = (VmaDiskImageReader)reader;
     Assert(vma.Devices.Count == 2 && vma.ActiveDevice.Name == "scsi0", "VMA largest device selection");
+    Assert(
+        vma.GetWarnings().Any(item => item.Contains("vmstate", StringComparison.Ordinal)),
+        "VMA vmstate is validated but hidden from disk selection");
     Assert(vma.Length == TestImageFactory.VirtualSize, "VMA virtual disk size");
     Assert(
         progressEvents.Any(item => item.Message.Contains("VMA索引作成", StringComparison.Ordinal)),
@@ -9024,15 +9027,19 @@ internal static class TestImageFactory
 
         var efiName = Encoding.UTF8.GetBytes("efidisk0");
         var diskName = Encoding.UTF8.GetBytes("scsi0");
+        var vmstateName = Encoding.UTF8.GetBytes("vmstate");
         const int efiNamePointer = 1;
         var diskNamePointer = efiNamePointer + 2 + efiName.Length;
-        var blobSize = diskNamePointer + 2 + diskName.Length;
+        var vmstateNamePointer = diskNamePointer + 2 + diskName.Length;
+        var blobSize = vmstateNamePointer + 2 + vmstateName.Length;
         WriteU32Be(header, 52, checked((uint)blobSize));
         WriteU32Be(header, 56, headerSize);
         WriteU16Le(header, blobOffset + efiNamePointer, checked((ushort)efiName.Length));
         efiName.CopyTo(header, blobOffset + efiNamePointer + 2);
         WriteU16Le(header, blobOffset + diskNamePointer, checked((ushort)diskName.Length));
         diskName.CopyTo(header, blobOffset + diskNamePointer + 2);
+        WriteU16Le(header, blobOffset + vmstateNamePointer, checked((ushort)vmstateName.Length));
+        vmstateName.CopyTo(header, blobOffset + vmstateNamePointer + 2);
 
         var efiDeviceInfoOffset = 4096 + 32;
         WriteU32Be(header, efiDeviceInfoOffset, efiNamePointer);
@@ -9040,6 +9047,9 @@ internal static class TestImageFactory
         var diskDeviceInfoOffset = 4096 + 64;
         WriteU32Be(header, diskDeviceInfoOffset, checked((uint)diskNamePointer));
         WriteU64Be(header, diskDeviceInfoOffset + 8, checked((ulong)disk.Length));
+        var vmstateDeviceInfoOffset = 4096 + 96;
+        WriteU32Be(header, vmstateDeviceInfoOffset, checked((uint)vmstateNamePointer));
+        WriteU64Be(header, vmstateDeviceInfoOffset + 8, clusterSize);
         WriteMd5(header, 32);
 
         var output = new List<byte>(header);
@@ -9049,6 +9059,7 @@ internal static class TestImageFactory
         {
             clusters.Add((1, checked((uint)clusterNumber), 0, []));
         }
+        clusters.Add((3, 0, 0, []));
 
         var clusterCount = (disk.Length + clusterSize - 1) / clusterSize;
         for (var clusterNumber = 0; clusterNumber < clusterCount; clusterNumber++)

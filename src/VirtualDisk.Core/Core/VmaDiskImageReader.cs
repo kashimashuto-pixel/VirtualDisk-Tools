@@ -20,6 +20,7 @@ public sealed class VmaDiskImageReader : IDiskImageReader
     private readonly IDiskImageReader _source;
     private readonly IProgress<DiskImageProgress>? _progress;
     private readonly CancellationToken _cancellationToken;
+    private readonly Dictionary<byte, VmaDevice> _archiveDevices = [];
     private readonly Dictionary<byte, Dictionary<uint, VmaClusterMap>> _clusterMaps = [];
     private readonly List<string> _warnings = [];
     private long _extentCount;
@@ -239,15 +240,16 @@ public sealed class VmaDiskImageReader : IDiskImageReader
             }
 
             var name = ReadBlobString(header, blobBufferOffset, blobBufferSize, namePointer);
+            var device = new VmaDevice(checked((byte)deviceId), name, checked((long)sizeValue));
+            _archiveDevices.Add(device.Id, device);
+            _clusterMaps.Add(device.Id, []);
             if (string.Equals(name, "vmstate", StringComparison.Ordinal))
             {
                 _warnings.Add($"VMA device {deviceId} のVMメモリ状態 (vmstate) はディスク一覧から除外しました。");
                 continue;
             }
 
-            var device = new VmaDevice(checked((byte)deviceId), name, checked((long)sizeValue));
             devices.Add(device);
-            _clusterMaps.Add(device.Id, []);
         }
 
         if (devices.Count == 0)
@@ -318,7 +320,7 @@ public sealed class VmaDiskImageReader : IDiskImageReader
                         $"VMAエクステント #{_extentCount + 1:N0} が未定義のdevice {deviceId}を参照しています。");
                 }
 
-                var device = Devices.First(item => item.Id == deviceId);
+                var device = _archiveDevices[deviceId];
                 if ((long)clusterNumber * ClusterSize >= device.Size)
                 {
                     throw new InvalidDataException(
@@ -354,7 +356,7 @@ public sealed class VmaDiskImageReader : IDiskImageReader
             ReportProgress(force: false);
         }
 
-        foreach (var device in Devices)
+        foreach (var device in _archiveDevices.Values)
         {
             _cancellationToken.ThrowIfCancellationRequested();
             var expectedClusters = checked((device.Size - 1) / ClusterSize + 1);
