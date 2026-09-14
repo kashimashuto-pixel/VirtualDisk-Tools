@@ -213,7 +213,7 @@ Windowsの全機能版（WinForms）:
 dotnet run --project src\Qcow2Explorer\Qcow2Explorer.csproj
 ```
 
-Windows／Linux／macOS共通GUI（Avalonia。イメージの新規作成と読込、パーティション／ディレクトリ閲覧、ファイル抽出、全読込検証に対応）:
+Windows／Linux／macOS共通GUI（Avalonia。イメージの新規作成と読込、パーティション／ディレクトリ閲覧、テキスト／DOCX／XLSXプレビュー、ファイル／ディレクトリ抽出、全読込検証に対応）:
 
 ```bash
 dotnet run --project src/VirtualDisk.Gui/VirtualDisk.Gui.csproj

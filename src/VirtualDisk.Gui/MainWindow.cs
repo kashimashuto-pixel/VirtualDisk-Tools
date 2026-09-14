@@ -1,3 +1,4 @@
+using System.Text;
 using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Input;
@@ -8,6 +9,7 @@ using Qcow2Explorer.Core;
 using Qcow2Explorer.Creation;
 using Qcow2Explorer.FileSystems;
 using Qcow2Explorer.Partitions;
+using Qcow2Explorer.Previewing;
 
 namespace VirtualDisk.Gui;
 
@@ -22,6 +24,7 @@ public sealed class MainWindow : Window
     private readonly Button _createButton = new() { Content = "新規作成..." };
     private readonly Button _openButton = new() { Content = "開く..." };
     private readonly Button _backButton = new() { Content = "上へ", IsEnabled = false };
+    private readonly Button _previewButton = new() { Content = "プレビュー", IsEnabled = false };
     private readonly Button _extractButton = new() { Content = "抽出...", IsEnabled = false };
     private readonly Button _verifyButton = new() { Content = "全読込検証", IsEnabled = false };
     private readonly Button _cancelButton = new() { Content = "キャンセル", IsEnabled = false };
@@ -47,9 +50,10 @@ public sealed class MainWindow : Window
         };
         _partitions.SelectionChanged += async (_, _) => await OpenSelectedPartitionAsync();
         _entries.SelectionChanged += (_, _) => RefreshCommandState();
-        _entries.DoubleTapped += async (_, _) => await NavigateSelectedEntryAsync();
+        _entries.DoubleTapped += async (_, _) => await ActivateSelectedEntryAsync();
         _backButton.Click += async (_, _) => await NavigateUpAsync();
         _createButton.Click += async (_, _) => await CreateDiskAsync();
+        _previewButton.Click += async (_, _) => await PreviewSelectedAsync();
         _extractButton.Click += async (_, _) => await ExtractSelectedAsync();
         _verifyButton.Click += async (_, _) => await VerifyFileSystemAsync();
         _cancelButton.Click += (_, _) => CancelActiveOperation();
@@ -68,7 +72,16 @@ public sealed class MainWindow : Window
             Orientation = Orientation.Horizontal,
             Spacing = 8,
             Margin = new Thickness(12),
-            Children = { _createButton, _openButton, _backButton, _extractButton, _verifyButton, _cancelButton },
+            Children =
+            {
+                _createButton,
+                _openButton,
+                _backButton,
+                _previewButton,
+                _extractButton,
+                _verifyButton,
+                _cancelButton,
+            },
         };
         var header = new StackPanel
         {
@@ -371,20 +384,27 @@ public sealed class MainWindow : Window
         }
     }
 
-    private async Task NavigateSelectedEntryAsync()
+    private async Task ActivateSelectedEntryAsync()
     {
-        if (_busy
-            || _entries.SelectedItem is not EntryItem { Node.IsDirectory: true } selected
-            || _currentDirectory is null)
+        if (_busy || _entries.SelectedItem is not EntryItem selected)
         {
             return;
         }
 
-        var previous = _currentDirectory;
-        if (await LoadDirectoryAsync(selected.Node))
+        if (!selected.Node.IsDirectory)
         {
-            _directoryHistory.Push(previous);
-            RefreshCommandState();
+            await PreviewSelectedAsync();
+            return;
+        }
+
+        if (_currentDirectory is not null)
+        {
+            var previous = _currentDirectory;
+            if (await LoadDirectoryAsync(selected.Node))
+            {
+                _directoryHistory.Push(previous);
+                RefreshCommandState();
+            }
         }
     }
 
@@ -475,6 +495,168 @@ public sealed class MainWindow : Window
         _pathLabel.Text = string.IsNullOrWhiteSpace(directory.VirtualPath) ? "/" : directory.VirtualPath;
         _entries.ItemsSource = entries;
         RefreshCommandState();
+    }
+
+    private async Task PreviewSelectedAsync()
+    {
+        if (_fileSystem is null
+            || _entries.SelectedItem is not EntryItem { Node.IsDirectory: false } selected)
+        {
+            return;
+        }
+
+        var fileSystem = _fileSystem;
+        var file = selected.Node;
+        var operation = BeginOperation($"{file.Name}をプレビュー用に読み込んでいます...");
+        FilePreviewContent? preview = null;
+        try
+        {
+            var progress = new CallbackProgress<DiskImageProgress>(update =>
+            {
+                Dispatcher.UIThread.Post(() =>
+                {
+                    if (ReferenceEquals(_activeOperation, operation))
+                    {
+                        var suffix = update.Percentage is int percentage ? $" {percentage}%" : string.Empty;
+                        _status.Text = update.Message + suffix;
+                    }
+                });
+            });
+            preview = await Task.Run(
+                () => ReadPreview(fileSystem, file, progress, operation.Token),
+                operation.Token);
+            _status.Text = $"プレビューを読み込みました: {file.Name}";
+        }
+        catch (OperationCanceledException)
+        {
+            _status.Text = "プレビューの読込をキャンセルしました。";
+        }
+        catch (Exception exception)
+        {
+            _status.Text = $"プレビューできませんでした: {exception.Message}";
+            await ShowErrorAsync("ファイルをプレビューできません", exception.Message);
+        }
+        finally
+        {
+            EndOperation(operation);
+        }
+
+        if (preview is not null)
+        {
+            await ShowPreviewAsync(file.Name, preview);
+        }
+    }
+
+    private static FilePreviewContent ReadPreview(
+        IReadOnlyFileSystem fileSystem,
+        VfsNode file,
+        IProgress<DiskImageProgress> progress,
+        CancellationToken cancellationToken)
+    {
+        if (file.Size < 0 || file.Size > FilePreviewReader.MaximumFileSize)
+        {
+            throw new NotSupportedException(
+                $"プレビューできるファイルは{FilePreviewReader.MaximumFileSize / 1024 / 1024:N0} MiB以下です。");
+        }
+
+        var data = new byte[checked((int)file.Size)];
+        const int chunkSize = 1024 * 1024;
+        var offset = 0;
+        while (offset < data.Length)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var count = Math.Min(chunkSize, data.Length - offset);
+            var chunk = fileSystem.ReadFile(file, offset, count)
+                ?? throw new InvalidDataException("ファイルシステムがnullデータを返しました。");
+            if (chunk.Length != count)
+            {
+                throw new EndOfStreamException(
+                    $"ファイルが途中で終了しました: offset={offset:N0}, requested={count:N0}, actual={chunk.Length:N0}");
+            }
+
+            Buffer.BlockCopy(chunk, 0, data, offset, count);
+            offset += count;
+            progress.Report(new DiskImageProgress("プレビュー用データを読み込んでいます...", offset, data.Length));
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+        return FilePreviewReader.Read(file.Name, data);
+    }
+
+    private async Task ShowPreviewAsync(string fileName, FilePreviewContent preview)
+    {
+        var close = new Button { Content = "閉じる", HorizontalAlignment = HorizontalAlignment.Right };
+        var text = new TextBox
+        {
+            Text = FormatPreview(preview),
+            IsReadOnly = true,
+            AcceptsReturn = true,
+            TextWrapping = Avalonia.Media.TextWrapping.NoWrap,
+        };
+        ScrollViewer.SetHorizontalScrollBarVisibility(
+            text,
+            Avalonia.Controls.Primitives.ScrollBarVisibility.Auto);
+        ScrollViewer.SetVerticalScrollBarVisibility(
+            text,
+            Avalonia.Controls.Primitives.ScrollBarVisibility.Auto);
+        var content = new Grid
+        {
+            RowDefinitions = new RowDefinitions("Auto,*,Auto"),
+            RowSpacing = 8,
+            Margin = new Thickness(12),
+        };
+        AddPreviewControl(content, new TextBlock
+        {
+            Text = preview.Description,
+            TextWrapping = Avalonia.Media.TextWrapping.Wrap,
+        }, 0);
+        AddPreviewControl(content, text, 1);
+        AddPreviewControl(content, close, 2);
+        var dialog = new Window
+        {
+            Title = $"プレビュー — {fileName}",
+            Width = 900,
+            Height = 700,
+            MinWidth = 600,
+            MinHeight = 400,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+            Content = content,
+        };
+        close.Click += (_, _) => dialog.Close();
+        await dialog.ShowDialog(this);
+    }
+
+    private static void AddPreviewControl(Grid grid, Control control, int row)
+    {
+        Grid.SetRow(control, row);
+        grid.Children.Add(control);
+    }
+
+    private static string FormatPreview(FilePreviewContent preview)
+    {
+        if (preview.Text is not null)
+        {
+            return preview.Text;
+        }
+
+        var output = new StringBuilder();
+        foreach (var sheet in preview.Sheets)
+        {
+            output.AppendLine($"===== {sheet.Name} =====");
+            foreach (var row in sheet.Rows)
+            {
+                output.AppendLine(string.Join('\t', row));
+            }
+
+            if (sheet.IsTruncated)
+            {
+                output.AppendLine("... 表示上限により以降の行を省略しました ...");
+            }
+
+            output.AppendLine();
+        }
+
+        return output.ToString();
     }
 
     private async Task ExtractSelectedAsync()
@@ -758,6 +940,8 @@ public sealed class MainWindow : Window
     private void RefreshCommandState()
     {
         _backButton.IsEnabled = !_busy && _directoryHistory.Count > 0;
+        _previewButton.IsEnabled = !_busy
+            && _entries.SelectedItem is EntryItem { Node.IsDirectory: false };
         _extractButton.IsEnabled = !_busy && _entries.SelectedItem is EntryItem;
         _verifyButton.IsEnabled = !_busy && _fileSystem is not null;
     }
