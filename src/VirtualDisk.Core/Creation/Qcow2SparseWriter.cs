@@ -57,10 +57,11 @@ public static class Qcow2SparseWriter
         var temporaryPath = Path.Combine(
             destinationDirectory,
             $".{Path.GetFileName(destinationPath)}.{Guid.NewGuid():N}.partial");
+        using var rawReader = new StreamBlockReader(raw, leaveOpen: true);
 
         try
         {
-            await WriteCoreAsync(raw, rawLength, temporaryPath, progress, cancellationToken);
+            await WriteCoreAsync(rawReader, temporaryPath, progress, cancellationToken);
             if (raw.Length != rawLength || File.GetLastWriteTimeUtc(rawPath) != rawLastWriteUtc)
             {
                 throw new IOException("変換中にRAW原本が変更されました。QCOW2出力を破棄します。");
@@ -75,13 +76,50 @@ public static class Qcow2SparseWriter
         }
     }
 
+    public static async Task WriteFromBlockReaderAsync(
+        IBlockReader source,
+        string destinationPath,
+        IProgress<DiskImageProgress>? progress = null,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        ArgumentException.ThrowIfNullOrWhiteSpace(destinationPath);
+        destinationPath = Path.GetFullPath(destinationPath);
+        if (File.Exists(destinationPath) || Directory.Exists(destinationPath))
+        {
+            throw new IOException($"出力先は既に存在します: {destinationPath}");
+        }
+
+        if (source.Length <= 0 || source.Length % 512 != 0)
+        {
+            throw new InvalidDataException("QCOW2へ変換する仮想容量は正の512-byte倍数である必要があります。");
+        }
+
+        var destinationDirectory = Path.GetDirectoryName(destinationPath)
+            ?? throw new ArgumentException("QCOW2出力フォルダーを取得できません。", nameof(destinationPath));
+        Directory.CreateDirectory(destinationDirectory);
+        var temporaryPath = Path.Combine(
+            destinationDirectory,
+            $".{Path.GetFileName(destinationPath)}.{Guid.NewGuid():N}.partial");
+        try
+        {
+            await WriteCoreAsync(source, temporaryPath, progress, cancellationToken);
+            File.Move(temporaryPath, destinationPath);
+        }
+        catch
+        {
+            TryDelete(temporaryPath);
+            throw;
+        }
+    }
+
     private static async Task WriteCoreAsync(
-        FileStream raw,
-        long rawLength,
+        IBlockReader source,
         string destinationPath,
         IProgress<DiskImageProgress>? progress,
         CancellationToken cancellationToken)
     {
+        var rawLength = source.Length;
         var guestClusterCount = DivideRoundUp(rawLength, ClusterSize);
         var l2Entries = ClusterSize / 8;
         var l1EntriesLong = DivideRoundUp(guestClusterCount, l2Entries);
@@ -94,9 +132,8 @@ public static class Qcow2SparseWriter
 
         var l1Entries = checked((int)l1EntriesLong);
         var l1Clusters = checked((int)DivideRoundUp(checked((long)l1Entries * 8), ClusterSize));
-        var allocatedGuestClusters = await FindAllocatedGuestClustersAsync(
-            raw,
-            rawLength,
+        var allocatedGuestClusters = FindAllocatedGuestClusters(
+            source,
             progress,
             cancellationToken);
         var allocatedL2Tables = new List<int>();
@@ -248,8 +285,7 @@ public static class Qcow2SparseWriter
             var guestCluster = allocatedGuestClusters[index];
             var rawOffset = checked(guestCluster * ClusterSize);
             var count = checked((int)Math.Min(ClusterSize, rawLength - rawOffset));
-            raw.Position = rawOffset;
-            await raw.ReadExactlyAsync(data.AsMemory(0, count), cancellationToken);
+            source.ReadAt(rawOffset, data, 0, count);
             await WriteAtAsync(
                 output,
                 checked((dataClusterIndex + index) * ClusterSize),
@@ -264,15 +300,14 @@ public static class Qcow2SparseWriter
         await output.FlushAsync(cancellationToken);
     }
 
-    private static async Task<List<long>> FindAllocatedGuestClustersAsync(
-        FileStream raw,
-        long rawLength,
+    private static List<long> FindAllocatedGuestClusters(
+        IBlockReader source,
         IProgress<DiskImageProgress>? progress,
         CancellationToken cancellationToken)
     {
+        var rawLength = source.Length;
         var allocated = new List<long>();
         var buffer = new byte[ClusterSize];
-        raw.Position = 0;
         long offset = 0;
         const long progressInterval = 16L * 1024 * 1024;
         while (offset < rawLength)
@@ -280,7 +315,7 @@ public static class Qcow2SparseWriter
             cancellationToken.ThrowIfCancellationRequested();
             Array.Clear(buffer);
             var count = checked((int)Math.Min(buffer.Length, rawLength - offset));
-            await raw.ReadExactlyAsync(buffer.AsMemory(0, count), cancellationToken);
+            source.ReadAt(offset, buffer, 0, count);
             if (buffer.AsSpan(0, count).IndexOfAnyExcept((byte)0) >= 0)
             {
                 allocated.Add(offset / ClusterSize);

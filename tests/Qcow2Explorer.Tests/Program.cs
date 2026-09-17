@@ -7170,14 +7170,23 @@ static void TestExt4SameLengthReplacement()
                  (vdiOutputPath, FileEditOutputFormat.Vdi),
              })
     {
+        var intermediateRawObserved = false;
+        var outputDirectory = Path.GetDirectoryName(containerPath)!;
+        var progress = new CallbackProgress<DiskImageProgress>(_ =>
+            intermediateRawObserved |= Directory.EnumerateFiles(
+                outputDirectory,
+                "*.vdt-partial.raw",
+                SearchOption.TopDirectoryOnly).Any());
         var containerResult = FileEditBatchService.ApplyAsync(
             source,
             partition,
             unchanged,
             [new PendingFileEdit(FileEditOperationKind.WriteContent, "/HELLO.TXT", replacementPath)],
             containerPath,
-            outputFormat).GetAwaiter().GetResult();
+            outputFormat,
+            progress).GetAwaiter().GetResult();
         Assert(containerResult.OutputFormat == outputFormat, $"ext4 {outputFormat} output format");
+        Assert(!intermediateRawObserved, $"ext4 {outputFormat} output does not create an intermediate RAW");
         using var containerReader = DiskImageReaderFactory.Open(containerPath);
         var containerFileSystem = new ExtFileSystem(new PartitionSliceReader(containerReader, partition), partition);
         var containerHello = containerFileSystem.ListDirectory(containerFileSystem.Root)

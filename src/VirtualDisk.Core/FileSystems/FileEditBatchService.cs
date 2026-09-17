@@ -137,55 +137,42 @@ public static class FileEditBatchService
         var destinationDirectory = Path.GetDirectoryName(destinationPath)
             ?? throw new ArgumentException("出力先フォルダーを取得できません。", nameof(destinationPath));
         Directory.CreateDirectory(destinationDirectory);
-        var rawPendingPath = Path.Combine(
-            destinationDirectory,
-            $".{Path.GetFileName(destinationPath)}.{Guid.NewGuid():N}.vdt-partial.raw");
-        var containerPendingPath = outputFormat == FileEditOutputFormat.Raw
-            ? rawPendingPath
+        var pendingPath = outputFormat == FileEditOutputFormat.Raw
+            ? Path.Combine(
+                destinationDirectory,
+                $".{Path.GetFileName(destinationPath)}.{Guid.NewGuid():N}.vdt-partial.raw")
             : CreateContainerPendingPath(destinationDirectory, destinationPath, outputFormat);
         try
         {
-            await overlay.ExportRawAsync(rawPendingPath, progress, cancellationToken);
+            if (outputFormat == FileEditOutputFormat.Raw)
+            {
+                await overlay.ExportRawAsync(pendingPath, progress, cancellationToken);
+            }
+            else
+            {
+                var snapshot = overlay.CreateReadSnapshot();
+                await ConvertBlockReaderAsync(
+                    snapshot,
+                    pendingPath,
+                    outputFormat,
+                    progress,
+                    cancellationToken);
+                overlay.EnsureSourceUnchanged();
+            }
+
             VerifyFinalImage(
-                rawPendingPath,
-                FileEditOutputFormat.Raw,
+                pendingPath,
+                outputFormat,
                 overlay.Length,
                 effectivePartition,
                 prepared.FileSystemName,
                 results,
                 cancellationToken);
-            if (outputFormat == FileEditOutputFormat.Raw)
-            {
-                File.Move(rawPendingPath, destinationPath);
-            }
-            else
-            {
-                await ConvertRawAsync(
-                    rawPendingPath,
-                    containerPendingPath,
-                    outputFormat,
-                    progress,
-                    cancellationToken);
-                VerifyFinalImage(
-                    containerPendingPath,
-                    outputFormat,
-                    overlay.Length,
-                    effectivePartition,
-                    prepared.FileSystemName,
-                    results,
-                    cancellationToken);
-                File.Move(containerPendingPath, destinationPath);
-                FileEditService.TryDelete(rawPendingPath);
-            }
+            File.Move(pendingPath, destinationPath);
         }
         catch
         {
-            FileEditService.TryDelete(rawPendingPath);
-            if (!string.Equals(rawPendingPath, containerPendingPath, PathSemantics.Comparison))
-            {
-                FileEditService.TryDelete(containerPendingPath);
-            }
-
+            FileEditService.TryDelete(pendingPath);
             throw;
         }
 
@@ -233,20 +220,20 @@ public static class FileEditBatchService
             $".{Path.GetFileName(destinationPath)}.{Guid.NewGuid():N}.vdt-partial{extension}");
     }
 
-    private static Task ConvertRawAsync(
-        string rawPath,
+    private static Task ConvertBlockReaderAsync(
+        IBlockReader source,
         string destinationPath,
         FileEditOutputFormat outputFormat,
         IProgress<DiskImageProgress>? progress,
         CancellationToken cancellationToken) => outputFormat switch
         {
-            FileEditOutputFormat.Qcow2 => Qcow2SparseWriter.WriteFromRawAsync(
-                rawPath,
+            FileEditOutputFormat.Qcow2 => Qcow2SparseWriter.WriteFromBlockReaderAsync(
+                source,
                 destinationPath,
                 progress,
                 cancellationToken),
-            FileEditOutputFormat.Vdi => VdiSparseWriter.WriteFromRawAsync(
-                rawPath,
+            FileEditOutputFormat.Vdi => VdiSparseWriter.WriteFromBlockReaderAsync(
+                source,
                 destinationPath,
                 progress,
                 cancellationToken),

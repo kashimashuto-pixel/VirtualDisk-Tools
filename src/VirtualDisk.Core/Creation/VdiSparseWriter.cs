@@ -53,10 +53,11 @@ public static class VdiSparseWriter
         var temporaryPath = Path.Combine(
             destinationDirectory,
             $".{Path.GetFileName(destinationPath)}.{Guid.NewGuid():N}.partial");
+        using var rawReader = new StreamBlockReader(raw, leaveOpen: true);
 
         try
         {
-            await WriteCoreAsync(raw, rawLength, temporaryPath, progress, cancellationToken);
+            await WriteCoreAsync(rawReader, temporaryPath, progress, cancellationToken);
             if (raw.Length != rawLength || File.GetLastWriteTimeUtc(rawPath) != rawLastWriteUtc)
             {
                 throw new IOException("変換中にRAW原本が変更されました。VDI出力を破棄します。");
@@ -71,13 +72,50 @@ public static class VdiSparseWriter
         }
     }
 
+    public static async Task WriteFromBlockReaderAsync(
+        IBlockReader source,
+        string destinationPath,
+        IProgress<DiskImageProgress>? progress = null,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        ArgumentException.ThrowIfNullOrWhiteSpace(destinationPath);
+        destinationPath = Path.GetFullPath(destinationPath);
+        if (File.Exists(destinationPath) || Directory.Exists(destinationPath))
+        {
+            throw new IOException($"出力先は既に存在します: {destinationPath}");
+        }
+
+        if (source.Length <= 0 || source.Length % 512 != 0)
+        {
+            throw new InvalidDataException("VDIへ変換する仮想容量は正の512-byte倍数である必要があります。");
+        }
+
+        var destinationDirectory = Path.GetDirectoryName(destinationPath)
+            ?? throw new ArgumentException("VDI出力フォルダーを取得できません。", nameof(destinationPath));
+        Directory.CreateDirectory(destinationDirectory);
+        var temporaryPath = Path.Combine(
+            destinationDirectory,
+            $".{Path.GetFileName(destinationPath)}.{Guid.NewGuid():N}.partial");
+        try
+        {
+            await WriteCoreAsync(source, temporaryPath, progress, cancellationToken);
+            File.Move(temporaryPath, destinationPath);
+        }
+        catch
+        {
+            TryDelete(temporaryPath);
+            throw;
+        }
+    }
+
     private static async Task WriteCoreAsync(
-        FileStream raw,
-        long rawLength,
+        IBlockReader source,
         string destinationPath,
         IProgress<DiskImageProgress>? progress,
         CancellationToken cancellationToken)
     {
+        var rawLength = source.Length;
         await using var output = new FileStream(
             destinationPath,
             FileMode.CreateNew,
@@ -94,7 +132,7 @@ public static class VdiSparseWriter
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 var count = checked((int)Math.Min(buffer.Length, rawLength - offset));
-                await raw.ReadExactlyAsync(buffer.AsMemory(0, count), cancellationToken);
+                source.ReadAt(offset, buffer, 0, count);
                 if (buffer.AsSpan(0, count).IndexOfAnyExcept((byte)0) >= 0)
                 {
                     content.Position = offset;

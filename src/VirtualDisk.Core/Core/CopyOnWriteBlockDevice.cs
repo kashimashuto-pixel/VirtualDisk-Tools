@@ -133,6 +133,14 @@ public sealed class CopyOnWriteBlockDevice : IBlockDevice
         // Changes stay in the overlay until ExportRawAsync is called.
     }
 
+    internal IBlockReader CreateReadSnapshot()
+    {
+        EnsureSourceFileUnchanged();
+        return new SnapshotBlockReader(_source, CapturePageSnapshot(), _pageSize, Length);
+    }
+
+    internal void EnsureSourceUnchanged() => EnsureSourceFileUnchanged();
+
     public async Task ExportRawAsync(
         string destinationPath,
         IProgress<DiskImageProgress>? progress = null,
@@ -331,4 +339,48 @@ public sealed class CopyOnWriteBlockDevice : IBlockDevice
     }
 
     private sealed record SourceFileStamp(string Path, long Length, long LastWriteUtcTicks);
+
+    private sealed class SnapshotBlockReader(
+        IBlockReader source,
+        IReadOnlyDictionary<long, byte[]> pages,
+        int pageSize,
+        long length) : IBlockReader
+    {
+        public long Length { get; } = length;
+
+        public void ReadAt(long offset, byte[] buffer, int bufferOffset, int count)
+        {
+            ArgumentNullException.ThrowIfNull(buffer);
+            ArgumentOutOfRangeException.ThrowIfNegative(offset);
+            ArgumentOutOfRangeException.ThrowIfNegative(bufferOffset);
+            ArgumentOutOfRangeException.ThrowIfNegative(count);
+            if (bufferOffset > buffer.Length - count || offset > Length - count)
+            {
+                throw new ArgumentOutOfRangeException(nameof(count), "スナップショットの読み取り範囲が不正です。");
+            }
+
+            var remaining = count;
+            var currentOffset = offset;
+            var destinationOffset = bufferOffset;
+            while (remaining > 0)
+            {
+                var pageIndex = currentOffset / pageSize;
+                var pageOffset = checked((int)(currentOffset % pageSize));
+                var pageLength = checked((int)Math.Min(pageSize, Length - checked(pageIndex * pageSize)));
+                var copyLength = Math.Min(remaining, pageLength - pageOffset);
+                if (pages.TryGetValue(pageIndex, out var page))
+                {
+                    Array.Copy(page, pageOffset, buffer, destinationOffset, copyLength);
+                }
+                else
+                {
+                    source.ReadAt(currentOffset, buffer, destinationOffset, copyLength);
+                }
+
+                remaining -= copyLength;
+                currentOffset += copyLength;
+                destinationOffset += copyLength;
+            }
+        }
+    }
 }
