@@ -23,7 +23,31 @@ public sealed record LzopRawCacheEntry(
             ? "未完成"
             : !SourceIsCurrent
                 ? "元LZO変更"
-                : "破損";
+            : "破損";
+}
+
+public sealed record LzopIndexCacheEntry(
+    string CacheId,
+    string FileName,
+    string? SourcePath,
+    long StoredBytes,
+    bool Completed,
+    bool? SourceIsCurrent,
+    DateTime LastUsedUtc)
+{
+    public string DisplayName => string.IsNullOrWhiteSpace(SourcePath)
+        ? $"(元ファイル不明) {CacheId}"
+        : SourcePath;
+
+    public string Status => !Completed
+        ? "未完成"
+        : SourceIsCurrent == false
+            ? "元LZO変更"
+            : SourceIsCurrent == true
+                ? "利用可能"
+                : "保存済み";
+
+    public bool IsUsable => Completed && SourceIsCurrent != false;
 }
 
 public static class LzopRawCacheManager
@@ -31,6 +55,9 @@ public static class LzopRawCacheManager
     internal const string MetadataFileName = "cache.json";
     internal const string RawFileName = "disk.raw";
     internal const string PartialRawFileName = "disk.raw.partial";
+    internal const string IndexDirectoryName = "Index";
+    internal const string IndexFileSuffix = ".lzop-index.br";
+    internal const string IndexMetadataSuffix = ".lzop-index.json";
 
     private const int MetadataVersion = 1;
     private const int HashBufferSize = 4 * 1024 * 1024;
@@ -52,6 +79,11 @@ public static class LzopRawCacheManager
         var entries = new List<LzopRawCacheEntry>();
         foreach (var directory in Directory.EnumerateDirectories(root))
         {
+            if (string.Equals(Path.GetFileName(directory), IndexDirectoryName, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
             var metadata = TryReadMetadata(directory);
             if (metadata is null)
             {
@@ -98,6 +130,78 @@ public static class LzopRawCacheManager
             .ToList();
     }
 
+    public static IReadOnlyList<LzopIndexCacheEntry> GetIndexEntries(string? cacheRoot = null)
+    {
+        var indexRoot = Path.Combine(NormalizeRoot(cacheRoot), IndexDirectoryName);
+        if (!Directory.Exists(indexRoot))
+        {
+            return Array.Empty<LzopIndexCacheEntry>();
+        }
+
+        var partialSuffix = IndexFileSuffix + ".partial";
+        return Directory.EnumerateFiles(indexRoot)
+            .Where(path =>
+            {
+                var fileName = Path.GetFileName(path);
+                return fileName.EndsWith(IndexFileSuffix, StringComparison.OrdinalIgnoreCase)
+                    || fileName.EndsWith(partialSuffix, StringComparison.OrdinalIgnoreCase);
+            })
+            .Select(path =>
+            {
+                var fileName = Path.GetFileName(path);
+                var completed = fileName.EndsWith(IndexFileSuffix, StringComparison.OrdinalIgnoreCase);
+                var cacheId = completed
+                    ? fileName[..^IndexFileSuffix.Length]
+                    : fileName.EndsWith(partialSuffix, StringComparison.OrdinalIgnoreCase)
+                        ? fileName[..^partialSuffix.Length]
+                        : fileName;
+                var info = new FileInfo(path);
+                var metadata = TryReadIndexMetadata(indexRoot, cacheId);
+                return new LzopIndexCacheEntry(
+                    cacheId,
+                    fileName,
+                    metadata?.SourcePath,
+                    info.Length,
+                    completed,
+                    metadata is null ? null : IsIndexSourceCurrent(metadata),
+                    metadata?.LastUsedUtc ?? info.LastWriteTimeUtc);
+            })
+            .OrderByDescending(entry => entry.LastUsedUtc)
+            .ThenBy(entry => entry.CacheId, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    internal static void RecordIndexSource(string cachePath, string sourcePath)
+    {
+        try
+        {
+            var cacheFileName = Path.GetFileName(cachePath);
+            if (!cacheFileName.EndsWith(IndexFileSuffix, StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+
+            var cacheId = cacheFileName[..^IndexFileSuffix.Length];
+            var source = new FileInfo(Path.GetFullPath(sourcePath));
+            var metadata = new LzopIndexCacheMetadata
+            {
+                Version = 1,
+                SourcePath = source.FullName,
+                SourceLength = source.Length,
+                SourceLastWriteUtcTicks = source.LastWriteTimeUtc.Ticks,
+                LastUsedUtc = DateTime.UtcNow
+            };
+            var metadataPath = Path.Combine(Path.GetDirectoryName(cachePath)!, cacheId + IndexMetadataSuffix);
+            var temporaryPath = metadataPath + ".tmp";
+            File.WriteAllText(temporaryPath, JsonSerializer.Serialize(metadata, JsonOptions), new UTF8Encoding(false));
+            File.Move(temporaryPath, metadataPath, overwrite: true);
+        }
+        catch (Exception ex) when (ex is ArgumentException or IOException or UnauthorizedAccessException or NotSupportedException)
+        {
+            // The index remains usable when its optional display metadata cannot be updated.
+        }
+    }
+
     public static bool TryDelete(string cacheId, string? cacheRoot, out string error)
     {
         error = "";
@@ -139,6 +243,56 @@ public static class LzopRawCacheManager
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             error = $"キャッシュを削除できませんでした: {ex.Message}";
+            return false;
+        }
+    }
+
+    public static bool TryDeleteIndex(string fileName, string? cacheRoot, out string error)
+    {
+        error = "";
+        if (string.IsNullOrWhiteSpace(fileName)
+            || fileName.IndexOfAny([Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar]) >= 0)
+        {
+            error = "索引キャッシュ名が不正です。";
+            return false;
+        }
+
+        try
+        {
+            var indexRoot = Path.GetFullPath(Path.Combine(NormalizeRoot(cacheRoot), IndexDirectoryName));
+            var path = Path.GetFullPath(Path.Combine(indexRoot, fileName));
+            if (!IsChildPath(indexRoot, path))
+            {
+                error = "索引キャッシュ保存先の外は削除できません。";
+                return false;
+            }
+
+            if (File.Exists(path))
+            {
+                File.Delete(path);
+            }
+
+            var cacheId = fileName.EndsWith(IndexFileSuffix, StringComparison.OrdinalIgnoreCase)
+                ? fileName[..^IndexFileSuffix.Length]
+                : fileName.EndsWith(IndexFileSuffix + ".partial", StringComparison.OrdinalIgnoreCase)
+                    ? fileName[..^(IndexFileSuffix.Length + ".partial".Length)]
+                    : null;
+            if (cacheId is not null
+                && !File.Exists(Path.Combine(indexRoot, cacheId + IndexFileSuffix))
+                && !File.Exists(Path.Combine(indexRoot, cacheId + IndexFileSuffix + ".partial")))
+            {
+                var metadataPath = Path.Combine(indexRoot, cacheId + IndexMetadataSuffix);
+                if (File.Exists(metadataPath))
+                {
+                    File.Delete(metadataPath);
+                }
+            }
+
+            return true;
+        }
+        catch (Exception ex) when (ex is ArgumentException or IOException or UnauthorizedAccessException or NotSupportedException)
+        {
+            error = $"索引キャッシュを削除できませんでした: {ex.Message}";
             return false;
         }
     }
@@ -291,9 +445,43 @@ public static class LzopRawCacheManager
         }
     }
 
+    private static LzopIndexCacheMetadata? TryReadIndexMetadata(string indexRoot, string cacheId)
+    {
+        try
+        {
+            var path = Path.Combine(indexRoot, cacheId + IndexMetadataSuffix);
+            if (!File.Exists(path))
+            {
+                return null;
+            }
+
+            var metadata = JsonSerializer.Deserialize<LzopIndexCacheMetadata>(File.ReadAllText(path));
+            return metadata is { Version: 1 } ? metadata : null;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
+        {
+            return null;
+        }
+    }
+
     private static long GetFileLength(string path) => File.Exists(path) ? new FileInfo(path).Length : 0;
 
     private static bool IsSourceCurrent(LzopCacheMetadata metadata)
+    {
+        try
+        {
+            var source = new FileInfo(metadata.SourcePath);
+            return source.Exists
+                && source.Length == metadata.SourceLength
+                && source.LastWriteTimeUtc.Ticks == metadata.SourceLastWriteUtcTicks;
+        }
+        catch (Exception ex) when (ex is ArgumentException or IOException or UnauthorizedAccessException or NotSupportedException)
+        {
+            return false;
+        }
+    }
+
+    private static bool IsIndexSourceCurrent(LzopIndexCacheMetadata metadata)
     {
         try
         {
@@ -325,6 +513,15 @@ internal sealed class LzopCacheMetadata
     public long RawLength { get; set; }
     public bool Completed { get; set; }
     public DateTime CreatedUtc { get; set; }
+    public DateTime LastUsedUtc { get; set; }
+}
+
+internal sealed class LzopIndexCacheMetadata
+{
+    public int Version { get; set; }
+    public string SourcePath { get; set; } = "";
+    public long SourceLength { get; set; }
+    public long SourceLastWriteUtcTicks { get; set; }
     public DateTime LastUsedUtc { get; set; }
 }
 

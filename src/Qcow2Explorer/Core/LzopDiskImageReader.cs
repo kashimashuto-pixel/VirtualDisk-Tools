@@ -564,6 +564,7 @@ public sealed class LzopDiskImageReader : IDiskImageReader
 
             Length = rawLength;
             UsedCachedIndex = true;
+            LzopRawCacheManager.RecordIndexSource(cachePath, Path);
             _progress?.Report(new DiskImageProgress(
                 $"LZO索引作成中: キャッシュ読み込み ({blockCount:N0}ブロック)",
                 _compressedLength,
@@ -613,6 +614,7 @@ public sealed class LzopDiskImageReader : IDiskImageReader
             }
 
             File.Move(temporaryPath, cachePath, overwrite: true);
+            LzopRawCacheManager.RecordIndexSource(cachePath, Path);
             DiagnosticLog.Write($"LZO index cache saved: path={cachePath}, blocks={_blocks.Count}");
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or NotSupportedException)
@@ -624,7 +626,10 @@ public sealed class LzopDiskImageReader : IDiskImageReader
     private string GetIndexCachePath()
     {
         var cacheId = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(System.IO.Path.GetFullPath(Path).ToUpperInvariant()))).ToLowerInvariant();
-        return System.IO.Path.Combine(LzopRawCacheManager.DefaultCacheRoot, "Index", cacheId + ".lzop-index.br");
+        return System.IO.Path.Combine(
+            LzopRawCacheManager.DefaultCacheRoot,
+            LzopRawCacheManager.IndexDirectoryName,
+            cacheId + LzopRawCacheManager.IndexFileSuffix);
     }
 
     private LzopIndexSourceIdentity GetSourceIdentity()

@@ -138,6 +138,11 @@ public partial class Form1 : Form
         openPhysicalDiskButton.Click += async (_, _) => await OpenPhysicalDiskDialogAsync();
         var recoverPhysicalDiskButton = new ToolStripButton("物理ディスク復旧");
         recoverPhysicalDiskButton.Click += async (_, _) => await RestorePhysicalDiskAsync();
+        var manageLzopCacheButton = new ToolStripButton("LZOキャッシュ")
+        {
+            ToolTipText = "LZO高速モードのRAWキャッシュを管理"
+        };
+        manageLzopCacheButton.Click += (_, _) => ShowLzopCacheManager(LzopRawCacheManager.DefaultCacheRoot);
         var reportButton = new ToolStripButton("解析レポート");
         reportButton.Click += (_, _) => SaveAnalysisReport();
         var snapshotButton = new ToolStripButton("スナップショット");
@@ -151,6 +156,7 @@ public partial class Form1 : Form
         toolStrip.Items.Add(openFolderButton);
         toolStrip.Items.Add(openPhysicalDiskButton);
         toolStrip.Items.Add(recoverPhysicalDiskButton);
+        toolStrip.Items.Add(manageLzopCacheButton);
         toolStrip.Items.Add(new ToolStripSeparator());
         toolStrip.Items.Add(new ToolStripLabel("ファイル"));
         toolStrip.Items.Add(_pathBox);
@@ -961,9 +967,10 @@ public partial class Form1 : Form
             GridLines = true,
             MultiSelect = true
         };
-        list.Columns.Add("元LZO", 410);
+        list.Columns.Add("種類", 70);
+        list.Columns.Add("元LZO / 識別ID", 340);
         list.Columns.Add("状態", 80);
-        list.Columns.Add("RAWサイズ", 110);
+        list.Columns.Add("保存容量", 110);
         list.Columns.Add("最終利用", 150);
         var summary = new Label { AutoSize = true, Padding = new Padding(8, 9, 8, 0) };
         var deleteButton = new Button { AutoSize = true, Text = "選択したキャッシュを削除" };
@@ -990,10 +997,22 @@ public partial class Form1 : Form
         {
             list.BeginUpdate();
             list.Items.Clear();
-            var entries = LzopRawCacheManager.GetEntries(cacheRoot);
-            foreach (var entry in entries)
+            var rawEntries = LzopRawCacheManager.GetEntries(cacheRoot);
+            var indexEntries = LzopRawCacheManager.GetIndexEntries(cacheRoot);
+            foreach (var entry in rawEntries)
             {
-                var item = new ListViewItem(entry.SourcePath) { Tag = entry };
+                var item = new ListViewItem("RAW") { Tag = entry };
+                item.SubItems.Add(entry.SourcePath);
+                item.SubItems.Add(entry.Status);
+                item.SubItems.Add(FormatBytes(entry.StoredBytes));
+                item.SubItems.Add(entry.LastUsedUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture));
+                list.Items.Add(item);
+            }
+
+            foreach (var entry in indexEntries)
+            {
+                var item = new ListViewItem("索引") { Tag = entry };
+                item.SubItems.Add(entry.DisplayName);
                 item.SubItems.Add(entry.Status);
                 item.SubItems.Add(FormatBytes(entry.StoredBytes));
                 item.SubItems.Add(entry.LastUsedUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture));
@@ -1001,18 +1020,31 @@ public partial class Form1 : Form
             }
 
             list.EndUpdate();
-            summary.Text = $"{entries.Count:N0}件 / {FormatBytes(entries.Sum(entry => entry.StoredBytes))}";
+            var count = rawEntries.Count + indexEntries.Count;
+            var storedBytes = rawEntries.Sum(entry => entry.StoredBytes) + indexEntries.Sum(entry => entry.StoredBytes);
+            summary.Text = $"{count:N0}件 / {FormatBytes(storedBytes)}";
             deleteButton.Enabled = list.SelectedItems.Count > 0;
-            deleteUnusableButton.Enabled = entries.Any(entry => !entry.IsUsable);
+            deleteUnusableButton.Enabled = rawEntries.Any(entry => !entry.IsUsable)
+                || indexEntries.Any(entry => !entry.IsUsable);
         }
 
-        bool DeleteEntries(IEnumerable<LzopRawCacheEntry> entries)
+        bool DeleteEntries(IEnumerable<object> entries)
         {
             foreach (var entry in entries)
             {
-                if (!LzopRawCacheManager.TryDelete(entry.CacheId, cacheRoot, out var error))
+                var deleted = entry switch
                 {
-                    MessageBox.Show(dialog, error, "キャッシュ削除エラー", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    LzopRawCacheEntry raw => LzopRawCacheManager.TryDelete(raw.CacheId, cacheRoot, out var rawError)
+                        ? (Success: true, Error: "")
+                        : (Success: false, Error: rawError),
+                    LzopIndexCacheEntry index => LzopRawCacheManager.TryDeleteIndex(index.FileName, cacheRoot, out var indexError)
+                        ? (Success: true, Error: "")
+                        : (Success: false, Error: indexError),
+                    _ => (Success: false, Error: "不明なキャッシュ項目です。")
+                };
+                if (!deleted.Success)
+                {
+                    MessageBox.Show(dialog, deleted.Error, "キャッシュ削除エラー", MessageBoxButtons.OK, MessageBoxIcon.Error);
                     return false;
                 }
             }
@@ -1024,7 +1056,7 @@ public partial class Form1 : Form
         deleteButton.Click += (_, _) =>
         {
             var selected = list.SelectedItems.Cast<ListViewItem>()
-                .Select(item => (LzopRawCacheEntry)item.Tag!)
+                .Select(item => item.Tag!)
                 .ToList();
             if (selected.Count == 0
                 || MessageBox.Show(
@@ -1045,7 +1077,11 @@ public partial class Form1 : Form
         };
         deleteUnusableButton.Click += (_, _) =>
         {
-            var unusable = LzopRawCacheManager.GetEntries(cacheRoot).Where(entry => !entry.IsUsable).ToList();
+            var unusable = LzopRawCacheManager.GetEntries(cacheRoot)
+                .Where(entry => !entry.IsUsable)
+                .Cast<object>()
+                .Concat(LzopRawCacheManager.GetIndexEntries(cacheRoot).Where(entry => !entry.IsUsable))
+                .ToList();
             if (unusable.Count > 0 && DeleteEntries(unusable))
             {
                 RefreshEntries();

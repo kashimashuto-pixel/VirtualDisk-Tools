@@ -4840,11 +4840,35 @@ static void TestGeneratedLzopExt4Image()
     }
 
     File.Delete(savedRawPath);
+    var indexCacheRoot = Path.Combine(cacheRoot, "Index");
+    Directory.CreateDirectory(indexCacheRoot);
+    var completeIndexPath = Path.Combine(indexCacheRoot, "complete.lzop-index.br");
+    File.WriteAllBytes(completeIndexPath, new byte[123]);
+    LzopRawCacheManager.RecordIndexSource(completeIndexPath, cacheSourcePath);
+    File.WriteAllBytes(Path.Combine(indexCacheRoot, "incomplete.lzop-index.br.partial"), new byte[45]);
     cacheEntries = LzopRawCacheManager.GetEntries(cacheRoot);
     Assert(cacheEntries.Count == 1, "dd.lzo cache manager entry count");
+    var indexEntries = LzopRawCacheManager.GetIndexEntries(cacheRoot);
+    Assert(
+        indexEntries.Count == 2
+        && indexEntries.Single(entry => entry.CacheId == "complete") is { IsUsable: true, StoredBytes: 123 } completeIndex
+        && completeIndex.SourcePath == Path.GetFullPath(cacheSourcePath)
+        && indexEntries.Single(entry => entry.CacheId == "incomplete") is { IsUsable: false, StoredBytes: 45 },
+        "dd.lzo index cache manager entries");
     Assert(
         !LzopRawCacheManager.TryDelete("..", cacheRoot, out _),
         "dd.lzo cache manager rejects parent deletion");
+    Assert(
+        !LzopRawCacheManager.TryDeleteIndex("..", cacheRoot, out _),
+        "dd.lzo index cache manager rejects parent deletion");
+    foreach (var indexEntry in indexEntries)
+    {
+        Assert(
+            LzopRawCacheManager.TryDeleteIndex(indexEntry.FileName, cacheRoot, out var indexDeleteError),
+            indexDeleteError);
+    }
+
+    Directory.Delete(indexCacheRoot);
     Assert(
         LzopRawCacheManager.TryDelete(cacheEntries[0].CacheId, cacheRoot, out var cacheDeleteError),
         cacheDeleteError);
