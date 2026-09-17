@@ -78,7 +78,8 @@ public static class LzopIndexCacheManager
                                        or UnauthorizedAccessException
                                        or ArgumentException
                                        or NotSupportedException
-                                       or OverflowException)
+                                       or OverflowException
+                                       or InvalidOperationException)
             {
                 entries.Add(new LzopIndexCacheEntry(
                     cacheId,

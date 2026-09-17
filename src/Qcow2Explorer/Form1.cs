@@ -321,7 +321,7 @@ public partial class Form1 : Form
         {
             var confirmation = MessageBox.Show(
                 this,
-                "編集モードは実験的な機能です。通常は原本を変更せず、新しいRAWへ保存します。"
+                "編集モードは実験的な機能です。通常は原本を変更せず、新しいRAW／QCOW2／VDIへ保存します。"
                 + Environment.NewLine
                 + "物理ディスクへの適用を選んだ場合だけ、確認後に対象ディスクへ書き込みます。"
                 + Environment.NewLine
@@ -582,7 +582,7 @@ public partial class Form1 : Form
         queueAttributesItem.Click += (_, _) => QueueSelectedEntryAttributes();
         var queueTimestampItem = new ToolStripMenuItem("選択項目の更新日時を変更...");
         queueTimestampItem.Click += (_, _) => QueueSelectedEntryTimestamp();
-        var saveEditsItem = new ToolStripMenuItem("変更一覧を新しいRAWへ保存...");
+        var saveEditsItem = new ToolStripMenuItem("変更一覧を新しいイメージへ保存...");
         saveEditsItem.Click += async (_, _) => await SavePendingEditsAsync();
         var undoEditItem = new ToolStripMenuItem("最後の変更を取り消す");
         undoEditItem.Click += (_, _) => UndoLastPendingEdit();
@@ -710,7 +710,7 @@ public partial class Form1 : Form
         undoLastButton.Click += (_, _) => UndoLastPendingEdit();
         var clearButton = new Button { Text = "すべて取り消す", AutoSize = true };
         clearButton.Click += (_, _) => ClearPendingEditsWithPrompt();
-        var saveButton = new Button { Text = "新しいRAWへ保存...", AutoSize = true };
+        var saveButton = new Button { Text = "新しいイメージへ保存...", AutoSize = true };
         saveButton.Click += async (_, _) => await SavePendingEditsAsync();
         var applyPhysicalButton = new Button { Text = "物理ディスクへ適用...", AutoSize = true };
         applyPhysicalButton.Click += async (_, _) => await ApplyPendingEditsToPhysicalDiskAsync();
@@ -719,7 +719,7 @@ public partial class Form1 : Form
             Dock = DockStyle.Fill,
             AutoEllipsis = true,
             Padding = new Padding(8, 4, 8, 0),
-            Text = "追加・変更予定の内容元は差し替えや外部編集ができます。通常は新規RAWへ保存します。",
+            Text = "追加・変更予定の内容元は差し替えや外部編集ができます。RAW／QCOW2／VDIへ保存できます。",
         };
         var buttons = new FlowLayoutPanel
         {
@@ -1342,7 +1342,7 @@ public partial class Form1 : Form
     {
         if (_isWritingImage)
         {
-            _statusLabel.Text = "変更済みRAWの保存中は別のイメージを開けません";
+            _statusLabel.Text = "変更済みイメージの保存中は別のイメージを開けません";
             return;
         }
 
@@ -3727,7 +3727,7 @@ public partial class Form1 : Form
     {
         if (_isWritingImage || _isLoadingImage)
         {
-            _statusLabel.Text = "イメージの読み込み・RAW保存中は変更予定を編集できません";
+            _statusLabel.Text = "イメージの読み込み・保存中は変更予定を編集できません";
             return;
         }
 
@@ -3752,7 +3752,7 @@ public partial class Form1 : Form
     {
         if (_isWritingImage || _isLoadingImage)
         {
-            _statusLabel.Text = "イメージの読み込み・RAW保存中は変更予定を編集できません";
+            _statusLabel.Text = "イメージの読み込み・保存中は変更予定を編集できません";
             return;
         }
 
@@ -3787,7 +3787,7 @@ public partial class Form1 : Form
     {
         if (_isWritingImage || _isLoadingImage)
         {
-            _statusLabel.Text = "イメージの読み込み・RAW保存中は外部編集を開始できません";
+            _statusLabel.Text = "イメージの読み込み・保存中は外部編集を開始できません";
             return;
         }
 
@@ -3843,7 +3843,7 @@ public partial class Form1 : Form
     {
         if (_isWritingImage || _isLoadingImage)
         {
-            _statusLabel.Text = "イメージの読み込み・RAW保存中は外部編集を開始できません";
+            _statusLabel.Text = "イメージの読み込み・保存中は外部編集を開始できません";
             return;
         }
 
@@ -3892,7 +3892,7 @@ public partial class Form1 : Form
     {
         if (_isWritingImage || _isLoadingImage)
         {
-            _statusLabel.Text = "イメージの読み込み・RAW保存中は変更予定を編集できません";
+            _statusLabel.Text = "イメージの読み込み・保存中は変更予定を編集できません";
             return;
         }
 
@@ -3918,7 +3918,7 @@ public partial class Form1 : Form
     {
         if (_isWritingImage || _isLoadingImage)
         {
-            _statusLabel.Text = "イメージの読み込み・RAW保存中は変更予定を編集できません";
+            _statusLabel.Text = "イメージの読み込み・保存中は変更予定を編集できません";
             return;
         }
 
@@ -4185,7 +4185,7 @@ public partial class Form1 : Form
     {
         if (_isWritingImage || _isLoadingImage)
         {
-            _statusLabel.Text = "イメージの読み込み・RAW保存中は変更予定を編集できません";
+            _statusLabel.Text = "イメージの読み込み・保存中は変更予定を編集できません";
             return;
         }
 
@@ -4321,7 +4321,7 @@ public partial class Form1 : Form
             return true;
         }
 
-        _statusLabel.Text = "イメージの読み込み・RAW保存中は変更予定を編集できません";
+        _statusLabel.Text = "イメージの読み込み・保存中は変更予定を編集できません";
         return false;
     }
 
@@ -4634,7 +4634,7 @@ public partial class Form1 : Form
     {
         if (_isWritingImage)
         {
-            _statusLabel.Text = "RAW保存中は変更予定を編集できません";
+            _statusLabel.Text = "イメージ保存中は変更予定を編集できません";
             return;
         }
 
@@ -4660,7 +4660,7 @@ public partial class Form1 : Form
     {
         if (_isWritingImage)
         {
-            _statusLabel.Text = "RAW保存中は変更予定を編集できません";
+            _statusLabel.Text = "イメージ保存中は変更予定を編集できません";
             return;
         }
 
@@ -4682,7 +4682,7 @@ public partial class Form1 : Form
     {
         if (_isWritingImage)
         {
-            _statusLabel.Text = "RAW保存中は変更予定を編集できません";
+            _statusLabel.Text = "イメージ保存中は変更予定を編集できません";
             return;
         }
 
@@ -4745,7 +4745,7 @@ public partial class Form1 : Form
     {
         if (_isWritingImage || _isLoadingImage)
         {
-            _statusLabel.Text = "イメージの読み込み・RAW保存中は保存を開始できません";
+            _statusLabel.Text = "イメージの読み込み・保存中は保存を開始できません";
             return;
         }
 
@@ -4753,7 +4753,7 @@ public partial class Form1 : Form
         {
             MessageBox.Show(
                 this,
-                "検索またはホストへのコピーが完了してから変更済みRAWを保存してください。",
+                "検索またはホストへのコピーが完了してから変更済みイメージを保存してください。",
                 "読み取り処理を実行中です",
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Information);
@@ -4775,9 +4775,9 @@ public partial class Form1 : Form
         using var outputDialog = new SaveFileDialog
         {
             Title = isLogicalOutput
-                ? "変更済み論理ボリュームを新しいRAWイメージとして保存"
-                : "変更済みディスクを新しいRAWイメージとして保存",
-            Filter = "RAW disk image (*.raw)|*.raw|Disk image (*.img)|*.img|All files (*.*)|*.*",
+                ? "変更済み論理ボリュームを新しいディスクイメージとして保存"
+                : "変更済みディスクを新しいディスクイメージとして保存",
+            Filter = "RAW disk image (*.raw;*.img)|*.raw;*.img|QCOW2 image (*.qcow2;*.qcow)|*.qcow2;*.qcow|VirtualBox VDI (*.vdi)|*.vdi|All files (*.*)|*.*",
             DefaultExt = "raw",
             AddExtension = true,
             OverwritePrompt = false,
@@ -4788,7 +4788,23 @@ public partial class Form1 : Form
             return;
         }
 
-        if (File.Exists(outputDialog.FileName) || Directory.Exists(outputDialog.FileName))
+        var outputFormat = outputDialog.FilterIndex switch
+        {
+            2 => FileEditOutputFormat.Qcow2,
+            3 => FileEditOutputFormat.Vdi,
+            _ => FileEditBatchService.DetectOutputFormat(outputDialog.FileName),
+        };
+        var outputFileName = outputFormat switch
+        {
+            FileEditOutputFormat.Qcow2
+                when Path.GetExtension(outputDialog.FileName) is not ".qcow2" and not ".qcow" =>
+                Path.ChangeExtension(outputDialog.FileName, ".qcow2"),
+            FileEditOutputFormat.Vdi
+                when !Path.GetExtension(outputDialog.FileName).Equals(".vdi", StringComparison.OrdinalIgnoreCase) =>
+                Path.ChangeExtension(outputDialog.FileName, ".vdi"),
+            _ => outputDialog.FileName,
+        };
+        if (File.Exists(outputFileName) || Directory.Exists(outputFileName))
         {
             MessageBox.Show(
                 this,
@@ -4798,6 +4814,8 @@ public partial class Form1 : Form
                 MessageBoxIcon.Warning);
             return;
         }
+
+        var outputFormatName = FileEditBatchService.GetOutputFormatName(outputFormat);
 
         var summary = string.Join("\r\n", _pendingFileEdits.Take(8).Select(edit =>
             $"・{FormatEditOperation(edit.Operation)}: {edit.VirtualPath}"));
@@ -4809,12 +4827,12 @@ public partial class Form1 : Form
         if (MessageBox.Show(
                 this,
                 $"実験的な書き込み機能です。\r\n\r\n{summary}\r\n\r\n"
-                    + $"出力: {outputDialog.FileName}\r\n\r\n"
+                    + $"出力: {outputFileName}\r\n\r\n"
                     + (isLogicalOutput
-                        ? "RAID/LVM/復号レイヤーの構成元は変更せず、選択した論理ボリュームを平坦なRAWとして出力します。\r\n"
+                        ? $"RAID/LVM/復号レイヤーの構成元は変更せず、選択した論理ボリュームを平坦化して{outputFormatName}へ格納します。\r\n"
                         : string.Empty)
-                    + "原本は変更せず、変更を上から順に仮適用して検証後、新しいRAWへ保存します。続行しますか？",
-                "変更済みRAW保存の確認",
+                    + $"原本は変更せず、変更を上から順に仮適用して検証後、新しい{outputFormatName}へ保存します。続行しますか？",
+                $"変更済み{outputFormatName}保存の確認",
                 MessageBoxButtons.YesNo,
                 MessageBoxIcon.Warning,
                 MessageBoxDefaultButton.Button2) != DialogResult.Yes)
@@ -4822,7 +4840,7 @@ public partial class Form1 : Form
             return;
         }
 
-        if (!ConfirmAndDisposeMounts("変更済みRAWを保存する前に、現在の読み取り専用マウントを解除します。続行しますか？"))
+        if (!ConfirmAndDisposeMounts("変更済みイメージを保存する前に、現在の読み取り専用マウントを解除します。続行しますか？"))
         {
             return;
         }
@@ -4854,20 +4872,21 @@ public partial class Form1 : Form
             var source = _reader;
             var fileSystem = _pendingEditFileSystem;
             var edits = _pendingFileEdits.ToArray();
-            var result = await Task.Run(() => FileEditBatchService.ApplyToRawAsync(
+            var result = await Task.Run(() => FileEditBatchService.ApplyAsync(
                 source,
                 fileSystem.Partition,
                 fileSystem,
                 edits,
-                outputDialog.FileName,
+                outputFileName,
+                outputFormat,
                 progress,
                 cancellation.Token), cancellation.Token);
             ClearPendingEdits();
-            _statusLabel.Text = $"変更済みRAWを保存しました: {result.DestinationPath}";
+            _statusLabel.Text = $"変更済み{outputFormatName}を保存しました: {result.DestinationPath}";
             MessageBox.Show(
                 this,
-                $"変更済みRAWを保存しました。\r\n\r\n{result.DestinationPath}\r\n"
-                    + (result.IsLogicalVolumeOutput ? "形式: 構成元へ書き戻さない平坦化済み論理RAW\r\n" : string.Empty)
+                $"変更済み{outputFormatName}を保存しました。\r\n\r\n{result.DestinationPath}\r\n"
+                    + (result.IsLogicalVolumeOutput ? $"形式: 構成元へ書き戻さない平坦化済み論理ディスク（{outputFormatName}）\r\n" : string.Empty)
                     + $"変更: {result.EditCount:N0}件\r\n変更ページ: {result.ModifiedPageCount:N0}",
                 "ファイル編集完了",
                 MessageBoxButtons.OK,
@@ -4875,11 +4894,11 @@ public partial class Form1 : Form
         }
         catch (OperationCanceledException)
         {
-            _statusLabel.Text = "変更済みRAWの保存をキャンセルしました";
+            _statusLabel.Text = $"変更済み{outputFormatName}の保存をキャンセルしました";
         }
         catch (Exception ex)
         {
-            _statusLabel.Text = "変更済みRAWの保存に失敗しました";
+            _statusLabel.Text = $"変更済み{outputFormatName}の保存に失敗しました";
             MessageBox.Show(this, ex.Message, "ファイル編集エラー", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
         finally

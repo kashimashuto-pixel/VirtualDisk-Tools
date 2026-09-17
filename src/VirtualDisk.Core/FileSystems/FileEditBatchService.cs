@@ -1,5 +1,6 @@
 using System.Security.Cryptography;
 using Qcow2Explorer.Core;
+using Qcow2Explorer.Creation;
 using Qcow2Explorer.Partitions;
 
 namespace Qcow2Explorer.FileSystems;
@@ -17,7 +18,15 @@ public sealed record FileEditBatchResult(
     int EditCount,
     int ModifiedPageCount,
     IReadOnlyList<FileEditResult> Edits,
-    bool IsLogicalVolumeOutput = false);
+    bool IsLogicalVolumeOutput = false,
+    FileEditOutputFormat OutputFormat = FileEditOutputFormat.Raw);
+
+public enum FileEditOutputFormat
+{
+    Raw,
+    Qcow2,
+    Vdi,
+}
 
 internal sealed record PreparedFileEditBatch(
     CopyOnWriteBlockDevice Overlay,
@@ -59,12 +68,31 @@ public static class FileEditBatchService
         }
     }
 
-    public static async Task<FileEditBatchResult> ApplyToRawAsync(
+    public static Task<FileEditBatchResult> ApplyToRawAsync(
         IDiskImageReader source,
         PartitionInfo partition,
         IReadOnlyFileSystem originalFileSystem,
         IReadOnlyList<PendingFileEdit> edits,
         string destinationPath,
+        IProgress<DiskImageProgress>? progress = null,
+        CancellationToken cancellationToken = default) =>
+        ApplyAsync(
+            source,
+            partition,
+            originalFileSystem,
+            edits,
+            destinationPath,
+            FileEditOutputFormat.Raw,
+            progress,
+            cancellationToken);
+
+    public static async Task<FileEditBatchResult> ApplyAsync(
+        IDiskImageReader source,
+        PartitionInfo partition,
+        IReadOnlyFileSystem originalFileSystem,
+        IReadOnlyList<PendingFileEdit> edits,
+        string destinationPath,
+        FileEditOutputFormat outputFormat,
         IProgress<DiskImageProgress>? progress = null,
         CancellationToken cancellationToken = default)
     {
@@ -89,6 +117,11 @@ public static class FileEditBatchService
             throw new IOException("原本と同じパスには保存できません。");
         }
 
+        if (!Enum.IsDefined(outputFormat))
+        {
+            throw new ArgumentOutOfRangeException(nameof(outputFormat));
+        }
+
         var prepared = await PrepareAsync(
             source,
             partition,
@@ -104,18 +137,55 @@ public static class FileEditBatchService
         var destinationDirectory = Path.GetDirectoryName(destinationPath)
             ?? throw new ArgumentException("出力先フォルダーを取得できません。", nameof(destinationPath));
         Directory.CreateDirectory(destinationDirectory);
-        var pendingPath = Path.Combine(
+        var rawPendingPath = Path.Combine(
             destinationDirectory,
-            $".{Path.GetFileName(destinationPath)}.{Guid.NewGuid():N}.vdt-partial");
+            $".{Path.GetFileName(destinationPath)}.{Guid.NewGuid():N}.vdt-partial.raw");
+        var containerPendingPath = outputFormat == FileEditOutputFormat.Raw
+            ? rawPendingPath
+            : CreateContainerPendingPath(destinationDirectory, destinationPath, outputFormat);
         try
         {
-            await overlay.ExportRawAsync(pendingPath, progress, cancellationToken);
-            VerifyFinalImage(pendingPath, effectivePartition, prepared.FileSystemName, results, cancellationToken);
-            File.Move(pendingPath, destinationPath);
+            await overlay.ExportRawAsync(rawPendingPath, progress, cancellationToken);
+            VerifyFinalImage(
+                rawPendingPath,
+                FileEditOutputFormat.Raw,
+                overlay.Length,
+                effectivePartition,
+                prepared.FileSystemName,
+                results,
+                cancellationToken);
+            if (outputFormat == FileEditOutputFormat.Raw)
+            {
+                File.Move(rawPendingPath, destinationPath);
+            }
+            else
+            {
+                await ConvertRawAsync(
+                    rawPendingPath,
+                    containerPendingPath,
+                    outputFormat,
+                    progress,
+                    cancellationToken);
+                VerifyFinalImage(
+                    containerPendingPath,
+                    outputFormat,
+                    overlay.Length,
+                    effectivePartition,
+                    prepared.FileSystemName,
+                    results,
+                    cancellationToken);
+                File.Move(containerPendingPath, destinationPath);
+                FileEditService.TryDelete(rawPendingPath);
+            }
         }
         catch
         {
-            FileEditService.TryDelete(pendingPath);
+            FileEditService.TryDelete(rawPendingPath);
+            if (!string.Equals(rawPendingPath, containerPendingPath, PathSemantics.Comparison))
+            {
+                FileEditService.TryDelete(containerPendingPath);
+            }
+
             throw;
         }
 
@@ -124,8 +194,64 @@ public static class FileEditBatchService
             results.Count,
             overlay.ModifiedPageCount,
             results,
-            prepared.IsLogicalVolumeOutput);
+            prepared.IsLogicalVolumeOutput,
+            outputFormat);
     }
+
+    public static FileEditOutputFormat DetectOutputFormat(string destinationPath)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(destinationPath);
+        return Path.GetExtension(destinationPath).ToLowerInvariant() switch
+        {
+            ".qcow" or ".qcow2" => FileEditOutputFormat.Qcow2,
+            ".vdi" => FileEditOutputFormat.Vdi,
+            _ => FileEditOutputFormat.Raw,
+        };
+    }
+
+    public static string GetOutputFormatName(FileEditOutputFormat outputFormat) => outputFormat switch
+    {
+        FileEditOutputFormat.Raw => "RAW",
+        FileEditOutputFormat.Qcow2 => "QCOW2",
+        FileEditOutputFormat.Vdi => "VDI",
+        _ => throw new ArgumentOutOfRangeException(nameof(outputFormat)),
+    };
+
+    private static string CreateContainerPendingPath(
+        string destinationDirectory,
+        string destinationPath,
+        FileEditOutputFormat outputFormat)
+    {
+        var extension = outputFormat switch
+        {
+            FileEditOutputFormat.Qcow2 => ".qcow2",
+            FileEditOutputFormat.Vdi => ".vdi",
+            _ => throw new ArgumentOutOfRangeException(nameof(outputFormat)),
+        };
+        return Path.Combine(
+            destinationDirectory,
+            $".{Path.GetFileName(destinationPath)}.{Guid.NewGuid():N}.vdt-partial{extension}");
+    }
+
+    private static Task ConvertRawAsync(
+        string rawPath,
+        string destinationPath,
+        FileEditOutputFormat outputFormat,
+        IProgress<DiskImageProgress>? progress,
+        CancellationToken cancellationToken) => outputFormat switch
+        {
+            FileEditOutputFormat.Qcow2 => Qcow2SparseWriter.WriteFromRawAsync(
+                rawPath,
+                destinationPath,
+                progress,
+                cancellationToken),
+            FileEditOutputFormat.Vdi => VdiSparseWriter.WriteFromRawAsync(
+                rawPath,
+                destinationPath,
+                progress,
+                cancellationToken),
+            _ => throw new ArgumentOutOfRangeException(nameof(outputFormat)),
+        };
 
     internal static async Task<PreparedFileEditBatch> PrepareAsync(
         IDiskImageReader source,
@@ -530,12 +656,23 @@ public static class FileEditBatchService
 
     private static void VerifyFinalImage(
         string imagePath,
+        FileEditOutputFormat outputFormat,
+        long expectedLength,
         PartitionInfo partition,
         string fileSystemName,
         IReadOnlyList<FileEditResult> results,
         CancellationToken cancellationToken)
     {
-        using var reader = new RawDiskImageReader(imagePath);
+        using var reader = outputFormat == FileEditOutputFormat.Raw
+            ? new RawDiskImageReader(imagePath)
+            : DiskImageReaderFactory.Open(imagePath, cancellationToken: cancellationToken);
+        if (reader.Length != expectedLength)
+        {
+            throw new InvalidDataException(
+                $"出力{GetOutputFormatName(outputFormat)}の仮想容量が一致しません: "
+                + $"expected={expectedLength:N0}, actual={reader.Length:N0}");
+        }
+
         var outputPartition = new PartitionInfo
         {
             Number = partition.Number,
@@ -551,7 +688,8 @@ public static class FileEditBatchService
             FileSystem = fileSystemName,
         };
         var fileSystem = FileSystemDetector.TryOpen(reader, outputPartition, out var error)
-            ?? throw new InvalidDataException($"出力RAWのファイルシステムを再オープンできません: {error}");
+            ?? throw new InvalidDataException(
+                $"出力{GetOutputFormatName(outputFormat)}のファイルシステムを再オープンできません: {error}");
         VerifyFinalFileSystem(fileSystem, results, cancellationToken);
     }
 

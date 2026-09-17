@@ -32,7 +32,7 @@ public static class PhysicalDiskEditService
 
         if (partition.ReaderOverride is not null)
         {
-            reason = "RAID、LVM、BitLocker／LUKS復号レイヤーは物理構成へ直接書き戻せません。平坦化した論理RAWへ保存してください。";
+            reason = "RAID、LVM、BitLocker／LUKS復号レイヤーは物理構成へ直接書き戻せません。平坦化した論理イメージへ保存してください。";
             return false;
         }
 

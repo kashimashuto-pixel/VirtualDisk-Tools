@@ -609,7 +609,8 @@ public sealed class LzopDiskImageReader : IDiskImageReader
                                    or EndOfStreamException
                                    or OverflowException
                                    or UnauthorizedAccessException
-                                   or NotSupportedException)
+                                   or NotSupportedException
+                                   or InvalidOperationException)
         {
             _blocks.Clear();
             DiagnosticLog.Write($"LZO index cache rejected: path={cachePath}, error={ex}");

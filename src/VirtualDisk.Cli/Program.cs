@@ -351,12 +351,7 @@ internal static class Cli
         var operationName = options.Require("operation").ToLowerInvariant();
         var virtualPath = options.Require("path");
         var outputPath = Path.GetFullPath(options.Require("output"));
-        var outputExtension = Path.GetExtension(outputPath);
-        if (outputExtension.Equals(".qcow2", StringComparison.OrdinalIgnoreCase)
-            || outputExtension.Equals(".qcow", StringComparison.OrdinalIgnoreCase))
-        {
-            throw new CliUsageException("editの出力はRAWイメージです。.rawまたは.img等の名前を指定してください。");
-        }
+        var outputFormat = FileEditBatchService.DetectOutputFormat(outputPath);
 
         var edit = operationName switch
         {
@@ -391,16 +386,18 @@ internal static class Cli
         }
 
         var progress = CreateThrottledDiskProgress();
-        var result = await FileEditBatchService.ApplyToRawAsync(
+        var result = await FileEditBatchService.ApplyAsync(
             context.Reader,
             context.Partition,
             context.FileSystem,
             [edit],
             outputPath,
+            outputFormat,
             progress,
             cancellationToken);
+        var outputFormatName = FileEditBatchService.GetOutputFormatName(result.OutputFormat);
         Console.WriteLine(
-            $"Edited RAW created: {result.DestinationPath} "
+            $"Edited {outputFormatName} created: {result.DestinationPath} "
             + $"(operation={operationName}, modifiedPages={result.ModifiedPageCount:N0}, "
             + $"logicalVolumeOutput={result.IsLogicalVolumeOutput})");
         return 0;
@@ -632,12 +629,13 @@ internal static class Cli
                          --partition xfs|ext4|ntfs:SIZE[:LABEL[:NAME]] [--partition ...]
                          [--initial-file PARTITION_NUMBER=HOST_FILE] [...]
               vdt edit IMAGE [--partition NUMBER] --operation OPERATION --path VIRTUAL_PATH
-                       [--content HOST_FILE] [--destination VIRTUAL_PATH] --output OUTPUT_RAW
+                       [--content HOST_FILE] [--destination VIRTUAL_PATH] --output OUTPUT_IMAGE
 
             Size suffixes: KiB, MiB, GiB, TiB (or decimal KB, MB, GB, TB).
             NTFS, ext4, and XFS creation are fully managed and do not require WSL or native mkfs tools.
             Edit operations: write, create-file, delete-file, create-directory, delete-directory, move.
-            edit never changes IMAGE; it writes and verifies a new RAW image.
+            edit never changes IMAGE; it writes and verifies a new RAW, QCOW2, or VDI image.
+            The edit output format is selected by the .raw/.img/.qcow2/.qcow/.vdi extension.
             list displays at most 100,000 entries unless --max-entries is explicitly specified.
             search displays at most 5,000 matches unless --max-results is explicitly specified.
             Press Ctrl+C to cancel long-running operations safely.

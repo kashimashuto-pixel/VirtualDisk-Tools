@@ -43,6 +43,7 @@ static void TestRawAndQcow2RoundTrip(string directory)
 {
     var rawPath = Path.Combine(directory, "roundtrip.raw");
     var qcow2Path = Path.Combine(directory, "roundtrip.qcow2");
+    var vdiPath = Path.Combine(directory, "roundtrip.vdi");
     const int length = 8 * 1024 * 1024;
     var expectedStart = Enumerable.Range(0, 64 * 1024)
         .Select(index => checked((byte)((index * 29 + 7) & 0xff)))
@@ -66,6 +67,13 @@ static void TestRawAndQcow2RoundTrip(string directory)
     Assert(Read(reader, 0, expectedStart.Length).SequenceEqual(expectedStart), "QCOW2 leading data");
     Assert(Read(reader, length - expectedEnd.Length, expectedEnd.Length).SequenceEqual(expectedEnd), "QCOW2 trailing data");
     Assert(Read(reader, length / 2, 4096).All(value => value == 0), "QCOW2 sparse zero range");
+
+    VdiSparseWriter.WriteFromRawAsync(rawPath, vdiPath).GetAwaiter().GetResult();
+    using var vdiReader = DiskImageReaderFactory.Open(vdiPath);
+    Assert(vdiReader.Length == length, "VDI virtual size");
+    Assert(Read(vdiReader, 0, expectedStart.Length).SequenceEqual(expectedStart), "VDI leading data");
+    Assert(Read(vdiReader, length - expectedEnd.Length, expectedEnd.Length).SequenceEqual(expectedEnd), "VDI trailing data");
+    Assert(Read(vdiReader, length / 2, 4096).All(value => value == 0), "VDI sparse zero range");
 }
 
 static void TestPartitionTables(string directory)

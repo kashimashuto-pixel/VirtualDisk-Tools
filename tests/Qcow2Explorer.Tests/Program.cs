@@ -7092,12 +7092,16 @@ static void TestExt4SameLengthReplacement()
     var sourcePath = Path.Combine(AppContext.BaseDirectory, "sample-ext4-write-source.raw");
     var outputPath = Path.Combine(AppContext.BaseDirectory, "sample-ext4-write-output.raw");
     var serviceOutputPath = Path.Combine(AppContext.BaseDirectory, "sample-ext4-write-service-output.raw");
+    var qcow2OutputPath = Path.Combine(AppContext.BaseDirectory, "sample-ext4-write-service-output.qcow2");
+    var vdiOutputPath = Path.Combine(AppContext.BaseDirectory, "sample-ext4-write-service-output.vdi");
     var resizedOutputPath = Path.Combine(AppContext.BaseDirectory, "sample-ext4-edit-resized.raw");
     var replacementPath = Path.Combine(AppContext.BaseDirectory, "sample-ext4-write-replacement.bin");
     var resizedContentPath = Path.Combine(AppContext.BaseDirectory, "sample-ext4-edit-resized.bin");
     File.Delete(sourcePath);
     File.Delete(outputPath);
     File.Delete(serviceOutputPath);
+    File.Delete(qcow2OutputPath);
+    File.Delete(vdiOutputPath);
     File.Delete(resizedOutputPath);
     File.Delete(replacementPath);
     File.Delete(resizedContentPath);
@@ -7159,6 +7163,29 @@ static void TestExt4SameLengthReplacement()
     Assert(
         serviceFileSystem.ReadFile(serviceHello, 0, replacement.Length).SequenceEqual(replacement),
         "ext4 replacement service exported data");
+
+    foreach (var (containerPath, outputFormat) in new[]
+             {
+                 (qcow2OutputPath, FileEditOutputFormat.Qcow2),
+                 (vdiOutputPath, FileEditOutputFormat.Vdi),
+             })
+    {
+        var containerResult = FileEditBatchService.ApplyAsync(
+            source,
+            partition,
+            unchanged,
+            [new PendingFileEdit(FileEditOperationKind.WriteContent, "/HELLO.TXT", replacementPath)],
+            containerPath,
+            outputFormat).GetAwaiter().GetResult();
+        Assert(containerResult.OutputFormat == outputFormat, $"ext4 {outputFormat} output format");
+        using var containerReader = DiskImageReaderFactory.Open(containerPath);
+        var containerFileSystem = new ExtFileSystem(new PartitionSliceReader(containerReader, partition), partition);
+        var containerHello = containerFileSystem.ListDirectory(containerFileSystem.Root)
+            .Single(node => node.Name == "HELLO.TXT");
+        Assert(
+            containerFileSystem.ReadFile(containerHello, 0, replacement.Length).SequenceEqual(replacement),
+            $"ext4 {outputFormat} edited content");
+    }
 
     var resizedContent = Enumerable.Range(0, 17).Select(index => (byte)(index * 19 + 3)).ToArray();
     File.WriteAllBytes(resizedContentPath, resizedContent);
