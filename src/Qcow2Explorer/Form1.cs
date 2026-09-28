@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
+using Qcow2Explorer.Creation;
 using Qcow2Explorer.Core;
 using Qcow2Explorer.FileSystems;
 using Qcow2Explorer.Mounting;
@@ -42,8 +43,16 @@ public partial class Form1 : Form
     private readonly ListView _fileList = new() { Dock = DockStyle.Fill, View = View.Details, FullRowSelect = true, GridLines = true, MultiSelect = true };
     private readonly TextBox _previewText = new() { Dock = DockStyle.Fill, Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Both, WordWrap = false, Font = new Font("Consolas", 10) };
     private readonly ListView _pendingEditList = new() { Dock = DockStyle.Fill, View = View.Details, FullRowSelect = true, GridLines = true, MultiSelect = true };
+    private readonly Button _pendingReplaceContentButton = new() { Text = "内容元を差し替え...", AutoSize = true, Enabled = false };
+    private readonly Button _pendingExternalEditButton = new() { Text = "外部エディターで編集...", AutoSize = true, Enabled = false };
+    private readonly Button _pendingMoveUpButton = new() { Text = "上へ", AutoSize = true, Enabled = false };
+    private readonly Button _pendingMoveDownButton = new() { Text = "下へ", AutoSize = true, Enabled = false };
     private readonly List<PendingFileEdit> _pendingFileEdits = [];
     private readonly TabControl _explorerDetailTabs = new() { Dock = DockStyle.Fill };
+    private ToolStripDropDownButton? _editOperationsButton;
+    private ToolStripMenuItem? _editModeMenuItem;
+    private TabPage? _pendingEditTab;
+    private bool _editModeEnabled;
     private readonly ListView _mountList = new() { Dock = DockStyle.Fill, View = View.Details, FullRowSelect = true, GridLines = true, MultiSelect = true };
     private readonly TextBox _mountText = new() { Dock = DockStyle.Fill, Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical };
 
@@ -73,11 +82,13 @@ public partial class Form1 : Form
     private bool _closeAfterWriteCancellation;
     private UefiVariableStore? _currentUefiVariableStore;
     private SwtpmStateStore? _currentTpmStateStore;
+    private PendingEditContentStore? _pendingEditContentStore;
 
     public Form1(string? initialPath = null)
     {
         InitializeComponent();
         BuildUi();
+        Shown += (_, _) => ShowPreparedPhysicalDiskRecoveryJournals();
         if (!string.IsNullOrWhiteSpace(initialPath))
         {
             Shown += async (_, _) => await LoadImageAsync(initialPath);
@@ -94,7 +105,80 @@ public partial class Form1 : Form
             DisposePartitionReaders();
             DisposeCompanionReaders();
             _reader?.Dispose();
+            _pendingEditContentStore?.Dispose();
         };
+    }
+
+    private void ShowPreparedPhysicalDiskRecoveryJournals()
+    {
+        PhysicalDiskRecoveryJournalScanResult scan;
+        try
+        {
+            scan = PhysicalDiskRecoveryJournalLocator.Scan();
+        }
+        catch (Exception ex) when (ex is IOException
+                                   or UnauthorizedAccessException
+                                   or ArgumentException)
+        {
+            MessageBox.Show(
+                this,
+                $"物理ディスク復旧ジャーナルを確認できませんでした。{Environment.NewLine}{ex.Message}",
+                "復旧ジャーナル確認エラー",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+            return;
+        }
+
+        if (scan.Prepared.Count == 0 && scan.Unreadable.Count == 0)
+        {
+            return;
+        }
+
+        var sections = new List<string>();
+        if (scan.Prepared.Count > 0)
+        {
+            var examples = string.Join(
+                Environment.NewLine,
+                scan.Prepared.Take(3).Select(journal =>
+                    $"- PhysicalDrive{journal.Target.DiskNumber}: {journal.Path}"));
+            var remaining = scan.Prepared.Count > 3
+                ? $"{Environment.NewLine}- ほか {scan.Prepared.Count - 3:N0} 件"
+                : string.Empty;
+            sections.Add(
+                $"完了状態が記録されていない復旧ジャーナル: {scan.Prepared.Count:N0} 件"
+                + Environment.NewLine
+                + examples
+                + remaining);
+        }
+
+        if (scan.Unreadable.Count > 0)
+        {
+            var examples = string.Join(
+                Environment.NewLine,
+                scan.Unreadable.Take(3).Select(journal =>
+                    $"- {journal.Path}{Environment.NewLine}  {journal.Error}"));
+            var remaining = scan.Unreadable.Count > 3
+                ? $"{Environment.NewLine}- ほか {scan.Unreadable.Count - 3:N0} 件"
+                : string.Empty;
+            sections.Add(
+                $"破損または読み取れない復旧ジャーナル: {scan.Unreadable.Count:N0} 件"
+                + Environment.NewLine
+                + examples
+                + remaining);
+        }
+
+        MessageBox.Show(
+            this,
+            "物理ディスクの復旧が必要な可能性があるジャーナルを検出しました。"
+            + Environment.NewLine
+            + Environment.NewLine
+            + string.Join(Environment.NewLine + Environment.NewLine, sections)
+            + Environment.NewLine
+            + Environment.NewLine
+            + "対象ディスクへ自動では書き込みません。内容を確認し、正常なジャーナルの場合だけ［物理ディスク復旧］を実行してください。",
+            "物理ディスク復旧ジャーナルの確認",
+            MessageBoxButtons.OK,
+            MessageBoxIcon.Warning);
     }
 
     protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
@@ -127,43 +211,10 @@ public partial class Form1 : Form
         Width = 1180;
         Height = 760;
 
+        var menuStrip = CreateMainMenu();
         var toolStrip = new ToolStrip { GripStyle = ToolStripGripStyle.Hidden };
-        var openButton = new ToolStripButton("開く");
-        openButton.Click += async (_, _) => await OpenImageDialogAsync();
-        var openDeviceSetButton = new ToolStripButton("複数ディスク");
-        openDeviceSetButton.Click += async (_, _) => await OpenDeviceSetDialogAsync();
-        var openFolderButton = new ToolStripButton("フォルダ");
-        openFolderButton.Click += async (_, _) => await OpenImageFolderDialogAsync();
-        var openPhysicalDiskButton = new ToolStripButton("物理ディスク");
-        openPhysicalDiskButton.Click += async (_, _) => await OpenPhysicalDiskDialogAsync();
-        var recoverPhysicalDiskButton = new ToolStripButton("物理ディスク復旧");
-        recoverPhysicalDiskButton.Click += async (_, _) => await RestorePhysicalDiskAsync();
-        var manageLzopCacheButton = new ToolStripButton("LZOキャッシュ")
-        {
-            ToolTipText = "LZO高速モードのRAWキャッシュを管理"
-        };
-        manageLzopCacheButton.Click += (_, _) => ShowLzopCacheManager(LzopRawCacheManager.DefaultCacheRoot);
-        var reportButton = new ToolStripButton("解析レポート");
-        reportButton.Click += (_, _) => SaveAnalysisReport();
-        var snapshotButton = new ToolStripButton("スナップショット");
-        snapshotButton.Click += (_, _) => SelectQcow2Snapshot();
-        var vmaDiskButton = new ToolStripButton("VMAディスク");
-        vmaDiskButton.Click += (_, _) => SelectVmaDisk();
-        var ovaDiskButton = new ToolStripButton("OVAディスク");
-        ovaDiskButton.Click += (_, _) => SelectOvaDisk();
-        toolStrip.Items.Add(openButton);
-        toolStrip.Items.Add(openDeviceSetButton);
-        toolStrip.Items.Add(openFolderButton);
-        toolStrip.Items.Add(openPhysicalDiskButton);
-        toolStrip.Items.Add(recoverPhysicalDiskButton);
-        toolStrip.Items.Add(manageLzopCacheButton);
-        toolStrip.Items.Add(new ToolStripSeparator());
         toolStrip.Items.Add(new ToolStripLabel("ファイル"));
         toolStrip.Items.Add(_pathBox);
-        toolStrip.Items.Add(reportButton);
-        toolStrip.Items.Add(snapshotButton);
-        toolStrip.Items.Add(vmaDiskButton);
-        toolStrip.Items.Add(ovaDiskButton);
         toolStrip.Items.Add(new ToolStripSeparator());
         toolStrip.Items.Add(_statusLabel);
         toolStrip.Items.Add(_loadProgressBar);
@@ -179,10 +230,152 @@ public partial class Form1 : Form
         tabs.TabPages.Add(CreateExplorerTab());
         tabs.TabPages.Add(CreateMountTab());
 
+        var root = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 3,
+            Margin = Padding.Empty,
+            Padding = Padding.Empty,
+        };
+        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        root.Controls.Add(menuStrip, 0, 0);
+        root.Controls.Add(toolStrip, 0, 1);
+        root.Controls.Add(tabs, 0, 2);
+
         Controls.Clear();
-        Controls.Add(tabs);
-        Controls.Add(toolStrip);
-        toolStrip.Dock = DockStyle.Top;
+        Controls.Add(root);
+        MainMenuStrip = menuStrip;
+    }
+
+    private MenuStrip CreateMainMenu()
+    {
+        var menuStrip = new MenuStrip { Dock = DockStyle.Fill };
+        var fileMenu = new ToolStripMenuItem("ファイル(&F)");
+        var createItem = new ToolStripMenuItem("新規作成(&N)...")
+        {
+            ShortcutKeys = Keys.Control | Keys.N,
+        };
+        createItem.Click += async (_, _) => await CreateVirtualDiskAsync();
+        var openItem = new ToolStripMenuItem("開く(&O)...")
+        {
+            ShortcutKeys = Keys.Control | Keys.O,
+        };
+        openItem.Click += async (_, _) => await OpenImageDialogAsync();
+
+        var otherOpenMenu = new ToolStripMenuItem("その他の開き方");
+        var openDeviceSetItem = new ToolStripMenuItem("複数ディスク...");
+        openDeviceSetItem.Click += async (_, _) => await OpenDeviceSetDialogAsync();
+        var openFolderItem = new ToolStripMenuItem("フォルダー...");
+        openFolderItem.Click += async (_, _) => await OpenImageFolderDialogAsync();
+        var openPhysicalDiskItem = new ToolStripMenuItem("物理ディスク...");
+        openPhysicalDiskItem.Click += async (_, _) => await OpenPhysicalDiskDialogAsync();
+        otherOpenMenu.DropDownItems.AddRange([openDeviceSetItem, openFolderItem, openPhysicalDiskItem]);
+
+        var imageSelectionMenu = new ToolStripMenuItem("イメージ内ディスクの選択");
+        var snapshotItem = new ToolStripMenuItem("QCOW2スナップショット...");
+        snapshotItem.Click += (_, _) => SelectQcow2Snapshot();
+        var vmaDiskItem = new ToolStripMenuItem("VMAディスク...");
+        vmaDiskItem.Click += (_, _) => SelectVmaDisk();
+        var ovaDiskItem = new ToolStripMenuItem("OVAディスク...");
+        ovaDiskItem.Click += (_, _) => SelectOvaDisk();
+        imageSelectionMenu.DropDownItems.AddRange([snapshotItem, vmaDiskItem, ovaDiskItem]);
+
+        var reportItem = new ToolStripMenuItem("解析レポートを保存...");
+        reportItem.Click += (_, _) => SaveAnalysisReport();
+        var manageLzopCacheItem = new ToolStripMenuItem("LZOキャッシュを管理...");
+        manageLzopCacheItem.Click += (_, _) => ShowLzopCacheManager(LzopRawCacheManager.DefaultCacheRoot);
+        var recoverPhysicalDiskItem = new ToolStripMenuItem("物理ディスクを復旧...");
+        recoverPhysicalDiskItem.Click += async (_, _) => await RestorePhysicalDiskAsync();
+        var exitItem = new ToolStripMenuItem("終了(&X)")
+        {
+            ShortcutKeys = Keys.Alt | Keys.F4,
+        };
+        exitItem.Click += (_, _) => Close();
+        fileMenu.DropDownItems.AddRange([
+            createItem,
+            openItem,
+            otherOpenMenu,
+            imageSelectionMenu,
+            new ToolStripSeparator(),
+            reportItem,
+            manageLzopCacheItem,
+            recoverPhysicalDiskItem,
+            new ToolStripSeparator(),
+            exitItem,
+        ]);
+
+        var editMenu = new ToolStripMenuItem("編集(&E)");
+        _editModeMenuItem = new ToolStripMenuItem("編集モードを有効にする")
+        {
+            ShortcutKeys = Keys.Control | Keys.E,
+        };
+        _editModeMenuItem.Click += (_, _) => ToggleEditMode();
+        editMenu.DropDownItems.Add(_editModeMenuItem);
+        menuStrip.Items.AddRange([fileMenu, editMenu]);
+        return menuStrip;
+    }
+
+    private void ToggleEditMode()
+    {
+        if (!_editModeEnabled)
+        {
+            var confirmation = MessageBox.Show(
+                this,
+                "編集モードは実験的な機能です。通常は原本を変更せず、新しいRAW／QCOW2／VDIへ保存します。"
+                + Environment.NewLine
+                + "物理ディスクへの適用を選んだ場合だけ、確認後に対象ディスクへ書き込みます。"
+                + Environment.NewLine
+                + Environment.NewLine
+                + "編集モードを有効にしますか？",
+                "編集モード",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Warning,
+                MessageBoxDefaultButton.Button2);
+            if (confirmation != DialogResult.Yes)
+            {
+                return;
+            }
+
+            SetEditModeEnabled(true);
+            _statusLabel.Text = "編集モードを有効にしました";
+            return;
+        }
+
+        if (!ConfirmDiscardPendingEdits("編集モードを無効にすると変更予定を破棄します。続行しますか？"))
+        {
+            return;
+        }
+
+        ClearPendingEdits();
+        SetEditModeEnabled(false);
+        _statusLabel.Text = "編集モードを無効にしました";
+    }
+
+    private void SetEditModeEnabled(bool enabled)
+    {
+        _editModeEnabled = enabled;
+        if (_editModeMenuItem is not null)
+        {
+            _editModeMenuItem.Checked = enabled;
+            _editModeMenuItem.Text = enabled ? "編集モードを無効にする" : "編集モードを有効にする";
+        }
+
+        if (_editOperationsButton is not null)
+        {
+            _editOperationsButton.Visible = enabled;
+        }
+
+        if (_pendingEditTab is not null)
+        {
+            _pendingEditTab.Enabled = enabled;
+            if (!enabled && ReferenceEquals(_explorerDetailTabs.SelectedTab, _pendingEditTab))
+            {
+                _explorerDetailTabs.SelectedIndex = 0;
+            }
+        }
     }
 
     private TabPage CreateSummaryTab()
@@ -370,11 +563,16 @@ public partial class Form1 : Form
         copyButton.Click += async (_, _) => await CopySelectedItemsAsync();
         var copyFolderButton = new ToolStripButton("表示フォルダをコピー");
         copyFolderButton.Click += async (_, _) => await CopyCurrentDirectoryAsync();
-        var editButton = new ToolStripDropDownButton("編集（実験）");
+        _editOperationsButton = new ToolStripDropDownButton("編集操作") { Visible = _editModeEnabled };
+        var editButton = _editOperationsButton;
         var queueWriteItem = new ToolStripMenuItem("選択ファイルの内容を変更...");
         queueWriteItem.Click += (_, _) => QueueSelectedFileWrite();
         var queueCreateItem = new ToolStripMenuItem("表示フォルダーへファイルを追加...");
         queueCreateItem.Click += (_, _) => QueueFileCreation();
+        var queueExternalCreateItem = new ToolStripMenuItem("表示フォルダーへ空ファイルを作成して外部編集...");
+        queueExternalCreateItem.Click += async (_, _) => await QueueExternalFileCreationAsync();
+        var queueExternalWriteItem = new ToolStripMenuItem("選択ファイルを外部エディターで編集...");
+        queueExternalWriteItem.Click += async (_, _) => await QueueSelectedFileExternalEditAsync();
         var queueDeleteItem = new ToolStripMenuItem("選択ファイルを削除予定に追加");
         queueDeleteItem.Click += (_, _) => QueueSelectedFileDeletion();
         var queueCreateDirectoryItem = new ToolStripMenuItem("表示フォルダーへディレクトリを作成...");
@@ -387,12 +585,14 @@ public partial class Form1 : Form
         queueAttributesItem.Click += (_, _) => QueueSelectedEntryAttributes();
         var queueTimestampItem = new ToolStripMenuItem("選択項目の更新日時を変更...");
         queueTimestampItem.Click += (_, _) => QueueSelectedEntryTimestamp();
-        var saveEditsItem = new ToolStripMenuItem("変更一覧を新しいRAWへ保存...");
+        var saveEditsItem = new ToolStripMenuItem("変更一覧を新しいイメージへ保存...");
         saveEditsItem.Click += async (_, _) => await SavePendingEditsAsync();
         var undoEditItem = new ToolStripMenuItem("最後の変更を取り消す");
         undoEditItem.Click += (_, _) => UndoLastPendingEdit();
         editButton.DropDownItems.Add(queueWriteItem);
+        editButton.DropDownItems.Add(queueExternalWriteItem);
         editButton.DropDownItems.Add(queueCreateItem);
+        editButton.DropDownItems.Add(queueExternalCreateItem);
         editButton.DropDownItems.Add(queueDeleteItem);
         editButton.DropDownItems.Add(queueCreateDirectoryItem);
         editButton.DropDownItems.Add(queueDeleteDirectoryItem);
@@ -460,7 +660,12 @@ public partial class Form1 : Form
         var right = new SplitContainer { Dock = DockStyle.Fill, Orientation = Orientation.Horizontal, FixedPanel = FixedPanel.Panel2 };
         right.Panel1.Controls.Add(_fileList);
         _explorerDetailTabs.TabPages.Add(new TabPage("プレビュー") { Controls = { _previewText } });
-        _explorerDetailTabs.TabPages.Add(new TabPage("変更予定") { Controls = { CreatePendingEditPanel() } });
+        _pendingEditTab = new TabPage("変更予定")
+        {
+            Enabled = _editModeEnabled,
+            Controls = { CreatePendingEditPanel() },
+        };
+        _explorerDetailTabs.TabPages.Add(_pendingEditTab);
         right.Panel2.Controls.Add(_explorerDetailTabs);
 
         var split = new SplitContainer { Dock = DockStyle.Fill, FixedPanel = FixedPanel.Panel1 };
@@ -494,14 +699,21 @@ public partial class Form1 : Form
         _pendingEditList.Columns.Add("仮想パス", 360);
         _pendingEditList.Columns.Add("入力・設定内容", 420);
         _pendingEditList.Columns.Add("入力サイズ", 110, HorizontalAlignment.Right);
+        _pendingEditList.Columns.Add("事前確認", 300);
 
         var undoButton = new Button { Text = "選択を取り消す", AutoSize = true };
         undoButton.Click += (_, _) => UndoSelectedPendingEdits();
+        _pendingReplaceContentButton.Click += (_, _) => ReplaceSelectedPendingEditContent();
+        _pendingExternalEditButton.Click += async (_, _) => await EditSelectedPendingContentExternallyAsync();
+        _pendingMoveUpButton.Click += (_, _) => MoveSelectedPendingEdits(-1);
+        _pendingMoveDownButton.Click += (_, _) => MoveSelectedPendingEdits(1);
+        _pendingEditList.SelectedIndexChanged += (_, _) => UpdatePendingContentButtons();
+        _pendingEditList.DoubleClick += async (_, _) => await EditSelectedPendingContentExternallyAsync();
         var undoLastButton = new Button { Text = "最後を取り消す", AutoSize = true };
         undoLastButton.Click += (_, _) => UndoLastPendingEdit();
         var clearButton = new Button { Text = "すべて取り消す", AutoSize = true };
         clearButton.Click += (_, _) => ClearPendingEditsWithPrompt();
-        var saveButton = new Button { Text = "新しいRAWへ保存...", AutoSize = true };
+        var saveButton = new Button { Text = "新しいイメージへ保存...", AutoSize = true };
         saveButton.Click += async (_, _) => await SavePendingEditsAsync();
         var applyPhysicalButton = new Button { Text = "物理ディスクへ適用...", AutoSize = true };
         applyPhysicalButton.Click += async (_, _) => await ApplyPendingEditsToPhysicalDiskAsync();
@@ -510,13 +722,13 @@ public partial class Form1 : Form
             Dock = DockStyle.Fill,
             AutoEllipsis = true,
             Padding = new Padding(8, 4, 8, 0),
-            Text = "通常は新規RAWへ保存します。物理ディスクへの直接適用は復旧ジャーナルと排他ロックを使用します。",
+            Text = "追加・変更予定の内容元は差し替えや外部編集ができます。RAW／QCOW2／VDIへ保存できます。",
         };
         var buttons = new FlowLayoutPanel
         {
             Dock = DockStyle.Fill,
             FlowDirection = FlowDirection.RightToLeft,
-            WrapContents = false,
+            WrapContents = true,
             Padding = new Padding(4, 2, 4, 2),
         };
         buttons.Controls.Add(saveButton);
@@ -524,10 +736,14 @@ public partial class Form1 : Form
         buttons.Controls.Add(clearButton);
         buttons.Controls.Add(undoLastButton);
         buttons.Controls.Add(undoButton);
+        buttons.Controls.Add(_pendingExternalEditButton);
+        buttons.Controls.Add(_pendingReplaceContentButton);
+        buttons.Controls.Add(_pendingMoveDownButton);
+        buttons.Controls.Add(_pendingMoveUpButton);
 
         var layout = new TableLayoutPanel { Dock = DockStyle.Fill, RowCount = 3, ColumnCount = 1 };
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 28));
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 72));
         layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         layout.Controls.Add(description, 0, 0);
         layout.Controls.Add(buttons, 0, 1);
@@ -943,8 +1159,8 @@ public partial class Form1 : Form
     {
         using var dialog = new Form
         {
-            Text = "LZO RAWキャッシュ管理",
-            Width = 900,
+            Text = "LZOキャッシュ管理",
+            Width = 980,
             Height = 480,
             StartPosition = FormStartPosition.CenterParent,
             FormBorderStyle = FormBorderStyle.Sizable,
@@ -955,9 +1171,9 @@ public partial class Form1 : Form
         {
             AutoEllipsis = true,
             Dock = DockStyle.Top,
-            Height = 44,
+            Height = 62,
             Padding = new Padding(10, 10, 10, 4),
-            Text = $"保存先: {Path.GetFullPath(cacheRoot)}"
+            Text = $"展開RAW: {Path.GetFullPath(cacheRoot)}{Environment.NewLine}省容量索引: {LzopIndexCacheManager.DefaultIndexRoot}"
         };
         var list = new ListView
         {
@@ -967,10 +1183,10 @@ public partial class Form1 : Form
             GridLines = true,
             MultiSelect = true
         };
-        list.Columns.Add("種類", 70);
-        list.Columns.Add("元LZO / 識別ID", 340);
+        list.Columns.Add("種類", 100);
+        list.Columns.Add("元LZO", 390);
         list.Columns.Add("状態", 80);
-        list.Columns.Add("保存容量", 110);
+        list.Columns.Add("保存サイズ", 110);
         list.Columns.Add("最終利用", 150);
         var summary = new Label { AutoSize = true, Padding = new Padding(8, 9, 8, 0) };
         var deleteButton = new Button { AutoSize = true, Text = "選択したキャッシュを削除" };
@@ -997,35 +1213,23 @@ public partial class Form1 : Form
         {
             list.BeginUpdate();
             list.Items.Clear();
-            var rawEntries = LzopRawCacheManager.GetEntries(cacheRoot);
-            var indexEntries = LzopRawCacheManager.GetIndexEntries(cacheRoot);
-            foreach (var entry in rawEntries)
+            var entries = new List<object>();
+            entries.AddRange(LzopRawCacheManager.GetEntries(cacheRoot));
+            entries.AddRange(LzopIndexCacheManager.GetEntries());
+            foreach (var entry in entries.OrderByDescending(GetLastUsedUtc))
             {
-                var item = new ListViewItem("RAW") { Tag = entry };
-                item.SubItems.Add(entry.SourcePath);
-                item.SubItems.Add(entry.Status);
-                item.SubItems.Add(FormatBytes(entry.StoredBytes));
-                item.SubItems.Add(entry.LastUsedUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture));
-                list.Items.Add(item);
-            }
-
-            foreach (var entry in indexEntries)
-            {
-                var item = new ListViewItem("索引") { Tag = entry };
-                item.SubItems.Add(entry.DisplayName);
-                item.SubItems.Add(entry.Status);
-                item.SubItems.Add(FormatBytes(entry.StoredBytes));
-                item.SubItems.Add(entry.LastUsedUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture));
+                var item = new ListViewItem(GetCacheKind(entry)) { Tag = entry };
+                item.SubItems.Add(GetSourcePath(entry));
+                item.SubItems.Add(GetCacheStatus(entry));
+                item.SubItems.Add(FormatBytes(GetStoredBytes(entry)));
+                item.SubItems.Add(GetLastUsedUtc(entry).ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture));
                 list.Items.Add(item);
             }
 
             list.EndUpdate();
-            var count = rawEntries.Count + indexEntries.Count;
-            var storedBytes = rawEntries.Sum(entry => entry.StoredBytes) + indexEntries.Sum(entry => entry.StoredBytes);
-            summary.Text = $"{count:N0}件 / {FormatBytes(storedBytes)}";
+            summary.Text = $"{entries.Count:N0}件 / {FormatBytes(entries.Sum(GetStoredBytes))}";
             deleteButton.Enabled = list.SelectedItems.Count > 0;
-            deleteUnusableButton.Enabled = rawEntries.Any(entry => !entry.IsUsable)
-                || indexEntries.Any(entry => !entry.IsUsable);
+            deleteUnusableButton.Enabled = entries.Any(entry => !IsCacheUsable(entry));
         }
 
         bool DeleteEntries(IEnumerable<object> entries)
@@ -1034,17 +1238,17 @@ public partial class Form1 : Form
             {
                 var deleted = entry switch
                 {
-                    LzopRawCacheEntry raw => LzopRawCacheManager.TryDelete(raw.CacheId, cacheRoot, out var rawError)
-                        ? (Success: true, Error: "")
-                        : (Success: false, Error: rawError),
-                    LzopIndexCacheEntry index => LzopRawCacheManager.TryDeleteIndex(index.FileName, cacheRoot, out var indexError)
-                        ? (Success: true, Error: "")
-                        : (Success: false, Error: indexError),
-                    _ => (Success: false, Error: "不明なキャッシュ項目です。")
+                    LzopRawCacheEntry raw => LzopRawCacheManager.TryDelete(raw.CacheId, cacheRoot, out var error)
+                        ? (true, string.Empty)
+                        : (false, error),
+                    LzopIndexCacheEntry index => LzopIndexCacheManager.TryDelete(index.CacheId, out var error)
+                        ? (true, string.Empty)
+                        : (false, error),
+                    _ => (false, "不明なキャッシュ形式です。")
                 };
-                if (!deleted.Success)
+                if (!deleted.Item1)
                 {
-                    MessageBox.Show(dialog, deleted.Error, "キャッシュ削除エラー", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    MessageBox.Show(dialog, deleted.Item2, "キャッシュ削除エラー", MessageBoxButtons.OK, MessageBoxIcon.Error);
                     return false;
                 }
             }
@@ -1061,7 +1265,7 @@ public partial class Form1 : Form
             if (selected.Count == 0
                 || MessageBox.Show(
                     dialog,
-                    $"選択した{selected.Count:N0}件のRAWキャッシュを削除しますか？",
+                    $"選択した{selected.Count:N0}件のキャッシュを削除しますか？",
                     "キャッシュ削除",
                     MessageBoxButtons.YesNo,
                     MessageBoxIcon.Warning,
@@ -1077,11 +1281,9 @@ public partial class Form1 : Form
         };
         deleteUnusableButton.Click += (_, _) =>
         {
-            var unusable = LzopRawCacheManager.GetEntries(cacheRoot)
-                .Where(entry => !entry.IsUsable)
-                .Cast<object>()
-                .Concat(LzopRawCacheManager.GetIndexEntries(cacheRoot).Where(entry => !entry.IsUsable))
-                .ToList();
+            var unusable = new List<object>();
+            unusable.AddRange(LzopRawCacheManager.GetEntries(cacheRoot).Where(entry => !entry.IsUsable));
+            unusable.AddRange(LzopIndexCacheManager.GetEntries().Where(entry => !entry.IsUsable));
             if (unusable.Count > 0 && DeleteEntries(unusable))
             {
                 RefreshEntries();
@@ -1090,13 +1292,60 @@ public partial class Form1 : Form
 
         RefreshEntries();
         dialog.ShowDialog(this);
+
+        static string GetCacheKind(object entry) => entry switch
+        {
+            LzopRawCacheEntry => "展開RAW",
+            LzopIndexCacheEntry => "省容量索引",
+            _ => "不明"
+        };
+        static string GetSourcePath(object entry) => entry switch
+        {
+            LzopRawCacheEntry raw => raw.SourcePath,
+            LzopIndexCacheEntry index => index.SourcePath,
+            _ => string.Empty
+        };
+        static string GetCacheStatus(object entry) => entry switch
+        {
+            LzopRawCacheEntry raw => raw.Status,
+            LzopIndexCacheEntry index => index.Status,
+            _ => "不明"
+        };
+        static long GetStoredBytes(object entry) => entry switch
+        {
+            LzopRawCacheEntry raw => raw.StoredBytes,
+            LzopIndexCacheEntry index => index.StoredBytes,
+            _ => 0
+        };
+        static DateTime GetLastUsedUtc(object entry) => entry switch
+        {
+            LzopRawCacheEntry raw => raw.LastUsedUtc,
+            LzopIndexCacheEntry index => index.LastUsedUtc,
+            _ => DateTime.MinValue
+        };
+        static bool IsCacheUsable(object entry) => entry switch
+        {
+            LzopRawCacheEntry raw => raw.IsUsable,
+            LzopIndexCacheEntry index => index.IsUsable,
+            _ => false
+        };
+    }
+
+    private async Task CreateVirtualDiskAsync()
+    {
+        using var dialog = new VirtualDiskCreationDialog();
+        if (dialog.ShowDialog(this) == DialogResult.OK
+            && !string.IsNullOrWhiteSpace(dialog.CreatedPath))
+        {
+            await LoadImageAsync(dialog.CreatedPath);
+        }
     }
 
     private async Task LoadImageAsync(string path, IReadOnlyList<string>? companionPaths = null)
     {
         if (_isWritingImage)
         {
-            _statusLabel.Text = "変更済みRAWの保存中は別のイメージを開けません";
+            _statusLabel.Text = "変更済みイメージの保存中は別のイメージを開けません";
             return;
         }
 
@@ -1291,13 +1540,15 @@ public partial class Form1 : Form
         try
         {
             cancellationToken.ThrowIfCancellationRequested();
-            reader = DiskImageReaderFactory.Open(
-                path,
-                progress,
-                lzopOpenMode,
-                lzopTemporaryDirectory,
-                cancellationToken,
-                overwriteSavedRaw);
+            reader = PhysicalDiskReader.IsPhysicalDiskPath(path)
+                ? new PhysicalDiskReader(path)
+                : DiskImageReaderFactory.Open(
+                    path,
+                    progress,
+                    lzopOpenMode,
+                    lzopTemporaryDirectory,
+                    cancellationToken,
+                    overwriteSavedRaw);
             foreach (var companionPath in companionPaths)
             {
                 cancellationToken.ThrowIfCancellationRequested();
@@ -1305,10 +1556,12 @@ public partial class Form1 : Form
                     $"companion diskを開いています: {companionReaders.Count + 1:N0} / {companionPaths.Count:N0}",
                     companionReaders.Count + 1,
                     companionPaths.Count));
-                companionReaders.Add(DiskImageReaderFactory.Open(
-                    companionPath,
-                    progress,
-                    cancellationToken: cancellationToken));
+                companionReaders.Add(PhysicalDiskReader.IsPhysicalDiskPath(companionPath)
+                    ? new PhysicalDiskReader(companionPath)
+                    : DiskImageReaderFactory.Open(
+                        companionPath,
+                        progress,
+                        cancellationToken: cancellationToken));
             }
 
             var disks = new List<IBlockReader> { reader };
@@ -1380,38 +1633,17 @@ public partial class Form1 : Form
     {
         progress.Report(new DiskImageProgress("パーティションテーブルを解析中..."));
         cancellationToken.ThrowIfCancellationRequested();
-        var discovered = PartitionTableReader.ReadPartitions(reader, cancellationToken).ToList();
-        if (discovered.Count == 0 && reader.Length >= 512)
-        {
-            discovered.Add(new PartitionInfo
-            {
-                Number = 1,
-                Scheme = "WholeDisk",
-                Name = "Whole disk",
-                Type = "Unpartitioned",
-                TypeId = "",
-                StartLba = 0,
-                SectorCount = checked((ulong)(reader.Length / 512))
-            });
-        }
+        var discovered = PartitionTableReader.ReadPartitionsWithWholeDiskFallback(
+            reader,
+            cancellationToken).ToList();
 
         var nextNumber = discovered.Count + 1;
         foreach (var companionDisk in inputDisks.Skip(1))
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var companionPartitions = PartitionTableReader.ReadPartitions(companionDisk, cancellationToken).ToList();
-            if (companionPartitions.Count == 0 && companionDisk.Length >= 512)
-            {
-                companionPartitions.Add(new PartitionInfo
-                {
-                    Number = 1,
-                    Scheme = "WholeDisk",
-                    Name = "Whole companion disk",
-                    Type = "Unpartitioned",
-                    StartLba = 0,
-                    SectorCount = checked((ulong)(companionDisk.Length / 512))
-                });
-            }
+            var companionPartitions = PartitionTableReader.ReadPartitionsWithWholeDiskFallback(
+                companionDisk,
+                cancellationToken);
 
             foreach (var companionPartition in companionPartitions)
             {
@@ -1842,20 +2074,7 @@ public partial class Form1 : Form
             return;
         }
 
-        var discovered = PartitionTableReader.ReadPartitions(_reader).ToList();
-        if (discovered.Count == 0 && _reader.Length >= 512)
-        {
-            discovered.Add(new PartitionInfo
-            {
-                Number = 1,
-                Scheme = "WholeDisk",
-                Name = "Whole disk",
-                Type = "Unpartitioned",
-                TypeId = "",
-                StartLba = 0,
-                SectorCount = checked((ulong)(_reader.Length / 512))
-            });
-        }
+        var discovered = PartitionTableReader.ReadPartitionsWithWholeDiskFallback(_reader);
 
         foreach (var partition in discovered)
         {
@@ -3511,7 +3730,7 @@ public partial class Form1 : Form
     {
         if (_isWritingImage || _isLoadingImage)
         {
-            _statusLabel.Text = "イメージの読み込み・RAW保存中は変更予定を編集できません";
+            _statusLabel.Text = "イメージの読み込み・保存中は変更予定を編集できません";
             return;
         }
 
@@ -3536,7 +3755,7 @@ public partial class Form1 : Form
     {
         if (_isWritingImage || _isLoadingImage)
         {
-            _statusLabel.Text = "イメージの読み込み・RAW保存中は変更予定を編集できません";
+            _statusLabel.Text = "イメージの読み込み・保存中は変更予定を編集できません";
             return;
         }
 
@@ -3567,11 +3786,409 @@ public partial class Form1 : Form
             contentDialog.FileName));
     }
 
+    private async Task QueueSelectedFileExternalEditAsync()
+    {
+        if (_isWritingImage || _isLoadingImage)
+        {
+            _statusLabel.Text = "イメージの読み込み・保存中は外部編集を開始できません";
+            return;
+        }
+
+        if (!TryGetSelectedEditableFile("外部エディターで編集する通常ファイルを1個選択してください。", out var file, out var path)
+            || !TryPreparePendingEditContext()
+            || _currentFileSystem is null)
+        {
+            return;
+        }
+
+        var fileSystem = _currentFileSystem;
+        string? workingPath = null;
+        try
+        {
+            workingPath = await CreateExternalWorkingCopyAsync(
+                token => PendingEditContentStore.CreateWorkingCopy(fileSystem, file, token),
+                file.Name);
+            if (workingPath is null)
+            {
+                return;
+            }
+
+            var capturedPath = await EditAndCaptureExternalWorkingCopyAsync(workingPath, path);
+            workingPath = null;
+            if (capturedPath is not null)
+            {
+                AddPendingEdit(new PendingFileEdit(FileEditOperationKind.WriteContent, path, capturedPath));
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            _statusLabel.Text = "外部編集用ファイルの取り出しをキャンセルしました";
+        }
+        catch (Exception ex) when (ex is IOException
+                                   or UnauthorizedAccessException
+                                   or InvalidDataException
+                                   or ArgumentException
+                                   or NotSupportedException)
+        {
+            MessageBox.Show(this, ex.Message, "外部編集の準備エラー", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            _statusLabel.Text = "外部編集を開始できませんでした";
+        }
+        finally
+        {
+            if (workingPath is not null)
+            {
+                PendingEditContentStore.TryDeleteOwnedFile(workingPath);
+            }
+        }
+    }
+
+    private async Task QueueExternalFileCreationAsync()
+    {
+        if (_isWritingImage || _isLoadingImage)
+        {
+            _statusLabel.Text = "イメージの読み込み・保存中は外部編集を開始できません";
+            return;
+        }
+
+        if (_currentDirectory is null || _currentFileSystem is null || !TryPreparePendingEditContext())
+        {
+            return;
+        }
+
+        var name = PromptForNewFileName("新規ファイル.txt");
+        if (name is null)
+        {
+            return;
+        }
+
+        string? workingPath = null;
+        try
+        {
+            workingPath = PendingEditContentStore.CreateEmptyWorkingCopy(name);
+            var virtualPath = VirtualPath.Combine(_currentDirectoryPath, name);
+            var capturedPath = await EditAndCaptureExternalWorkingCopyAsync(workingPath, virtualPath);
+            workingPath = null;
+            if (capturedPath is not null)
+            {
+                AddPendingEdit(new PendingFileEdit(FileEditOperationKind.CreateFile, virtualPath, capturedPath));
+            }
+        }
+        catch (Exception ex) when (ex is IOException
+                                   or UnauthorizedAccessException
+                                   or ArgumentException
+                                   or NotSupportedException)
+        {
+            MessageBox.Show(this, ex.Message, "外部編集の準備エラー", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            _statusLabel.Text = "外部編集を開始できませんでした";
+        }
+        finally
+        {
+            if (workingPath is not null)
+            {
+                PendingEditContentStore.TryDeleteOwnedFile(workingPath);
+            }
+        }
+
+    }
+
+    private void ReplaceSelectedPendingEditContent()
+    {
+        if (_isWritingImage || _isLoadingImage)
+        {
+            _statusLabel.Text = "イメージの読み込み・保存中は変更予定を編集できません";
+            return;
+        }
+
+        if (!TryGetSelectedPendingContentEdit(out var index, out var edit, showMessage: true))
+        {
+            return;
+        }
+
+        using var dialog = new OpenFileDialog
+        {
+            Title = $"{edit.VirtualPath} の新しい内容元を選択",
+            Filter = "すべてのファイル (*.*)|*.*",
+        };
+        if (dialog.ShowDialog(this) != DialogResult.OK)
+        {
+            return;
+        }
+
+        ReplacePendingEditContent(index, dialog.FileName);
+    }
+
+    private async Task EditSelectedPendingContentExternallyAsync()
+    {
+        if (_isWritingImage || _isLoadingImage)
+        {
+            _statusLabel.Text = "イメージの読み込み・保存中は変更予定を編集できません";
+            return;
+        }
+
+        if (!TryGetSelectedPendingContentEdit(out var index, out var edit, showMessage: true))
+        {
+            return;
+        }
+
+        var contentPath = edit.ContentPath!;
+        string? workingPath = null;
+        try
+        {
+            workingPath = await CreateExternalWorkingCopyAsync(
+                token => PendingEditContentStore.CreateWorkingCopy(contentPath, Path.GetFileName(edit.VirtualPath), token),
+                Path.GetFileName(edit.VirtualPath));
+            if (workingPath is null)
+            {
+                return;
+            }
+
+            var capturedPath = await EditAndCaptureExternalWorkingCopyAsync(workingPath, edit.VirtualPath);
+            workingPath = null;
+            if (capturedPath is not null)
+            {
+                ReplacePendingEditContent(index, capturedPath);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            _statusLabel.Text = "外部編集用ファイルのコピーをキャンセルしました";
+        }
+        catch (Exception ex) when (ex is IOException
+                                   or UnauthorizedAccessException
+                                   or ArgumentException
+                                   or NotSupportedException)
+        {
+            MessageBox.Show(this, ex.Message, "外部編集の準備エラー", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            _statusLabel.Text = "外部編集を開始できませんでした";
+        }
+        finally
+        {
+            if (workingPath is not null)
+            {
+                PendingEditContentStore.TryDeleteOwnedFile(workingPath);
+            }
+        }
+    }
+
+    private async Task<string?> CreateExternalWorkingCopyAsync(
+        Func<CancellationToken, string> create,
+        string displayName)
+    {
+        var cancellation = new CancellationTokenSource();
+        _copyCancellations.Add(cancellation);
+        _cancelCopyButton.Enabled = true;
+        try
+        {
+            if (_copyCancellations.Count > 1)
+            {
+                _statusLabel.Text = $"外部編集用コピーの待機中: {displayName}";
+            }
+
+            await _copyExecutionGate.WaitAsync(cancellation.Token);
+            try
+            {
+                _statusLabel.Text = $"外部編集用に取り出しています: {displayName}";
+                return await Task.Run(() => create(cancellation.Token), cancellation.Token);
+            }
+            finally
+            {
+                _copyExecutionGate.Release();
+            }
+        }
+        finally
+        {
+            _copyCancellations.Remove(cancellation);
+            cancellation.Dispose();
+            _cancelCopyButton.Enabled = _copyCancellations.Count > 0;
+        }
+    }
+
+    private async Task<string?> EditAndCaptureExternalWorkingCopyAsync(string workingPath, string virtualPath)
+    {
+        if (!TryStartExternalEditor(workingPath, editorPath: null, this)
+            && !TryChooseAndStartExternalEditor(workingPath, this))
+        {
+            PendingEditContentStore.TryDeleteOwnedFile(workingPath);
+            return null;
+        }
+
+        while (ShowExternalEditImportDialog(workingPath, virtualPath) == DialogResult.OK)
+        {
+            try
+            {
+                var capturedPath = await CreateExternalWorkingCopyAsync(
+                    token => PendingEditContentStore.CaptureWorkingCopy(
+                        workingPath,
+                        Path.GetFileName(virtualPath),
+                        token),
+                    Path.GetFileName(virtualPath));
+                PendingEditContentStore.TryDeleteOwnedFile(workingPath);
+                _statusLabel.Text = $"外部エディターの内容を取り込みました: {virtualPath}";
+                return capturedPath;
+            }
+            catch (OperationCanceledException)
+            {
+                _statusLabel.Text = $"外部編集内容の取り込みをキャンセルしました: {virtualPath}";
+                break;
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                if (MessageBox.Show(
+                        this,
+                        $"編集内容を取り込めませんでした。外部エディターで保存し、必要ならファイルを閉じてから再試行してください。"
+                        + Environment.NewLine
+                        + Environment.NewLine
+                        + ex.Message,
+                        "外部編集内容の取り込みエラー",
+                        MessageBoxButtons.RetryCancel,
+                        MessageBoxIcon.Warning) != DialogResult.Retry)
+                {
+                    break;
+                }
+            }
+        }
+
+        PendingEditContentStore.TryDeleteOwnedFile(workingPath);
+        _statusLabel.Text = $"外部編集の取り込みをキャンセルしました: {virtualPath}";
+        return null;
+    }
+
+    private DialogResult ShowExternalEditImportDialog(string workingPath, string virtualPath)
+    {
+        using var dialog = new Form
+        {
+            Text = "外部エディターから変更を取り込む",
+            Width = 720,
+            Height = 235,
+            StartPosition = FormStartPosition.CenterParent,
+            FormBorderStyle = FormBorderStyle.FixedDialog,
+            MinimizeBox = false,
+            MaximizeBox = false,
+            ShowInTaskbar = false,
+        };
+        var explanation = new Label
+        {
+            Left = 14,
+            Top = 14,
+            Width = 675,
+            Height = 56,
+            Text = $"{virtualPath}{Environment.NewLine}外部エディターで保存してから［保存内容を取り込む］を押してください。取り込み後の編集は自動反映されません。",
+        };
+        var pathBox = new TextBox
+        {
+            Left = 14,
+            Top = 74,
+            Width = 675,
+            ReadOnly = true,
+            Text = workingPath,
+        };
+        var reopenButton = new Button { Left = 14, Top = 116, Width = 145, Text = "既定アプリで開く" };
+        reopenButton.Click += (_, _) => TryStartExternalEditor(workingPath, editorPath: null, dialog);
+        var chooseButton = new Button { Left = 169, Top = 116, Width = 150, Text = "エディターを指定..." };
+        chooseButton.Click += (_, _) => TryChooseAndStartExternalEditor(workingPath, dialog);
+        var importButton = new Button
+        {
+            Left = 431,
+            Top = 116,
+            Width = 160,
+            Text = "保存内容を取り込む",
+            DialogResult = DialogResult.OK,
+        };
+        var cancelButton = new Button
+        {
+            Left = 601,
+            Top = 116,
+            Width = 88,
+            Text = "キャンセル",
+            DialogResult = DialogResult.Cancel,
+        };
+        dialog.Controls.AddRange([explanation, pathBox, reopenButton, chooseButton, importButton, cancelButton]);
+        dialog.AcceptButton = importButton;
+        dialog.CancelButton = cancelButton;
+        return dialog.ShowDialog(this);
+    }
+
+    private static bool TryStartExternalEditor(string workingPath, string? editorPath, IWin32Window owner)
+    {
+        if (editorPath is null && !ExternalEditorSafety.CanOpenWithAssociatedApplication(workingPath))
+        {
+            MessageBox.Show(
+                owner,
+                "実行可能ファイルやスクリプトを既定アプリで開くと、その内容を実行する危険があります。"
+                + Environment.NewLine
+                + "［エディターを指定］から、信頼できるテキスト／バイナリエディターを選択してください。",
+                "関連付け起動を停止しました",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+            return false;
+        }
+
+        if (editorPath is not null
+            && string.Equals(Path.GetFullPath(editorPath), Path.GetFullPath(workingPath), StringComparison.OrdinalIgnoreCase))
+        {
+            MessageBox.Show(
+                owner,
+                "編集対象そのものをエディターとして実行することはできません。",
+                "外部エディターの指定エラー",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+            return false;
+        }
+
+        try
+        {
+            var startInfo = editorPath is null
+                ? new ProcessStartInfo
+                {
+                    FileName = workingPath,
+                    UseShellExecute = true,
+                    Verb = "open",
+                }
+                : new ProcessStartInfo
+                {
+                    FileName = editorPath,
+                    UseShellExecute = true,
+                };
+            if (editorPath is not null)
+            {
+                startInfo.ArgumentList.Add(workingPath);
+            }
+
+            Process.Start(startInfo);
+            return true;
+        }
+        catch (Exception ex) when (ex is Win32Exception or InvalidOperationException or FileNotFoundException)
+        {
+            MessageBox.Show(
+                owner,
+                $"外部エディターを起動できませんでした。{Environment.NewLine}{ex.Message}",
+                "外部エディター起動エラー",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+            return false;
+        }
+    }
+
+    private static bool TryChooseAndStartExternalEditor(string workingPath, IWin32Window owner)
+    {
+        using var dialog = new OpenFileDialog
+        {
+            Title = "使用する外部エディターを選択",
+            Filter = "実行ファイル (*.exe;*.cmd;*.bat;*.com)|*.exe;*.cmd;*.bat;*.com|すべてのファイル (*.*)|*.*",
+            CheckFileExists = true,
+        };
+        return dialog.ShowDialog(owner) == DialogResult.OK
+            && TryStartExternalEditor(workingPath, dialog.FileName, owner);
+    }
+
+    private PendingEditContentStore PendingEditContentStore =>
+        _pendingEditContentStore ??= new PendingEditContentStore();
+
     private void QueueSelectedFileDeletion()
     {
         if (_isWritingImage || _isLoadingImage)
         {
-            _statusLabel.Text = "イメージの読み込み・RAW保存中は変更予定を編集できません";
+            _statusLabel.Text = "イメージの読み込み・保存中は変更予定を編集できません";
             return;
         }
 
@@ -3696,12 +4313,18 @@ public partial class Form1 : Form
 
     private bool CanQueuePendingEdit()
     {
+        if (!_editModeEnabled)
+        {
+            _statusLabel.Text = "［編集］メニューから編集モードを有効にしてください";
+            return false;
+        }
+
         if (!_isWritingImage && !_isLoadingImage)
         {
             return true;
         }
 
-        _statusLabel.Text = "イメージの読み込み・RAW保存中は変更予定を編集できません";
+        _statusLabel.Text = "イメージの読み込み・保存中は変更予定を編集できません";
         return false;
     }
 
@@ -3796,8 +4419,12 @@ public partial class Form1 : Form
         try
         {
             _pendingEditList.Items.Clear();
-            foreach (var edit in _pendingFileEdits)
+            var issues = GetPendingEditSequenceIssues()
+                .GroupBy(issue => issue.EditIndex)
+                .ToDictionary(group => group.Key, group => string.Join(" / ", group.Select(issue => issue.Message)));
+            for (var index = 0; index < _pendingFileEdits.Count; index++)
             {
+                var edit = _pendingFileEdits[index];
                 var operation = edit.Operation switch
                 {
                     FileEditOperationKind.WriteContent => "内容変更",
@@ -3836,6 +4463,16 @@ public partial class Form1 : Form
                     item.SubItems.Add("-");
                 }
 
+                if (issues.TryGetValue(index, out var issue))
+                {
+                    item.SubItems.Add(issue);
+                    item.ForeColor = Color.DarkRed;
+                }
+                else
+                {
+                    item.SubItems.Add("OK");
+                }
+
                 _pendingEditList.Items.Add(item);
             }
         }
@@ -3843,13 +4480,164 @@ public partial class Form1 : Form
         {
             _pendingEditList.EndUpdate();
         }
+
+        UpdatePendingContentButtons();
+    }
+
+    private void UpdatePendingContentButtons()
+    {
+        var enabled = !_isWritingImage
+            && !_isLoadingImage
+            && TryGetSelectedPendingContentEdit(out _, out _, showMessage: false);
+        _pendingReplaceContentButton.Enabled = enabled;
+        _pendingExternalEditButton.Enabled = enabled;
+        var selected = _pendingEditList.SelectedIndices.Cast<int>().OrderBy(index => index).ToArray();
+        var canReorder = !_isWritingImage && !_isLoadingImage && selected.Length > 0;
+        _pendingMoveUpButton.Enabled = canReorder && selected[0] > 0;
+        _pendingMoveDownButton.Enabled = canReorder && selected[^1] < _pendingFileEdits.Count - 1;
+    }
+
+    private IReadOnlyList<PendingEditSequenceIssue> GetPendingEditSequenceIssues()
+    {
+        return _pendingEditFileSystem is null || _pendingFileEdits.Count == 0
+            ? Array.Empty<PendingEditSequenceIssue>()
+            : PendingEditSequenceValidator.Validate(_pendingEditFileSystem, _pendingFileEdits);
+    }
+
+    private bool ValidatePendingEditSequence(bool showMessage)
+    {
+        var issues = GetPendingEditSequenceIssues();
+        if (issues.Count == 0)
+        {
+            return true;
+        }
+
+        _explorerDetailTabs.SelectedIndex = 1;
+        if (showMessage)
+        {
+            var details = string.Join(
+                Environment.NewLine,
+                issues.Take(8).Select(issue => $"{issue.EditIndex + 1:N0}. {issue.Message}"));
+            if (issues.Count > 8)
+            {
+                details += $"{Environment.NewLine}ほか {issues.Count - 8:N0} 件";
+            }
+
+            MessageBox.Show(
+                this,
+                "変更予定の順序または対象に問題があります。［事前確認］列を確認し、必要に応じて並べ替えてください。"
+                + Environment.NewLine
+                + Environment.NewLine
+                + details,
+                "変更予定を保存できません",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+        }
+
+        return false;
+    }
+
+    private void MoveSelectedPendingEdits(int direction)
+    {
+        if (_isWritingImage || _isLoadingImage || direction is not (-1 or 1))
+        {
+            return;
+        }
+
+        var selected = _pendingEditList.SelectedIndices.Cast<int>().OrderBy(index => index).ToArray();
+        if (selected.Length == 0
+            || (direction < 0 && selected[0] == 0)
+            || (direction > 0 && selected[^1] == _pendingFileEdits.Count - 1))
+        {
+            return;
+        }
+
+        var iteration = direction < 0 ? selected : selected.Reverse().ToArray();
+        foreach (var index in iteration)
+        {
+            var destination = index + direction;
+            (_pendingFileEdits[index], _pendingFileEdits[destination]) =
+                (_pendingFileEdits[destination], _pendingFileEdits[index]);
+        }
+
+        var newSelection = selected.Select(index => index + direction).ToArray();
+        RefreshPendingEditList();
+        foreach (var index in newSelection)
+        {
+            _pendingEditList.Items[index].Selected = true;
+        }
+
+        _pendingEditList.Items[newSelection[0]].Focused = true;
+        _pendingEditList.Items[newSelection[0]].EnsureVisible();
+        var issueCount = GetPendingEditSequenceIssues().Count;
+        _statusLabel.Text = issueCount == 0
+            ? "変更予定の順序を更新しました（事前確認OK）"
+            : $"変更予定の順序を更新しました（要確認 {issueCount:N0}件）";
+    }
+
+    private bool TryGetSelectedPendingContentEdit(
+        out int index,
+        out PendingFileEdit edit,
+        bool showMessage)
+    {
+        index = -1;
+        edit = null!;
+        if (_pendingEditList.SelectedIndices.Count == 1)
+        {
+            var selectedIndex = _pendingEditList.SelectedIndices[0];
+            if (selectedIndex >= 0 && selectedIndex < _pendingFileEdits.Count)
+            {
+                var selected = _pendingFileEdits[selectedIndex];
+                if (selected.Operation is FileEditOperationKind.CreateFile or FileEditOperationKind.WriteContent
+                    && !string.IsNullOrWhiteSpace(selected.ContentPath))
+                {
+                    index = selectedIndex;
+                    edit = selected;
+                    return true;
+                }
+            }
+        }
+
+        if (showMessage)
+        {
+            MessageBox.Show(
+                this,
+                "内容を編集するファイル追加または内容変更の予定を1件選択してください。",
+                "変更予定の内容編集",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+        }
+
+        return false;
+    }
+
+    private void ReplacePendingEditContent(int index, string contentPath)
+    {
+        contentPath = Path.GetFullPath(contentPath);
+        var previous = _pendingFileEdits[index];
+        _pendingFileEdits[index] = previous with { ContentPath = contentPath };
+        if (previous.ContentPath is not null
+            && !string.Equals(previous.ContentPath, contentPath, StringComparison.OrdinalIgnoreCase))
+        {
+            _pendingEditContentStore?.TryDeleteOwnedFile(previous.ContentPath);
+        }
+
+        RefreshPendingEditList();
+        if (index < _pendingEditList.Items.Count)
+        {
+            _pendingEditList.Items[index].Selected = true;
+            _pendingEditList.Items[index].Focused = true;
+            _pendingEditList.Items[index].EnsureVisible();
+        }
+
+        _statusLabel.Text = $"変更予定の内容を差し替えました: {previous.VirtualPath}";
     }
 
     private void UndoSelectedPendingEdits()
     {
         if (_isWritingImage)
         {
-            _statusLabel.Text = "RAW保存中は変更予定を編集できません";
+            _statusLabel.Text = "イメージ保存中は変更予定を編集できません";
             return;
         }
 
@@ -3862,6 +4650,7 @@ public partial class Form1 : Form
 
         foreach (var index in indices)
         {
+            ReleasePendingEditContent(_pendingFileEdits[index]);
             _pendingFileEdits.RemoveAt(index);
         }
 
@@ -3874,7 +4663,7 @@ public partial class Form1 : Form
     {
         if (_isWritingImage)
         {
-            _statusLabel.Text = "RAW保存中は変更予定を編集できません";
+            _statusLabel.Text = "イメージ保存中は変更予定を編集できません";
             return;
         }
 
@@ -3886,6 +4675,7 @@ public partial class Form1 : Form
 
         var removed = _pendingFileEdits[^1];
         _pendingFileEdits.RemoveAt(_pendingFileEdits.Count - 1);
+        ReleasePendingEditContent(removed);
         ResetPendingEditContextIfEmpty();
         RefreshPendingEditList();
         _statusLabel.Text = $"最後の変更予定を取り消しました: {removed.VirtualPath}";
@@ -3895,7 +4685,7 @@ public partial class Form1 : Form
     {
         if (_isWritingImage)
         {
-            _statusLabel.Text = "RAW保存中は変更予定を編集できません";
+            _statusLabel.Text = "イメージ保存中は変更予定を編集できません";
             return;
         }
 
@@ -3933,7 +4723,17 @@ public partial class Form1 : Form
     {
         _pendingFileEdits.Clear();
         _pendingEditFileSystem = null;
+        _pendingEditContentStore?.Dispose();
+        _pendingEditContentStore = null;
         RefreshPendingEditList();
+    }
+
+    private void ReleasePendingEditContent(PendingFileEdit edit)
+    {
+        if (edit.ContentPath is not null)
+        {
+            _pendingEditContentStore?.TryDeleteOwnedFile(edit.ContentPath);
+        }
     }
 
     private void ResetPendingEditContextIfEmpty()
@@ -3948,7 +4748,7 @@ public partial class Form1 : Form
     {
         if (_isWritingImage || _isLoadingImage)
         {
-            _statusLabel.Text = "イメージの読み込み・RAW保存中は保存を開始できません";
+            _statusLabel.Text = "イメージの読み込み・保存中は保存を開始できません";
             return;
         }
 
@@ -3956,7 +4756,7 @@ public partial class Form1 : Form
         {
             MessageBox.Show(
                 this,
-                "検索またはホストへのコピーが完了してから変更済みRAWを保存してください。",
+                "検索またはホストへのコピーが完了してから変更済みイメージを保存してください。",
                 "読み取り処理を実行中です",
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Information);
@@ -3969,13 +4769,18 @@ public partial class Form1 : Form
             return;
         }
 
+        if (!ValidatePendingEditSequence(showMessage: true))
+        {
+            return;
+        }
+
         var isLogicalOutput = _pendingEditFileSystem.Partition.ReaderOverride is not null;
         using var outputDialog = new SaveFileDialog
         {
             Title = isLogicalOutput
-                ? "変更済み論理ボリュームを新しいRAWイメージとして保存"
-                : "変更済みディスクを新しいRAWイメージとして保存",
-            Filter = "RAW disk image (*.raw)|*.raw|Disk image (*.img)|*.img|All files (*.*)|*.*",
+                ? "変更済み論理ボリュームを新しいディスクイメージとして保存"
+                : "変更済みディスクを新しいディスクイメージとして保存",
+            Filter = "RAW disk image (*.raw;*.img)|*.raw;*.img|QCOW2 image (*.qcow2;*.qcow)|*.qcow2;*.qcow|VirtualBox VDI (*.vdi)|*.vdi|All files (*.*)|*.*",
             DefaultExt = "raw",
             AddExtension = true,
             OverwritePrompt = false,
@@ -3986,7 +4791,23 @@ public partial class Form1 : Form
             return;
         }
 
-        if (File.Exists(outputDialog.FileName) || Directory.Exists(outputDialog.FileName))
+        var outputFormat = outputDialog.FilterIndex switch
+        {
+            2 => FileEditOutputFormat.Qcow2,
+            3 => FileEditOutputFormat.Vdi,
+            _ => FileEditBatchService.DetectOutputFormat(outputDialog.FileName),
+        };
+        var outputFileName = outputFormat switch
+        {
+            FileEditOutputFormat.Qcow2
+                when Path.GetExtension(outputDialog.FileName) is not ".qcow2" and not ".qcow" =>
+                Path.ChangeExtension(outputDialog.FileName, ".qcow2"),
+            FileEditOutputFormat.Vdi
+                when !Path.GetExtension(outputDialog.FileName).Equals(".vdi", StringComparison.OrdinalIgnoreCase) =>
+                Path.ChangeExtension(outputDialog.FileName, ".vdi"),
+            _ => outputDialog.FileName,
+        };
+        if (File.Exists(outputFileName) || Directory.Exists(outputFileName))
         {
             MessageBox.Show(
                 this,
@@ -3996,6 +4817,8 @@ public partial class Form1 : Form
                 MessageBoxIcon.Warning);
             return;
         }
+
+        var outputFormatName = FileEditBatchService.GetOutputFormatName(outputFormat);
 
         var summary = string.Join("\r\n", _pendingFileEdits.Take(8).Select(edit =>
             $"・{FormatEditOperation(edit.Operation)}: {edit.VirtualPath}"));
@@ -4007,12 +4830,12 @@ public partial class Form1 : Form
         if (MessageBox.Show(
                 this,
                 $"実験的な書き込み機能です。\r\n\r\n{summary}\r\n\r\n"
-                    + $"出力: {outputDialog.FileName}\r\n\r\n"
+                    + $"出力: {outputFileName}\r\n\r\n"
                     + (isLogicalOutput
-                        ? "RAID/LVM/復号レイヤーの構成元は変更せず、選択した論理ボリュームを平坦なRAWとして出力します。\r\n"
+                        ? $"RAID/LVM/復号レイヤーの構成元は変更せず、選択した論理ボリュームを平坦化して{outputFormatName}へ格納します。\r\n"
                         : string.Empty)
-                    + "原本は変更せず、変更を上から順に仮適用して検証後、新しいRAWへ保存します。続行しますか？",
-                "変更済みRAW保存の確認",
+                    + $"原本は変更せず、変更を上から順に仮適用して検証後、新しい{outputFormatName}へ保存します。続行しますか？",
+                $"変更済み{outputFormatName}保存の確認",
                 MessageBoxButtons.YesNo,
                 MessageBoxIcon.Warning,
                 MessageBoxDefaultButton.Button2) != DialogResult.Yes)
@@ -4020,7 +4843,7 @@ public partial class Form1 : Form
             return;
         }
 
-        if (!ConfirmAndDisposeMounts("変更済みRAWを保存する前に、現在の読み取り専用マウントを解除します。続行しますか？"))
+        if (!ConfirmAndDisposeMounts("変更済みイメージを保存する前に、現在の読み取り専用マウントを解除します。続行しますか？"))
         {
             return;
         }
@@ -4028,6 +4851,7 @@ public partial class Form1 : Form
         using var cancellation = new CancellationTokenSource();
         _writeCancellation = cancellation;
         _isWritingImage = true;
+        UpdatePendingContentButtons();
         _cancelWriteButton.Enabled = true;
         _writeProgressBar.Visible = true;
         _writeProgressBar.Style = ProgressBarStyle.Marquee;
@@ -4051,20 +4875,21 @@ public partial class Form1 : Form
             var source = _reader;
             var fileSystem = _pendingEditFileSystem;
             var edits = _pendingFileEdits.ToArray();
-            var result = await Task.Run(() => FileEditBatchService.ApplyToRawAsync(
+            var result = await Task.Run(() => FileEditBatchService.ApplyAsync(
                 source,
                 fileSystem.Partition,
                 fileSystem,
                 edits,
-                outputDialog.FileName,
+                outputFileName,
+                outputFormat,
                 progress,
                 cancellation.Token), cancellation.Token);
             ClearPendingEdits();
-            _statusLabel.Text = $"変更済みRAWを保存しました: {result.DestinationPath}";
+            _statusLabel.Text = $"変更済み{outputFormatName}を保存しました: {result.DestinationPath}";
             MessageBox.Show(
                 this,
-                $"変更済みRAWを保存しました。\r\n\r\n{result.DestinationPath}\r\n"
-                    + (result.IsLogicalVolumeOutput ? "形式: 構成元へ書き戻さない平坦化済み論理RAW\r\n" : string.Empty)
+                $"変更済み{outputFormatName}を保存しました。\r\n\r\n{result.DestinationPath}\r\n"
+                    + (result.IsLogicalVolumeOutput ? $"形式: 構成元へ書き戻さない平坦化済み論理ディスク（{outputFormatName}）\r\n" : string.Empty)
                     + $"変更: {result.EditCount:N0}件\r\n変更ページ: {result.ModifiedPageCount:N0}",
                 "ファイル編集完了",
                 MessageBoxButtons.OK,
@@ -4072,17 +4897,18 @@ public partial class Form1 : Form
         }
         catch (OperationCanceledException)
         {
-            _statusLabel.Text = "変更済みRAWの保存をキャンセルしました";
+            _statusLabel.Text = $"変更済み{outputFormatName}の保存をキャンセルしました";
         }
         catch (Exception ex)
         {
-            _statusLabel.Text = "変更済みRAWの保存に失敗しました";
+            _statusLabel.Text = $"変更済み{outputFormatName}の保存に失敗しました";
             MessageBox.Show(this, ex.Message, "ファイル編集エラー", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
         finally
         {
             _writeCancellation = null;
             _isWritingImage = false;
+            UpdatePendingContentButtons();
             _cancelWriteButton.Enabled = false;
             _writeProgressBar.Visible = false;
             _writeProgressBar.Value = 0;
@@ -4119,6 +4945,11 @@ public partial class Form1 : Form
             return;
         }
 
+        if (!ValidatePendingEditSequence(showMessage: true))
+        {
+            return;
+        }
+
         if (!PhysicalDiskEditService.CanApply(
                 _reader,
                 _pendingEditFileSystem.Partition,
@@ -4149,6 +4980,7 @@ public partial class Form1 : Form
         using var cancellation = new CancellationTokenSource();
         _writeCancellation = cancellation;
         _isWritingImage = true;
+        UpdatePendingContentButtons();
         _cancelWriteButton.Enabled = true;
         _writeProgressBar.Visible = true;
         _writeProgressBar.Style = ProgressBarStyle.Marquee;
@@ -4252,6 +5084,7 @@ public partial class Form1 : Form
             using var cancellation = new CancellationTokenSource();
             _writeCancellation = cancellation;
             _isWritingImage = true;
+            UpdatePendingContentButtons();
             _cancelWriteButton.Enabled = true;
             _writeProgressBar.Visible = true;
             _writeProgressBar.Style = ProgressBarStyle.Marquee;
@@ -4321,6 +5154,7 @@ public partial class Form1 : Form
     {
         _writeCancellation = null;
         _isWritingImage = false;
+        UpdatePendingContentButtons();
         _cancelWriteButton.Enabled = false;
         _writeProgressBar.Visible = false;
         _writeProgressBar.Value = 0;

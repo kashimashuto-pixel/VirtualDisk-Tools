@@ -49,6 +49,26 @@ internal static class PhysicalDiskRecoveryJournal
         var directory = Path.GetDirectoryName(path)
             ?? throw new ArgumentException("復旧ジャーナルの保存先フォルダーを取得できません。", nameof(path));
         Directory.CreateDirectory(directory);
+        var temporaryPath = Path.Combine(
+            directory,
+            $".{Path.GetFileName(path)}.{Guid.NewGuid():N}.partial");
+        try
+        {
+            WriteJournal(temporaryPath, target, pages);
+            File.Move(temporaryPath, path);
+        }
+        catch
+        {
+            TryDelete(temporaryPath);
+            throw;
+        }
+    }
+
+    private static void WriteJournal(
+        string path,
+        PhysicalDiskTargetInfo target,
+        IReadOnlyList<CopyOnWritePage> pages)
+    {
         using var stream = new FileStream(
             path,
             FileMode.CreateNew,
@@ -348,6 +368,18 @@ internal static class PhysicalDiskRecoveryJournal
         finally
         {
             stream.Position = originalPosition;
+        }
+    }
+
+    private static void TryDelete(string path)
+    {
+        try
+        {
+            File.Delete(path);
+        }
+        catch
+        {
+            // Preserve the journal creation failure. The unique partial can be removed manually.
         }
     }
 }

@@ -32,7 +32,7 @@ public static class PhysicalDiskEditService
 
         if (partition.ReaderOverride is not null)
         {
-            reason = "RAID、LVM、BitLocker／LUKS復号レイヤーは物理構成へ直接書き戻せません。平坦化した論理RAWへ保存してください。";
+            reason = "RAID、LVM、BitLocker／LUKS復号レイヤーは物理構成へ直接書き戻せません。平坦化した論理イメージへ保存してください。";
             return false;
         }
 
@@ -90,16 +90,8 @@ public static class PhysicalDiskEditService
     public static string GetDefaultRecoveryJournalPath(PhysicalDiskTargetInfo target)
     {
         ArgumentNullException.ThrowIfNull(target);
-        var localData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-        if (string.IsNullOrWhiteSpace(localData))
-        {
-            throw new InvalidOperationException("復旧ジャーナル用のローカル保存先を取得できません。");
-        }
-
         return Path.Combine(
-            localData,
-            "VirtualDiskTools",
-            "Recovery",
+            PhysicalDiskRecoveryJournalLocator.GetDefaultDirectory(),
             $"PhysicalDrive{target.DiskNumber}-{DateTime.UtcNow:yyyyMMdd-HHmmss}-{Guid.NewGuid():N}.vdt-recovery");
     }
 

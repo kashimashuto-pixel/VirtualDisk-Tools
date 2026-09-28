@@ -1,7 +1,7 @@
 # 次回対応予定
 
-- 最終更新: 2026-09-08
-- 基準ブランチ: `experimental/fs-editing`
+- 最終更新: 2026-09-15
+- 基準ブランチ: `main`
 
 この文書は、次回の開発作業へ引き継ぐための優先順位付きロードマップです。
 通常の解析は読み取り専用を維持し、書き込み機能は原本を変更しないコピーオンライト方式で段階的に実装します。
@@ -14,13 +14,26 @@
 - 既存ファイルの内容変更（拡大・縮小を含む）、新規ファイル作成、通常ファイル削除
 - ディレクトリ作成／空ディレクトリ削除、ファイル・ディレクトリの移動／名前変更、属性・更新日時編集
 - 複数操作を1つのコピーオンライト領域へ順番に適用し、操作ごとの再オープン検証と最終RAW検証を実施
-- UIの変更予定一覧、選択／直前／全操作の取り消し、別イメージ切替・終了時の未保存確認
+- UIの変更予定一覧、追加・内容変更予定の内容元差し替え、既定／指定外部エディターとの安全な一時コピー連携、操作順の上／下移動、選択／直前／全操作の取り消し、別イメージ切替・終了時の未保存確認
+- 新規空ファイルまたは既存ファイルを外部編集し、「取り込む」時点のスナップショットを変更予定へ保持。元イメージを外部プロセスへ直接渡さず、一時内容を取り消し・保存・終了時に清掃
+- 登録順の仮想パス状態を軽量検証し、同名作成、削除／移動済みパスの参照、移動先衝突、非空ディレクトリ削除、入力内容消失を一覧表示。問題が残るRAW保存／物理適用は開始前に拒否
 - スパース、未初期化extent、XFS realtime／共有reflink、暗号化などを事前に拒否
 - XFS logのcycleからheadを確認し、直前の正常unmount recordを認識できる単純なclean状態だけを許可（未回収logと複雑な循環状態は安全側で拒否）
 - 内容変更／追加後の仮想ファイルをSHA-256で読み戻し、削除後のパス消失を検証してから新規RAWへ原子的に保存
 - RAID、LVM、復号パーティションは構成元へ書き戻さず、編集済みの平坦な論理RAWとして保存
 - 物理ディスクはリムーバブル／固定データディスクへ直接差分を適用可能。実行中Windowsのシステムディスク、合成・復号レイヤー、既存出力の上書きは拒否
 - 物理ディスク直接適用は、シリアル番号またはStorage Device IDを必須とする対象再識別、全所属ボリュームの排他ロック／アンマウント、変更前ページの競合検出、別ディスク上の復旧ジャーナル、flush／読み戻し／最終FS検証、自動ロールバックを実施
+- 状態が`Prepared`のまま残った復旧ジャーナルと、破損・読取不能な復旧ジャーナルを起動時に通知（自動復旧はしない）
+- Windows固定VHDXを使い、ロック拒否、差分書き込み、読み戻し、ジャーナル復旧、システムディスク拒否を確認する管理者向け統合テスト
+- 消去可能な実USB媒体を使い、直接Storage APIで欠落する識別情報の`Win32_DiskDrive`補完、対象再識別、ロック拒否、flush／読み戻し、Committed／Preparedジャーナル復元、製品経路のFAT32編集／復元を確認する管理者向け統合テスト
+- 物理ディスク書き込みセッションの非セクター境界読み取りを整列I/Oへ変換し、実USBでFAT metadataの小さい読み取りを回帰確認
+- 同じ実USB媒体でFAT16／exFAT／NTFS／ext4／XFSの作成・縮小更新・同一directory内rename・削除・ジャーナル完全復元を確認する破壊的統合テスト（NTFS自動マウントをLinux filesystem GPT typeで抑止）
+- XFS short-form directoryの同一directory内renameが古いinode snapshotで新entryを消す問題を修正し、実fixture、`xfs_repair -n`、読み取り専用mount、実USBで回帰確認
+- XFS内部logのfsblockを実LBAへ変換する際、2の累乗でないallocation groupのpaddingを除去し、小容量XFSでもclean unmountを正しく判定
+- ［ファイル］→［新規作成］からRAW／内製非圧縮sparse QCOW2、MBR／GPT、XFS／ext4／NTFS混在パーティションと初期ファイルを作成し、完成後に自動で開くウィザード
+- 新規作成は1 MiB alignment、ファイルシステム別MBR/GPT type、ラベル制約、既存出力拒否、キャンセル時清掃、全初期ファイル内容、writer対応状態を完成前に再検証
+- MBR/RAWでext4＋NTFS、GPT/QCOW2でXFS＋ext4＋NTFSをゼロから生成し、全パーティションへの初期ファイル配置、製品writerによる追加、製品readerによる全内容読込、`sfdisk --verify`、各FS検査、読み取り専用mountを回帰確認（`qemu-img`は任意の相互検証のみ）
+- 上部の操作ボタンを［ファイル］メニューへ整理し、［編集］→［編集モードを有効にする］で確認後に実験的な編集操作を表示
 - C#生成ext4 fixtureの原本不変・保存後再読込テスト
 - Linux生成ext4／XFSで`e2fsck -fn`、`xfs_repair -n`、読み取り専用マウント後の内容一致を検証
 - FAT16／FAT32はclean状態、複数FAT copyの一致、cluster chainの範囲・loop・長さを検証して割り当て済みdataだけを置換
@@ -30,12 +43,22 @@
 - exFATはdirty／media-failure状態とサイズを事前検証し、書き込み可能streamをコピーオンライトだけへ公開
 - 実`exfatprogs 1.2.2`生成fixtureを`fsck.exfat -n`、読み取り専用マウント、内容一致で検証
 
+### 対応済み: Linux・クロスプラットフォーム基盤と内蔵フォーマッター
+
+- OS非依存のimage reader、filesystem、partition、作成処理を`VirtualDisk.Core`（`net10.0`）へ分離
+- Windows全機能版はWinFormsを維持し、物理ディスク／ProjFSなどをWindows adapter側に分離したまま共通コアを利用
+- Linuxを含むCLIで`info`、`list`、`search`、`verify`、`extract`、実験的`edit`、RAW／QCOW2・MBR／GPT・XFS／ext4／NTFSの新規作成に対応
+- Avalonia共通GUIでイメージ作成／読込、パーティション／ディレクトリ閲覧、名前検索、プレビュー、ファイル／ディレクトリ抽出、全読込検証を実装
+- Windows／Ubuntu matrix CIで共通コア、CLI、Avalonia GUI、managed作成回帰をビルド・実行
+- NTFS、ext4、XFSをC#内部で直接初期化し、通常の新規作成からWSL、`mkfs.*`、`qemu-img`依存を除去
+- 内蔵XFSはv5 CRC、finobt、rmapbt、sparse inode、leaf AG btree、short-form root directory、clean内部logを生成し、製品reader／writer、`xfs_repair -n`、Linux読み取り専用mountで相互検証
+
 ### 次段階
 
 1. 現在安全側で拒否する複雑なext4 extent tree／directory layoutの対応範囲を、実fixtureとfsck検証付きで拡張
 2. XFSのdirectory／extent btree、複数allocation group、reflink CoWを、rmap／refcount更新と実fixture検証付きで段階的に拡張
-3. 物理ディスク書き込みを実リムーバブル試験媒体とオフライン固定ディスクで検証し、電源断を模したジャーナル復旧手順を継続的に確認
-4. RAW以外のコンテナーを同形式で保存するwriterを追加
+3. 物理ディスク書き込みをオフライン固定ディスクでも検証し、実USBの物理的な取り外し／電源断後の手動ジャーナル復旧を別の消去可能媒体で確認
+4. 既存コンテナーを編集後にRAWへ平坦化せず、元と同じコンテナー形式で保存するwriterを追加
 
 ## 対応済み
 
@@ -157,7 +180,7 @@
 - 2-copy RAID1 chunkの2 stripeを異なるdeviceとして検証し、論理アドレスを各mirrorへ読み取り専用で写像
 - metadata tree blockはCRC32Cとheader、data sectorはchecksum treeのCRC32Cをmirrorごとに検証し、片系不一致時は健全なmirrorへ切替
 - RAID1の片系metadata/data破損からの復旧、両系破損、同一deviceの重複stripeを2デバイス合成fixtureで回帰確認
-- ツールバーの「Btrfs複数RAW」で同一FSIDのRAW一式を選択し、画面上のprimary partitionを複数device readerで開く経路を追加
+- ［ファイル］→［その他の開き方］→［複数ディスク］で同一FSIDのRAW一式を選択し、画面上のprimary partitionを複数device readerで開く経路を追加
 - 実イメージ回帰manifestへ`companionImages`を追加し、各RAWのSHA-256と全入力に共通するFSIDを検証
 - 2台用`mkfs.btrfs -m single -d single`／`-m raid1 -d raid1` fixture生成スクリプトを追加し、両profileを`btrfs check --readonly`と実イメージ回帰で確認
 - 欠損deviceのUUIDをDEVICE_ITEMで検証し、すべてのchunkに利用可能なstripeが残る場合だけdegraded読み取りを許可
@@ -244,6 +267,19 @@
 - 合成FAT16 fixtureで全体写像、64 KiB境界、未割当block、superblock／B-tree／space-map破損、transaction不一致、範囲外／未割当data blockを回帰確認
 - 実`lvm2 2.03.16`／`thin-provisioning-tools 0.9.0`で384 MiB thin LV + ext4を生成し、`thin_check`と160 MiBファイルのmanifest回帰を確認
 
+### LZO省容量モードのindex cache管理
+
+- block indexを圧縮sidecarへ保存し、元LZOのパス、サイズ、更新日時、先頭・末尾fingerprintと全block配置を検証して再利用
+- 展開RAWと省容量索引を同じキャッシュ管理画面で区別し、保存容量、元ファイル状態、最終利用日時の確認と選択削除に対応
+- 旧形式・破損sidecarを利用せず再構築し、管理画面の「未完成・破損を削除」対象として表示
+- 初回作成、再利用、破損検出、再構築、削除、保存先外への削除拒否を合成LZO fixtureで回帰確認
+
+### LZO索引と公式lzopの相互検証
+
+- 合成LZOの先頭・中間・末尾付近から複数の単独block `.lzo`と組み込みreaderの期待RAWを生成
+- WSL上の公式`lzop 1.04`／LZO library 2.10で各blockを復号し、出力長とSHA-256の一致を確認
+- PowerShell検証スクリプトは成功時に生成物を清掃し、失敗時だけ診断用に保持
+
 ## 次回の推奨作業
 
 ### 1. Linux md RAID5
@@ -266,13 +302,7 @@
 - format-3 inodeのbmap B+treeを含む合成XFS fixtureを追加し、inline extent、B+tree、sparse/unwritten extent、複数回・範囲横断読み取りを自動テストする
 - 30 GiB級、2 GiB超の単一extent、`int.MaxValue`超のファイルoffsetを含むfixtureで、block countとbyte offsetの計算が64-bitで行われることを回帰確認する
 - 実XFSイメージでRaw ReaderとLinuxの読み取り結果をファイル単位SHA-256で比較する任意回帰手順を追加する
-- DiscUtils XFS fallbackは、Raw Readerが解決済みのnodeを読み直さない経路を優先し、fallback失敗時もRaw Readerの読み取りを妨げないようにする
-
-### 5. LZO省容量モードのindex cache管理
-
-- 圧縮LZO block index sidecarの使用容量、作成日時、元ファイル検証状態を一覧表示し、選択削除できるUIを追加する
-- sidecar cacheのヒット、破棄、再構築、元ファイル変更、破損を自動テストで確認する
-- LZO検証用の単一block書き出しを公式`lzop`で復号して、指定logical offsetのSHA-256が一致するテストを追加する
+- DiscUtils XFS fallbackは未対応layoutを示す`NotSupportedException`に限定済み。破損、I/O失敗、キャンセル、メモリ不足をfallbackで隠さない方針を維持する
 
 ## 保守・品質改善
 
@@ -291,21 +321,21 @@
 利用目的に応じ、次の順で検討します。
 
 1. Linux md RAIDの拡張
-   - RAID0／RAID1／RAID10 near/far/offset対応を基盤に、RAID5/6を検討する
+   - RAID0／RAID1／RAID5／RAID10 near/far/offset対応を基盤に、RAID5実fixtureの拡充とRAID6を検討する
 2. LVM2の拡張
    - striped／通常thin対応を基盤に、thin snapshot、external origin、通常snapshot、cache、mirror、RAID segmentを段階的に対応する
 3. 証拠・暗号化形式の拡張
    - EWF2/Ex01、LUKS detached header／複数segmentを検討する
-4. Linux・クロスプラットフォーム対応
-   - filesystem/image readerのCore層をWindows UIから分離し、`net10.0`のcross-platform libraryとしてLinux上のCLI・自動回帰から利用可能にする
-   - WinForms/ProjFS/物理ディスク列挙はWindows固有adapterとして維持し、LinuxではFUSE、mount helper、またはCLI exportを別実装として検討する
-   - CIへLinux runnerを追加し、RAW、QCOW2、LZO、EWF、LUKS、ext、XFS、Btrfs、md RAID、LVMの読み取り回帰を実行する
-   - 実イメージ検証では`xfs_repair -n`、`btrfs check --readonly`、`e2fsck -fn`、`cryptsetup`、`mdadm`、`lvm`などLinux標準ツールとの相互検証を継続する
+4. クロスプラットフォーム機能の拡張
+   - Avalonia GUIへ編集予定と安全な外部エディター連携を段階的に移植する
+   - LinuxではFUSEまたはmount helperを検討し、現在のCLI exportと用途を分ける
+   - RAW、QCOW2、LZO、EWF、LUKS、ext、XFS、Btrfs、md RAID、LVMの実fixture回帰をLinux CIへ段階的に追加する
+   - `xfs_repair -n`、`btrfs check --readonly`、`e2fsck -fn`、`cryptsetup`、`mdadm`、`lvm`などLinux標準ツールとの相互検証を継続する
 
 ## 維持する既存仕様
 
-- 通常の解析経路と物理ディスクは読み取り専用
-- 書き込みは原本と既存ファイルを変更せず、新規出力へのコピーオンライト確定だけを許可
+- 通常の解析経路は読み取り専用。物理ディスクは明示確認、対象再識別、排他ロック、別ディスク上の復旧ジャーナルを満たす実験的な直接適用時だけ書き込み用に開く
+- 通常のイメージ編集は原本と既存ファイルを変更せず、新規出力へのコピーオンライト確定だけを許可
 - 選択コピーと表示フォルダーコピーではハッシュ計算を行わない
 - コピーはバックグラウンドキューで処理し、追加コピーで既存コピーをキャンセルしない
 - 検索、コピー、読み込みには独立したキャンセルトークンを使用する

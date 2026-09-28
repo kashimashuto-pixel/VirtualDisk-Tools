@@ -1,0 +1,718 @@
+using Qcow2Explorer.Core;
+using Qcow2Explorer.Partitions;
+using System.Security.Cryptography;
+using DiscExFatFileSystem = DiscUtils.ExFat.ExFatFileSystem;
+using DiscNtfsFileSystem = DiscUtils.Ntfs.NtfsFileSystem;
+
+namespace Qcow2Explorer.FileSystems;
+
+public static class FileSystemDetector
+{
+    public static string Detect(
+        IBlockReader disk,
+        PartitionInfo partition,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (partition.LengthBytes < 512)
+        {
+            return "";
+        }
+
+        var slice = new PartitionSliceReader(disk, partition);
+        var boot = EndianUtilities.ReadBytes(slice, 0, 512);
+        cancellationToken.ThrowIfCancellationRequested();
+        var oem = EndianUtilities.ReadAscii(boot, 3, 8);
+        if (oem == "-FVE-FS-")
+        {
+            return "BitLocker/FVE";
+        }
+
+        if (Luks1MetadataReader.HasLuksMagic(boot))
+        {
+            return EndianUtilities.ReadUInt16Big(boot, 6) switch
+            {
+                1 => "LUKS1",
+                2 => "LUKS2",
+                var version => $"LUKS{version} (検出のみ)"
+            };
+        }
+
+        if (oem == "NTFS")
+        {
+            return "NTFS";
+        }
+
+        if (oem == "EXFAT")
+        {
+            return "exFAT";
+        }
+
+        if (boot[0] == (byte)'X' && boot[1] == (byte)'F' && boot[2] == (byte)'S' && boot[3] == (byte)'B')
+        {
+            return "XFS";
+        }
+
+        const long btrfsMagicOffset = 64 * 1024 + 0x40;
+        if (partition.LengthBytes >= btrfsMagicOffset + 8)
+        {
+            var btrfsMagic = EndianUtilities.ReadBytes(slice, btrfsMagicOffset, 8);
+            cancellationToken.ThrowIfCancellationRequested();
+            if (EndianUtilities.ReadAscii(btrfsMagic, 0, 8) == "_BHRfS_M")
+            {
+                return "Btrfs";
+            }
+        }
+
+        foreach (var backupOffset in new[] { 64L * 1024 * 1024, 256L * 1024 * 1024 * 1024 })
+        {
+            if (backupOffset > partition.LengthBytes - 0x48)
+            {
+                continue;
+            }
+
+            var btrfsBackupMagic = EndianUtilities.ReadBytes(slice, backupOffset + 0x40, 8);
+            cancellationToken.ThrowIfCancellationRequested();
+            if (EndianUtilities.ReadAscii(btrfsBackupMagic, 0, 8) == "_BHRfS_M")
+            {
+                return "Btrfs";
+            }
+        }
+
+        var squashFs = DetectSquashFs(boot);
+        if (!string.IsNullOrEmpty(squashFs))
+        {
+            return squashFs;
+        }
+
+        var fat = DetectFat(boot, partition.LengthBytes);
+        if (!string.IsNullOrEmpty(fat))
+        {
+            return fat;
+        }
+
+        if (partition.LengthBytes > 2048)
+        {
+            var super = EndianUtilities.ReadBytes(slice, 1024, 1024);
+            cancellationToken.ThrowIfCancellationRequested();
+            if (EndianUtilities.ReadUInt16Little(super, 0x38) == 0xef53)
+            {
+                var incompat = EndianUtilities.ReadUInt32Little(super, 0x60);
+                return (incompat & 0x40) != 0 ? "ext4" : "ext2/ext3";
+            }
+        }
+
+        var blockLayer = DetectBlockLayer(slice, cancellationToken);
+        if (!string.IsNullOrWhiteSpace(blockLayer))
+        {
+            return blockLayer;
+        }
+
+        return "";
+    }
+
+    private static string DetectFat(byte[] boot, long partitionLengthBytes)
+    {
+        var fat32 = EndianUtilities.ReadAscii(boot, 82, 8);
+        var fat16 = EndianUtilities.ReadAscii(boot, 54, 8);
+        var labelFat32 = fat32.StartsWith("FAT32", StringComparison.OrdinalIgnoreCase);
+        var labelFat16 = fat16.StartsWith("FAT16", StringComparison.OrdinalIgnoreCase);
+        var labelFat12 = fat16.StartsWith("FAT12", StringComparison.OrdinalIgnoreCase);
+        if (!labelFat32 && !labelFat16 && !labelFat12)
+        {
+            return "";
+        }
+
+        if (!TryCalculateFatBits(boot, partitionLengthBytes, out var fatBits))
+        {
+            return "";
+        }
+
+        return fatBits switch
+        {
+            32 when labelFat32 => "FAT32",
+            16 when labelFat16 => "FAT16",
+            12 when labelFat12 => "FAT12 (検出のみ)",
+            _ => ""
+        };
+    }
+
+    private static bool TryCalculateFatBits(byte[] boot, long partitionLengthBytes, out int fatBits)
+    {
+        fatBits = 0;
+        if (boot[510] != 0x55 || boot[511] != 0xaa)
+        {
+            return false;
+        }
+
+        var bytesPerSector = EndianUtilities.ReadUInt16Little(boot, 11);
+        var sectorsPerCluster = boot[13];
+        var reservedSectors = EndianUtilities.ReadUInt16Little(boot, 14);
+        var fatCount = boot[16];
+        var rootEntryCount = EndianUtilities.ReadUInt16Little(boot, 17);
+        var total16 = EndianUtilities.ReadUInt16Little(boot, 19);
+        var totalSectors = total16 != 0 ? total16 : EndianUtilities.ReadUInt32Little(boot, 32);
+        var fat16 = EndianUtilities.ReadUInt16Little(boot, 22);
+        var fatSizeSectors = fat16 != 0 ? fat16 : EndianUtilities.ReadUInt32Little(boot, 36);
+
+        if (!IsPowerOfTwo(bytesPerSector) || bytesPerSector < 512 || bytesPerSector > 4096)
+        {
+            return false;
+        }
+
+        if (!IsPowerOfTwo(sectorsPerCluster) || sectorsPerCluster > 128)
+        {
+            return false;
+        }
+
+        if (reservedSectors == 0 || fatCount == 0 || fatCount > 4 || totalSectors == 0 || fatSizeSectors == 0)
+        {
+            return false;
+        }
+
+        var partitionSectors = (ulong)partitionLengthBytes / bytesPerSector;
+        if (partitionSectors != 0 && totalSectors > partitionSectors)
+        {
+            return false;
+        }
+
+        var rootDirSectors = ((ulong)rootEntryCount * 32 + (uint)bytesPerSector - 1) / bytesPerSector;
+        var firstDataSector = (ulong)reservedSectors + (ulong)fatCount * fatSizeSectors + rootDirSectors;
+        if (firstDataSector >= totalSectors)
+        {
+            return false;
+        }
+
+        var dataSectors = totalSectors - firstDataSector;
+        var clusterCount = dataSectors / sectorsPerCluster;
+        fatBits = clusterCount < 4085 ? 12 : clusterCount < 65525 ? 16 : 32;
+        return fatBits switch
+        {
+            32 => rootEntryCount == 0,
+            16 or 12 => rootEntryCount > 0,
+            _ => false
+        };
+    }
+
+    private static bool IsPowerOfTwo(int value)
+    {
+        return value > 0 && (value & (value - 1)) == 0;
+    }
+
+    private static string DetectSquashFs(byte[] boot)
+    {
+        if (EndianUtilities.ReadUInt32Little(boot, 0) != 0x73717368)
+        {
+            return "";
+        }
+
+        var compression = boot.Length >= 22
+            ? EndianUtilities.ReadUInt16Little(boot, 20) switch
+            {
+                1 => "gzip",
+                2 => "lzma",
+                3 => "lzo",
+                4 => "xz",
+                5 => "lz4",
+                6 => "zstd",
+                _ => "unknown"
+            }
+            : "unknown";
+
+        return $"SquashFS ({compression}, 検出のみ)";
+    }
+
+    private static string DetectBlockLayer(IBlockReader reader, CancellationToken cancellationToken)
+    {
+        if (reader.Length >= 2048)
+        {
+            for (var sector = 0; sector < 4; sector++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var label = EndianUtilities.ReadBytes(reader, sector * 512L, 512);
+                if (EndianUtilities.ReadAscii(label, 0, 8) == "LABELONE"
+                    && EndianUtilities.ReadAscii(label, 24, 8).StartsWith("LVM2", StringComparison.Ordinal))
+                {
+                    return "LVM2 PV (検出のみ)";
+                }
+            }
+        }
+
+        if (reader.Length >= 8192)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (HasMdMagic(reader, 0) || HasMdMagic(reader, 4096) || HasMdMagic(reader, Math.Max(0, reader.Length - 4096)))
+            {
+                return "Linux md RAID (検出のみ)";
+            }
+        }
+
+        return "";
+    }
+
+    private static bool HasMdMagic(IBlockReader reader, long offset)
+    {
+        if (offset < 0 || offset + 4 > reader.Length)
+        {
+            return false;
+        }
+
+        var buffer = EndianUtilities.ReadBytes(reader, offset, 4);
+        return EndianUtilities.ReadUInt32Little(buffer, 0) == 0xa92b4efc;
+    }
+
+    public static IReadOnlyFileSystem? TryOpen(
+        IBlockReader disk,
+        PartitionInfo partition,
+        out string error,
+        CancellationToken cancellationToken = default)
+    {
+        return TryOpenCore(
+            disk,
+            partition,
+            ReadOnlySpan<byte>.Empty,
+            ReadOnlySpan<char>.Empty,
+            null,
+            ReadOnlySpan<char>.Empty,
+            out error,
+            cancellationToken);
+    }
+
+    public static IReadOnlyFileSystem? TryOpen(
+        IBlockReader disk,
+        PartitionInfo partition,
+        ReadOnlySpan<byte> recoveryPasswordKey,
+        out string error,
+        CancellationToken cancellationToken = default)
+    {
+        return TryOpenCore(
+            disk,
+            partition,
+            recoveryPasswordKey,
+            ReadOnlySpan<char>.Empty,
+            null,
+            ReadOnlySpan<char>.Empty,
+            out error,
+            cancellationToken);
+    }
+
+    public static IReadOnlyFileSystem? TryOpenWithBitLockerPassword(
+        IBlockReader disk,
+        PartitionInfo partition,
+        ReadOnlySpan<char> password,
+        out string error,
+        CancellationToken cancellationToken = default)
+    {
+        return TryOpenCore(
+            disk,
+            partition,
+            ReadOnlySpan<byte>.Empty,
+            password,
+            null,
+            ReadOnlySpan<char>.Empty,
+            out error,
+            cancellationToken);
+    }
+
+    public static IReadOnlyFileSystem? TryOpenWithBitLockerStartupKey(
+        IBlockReader disk,
+        PartitionInfo partition,
+        BitLockerStartupKey startupKey,
+        out string error,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(startupKey);
+        return TryOpenCore(
+            disk,
+            partition,
+            ReadOnlySpan<byte>.Empty,
+            ReadOnlySpan<char>.Empty,
+            startupKey,
+            ReadOnlySpan<char>.Empty,
+            out error,
+            cancellationToken);
+    }
+
+    public static IReadOnlyFileSystem? TryOpenWithLuksPassphrase(
+        IBlockReader disk,
+        PartitionInfo partition,
+        ReadOnlySpan<char> passphrase,
+        out string error,
+        CancellationToken cancellationToken = default)
+    {
+        return TryOpenCore(
+            disk,
+            partition,
+            ReadOnlySpan<byte>.Empty,
+            ReadOnlySpan<char>.Empty,
+            null,
+            passphrase,
+            out error,
+            cancellationToken);
+    }
+
+    private static IReadOnlyFileSystem? TryOpenCore(
+        IBlockReader disk,
+        PartitionInfo partition,
+        ReadOnlySpan<byte> recoveryPasswordKey,
+        ReadOnlySpan<char> password,
+        BitLockerStartupKey? startupKey,
+        ReadOnlySpan<char> luksPassphrase,
+        out string error,
+        CancellationToken cancellationToken = default)
+    {
+        error = "";
+        try
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var detected = string.IsNullOrWhiteSpace(partition.FileSystem)
+                ? Detect(disk, partition, cancellationToken)
+                : partition.FileSystem;
+            partition.FileSystem = detected;
+            var slice = new PartitionSliceReader(disk, partition);
+
+            var fileSystem = OpenSupportedFileSystem(disk, partition, detected, cancellationToken);
+            if (fileSystem is not null)
+            {
+                return fileSystem;
+            }
+
+            if (detected.StartsWith("BitLocker/FVE", StringComparison.OrdinalIgnoreCase))
+            {
+                if (BitLockerMetadataReader.TryRead(slice, out var metadata, out var metadataError) && metadata is not null)
+                {
+                    var unlocked = BitLockerUnlock.TryCreateReaderWithClearKey(
+                        slice,
+                        metadata,
+                        out var decryptedReader,
+                        out var unlockError);
+                    if (!unlocked && recoveryPasswordKey.Length > 0)
+                    {
+                        unlocked = BitLockerUnlock.TryCreateReaderWithRecoveryKey(
+                            slice,
+                            metadata,
+                            recoveryPasswordKey,
+                            out decryptedReader,
+                            out unlockError,
+                            cancellationToken);
+                    }
+
+                    if (!unlocked && !password.IsEmpty)
+                    {
+                        unlocked = BitLockerUnlock.TryCreateReaderWithPassword(
+                            slice,
+                            metadata,
+                            password,
+                            out decryptedReader,
+                            out unlockError,
+                            cancellationToken);
+                    }
+
+                    if (!unlocked && startupKey is not null)
+                    {
+                        unlocked = BitLockerUnlock.TryCreateReaderWithStartupKey(
+                            slice,
+                            metadata,
+                            startupKey,
+                            out decryptedReader,
+                            out unlockError);
+                    }
+
+                    if (unlocked && decryptedReader is not null)
+                    {
+                        var ownershipTransferred = false;
+                        try
+                        {
+                            var innerPartition = new PartitionInfo
+                            {
+                                Number = partition.Number,
+                                Scheme = "BitLocker",
+                                Name = partition.Name,
+                                Type = partition.Type,
+                                TypeId = partition.TypeId,
+                                StartLba = 0,
+                                SectorCount = checked((ulong)(decryptedReader.Length / 512)),
+                                ReaderOverride = decryptedReader,
+                                LengthOverrideBytes = decryptedReader.Length
+                            };
+                            innerPartition.FileSystem = Detect(decryptedReader, innerPartition, cancellationToken);
+                            var innerFileSystem = OpenSupportedFileSystem(
+                                decryptedReader,
+                                innerPartition,
+                                innerPartition.FileSystem,
+                                cancellationToken);
+                            if (innerFileSystem is not null)
+                            {
+                                partition.FileSystem = $"BitLocker/FVE -> {innerPartition.FileSystem}";
+                                var bitLockerFileSystem = new BitLockerFileSystem(
+                                    innerFileSystem,
+                                    decryptedReader,
+                                    partition,
+                                    innerPartition);
+                                ownershipTransferred = true;
+                                return bitLockerFileSystem;
+                            }
+
+                            error = $"BitLocker/FVE の解除は成功しましたが、内部ファイルシステムを開けませんでした: {innerPartition.FileSystem}";
+                            return null;
+                        }
+                        finally
+                        {
+                            if (!ownershipTransferred && decryptedReader is IDisposable disposable)
+                            {
+                                disposable.Dispose();
+                            }
+                        }
+                    }
+
+                    error = string.Join(Environment.NewLine, new[]
+                    {
+                        "BitLocker/FVE ボリュームです。",
+                        $"暗号方式: {metadata.EncryptionMethodName}",
+                        $"キー保護子: {string.Join(", ", metadata.KeyProtectors.Select(p => p.ProtectionName).Distinct())}",
+                        string.IsNullOrWhiteSpace(unlockError) ? "" : $"復号試行: {unlockError}",
+                        BitLockerUnlock.GetUnlockStatus(metadata)
+                    }.Where(s => !string.IsNullOrWhiteSpace(s)));
+                    return null;
+                }
+
+                error = $"BitLocker/FVE ボリュームですが、メタデータを読めませんでした: {metadataError}";
+                return null;
+            }
+
+            if (string.Equals(detected, "LUKS1", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!Luks1MetadataReader.TryRead(slice, out var metadata, out var metadataError) || metadata is null)
+                {
+                    error = $"LUKS1ボリュームですが、ヘッダーを読めませんでした: {metadataError}";
+                    return null;
+                }
+
+                if (luksPassphrase.IsEmpty)
+                {
+                    error = string.Join(Environment.NewLine, new[]
+                    {
+                        "LUKS1暗号化ボリュームです。",
+                        $"暗号方式: {metadata.CipherName}-{metadata.CipherMode}",
+                        $"ハッシュ: {metadata.HashSpec}",
+                        $"有効key slot: {string.Join(", ", metadata.ActiveKeySlots.Select(slot => slot.Index))}",
+                        "パスフレーズを入力して解除できます。"
+                    });
+                    return null;
+                }
+
+                if (!Luks1Unlock.TryCreateReader(
+                    slice,
+                    metadata,
+                    luksPassphrase,
+                    out var decryptedReader,
+                    out var unlockError,
+                    cancellationToken)
+                    || decryptedReader is null)
+                {
+                    error = unlockError;
+                    return null;
+                }
+
+                var ownershipTransferred = false;
+                try
+                {
+                    var innerPartition = new PartitionInfo
+                    {
+                        Number = partition.Number,
+                        Scheme = "LUKS1",
+                        Name = partition.Name,
+                        Type = partition.Type,
+                        TypeId = partition.TypeId,
+                        StartLba = 0,
+                        SectorCount = checked((ulong)(decryptedReader.Length / 512)),
+                        ReaderOverride = decryptedReader,
+                        LengthOverrideBytes = decryptedReader.Length
+                    };
+                    innerPartition.FileSystem = Detect(decryptedReader, innerPartition, cancellationToken);
+                    var innerFileSystem = OpenSupportedFileSystem(
+                        decryptedReader,
+                        innerPartition,
+                        innerPartition.FileSystem,
+                        cancellationToken);
+                    if (innerFileSystem is null)
+                    {
+                        error = $"LUKS1の解除は成功しましたが、内部ファイルシステムを開けませんでした: {innerPartition.FileSystem}";
+                        return null;
+                    }
+
+                    partition.FileSystem = $"LUKS1 -> {innerPartition.FileSystem}";
+                    var luksFileSystem = new Luks1FileSystem(
+                        innerFileSystem,
+                        decryptedReader,
+                        partition,
+                        innerPartition);
+                    ownershipTransferred = true;
+                    return luksFileSystem;
+                }
+                finally
+                {
+                    if (!ownershipTransferred && decryptedReader is IDisposable disposable)
+                    {
+                        disposable.Dispose();
+                    }
+                }
+            }
+
+            if (string.Equals(detected, "LUKS2", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!Luks2MetadataReader.TryRead(slice, out var metadata, out var metadataError) || metadata is null)
+                {
+                    error = $"LUKS2ボリュームですが、ヘッダーを読めませんでした: {metadataError}";
+                    return null;
+                }
+
+                if (luksPassphrase.IsEmpty)
+                {
+                    error = string.Join(Environment.NewLine, new[]
+                    {
+                        "LUKS2暗号化ボリュームです。",
+                        $"暗号方式: {metadata.Segment.Encryption}",
+                        $"KDF: {string.Join(", ", metadata.SupportedKeySlots.Select(slot => $"{slot.Index}={slot.KdfType}"))}",
+                        $"対応keyslot: {string.Join(", ", metadata.SupportedKeySlots.Select(slot => slot.Index))}",
+                        metadata.UnsupportedKeySlots.Count == 0
+                            ? ""
+                            : $"未対応keyslot: {string.Join(", ", metadata.UnsupportedKeySlots.Select(slot => $"{slot.Index} ({slot.UnsupportedReason})"))}",
+                        metadata.SupportedKeySlots.Count == 0
+                            ? "このボリュームにはPBKDF2対応keyslotがありません。"
+                            : "パスフレーズを入力して解除できます。"
+                    }.Where(s => !string.IsNullOrWhiteSpace(s)));
+                    return null;
+                }
+
+                if (!Luks2Unlock.TryCreateReader(
+                    slice,
+                    metadata,
+                    luksPassphrase,
+                    out var decryptedReader,
+                    out var unlockError,
+                    cancellationToken)
+                    || decryptedReader is null)
+                {
+                    error = unlockError;
+                    return null;
+                }
+
+                var ownershipTransferred = false;
+                try
+                {
+                    var innerPartition = new PartitionInfo
+                    {
+                        Number = partition.Number,
+                        Scheme = "LUKS2",
+                        Name = partition.Name,
+                        Type = partition.Type,
+                        TypeId = partition.TypeId,
+                        StartLba = 0,
+                        SectorCount = checked((ulong)(decryptedReader.Length / 512)),
+                        ReaderOverride = decryptedReader,
+                        LengthOverrideBytes = decryptedReader.Length
+                    };
+                    innerPartition.FileSystem = Detect(decryptedReader, innerPartition, cancellationToken);
+                    var innerFileSystem = OpenSupportedFileSystem(
+                        decryptedReader,
+                        innerPartition,
+                        innerPartition.FileSystem,
+                        cancellationToken);
+                    if (innerFileSystem is null)
+                    {
+                        error = $"LUKS2の解除は成功しましたが、内部ファイルシステムを開けませんでした: {innerPartition.FileSystem}";
+                        return null;
+                    }
+
+                    partition.FileSystem = $"LUKS2 -> {innerPartition.FileSystem}";
+                    var luksFileSystem = new Luks2FileSystem(
+                        innerFileSystem,
+                        decryptedReader,
+                        partition,
+                        innerPartition);
+                    ownershipTransferred = true;
+                    return luksFileSystem;
+                }
+                finally
+                {
+                    if (!ownershipTransferred && decryptedReader is IDisposable disposable)
+                    {
+                        disposable.Dispose();
+                    }
+                }
+            }
+
+            error = string.IsNullOrWhiteSpace(detected)
+                ? "対応ファイルシステムを検出できませんでした。"
+                : $"{detected} は検出のみで、ファイル一覧表示は未対応です。";
+            return null;
+        }
+        catch (Exception ex) when (ex is IOException or InvalidDataException or NotSupportedException
+            or ArgumentOutOfRangeException or OverflowException or CryptographicException)
+        {
+            error = ex.Message;
+            return null;
+        }
+    }
+
+    private static IReadOnlyFileSystem? OpenSupportedFileSystem(
+        IBlockReader disk,
+        PartitionInfo partition,
+        string detected,
+        CancellationToken cancellationToken)
+    {
+        var slice = new PartitionSliceReader(disk, partition);
+
+        if (detected is "FAT32" or "FAT16")
+        {
+            return new FatFileSystem(slice, partition);
+        }
+
+        if (detected == "NTFS")
+        {
+            try
+            {
+                return new DiscUtilsFileSystem(slice, partition, stream =>
+                {
+                    var ntfs = new DiscNtfsFileSystem(stream);
+                    ntfs.NtfsOptions.HideHiddenFiles = false;
+                    ntfs.NtfsOptions.HideSystemFiles = false;
+                    ntfs.NtfsOptions.HideMetafiles = false;
+                    return ntfs;
+                }, "NTFS");
+            }
+            catch
+            {
+                return new NtfsFileSystem(slice, partition);
+            }
+        }
+
+        if (detected == "exFAT")
+        {
+            return new DiscUtilsFileSystem(slice, partition, stream => new DiscExFatFileSystem(stream, ['\\', '/']), "exFAT");
+        }
+
+        if (detected is "ext4" or "ext2/ext3")
+        {
+            return new ExtFileSystem(slice, partition);
+        }
+
+        if (detected.StartsWith("SquashFS", StringComparison.OrdinalIgnoreCase))
+        {
+            return new SquashFileSystem(slice, partition);
+        }
+
+        if (detected == "XFS")
+        {
+            return new XfsFileSystem(slice, partition);
+        }
+
+        if (detected == "Btrfs")
+        {
+            return new BtrfsFileSystem(slice, partition, cancellationToken);
+        }
+
+        return null;
+    }
+}

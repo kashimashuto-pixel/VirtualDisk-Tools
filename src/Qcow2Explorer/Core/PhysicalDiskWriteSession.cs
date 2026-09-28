@@ -1,5 +1,7 @@
+using System.Buffers;
 using System.Buffers.Binary;
 using System.ComponentModel;
+using System.Management;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
@@ -51,6 +53,11 @@ internal sealed class PhysicalDiskWriteSession : IDiskImageReader, IBlockDevice
     private const int ErrorNoMoreFiles = 18;
     private const int ErrorMoreData = 234;
     private const int ErrorAccessDenied = 5;
+    private const uint DriveRemovable = 2;
+    private const uint DriveFixed = 3;
+    private const uint DriveRemote = 4;
+    private const uint DriveCdRom = 5;
+    private const uint DriveRamDisk = 6;
     private const uint StorageDeviceIdProperty = 2;
     private const uint StorageDeviceUniqueIdProperty = 3;
 
@@ -100,11 +107,12 @@ internal sealed class PhysicalDiskWriteSession : IDiskImageReader, IBlockDevice
         }
 
         var normalizedPath = NormalizeDiskPath(devicePath, out var diskNumber);
-        using var handle = OpenDevice(normalizedPath, 0, writeThrough: false, "情報取得");
+        using var handle = OpenDevice(normalizedPath, GenericRead, writeThrough: false, "情報取得");
         var length = GetLength(handle);
         var sectorSize = GetSectorSize(handle);
         var descriptor = GetStorageDescriptor(handle);
         var hotplug = GetHotplugInfo(handle);
+        var identity = ResolveStorageIdentity(diskNumber, descriptor, GetStorageIdentityToken(handle));
         var isRemovable = descriptor.RemovableMedia || hotplug.MediaRemovable || hotplug.DeviceHotplug;
         return new PhysicalDiskTargetInfo(
             diskNumber,
@@ -113,10 +121,10 @@ internal sealed class PhysicalDiskWriteSession : IDiskImageReader, IBlockDevice
             checked((uint)sectorSize),
             isRemovable,
             IsSystemDisk(diskNumber),
-            descriptor.Model,
-            descriptor.SerialNumber,
-            descriptor.BusType,
-            GetStorageIdentityToken(handle));
+            identity.Model,
+            identity.SerialNumber,
+            identity.BusType,
+            identity.IdentityToken);
     }
 
     public static PhysicalDiskWriteSession Open(PhysicalDiskTargetInfo expectedTarget)
@@ -190,7 +198,11 @@ internal sealed class PhysicalDiskWriteSession : IDiskImageReader, IBlockDevice
             throw new Win32Exception(Marshal.GetLastWin32Error(), "復旧ジャーナルの保存先デバイスを特定できませんでした。");
         }
 
-        using var handle = OpenDevice(volumeName.ToString().TrimEnd('\\'), 0, writeThrough: false, "保存先確認");
+        using var handle = OpenDevice(
+            volumeName.ToString().TrimEnd('\\'),
+            GenericRead,
+            writeThrough: false,
+            "保存先確認");
         return GetVolumeDiskNumbers(handle).Contains(diskNumber);
     }
 
@@ -198,12 +210,43 @@ internal sealed class PhysicalDiskWriteSession : IDiskImageReader, IBlockDevice
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         ValidateRange(offset, buffer, bufferOffset, count);
+        if (count == 0)
+        {
+            return;
+        }
+
+        var sectorSize = checked((int)Target.LogicalSectorSize);
+        var alignedOffset = offset / sectorSize * sectorSize;
+        var alignedEnd = Math.Min(Length, RoundUp(checked(offset + count), sectorSize));
+        var alignedLength = checked((int)(alignedEnd - alignedOffset));
+        if (alignedOffset == offset && alignedLength == count)
+        {
+            ReadExact(alignedOffset, buffer.AsSpan(bufferOffset, count));
+            return;
+        }
+
+        var rented = ArrayPool<byte>.Shared.Rent(alignedLength);
+        try
+        {
+            var aligned = rented.AsSpan(0, alignedLength);
+            ReadExact(alignedOffset, aligned);
+            aligned.Slice(checked((int)(offset - alignedOffset)), count)
+                .CopyTo(buffer.AsSpan(bufferOffset, count));
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(rented);
+        }
+    }
+
+    private void ReadExact(long offset, Span<byte> destination)
+    {
         var total = 0;
-        while (total < count)
+        while (total < destination.Length)
         {
             var read = RandomAccess.Read(
                 _diskHandle,
-                buffer.AsSpan(bufferOffset + total, count - total),
+                destination[total..],
                 offset + total);
             if (read == 0)
             {
@@ -264,15 +307,19 @@ internal sealed class PhysicalDiskWriteSession : IDiskImageReader, IBlockDevice
     {
         var descriptor = GetStorageDescriptor(handle);
         var hotplug = GetHotplugInfo(handle);
+        var identity = ResolveStorageIdentity(
+            knownTarget.DiskNumber,
+            descriptor,
+            GetStorageIdentityToken(handle));
         return knownTarget with
         {
             Length = GetLength(handle),
             LogicalSectorSize = checked((uint)GetSectorSize(handle)),
             IsRemovable = descriptor.RemovableMedia || hotplug.MediaRemovable || hotplug.DeviceHotplug,
-            Model = descriptor.Model,
-            SerialNumber = descriptor.SerialNumber,
-            BusType = descriptor.BusType,
-            IdentityToken = GetStorageIdentityToken(handle),
+            Model = identity.Model,
+            SerialNumber = identity.SerialNumber,
+            BusType = identity.BusType,
+            IdentityToken = identity.IdentityToken,
         };
     }
 
@@ -303,8 +350,36 @@ internal sealed class PhysicalDiskWriteSession : IDiskImageReader, IBlockDevice
         {
             foreach (var volumePath in EnumerateVolumePaths())
             {
-                using var queryHandle = OpenDevice(volumePath, 0, writeThrough: false, "ボリューム確認");
-                if (!GetVolumeDiskNumbers(queryHandle).Contains(diskNumber))
+                var driveType = GetDriveTypeW(volumePath + "\\");
+                if (driveType is not DriveRemovable and not DriveFixed)
+                {
+                    if (driveType is DriveRemote or DriveCdRom or DriveRamDisk)
+                    {
+                        continue;
+                    }
+
+                    throw new IOException(
+                        $"ボリューム種別を安全に判定できませんでした: {volumePath} (driveType={driveType})");
+                }
+
+                bool belongsToTarget;
+                try
+                {
+                    using var queryHandle = OpenDevice(
+                        volumePath,
+                        GenericRead,
+                        writeThrough: false,
+                        "ボリューム確認");
+                    belongsToTarget = GetVolumeDiskNumbers(queryHandle).Contains(diskNumber);
+                }
+                catch (Win32Exception ex)
+                {
+                    throw new Win32Exception(
+                        ex.NativeErrorCode,
+                        $"ボリュームの所属ディスクを確認できませんでした: {volumePath}");
+                }
+
+                if (!belongsToTarget)
                 {
                     continue;
                 }
@@ -392,7 +467,11 @@ internal sealed class PhysicalDiskWriteSession : IDiskImageReader, IBlockDevice
         }
 
         var systemVolumePath = $@"\\.\{root[..2]}";
-        using var handle = OpenDevice(systemVolumePath, 0, writeThrough: false, "システムボリューム確認");
+        using var handle = OpenDevice(
+            systemVolumePath,
+            GenericRead,
+            writeThrough: false,
+            "システムボリューム確認");
         return GetVolumeDiskNumbers(handle).Contains(diskNumber);
     }
 
@@ -627,6 +706,75 @@ internal sealed class PhysicalDiskWriteSession : IDiskImageReader, IBlockDevice
         return string.Empty;
     }
 
+    private static ResolvedStorageIdentity ResolveStorageIdentity(
+        int diskNumber,
+        StorageDescriptor descriptor,
+        string directIdentityToken)
+    {
+        var fallback = GetManagementStorageIdentity(diskNumber);
+        return new ResolvedStorageIdentity(
+            string.IsNullOrWhiteSpace(descriptor.Model) ? fallback.Model : descriptor.Model,
+            string.IsNullOrWhiteSpace(descriptor.SerialNumber) ? fallback.SerialNumber : descriptor.SerialNumber,
+            IsUnknownBusType(descriptor.BusType) ? fallback.BusType : descriptor.BusType,
+            string.IsNullOrWhiteSpace(directIdentityToken) ? fallback.IdentityToken : directIdentityToken);
+    }
+
+    private static ResolvedStorageIdentity GetManagementStorageIdentity(int diskNumber)
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return new ResolvedStorageIdentity(string.Empty, string.Empty, string.Empty, string.Empty);
+        }
+
+        try
+        {
+            using var searcher = new ManagementObjectSearcher(
+                "root\\CIMV2",
+                $"SELECT Model, SerialNumber, InterfaceType, PNPDeviceID FROM Win32_DiskDrive WHERE Index = {diskNumber}");
+            using var results = searcher.Get();
+            var disk = results.Cast<ManagementObject>().SingleOrDefault();
+            if (disk is null)
+            {
+                return new ResolvedStorageIdentity(string.Empty, string.Empty, string.Empty, string.Empty);
+            }
+
+            using (disk)
+            {
+                var model = ReadManagementString(disk, "Model");
+                var serial = ReadManagementString(disk, "SerialNumber");
+                var busType = ReadManagementString(disk, "InterfaceType");
+                var pnpDeviceId = ReadManagementString(disk, "PNPDeviceID");
+                var identityToken = string.IsNullOrWhiteSpace(serial) || string.IsNullOrWhiteSpace(pnpDeviceId)
+                    ? string.Empty
+                    : Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(
+                        $"Win32_DiskDrive\0{serial}\0{pnpDeviceId}")));
+                return new ResolvedStorageIdentity(model, serial, busType, identityToken);
+            }
+        }
+        catch (Exception ex) when (ex is ManagementException
+                                   or COMException
+                                   or UnauthorizedAccessException
+                                   or InvalidOperationException)
+        {
+            return new ResolvedStorageIdentity(string.Empty, string.Empty, string.Empty, string.Empty);
+        }
+    }
+
+    private static long RoundUp(long value, int alignment)
+    {
+        var remainder = value % alignment;
+        return remainder == 0 ? value : checked(value + alignment - remainder);
+    }
+
+    private static string ReadManagementString(ManagementObject disk, string propertyName) =>
+        Convert.ToString(disk[propertyName], System.Globalization.CultureInfo.InvariantCulture)?.Trim()
+        ?? string.Empty;
+
+    private static bool IsUnknownBusType(string busType) =>
+        string.IsNullOrWhiteSpace(busType)
+        || string.Equals(busType, "Unknown", StringComparison.OrdinalIgnoreCase)
+        || busType.StartsWith("BusType ", StringComparison.OrdinalIgnoreCase);
+
     private static string ReadDescriptorString(byte[] data, int length, uint offset)
     {
         if (offset == 0 || offset >= length)
@@ -654,6 +802,9 @@ internal sealed class PhysicalDiskWriteSession : IDiskImageReader, IBlockDevice
         11 => "SATA",
         12 => "SD",
         13 => "MMC",
+        14 => "Virtual",
+        15 => "File Backed Virtual",
+        16 => "Storage Spaces",
         17 => "NVMe",
         18 => "SCM",
         19 => "UFS",
@@ -685,6 +836,11 @@ internal sealed class PhysicalDiskWriteSession : IDiskImageReader, IBlockDevice
         string SerialNumber,
         string BusType,
         bool RemovableMedia);
+    private readonly record struct ResolvedStorageIdentity(
+        string Model,
+        string SerialNumber,
+        string BusType,
+        string IdentityToken);
     private readonly record struct HotplugInfo(bool MediaRemovable, bool MediaHotplug, bool DeviceHotplug);
 
     [StructLayout(LayoutKind.Sequential)]
@@ -794,4 +950,7 @@ internal sealed class PhysicalDiskWriteSession : IDiskImageReader, IBlockDevice
         string volumeMountPoint,
         StringBuilder volumeName,
         int bufferLength);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern uint GetDriveTypeW(string rootPathName);
 }
