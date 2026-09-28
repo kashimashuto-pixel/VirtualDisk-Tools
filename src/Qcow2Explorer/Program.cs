@@ -1,4 +1,5 @@
 using Qcow2Explorer.Core;
+using Qcow2Explorer.Shell;
 
 namespace Qcow2Explorer;
 
@@ -13,6 +14,28 @@ static class Program
         // To customize application configuration such as set high DPI settings or default font,
         // see https://aka.ms/applicationconfiguration.
         ApplicationConfiguration.Initialize();
+
+        if (args.Length > 0
+            && string.Equals(args[0], FileAssociationManager.ApplyMachineArgument, StringComparison.Ordinal))
+        {
+            try
+            {
+                FileAssociationManager.Apply(FileAssociationScope.AllUsers, args.Skip(1));
+                Environment.ExitCode = 0;
+            }
+            catch (Exception ex)
+            {
+                Environment.ExitCode = 1;
+                MessageBox.Show(
+                    ex.Message,
+                    "全ユーザー向けファイル関連付け",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
+            }
+
+            return;
+        }
+
         DiagnosticLog.Initialize();
         DiagnosticLog.Write($"Application started: build=xfs-extent-read-context-1, baseDirectory={AppContext.BaseDirectory}");
         new DiagnosticLogForm().Show();

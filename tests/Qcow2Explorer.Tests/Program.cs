@@ -15,6 +15,7 @@ using Qcow2Explorer.Mounting;
 using Qcow2Explorer.Partitions;
 using Qcow2Explorer.Previewing;
 using Qcow2Explorer.Platform.Windows;
+using Qcow2Explorer.Shell;
 using DiscUtils.Streams;
 using DiscXfsFileSystem = DiscUtils.Xfs.XfsFileSystem;
 using VdiDisk = DiscUtils.Vdi.Disk;
@@ -457,6 +458,7 @@ static void RunGeneratedImageTests()
     TestVirtualDiskCreationPrimitives();
     TestVirtualDiskCreationDialog();
     TestMainMenuStructure();
+    TestFileAssociationDefinitions();
     TestFileSystemExporterUnexpectedEofDiagnostics();
     TestPendingEditContentStore();
     TestPendingEditSequenceValidation();
@@ -4051,6 +4053,7 @@ static void TestMainMenuStructure()
                 .ToArray();
             Assert(fileItems.Any(text => text.StartsWith("新規作成", StringComparison.Ordinal)), "main menu new item");
             Assert(fileItems.Any(text => text.StartsWith("開く", StringComparison.Ordinal)), "main menu open item");
+            Assert(fileItems.Any(text => text.StartsWith("ファイルの関連付け", StringComparison.Ordinal)), "main menu file association item");
             Assert(fileItems.Any(text => text.StartsWith("終了", StringComparison.Ordinal)), "main menu exit item");
             Assert(
                 editMenu.DropDownItems.OfType<ToolStripMenuItem>()
@@ -4088,6 +4091,35 @@ static void TestMainMenuStructure()
                 yield return nested;
             }
         }
+    }
+}
+
+static void TestFileAssociationDefinitions()
+{
+    var definitions = FileAssociationManager.SupportedExtensions;
+    Assert(definitions.Count > 0, "file association definitions are available");
+    Assert(
+        definitions.All(item => item.Extension.StartsWith('.') && item.Extension.Length > 1),
+        "file association extensions are valid");
+    Assert(
+        definitions.Select(item => item.Extension).Distinct(StringComparer.OrdinalIgnoreCase).Count() == definitions.Count,
+        "file association extensions are unique");
+    Assert(
+        definitions.All(item => DiskImageReaderFactory.DialogFilter.Contains(
+            $"*{item.Extension}",
+            StringComparison.OrdinalIgnoreCase)),
+        "file association extensions are present in the open dialog");
+
+    var normalized = FileAssociationManager.NormalizeExtensions([".VHDX", ".qcow2", ".vhdx"]);
+    Assert(normalized.SequenceEqual([".qcow2", ".vhdx"]), "file association normalization and ordering");
+
+    try
+    {
+        _ = FileAssociationManager.NormalizeExtensions([".unsupported"]);
+        throw new InvalidOperationException("Test failed: unsupported file association extension was accepted");
+    }
+    catch (ArgumentException)
+    {
     }
 }
 
