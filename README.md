@@ -244,6 +244,10 @@ OS非依存のreader、filesystem、partition、作成処理は`VirtualDisk.Core
 
 Visual Studio で開く場合は `Qcow2Explorer.sln` を使ってください。
 
+## ライセンス
+
+このプロジェクトは[MIT License](LICENSE)で公開しています。
+
 ## Windowsファイル関連付け
 
 WinForms版の［ファイル］→［ファイルの関連付け...］から、Virtual Disk ExplorerをWindowsの「プログラムから開く」と既定アプリ候補へ登録できます。
