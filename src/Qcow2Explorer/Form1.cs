@@ -285,6 +285,8 @@ public partial class Form1 : Form
 
         var reportItem = new ToolStripMenuItem("解析レポートを保存...");
         reportItem.Click += (_, _) => SaveAnalysisReport();
+        var manageLzopCacheItem = new ToolStripMenuItem("LZOキャッシュを管理...");
+        manageLzopCacheItem.Click += (_, _) => ShowLzopCacheManager(LzopRawCacheManager.DefaultCacheRoot);
         var recoverPhysicalDiskItem = new ToolStripMenuItem("物理ディスクを復旧...");
         recoverPhysicalDiskItem.Click += async (_, _) => await RestorePhysicalDiskAsync();
         var exitItem = new ToolStripMenuItem("終了(&X)")
@@ -299,6 +301,7 @@ public partial class Form1 : Form
             imageSelectionMenu,
             new ToolStripSeparator(),
             reportItem,
+            manageLzopCacheItem,
             recoverPhysicalDiskItem,
             new ToolStripSeparator(),
             exitItem,
