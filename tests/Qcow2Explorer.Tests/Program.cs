@@ -5265,7 +5265,10 @@ static void TestGeneratedLzopExt4Image()
     var imagePath = Path.Combine(AppContext.BaseDirectory, "sample-ext4.dd.lzo");
     TestImageFactory.CreateExt4LzopDisk(imagePath);
     var indexCachePath = LzopIndexCacheManager.GetCachePath(imagePath);
-    File.Delete(indexCachePath);
+    if (File.Exists(indexCachePath))
+    {
+        File.Delete(indexCachePath);
+    }
 
     var progressEvents = new List<DiskImageProgress>();
     using var reader = DiskImageReaderFactory.Open(
