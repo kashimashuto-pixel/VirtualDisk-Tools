@@ -29,6 +29,8 @@ public sealed class ExtFileSystem : IReadOnlyFileSystem, IFileContentWriter, IFi
     private const ushort InodeBitmapUninitializedGroupFlag = 0x0001;
     private const ushort BlockBitmapUninitializedGroupFlag = 0x0002;
     private const int MaxDirectoryBytes = 64 * 1024 * 1024;
+    private const int MaxSymlinkBytes = 64 * 1024;
+    private const int MaxSymlinkDepth = 40;
 
     private readonly IBlockReader _reader;
     private readonly IBlockWriter? _writer;
@@ -123,7 +125,7 @@ public sealed class ExtFileSystem : IReadOnlyFileSystem, IFileContentWriter, IFi
 
     public IReadOnlyList<VfsNode> ListDirectory(VfsNode directory)
     {
-        if (!directory.IsDirectory || directory.Metadata is not uint inodeNumber)
+        if (!directory.IsDirectory || !TryGetReadableInodeNumber(directory.Metadata, out var inodeNumber))
         {
             return Array.Empty<VfsNode>();
         }
@@ -140,18 +142,33 @@ public sealed class ExtFileSystem : IReadOnlyFileSystem, IFileContentWriter, IFi
         }
 
         var data = ReadInodeData(inode, 0, checked((int)inode.Size));
-        return ParseDirectory(data, directory.VirtualPath);
+        return ParseDirectory(data, directory.VirtualPath, inode.Number);
     }
 
     public byte[] ReadFile(VfsNode file, long offset, int count)
     {
-        if (file.IsDirectory || file.Metadata is not uint inodeNumber)
+        if (file.IsDirectory
+            || !TryGetReadableInodeNumber(file.Metadata, out var inodeNumber)
+            || offset < 0
+            || count <= 0)
         {
             return Array.Empty<byte>();
         }
 
         var inode = ReadInode(inodeNumber);
-        if (offset < 0 || (ulong)offset >= inode.Size || count <= 0)
+        if (file.Metadata is ExtSymlinkReference { IsResolved: false })
+        {
+            var target = Encoding.UTF8.GetBytes(ReadSymlinkTarget(inode));
+            if (offset >= target.Length)
+            {
+                return Array.Empty<byte>();
+            }
+
+            var targetCount = Math.Min(count, target.Length - checked((int)offset));
+            return target.AsSpan(checked((int)offset), targetCount).ToArray();
+        }
+
+        if ((ulong)offset >= inode.Size)
         {
             return Array.Empty<byte>();
         }
@@ -889,15 +906,15 @@ public sealed class ExtFileSystem : IReadOnlyFileSystem, IFileContentWriter, IFi
         _writer!.Flush();
     }
 
-    private IReadOnlyList<VfsNode> ParseDirectory(byte[] data, string parentPath)
+    private IReadOnlyList<VfsNode> ParseDirectory(byte[] data, string parentPath, uint parentInodeNumber)
     {
         var nodes = new Dictionary<(uint Inode, string Name), VfsNode>();
         for (var blockOffset = 0; blockOffset < data.Length; blockOffset += _blockSize)
         {
             var blockLength = Math.Min(_blockSize, data.Length - blockOffset);
-            foreach (var node in ParseDirectoryBlock(data, blockOffset, blockLength, parentPath))
+            foreach (var node in ParseDirectoryBlock(data, blockOffset, blockLength, parentPath, parentInodeNumber))
             {
-                if (node.Metadata is uint inodeNumber)
+                if (TryGetDirectoryEntryInodeNumber(node.Metadata, out var inodeNumber))
                 {
                     nodes[(inodeNumber, node.Name)] = node;
                 }
@@ -914,7 +931,8 @@ public sealed class ExtFileSystem : IReadOnlyFileSystem, IFileContentWriter, IFi
         byte[] data,
         int blockOffset,
         int blockLength,
-        string parentPath)
+        string parentPath,
+        uint parentInodeNumber)
     {
         var offset = blockOffset;
         var blockEnd = blockOffset + blockLength;
@@ -945,22 +963,202 @@ public sealed class ExtFileSystem : IReadOnlyFileSystem, IFileContentWriter, IFi
                         continue;
                     }
 
-                    var isDirectory = fileType == 2 || inode.IsDirectory;
+                    var originalInode = inode;
+                    var isSymlink = fileType == 7 || inode.IsSymlink;
+                    var isResolved = false;
+                    if (isSymlink)
+                    {
+                        try
+                        {
+                            var target = ReadSymlinkTarget(inode);
+                            if (TryResolvePath(parentInodeNumber, target, 1, out var resolvedInode))
+                            {
+                                inode = resolvedInode;
+                                isResolved = true;
+                            }
+                        }
+                        catch (Exception ex) when (ex is IOException or InvalidDataException or NotSupportedException or OverflowException)
+                        {
+                            // Keep an unreadable or broken link visible and expose its target text when possible.
+                        }
+                    }
+
+                    var isDirectory = isResolved ? inode.IsDirectory : !isSymlink && (fileType == 2 || inode.IsDirectory);
+                    var attributes = ToFileAttributes(inode);
+                    if (isSymlink)
+                    {
+                        attributes |= FileAttributes.ReparsePoint;
+                    }
+
                     yield return new VfsNode
                     {
                         Name = name,
                         VirtualPath = parentPath.TrimEnd('\\') + "\\" + name,
                         IsDirectory = isDirectory,
-                        Size = isDirectory ? 0 : ToLongSize(inode.Size),
-                        ModifiedUtc = inode.ModifiedUtc,
-                        Attributes = ToFileAttributes(inode),
-                        Metadata = inodeNumber
+                        Size = isDirectory ? 0 : isSymlink && !isResolved
+                            ? ToLongSize(originalInode.Size)
+                            : ToLongSize(inode.Size),
+                        ModifiedUtc = originalInode.ModifiedUtc,
+                        Attributes = attributes,
+                        Metadata = isSymlink
+                            ? new ExtSymlinkReference(originalInode.Number, inode.Number, isResolved)
+                            : inodeNumber
                     };
                 }
             }
 
             offset += recLen;
         }
+    }
+
+    private bool TryResolvePath(uint baseDirectoryInodeNumber, string target, int depth, out ExtInode inode)
+    {
+        inode = null!;
+        if (depth > MaxSymlinkDepth || string.IsNullOrEmpty(target))
+        {
+            return false;
+        }
+
+        var parts = target.Replace('\\', '/').Split('/', StringSplitOptions.RemoveEmptyEntries);
+        var currentDirectoryNumber = target.StartsWith('/') ? 2U : baseDirectoryInodeNumber;
+        if (parts.Length == 0)
+        {
+            inode = ReadInode(currentDirectoryNumber);
+            return true;
+        }
+
+        for (var index = 0; index < parts.Length; index++)
+        {
+            var part = parts[index];
+            if (part == ".")
+            {
+                continue;
+            }
+
+            var directory = ReadInode(currentDirectoryNumber);
+            if (!directory.IsDirectory
+                || !TryFindDirectoryEntry(directory, part == ".." ? ".." : part, out var childInodeNumber))
+            {
+                return false;
+            }
+
+            var child = ReadInode(childInodeNumber);
+            if (child.IsSymlink)
+            {
+                var linkTarget = ReadSymlinkTarget(child);
+                var remainder = index + 1 < parts.Length
+                    ? string.Join('/', parts[(index + 1)..])
+                    : string.Empty;
+                var combinedTarget = string.IsNullOrEmpty(remainder)
+                    ? linkTarget
+                    : linkTarget.TrimEnd('/', '\\') + "/" + remainder;
+                return TryResolvePath(currentDirectoryNumber, combinedTarget, depth + 1, out inode);
+            }
+
+            if (index + 1 < parts.Length)
+            {
+                if (!child.IsDirectory)
+                {
+                    return false;
+                }
+
+                currentDirectoryNumber = child.Number;
+                continue;
+            }
+
+            inode = child;
+            return true;
+        }
+
+        inode = ReadInode(currentDirectoryNumber);
+        return true;
+    }
+
+    private bool TryFindDirectoryEntry(ExtInode directory, string name, out uint inodeNumber)
+    {
+        inodeNumber = 0;
+        if (!directory.IsDirectory || directory.Size > MaxDirectoryBytes)
+        {
+            return false;
+        }
+
+        var data = ReadInodeData(directory, 0, checked((int)directory.Size));
+        for (var blockOffset = 0; blockOffset < data.Length; blockOffset += _blockSize)
+        {
+            var offset = blockOffset;
+            var blockEnd = Math.Min(blockOffset + _blockSize, data.Length);
+            while (offset + 8 <= blockEnd)
+            {
+                var candidateInode = EndianUtilities.ReadUInt32Little(data, offset);
+                var recordLength = EndianUtilities.ReadUInt16Little(data, offset + 4);
+                var nameLength = data[offset + 6];
+                if (recordLength < 8
+                    || (recordLength % 4) != 0
+                    || offset + recordLength > blockEnd
+                    || nameLength > recordLength - 8)
+                {
+                    break;
+                }
+
+                if (candidateInode != 0
+                    && nameLength > 0
+                    && string.Equals(Encoding.UTF8.GetString(data, offset + 8, nameLength), name, StringComparison.Ordinal))
+                {
+                    inodeNumber = candidateInode;
+                    return true;
+                }
+
+                offset += recordLength;
+            }
+        }
+
+        return false;
+    }
+
+    private string ReadSymlinkTarget(ExtInode inode)
+    {
+        if (!inode.IsSymlink)
+        {
+            throw new InvalidDataException("ext inodeはシンボリックリンクではありません。");
+        }
+
+        if (inode.Size > MaxSymlinkBytes)
+        {
+            throw new NotSupportedException("大きすぎるextシンボリックリンクは読み取れません。");
+        }
+
+        var length = checked((int)inode.Size);
+        var bytes = length <= inode.BlockBytes.Length && inode.BlockCount == 0
+            ? inode.BlockBytes.AsSpan(0, length).ToArray()
+            : ReadInodeData(inode, 0, length);
+        return Encoding.UTF8.GetString(bytes).TrimEnd('\0');
+    }
+
+    private static bool TryGetReadableInodeNumber(object? metadata, out uint inodeNumber)
+    {
+        switch (metadata)
+        {
+            case uint directInodeNumber:
+                inodeNumber = directInodeNumber;
+                return true;
+            case ExtSymlinkReference symlink:
+                inodeNumber = symlink.IsResolved ? symlink.ResolvedInodeNumber : symlink.LinkInodeNumber;
+                return true;
+            default:
+                inodeNumber = 0;
+                return false;
+        }
+    }
+
+    private static bool TryGetDirectoryEntryInodeNumber(object? metadata, out uint inodeNumber)
+    {
+        if (metadata is ExtSymlinkReference symlink)
+        {
+            inodeNumber = symlink.LinkInodeNumber;
+            return true;
+        }
+
+        return TryGetReadableInodeNumber(metadata, out inodeNumber);
     }
 
     private ExtInode ReadInode(uint inodeNumber)
@@ -985,6 +1183,12 @@ public sealed class ExtFileSystem : IReadOnlyFileSystem, IFileContentWriter, IFi
 
         var iBlock = new byte[60];
         Array.Copy(data, 40, iBlock, 0, iBlock.Length);
+        ulong blockCount = EndianUtilities.ReadUInt32Little(data, 28);
+        if (_inodeSize > 128)
+        {
+            blockCount |= (ulong)EndianUtilities.ReadUInt16Little(data, 116) << 32;
+        }
+
         var inode = new ExtInode(
             inodeNumber,
             mode,
@@ -992,6 +1196,7 @@ public sealed class ExtFileSystem : IReadOnlyFileSystem, IFileContentWriter, IFi
             EndianUtilities.ReadUInt32Little(data, 32),
             ReadUnixTime(data, 16),
             iBlock,
+            blockCount,
             EndianUtilities.ReadUInt16Little(data, 26),
             EndianUtilities.ReadUInt32Little(data, 100),
             inodeOffset,
@@ -2901,6 +3106,7 @@ public sealed class ExtFileSystem : IReadOnlyFileSystem, IFileContentWriter, IFi
         uint Flags,
         DateTime? ModifiedUtc,
         byte[] BlockBytes,
+        ulong BlockCount,
         ushort LinkCount,
         uint Generation,
         long DiskOffset,
@@ -2908,5 +3114,11 @@ public sealed class ExtFileSystem : IReadOnlyFileSystem, IFileContentWriter, IFi
     {
         public bool IsDirectory => (Mode & 0xf000) == 0x4000;
         public bool IsRegularFile => (Mode & 0xf000) == 0x8000;
+        public bool IsSymlink => (Mode & 0xf000) == 0xa000;
     }
+
+    private sealed record ExtSymlinkReference(
+        uint LinkInodeNumber,
+        uint ResolvedInodeNumber,
+        bool IsResolved);
 }
