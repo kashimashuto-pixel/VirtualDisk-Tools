@@ -1368,16 +1368,25 @@ public partial class Form1 : Form
         }
 
         var lzopSelection = new LzopOpenSelection(LzopOpenMode.OnDemand, null, OverwriteSavedRaw: false);
-        if (DiskImageReaderFactory.IsLzopFile(path))
+        try
         {
-            var selectedMode = SelectLzopOpenMode(path);
-            if (selectedMode is null)
+            if (!PhysicalDiskReader.IsPhysicalDiskPath(path) && DiskImageReaderFactory.IsLzopFile(path))
             {
-                _statusLabel.Text = "LZOイメージの読み込みをキャンセルしました";
-                return;
-            }
+                var selectedMode = SelectLzopOpenMode(path);
+                if (selectedMode is null)
+                {
+                    _statusLabel.Text = "LZOイメージの読み込みをキャンセルしました";
+                    return;
+                }
 
-            lzopSelection = selectedMode;
+                lzopSelection = selectedMode;
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
+        {
+            _statusLabel.Text = "読込失敗";
+            MessageBox.Show(this, ex.Message, "ディスクイメージ読込エラー", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return;
         }
 
         if (!ConfirmAndDisposeMounts("新しいディスクイメージを開く前に、現在のマウントを解除します。続行しますか？"))
@@ -1401,17 +1410,71 @@ public partial class Form1 : Form
             var rawOffset = ParseOffset(_offsetBox.Text);
             var rawLength = (int)_lengthBox.Value;
             var progress = new Progress<DiskImageProgress>(UpdateLoadProgress);
-            loadResult = await Task.Run(() => LoadAndAnalyzeImage(
-                path,
-                companionPaths ?? [],
-                rawOffset,
-                rawLength,
-                progress,
-                lzopSelection.Mode,
-                lzopSelection.TemporaryDirectory,
-                loadCancellation.Token,
-                lzopSelection.OverwriteSavedRaw),
-                loadCancellation.Token);
+            ImageFileAccessPolicy? fileAccessPolicy = null;
+            if (!PhysicalDiskReader.IsPhysicalDiskPath(path))
+            {
+                fileAccessPolicy = ImageFileAccessPolicy.ForImage(path);
+                foreach (var companion in companionPaths ?? [])
+                {
+                    if (!PhysicalDiskReader.IsPhysicalDiskPath(companion))
+                    {
+                        // These files were explicitly selected together in the multi-disk picker.
+                        fileAccessPolicy.SelectFile(companion, companion);
+                    }
+                }
+            }
+
+            while (true)
+            {
+                loadCancellation.Token.ThrowIfCancellationRequested();
+                try
+                {
+                    loadResult = await Task.Run(() => LoadAndAnalyzeImage(
+                        path,
+                        companionPaths ?? [],
+                        rawOffset,
+                        rawLength,
+                        progress,
+                        lzopSelection.Mode,
+                        lzopSelection.TemporaryDirectory,
+                        loadCancellation.Token,
+                        lzopSelection.OverwriteSavedRaw,
+                        fileAccessPolicy),
+                        loadCancellation.Token);
+                    break;
+                }
+                catch (ImageReferenceAccessException reference) when (reference.CanSelectFile && fileAccessPolicy is not null)
+                {
+                    UseWaitCursor = false;
+                    try
+                    {
+                        var choice = MessageBox.Show(this,
+                            reference.Message + Environment.NewLine + Environment.NewLine
+                            + "信頼できる親ディスクや分割ファイルを選択しますか？選択したファイルだけを、今回の読み込みに限って使用します。",
+                            "関連ファイルの確認", MessageBoxButtons.OKCancel, MessageBoxIcon.Warning,
+                            MessageBoxDefaultButton.Button2);
+                        if (choice != DialogResult.OK)
+                        {
+                            loadCancellation.Cancel();
+                            loadCancellation.Token.ThrowIfCancellationRequested();
+                        }
+
+                        using var relatedFile = new OpenFileDialog
+                        {
+                            Title = "信頼できる関連ファイルを選択", CheckFileExists = true,
+                            Multiselect = false, Filter = "すべてのファイル (*.*)|*.*",
+                        };
+                        if (relatedFile.ShowDialog(this) != DialogResult.OK)
+                        {
+                            loadCancellation.Cancel();
+                            loadCancellation.Token.ThrowIfCancellationRequested();
+                        }
+
+                        fileAccessPolicy.SelectFile(reference.ReferencePath, relatedFile.FileName);
+                    }
+                    finally { UseWaitCursor = true; }
+                }
+            }
             loadCancellation.Token.ThrowIfCancellationRequested();
             if (IsDisposed)
             {
@@ -1539,7 +1602,8 @@ public partial class Form1 : Form
         LzopOpenMode lzopOpenMode,
         string? lzopTemporaryDirectory,
         CancellationToken cancellationToken,
-        bool overwriteSavedRaw)
+        bool overwriteSavedRaw,
+        ImageFileAccessPolicy? fileAccessPolicy = null)
     {
         IDiskImageReader? reader = null;
         var companionReaders = new List<IDiskImageReader>();
@@ -1555,7 +1619,8 @@ public partial class Form1 : Form
                     lzopOpenMode,
                     lzopTemporaryDirectory,
                     cancellationToken,
-                    overwriteSavedRaw);
+                    overwriteSavedRaw,
+                    fileAccessPolicy);
             foreach (var companionPath in companionPaths)
             {
                 cancellationToken.ThrowIfCancellationRequested();
@@ -1568,7 +1633,8 @@ public partial class Form1 : Form
                     : DiskImageReaderFactory.Open(
                         companionPath,
                         progress,
-                        cancellationToken: cancellationToken));
+                        cancellationToken: cancellationToken,
+                        fileAccessPolicy: fileAccessPolicy));
             }
 
             var disks = new List<IBlockReader> { reader };

@@ -19,14 +19,17 @@ public static class DiskImageReaderFactory
         LzopOpenMode lzopOpenMode = LzopOpenMode.OnDemand,
         string? lzopTemporaryDirectory = null,
         CancellationToken cancellationToken = default,
-        bool overwriteSavedRaw = false)
+        bool overwriteSavedRaw = false,
+        ImageFileAccessPolicy? fileAccessPolicy = null)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        fileAccessPolicy ??= ImageFileAccessPolicy.ForImage(path);
+        path = fileAccessPolicy.ResolveFile(path);
         if (Directory.Exists(path))
         {
             if (ParallelsHddReader.CanOpenDirectory(path))
             {
-                return ParallelsHddReader.Open(path, cancellationToken);
+                return ParallelsHddReader.Open(path, cancellationToken, fileAccessPolicy);
             }
 
             throw new NotSupportedException("フォルダ形式の仮想ディスクは Parallels .hdd の DiskDescriptor.xml がある場合のみ対応しています。");
@@ -85,19 +88,19 @@ public static class DiskImageReaderFactory
 
         if (IsQcow2(path))
         {
-            return new Qcow2Reader(path, cancellationToken);
+            return new Qcow2Reader(path, cancellationToken, fileAccessPolicy);
         }
 
         if (path.EndsWith(".E01", StringComparison.OrdinalIgnoreCase) || EwfDiskImageReader.HasMagic(path))
         {
-            return EwfDiskImageReader.Open(path, cancellationToken);
+            return EwfDiskImageReader.Open(path, cancellationToken, fileAccessPolicy);
         }
 
         var extension = Path.GetExtension(path).ToLowerInvariant();
         return extension switch
         {
-            ".vhd" or ".vhdx" or ".avhdx" or ".vmdk" or ".vdi" => DiscUtilsDiskImageReader.Open(path),
-            ".hdd" or ".hds" => ParallelsHddReader.Open(path, cancellationToken),
+            ".vhd" or ".vhdx" or ".avhdx" or ".vmdk" or ".vdi" => DiscUtilsDiskImageReader.Open(path, fileAccessPolicy),
+            ".hdd" or ".hds" => ParallelsHddReader.Open(path, cancellationToken, fileAccessPolicy),
             ".dd" or ".img" or ".raw" => new RawDiskImageReader(path),
             _ => new RawDiskImageReader(path, "raw/dd (拡張子未判定)")
         };
@@ -105,6 +108,7 @@ public static class DiskImageReaderFactory
 
     public static bool IsLzopFile(string path)
     {
+        path = ImageFileAccessPolicy.ForImage(path).ResolveFile(path);
         if (Directory.Exists(path))
         {
             return false;

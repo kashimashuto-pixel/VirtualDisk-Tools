@@ -27,6 +27,7 @@ public sealed class OvaDiskImageReader : IDiskImageReader
     private const long MinimumFreeSpaceReserve = 256L * 1024 * 1024;
 
     private readonly string _temporaryDirectory;
+    private readonly ImageFileAccessPolicy _fileAccessPolicy;
     private readonly List<string> _warnings = [];
     private IDiskImageReader _activeReader;
 
@@ -40,6 +41,7 @@ public sealed class OvaDiskImageReader : IDiskImageReader
     {
         Path = path;
         _temporaryDirectory = temporaryDirectory;
+        _fileAccessPolicy = ImageFileAccessPolicy.ForArchive(temporaryDirectory);
         Disks = disks;
         ActiveDiskIndex = activeDiskIndex;
         _activeReader = activeReader;
@@ -59,6 +61,7 @@ public sealed class OvaDiskImageReader : IDiskImageReader
         CancellationToken cancellationToken = default,
         string? temporaryRoot = null)
     {
+        path = ImageFileAccessPolicy.ForImage(path).ResolveFile(path);
         temporaryRoot = string.IsNullOrWhiteSpace(temporaryRoot)
             ? System.IO.Path.GetTempPath()
             : System.IO.Path.GetFullPath(temporaryRoot);
@@ -85,7 +88,8 @@ public sealed class OvaDiskImageReader : IDiskImageReader
             activeReader = DiskImageReaderFactory.Open(
                 disks[activeDiskIndex].ExtractedPath,
                 progress,
-                cancellationToken: cancellationToken);
+                cancellationToken: cancellationToken,
+                fileAccessPolicy: ImageFileAccessPolicy.ForArchive(temporaryDirectory));
             if (disks.Count > 1)
             {
                 warnings.Add($"OVAには仮想ディスクが{disks.Count:N0}個あります。現在は「{disks[activeDiskIndex].ArchivePath}」を表示しています。");
@@ -119,7 +123,7 @@ public sealed class OvaDiskImageReader : IDiskImageReader
             return;
         }
 
-        var replacement = DiskImageReaderFactory.Open(Disks[index].ExtractedPath);
+        var replacement = DiskImageReaderFactory.Open(Disks[index].ExtractedPath, fileAccessPolicy: _fileAccessPolicy);
         var previous = _activeReader;
         _activeReader = replacement;
         ActiveDiskIndex = index;

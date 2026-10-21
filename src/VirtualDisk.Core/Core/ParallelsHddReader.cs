@@ -38,12 +38,15 @@ public sealed class ParallelsHddReader : IDiskImageReader
 
     public static ParallelsHddReader Open(
         string path,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        ImageFileAccessPolicy? fileAccessPolicy = null)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        fileAccessPolicy ??= ImageFileAccessPolicy.ForImage(path);
+        path = fileAccessPolicy.ResolveFile(path);
         if (Directory.Exists(path))
         {
-            return OpenBundle(path, cancellationToken);
+            return OpenBundle(path, cancellationToken, fileAccessPolicy);
         }
 
         var extension = System.IO.Path.GetExtension(path).ToLowerInvariant();
@@ -146,10 +149,10 @@ public sealed class ParallelsHddReader : IDiskImageReader
         return new ParallelsHddReader(path, "Parallels HDD (.hds)", layer.Length, new[] { layer }, warnings);
     }
 
-    private static ParallelsHddReader OpenBundle(string path, CancellationToken cancellationToken)
+    private static ParallelsHddReader OpenBundle(string path, CancellationToken cancellationToken, ImageFileAccessPolicy fileAccessPolicy)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        var descriptorPath = System.IO.Path.Combine(path, DescriptorFileName);
+        var descriptorPath = fileAccessPolicy.ResolveFile(System.IO.Path.Combine(path, DescriptorFileName));
         if (!File.Exists(descriptorPath))
         {
             throw new FileNotFoundException("Parallels HDD の DiskDescriptor.xml が見つかりません。", descriptorPath);
@@ -218,7 +221,7 @@ public sealed class ParallelsHddReader : IDiskImageReader
             foreach (var image in orderedImages)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                var imagePath = ResolveImagePath(path, image.FileName);
+                var imagePath = fileAccessPolicy.ResolveFile(ResolveImagePath(path, image.FileName));
                 layers.Add(OpenLayer(imagePath, image.Type, warnings, cancellationToken));
             }
         }

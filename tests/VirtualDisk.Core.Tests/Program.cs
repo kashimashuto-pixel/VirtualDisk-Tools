@@ -7,6 +7,12 @@ var temporaryDirectory = Path.Combine(Path.GetTempPath(), $"virtualdisk-core-tes
 Directory.CreateDirectory(temporaryDirectory);
 try
 {
+    if (args.SequenceEqual(new[] { "--reference-access-only" }))
+    {
+        ImageReferenceAccessTests.Run(temporaryDirectory);
+        Console.WriteLine("All image reference access checks passed.");
+        return;
+    }
     TestRawAndQcow2RoundTrip(temporaryDirectory);
     TestPartitionTables(temporaryDirectory);
     TestWholeDiskFileSystem(temporaryDirectory);
@@ -28,6 +34,7 @@ try
     EncryptionCancellationTests.Run();
     Qcow2RobustnessTests.Run(temporaryDirectory);
     ContainerRobustnessTests.Run(temporaryDirectory);
+    ImageReferenceAccessTests.Run(temporaryDirectory);
     PartitionTableRobustnessTests.Run(temporaryDirectory);
     FileSystemRobustnessTests.Run(temporaryDirectory);
     OverlayRobustnessTests.Run(temporaryDirectory);

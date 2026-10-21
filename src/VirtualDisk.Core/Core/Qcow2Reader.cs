@@ -47,8 +47,9 @@ public sealed class Qcow2Reader : IDiskImageReader
         }
     }
 
-    public Qcow2Reader(string path, CancellationToken cancellationToken = default)
-        : this(path, new HashSet<string>(PathSemantics.Comparer), 0, cancellationToken)
+    public Qcow2Reader(string path, CancellationToken cancellationToken = default, ImageFileAccessPolicy? fileAccessPolicy = null)
+        : this(path, new HashSet<string>(PathSemantics.Comparer), 0, cancellationToken,
+            fileAccessPolicy ?? ImageFileAccessPolicy.ForImage(path))
     {
     }
 
@@ -56,9 +57,11 @@ public sealed class Qcow2Reader : IDiskImageReader
         string path,
         HashSet<string> backingChain,
         int backingDepth,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        ImageFileAccessPolicy fileAccessPolicy)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        path = fileAccessPolicy.ResolveFile(path);
         if (backingDepth >= MaxBackingChainDepth)
         {
             throw new NotSupportedException(
@@ -98,10 +101,10 @@ public sealed class Qcow2Reader : IDiskImageReader
                     Header,
                     backingChain,
                     backingDepth + 1,
-                    cancellationToken);
+                    cancellationToken, fileAccessPolicy);
                 try
                 {
-                    _externalDataStream = OpenExternalDataFile(path, Header);
+                    _externalDataStream = OpenExternalDataFile(path, Header, fileAccessPolicy);
                 }
                 catch
                 {
@@ -580,7 +583,8 @@ public sealed class Qcow2Reader : IDiskImageReader
         Qcow2Header header,
         HashSet<string> backingChain,
         int backingDepth,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        ImageFileAccessPolicy fileAccessPolicy)
     {
         cancellationToken.ThrowIfCancellationRequested();
         if (!header.HasBackingFile || string.IsNullOrWhiteSpace(header.BackingFileName))
@@ -589,17 +593,15 @@ public sealed class Qcow2Reader : IDiskImageReader
         }
 
         var directory = System.IO.Path.GetDirectoryName(System.IO.Path.GetFullPath(imagePath)) ?? ".";
-        var backingPath = System.IO.Path.IsPathRooted(header.BackingFileName)
-            ? header.BackingFileName
-            : System.IO.Path.Combine(directory, header.BackingFileName);
+        var backingPath = fileAccessPolicy.ResolveReference(directory, header.BackingFileName);
         if (!File.Exists(backingPath))
         {
             throw new FileNotFoundException("qcow2 の backing file が見つかりません。", backingPath);
         }
 
         return IsQcow2File(backingPath)
-            ? new Qcow2Reader(backingPath, backingChain, backingDepth, cancellationToken)
-            : DiskImageReaderFactory.Open(backingPath, cancellationToken: cancellationToken);
+            ? new Qcow2Reader(backingPath, backingChain, backingDepth, cancellationToken, fileAccessPolicy)
+            : DiskImageReaderFactory.Open(backingPath, cancellationToken: cancellationToken, fileAccessPolicy: fileAccessPolicy);
     }
 
     private static bool IsQcow2File(string path)
@@ -620,7 +622,7 @@ public sealed class Qcow2Reader : IDiskImageReader
             && magic[3] == 0xfb;
     }
 
-    private static FileStream? OpenExternalDataFile(string imagePath, Qcow2Header header)
+    private static FileStream? OpenExternalDataFile(string imagePath, Qcow2Header header, ImageFileAccessPolicy fileAccessPolicy)
     {
         if (!header.UsesExternalDataFile || string.IsNullOrWhiteSpace(header.ExternalDataFileName))
         {
@@ -628,9 +630,7 @@ public sealed class Qcow2Reader : IDiskImageReader
         }
 
         var directory = System.IO.Path.GetDirectoryName(System.IO.Path.GetFullPath(imagePath)) ?? ".";
-        var dataPath = System.IO.Path.IsPathRooted(header.ExternalDataFileName)
-            ? header.ExternalDataFileName
-            : System.IO.Path.Combine(directory, header.ExternalDataFileName);
+        var dataPath = fileAccessPolicy.ResolveReference(directory, header.ExternalDataFileName);
         return new FileStream(dataPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
     }
 

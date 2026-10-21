@@ -21,15 +21,15 @@ public sealed class EwfDiskImageReader : IDiskImageReader
     private int _cachedChunkIndex = -1;
     private bool _disposed;
 
-    private EwfDiskImageReader(string path, CancellationToken cancellationToken)
+    private EwfDiskImageReader(string path, CancellationToken cancellationToken, ImageFileAccessPolicy fileAccessPolicy)
     {
-        var segmentPaths = DiscoverSegmentPaths(path, cancellationToken);
+        var segmentPaths = DiscoverSegmentPaths(path, cancellationToken, fileAccessPolicy);
         try
         {
             foreach (var segmentPath in segmentPaths)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                _segments.Add(new EwfSegment(segmentPath));
+                _segments.Add(new EwfSegment(fileAccessPolicy.ResolveFile(segmentPath)));
             }
 
             Path = _segments[0].Path;
@@ -54,10 +54,11 @@ public sealed class EwfDiskImageReader : IDiskImageReader
     public int SegmentCount => _segments.Count;
     public int ChunkCount => _chunks.Count;
 
-    public static EwfDiskImageReader Open(string path, CancellationToken cancellationToken = default)
+    public static EwfDiskImageReader Open(string path, CancellationToken cancellationToken = default, ImageFileAccessPolicy? fileAccessPolicy = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(path);
-        return new EwfDiskImageReader(System.IO.Path.GetFullPath(path), cancellationToken);
+        fileAccessPolicy ??= ImageFileAccessPolicy.ForImage(path);
+        return new EwfDiskImageReader(fileAccessPolicy.ResolveFile(path), cancellationToken, fileAccessPolicy);
     }
 
     public static bool HasMagic(string path)
@@ -406,7 +407,8 @@ public sealed class EwfDiskImageReader : IDiskImageReader
 
     private static IReadOnlyList<string> DiscoverSegmentPaths(
         string inputPath,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        ImageFileAccessPolicy fileAccessPolicy)
     {
         if (!File.Exists(inputPath))
         {
@@ -419,7 +421,7 @@ public sealed class EwfDiskImageReader : IDiskImageReader
         foreach (var candidate in Directory.EnumerateFiles(directory, $"{stem}.*", SearchOption.TopDirectoryOnly))
         {
             cancellationToken.ThrowIfCancellationRequested();
-            using var stream = new FileStream(candidate, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            using var stream = new FileStream(fileAccessPolicy.ResolveFile(candidate), FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
             Array.Clear(header);
             if (stream.Read(header) != header.Length || !header[..EwfMagic.Length].SequenceEqual(EwfMagic)
                 || header[8] != 1 || header[11] != 0 || header[12] != 0)

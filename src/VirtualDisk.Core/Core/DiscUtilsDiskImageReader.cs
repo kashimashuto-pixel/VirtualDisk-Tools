@@ -10,16 +10,18 @@ public sealed class DiscUtilsDiskImageReader : IDiskImageReader
     private static int _registered;
 
     private readonly VirtualDisk _disk;
+    private readonly RestrictedImageFileSystem _fileSystem;
     private readonly Stream _content;
     private readonly IReadOnlyList<string> _layerPaths;
     private readonly IReadOnlyList<string> _warnings;
     private readonly object _sync = new();
 
-    private DiscUtilsDiskImageReader(string path, string formatName, VirtualDisk disk)
+    private DiscUtilsDiskImageReader(string path, string formatName, VirtualDisk disk, RestrictedImageFileSystem fileSystem)
     {
         Path = path;
         FormatName = formatName;
         _disk = disk;
+        _fileSystem = fileSystem;
         _content = disk.Content;
         Length = disk.Capacity;
         if (disk is VhdxDisk vhdx)
@@ -27,7 +29,7 @@ public sealed class DiscUtilsDiskImageReader : IDiskImageReader
             var layers = vhdx.Layers.Cast<VhdxLayer>().ToArray();
             ValidateVhdxChain(layers);
             _layerPaths = layers
-                .Select(layer => string.IsNullOrWhiteSpace(layer.FullPath) ? "(path unavailable)" : layer.FullPath)
+                .Select(layer => string.IsNullOrWhiteSpace(layer.FullPath) ? "(path unavailable)" : fileSystem.GetHostPath(layer.FullPath))
                 .ToArray();
             _warnings = layers.Length > 1
                 ? [$"VHDX差分チェーンを{layers.Length:N0}層で読み取っています。親ディスクを移動・変更すると、このスナップショットを正しく読めなくなります。"]
@@ -44,27 +46,36 @@ public sealed class DiscUtilsDiskImageReader : IDiskImageReader
     public string FormatName { get; }
     public long Length { get; }
 
-    public static DiscUtilsDiskImageReader Open(string path)
+    public static DiscUtilsDiskImageReader Open(string path, ImageFileAccessPolicy? fileAccessPolicy = null)
     {
         EnsureRegistered();
+        fileAccessPolicy ??= ImageFileAccessPolicy.ForImage(path);
+        path = fileAccessPolicy.ResolveFile(path);
+        var fileSystem = new RestrictedImageFileSystem(fileAccessPolicy, System.IO.Path.GetDirectoryName(path)!);
         var extension = System.IO.Path.GetExtension(path).ToLowerInvariant();
         VirtualDisk? disk = null;
         try
         {
-            disk = extension is ".vhdx" or ".avhdx"
-                ? new VhdxDisk(System.IO.Path.GetFullPath(path), FileAccess.Read)
-                : VirtualDisk.OpenDisk(path, FileAccess.Read);
+            disk = extension switch
+            {
+                ".vhdx" or ".avhdx" => new VhdxDisk(fileSystem, System.IO.Path.GetFileName(path), FileAccess.Read),
+                ".vhd" => new DiscUtils.Vhd.Disk(fileSystem, System.IO.Path.GetFileName(path), FileAccess.Read),
+                ".vmdk" => new DiscUtils.Vmdk.Disk(fileSystem, System.IO.Path.GetFileName(path), FileAccess.Read),
+                ".vdi" => new DiscUtils.Vdi.Disk(fileSystem.OpenFile(System.IO.Path.GetFileName(path), FileMode.Open, FileAccess.Read), DiscUtils.Streams.Ownership.Dispose),
+                _ => throw new NotSupportedException("未対応の仮想ディスク形式です。"),
+            };
 
             if (disk is null)
             {
                 throw new InvalidDataException("仮想ディスクを開けませんでした。");
             }
 
-            return new DiscUtilsDiskImageReader(path, DetectFormatName(path), disk);
+            return new DiscUtilsDiskImageReader(path, DetectFormatName(path), disk, fileSystem);
         }
-        catch (Exception ex) when (extension == ".avhdx" && ex is IOException or InvalidDataException)
+        catch (Exception ex) when (extension == ".avhdx" && ex is not ImageReferenceAccessException && (ex is IOException or InvalidDataException))
         {
             disk?.Dispose();
+            fileSystem.Dispose();
             throw new InvalidDataException(
                 "AVHDX差分ディスクを開けませんでした。親VHDX/AVHDXが元の相対位置または記録されたパスにあり、チェーン全体が揃っているか確認してください。",
                 ex);
@@ -72,6 +83,7 @@ public sealed class DiscUtilsDiskImageReader : IDiskImageReader
         catch
         {
             disk?.Dispose();
+            fileSystem.Dispose();
             throw;
         }
     }
@@ -146,7 +158,8 @@ public sealed class DiscUtilsDiskImageReader : IDiskImageReader
 
     public void Dispose()
     {
-        _disk.Dispose();
+        try { _disk.Dispose(); }
+        finally { _fileSystem.Dispose(); }
     }
 
     private static void EnsureRegistered()

@@ -297,7 +297,24 @@ public sealed class MainWindow : Window
         var selectFirstPartition = false;
         try
         {
-            var opened = await Task.Run(() => OpenImage(path, operation.Token), operation.Token);
+            var policy = ImageFileAccessPolicy.ForImage(path);
+            OpenedImage opened;
+            while (true)
+            {
+                operation.Token.ThrowIfCancellationRequested();
+                try
+                {
+                    opened = await Task.Run(() => OpenImage(path, operation.Token, policy), operation.Token);
+                    break;
+                }
+                catch (ImageReferenceAccessException reference) when (reference.CanSelectFile)
+                {
+                    if (!await SelectReferencedFileAsync(reference, policy))
+                    {
+                        throw new OperationCanceledException("関連ファイルの選択をキャンセルしました。");
+                    }
+                }
+            }
             DisposeImage();
             _reader = opened.Reader;
             _partitions.ItemsSource = opened.Partitions;
@@ -328,9 +345,9 @@ public sealed class MainWindow : Window
         }
     }
 
-    private static OpenedImage OpenImage(string path, CancellationToken cancellationToken)
+    private static OpenedImage OpenImage(string path, CancellationToken cancellationToken, ImageFileAccessPolicy? fileAccessPolicy = null)
     {
-        var reader = DiskImageReaderFactory.Open(path, cancellationToken: cancellationToken);
+        var reader = DiskImageReaderFactory.Open(path, cancellationToken: cancellationToken, fileAccessPolicy: fileAccessPolicy);
         try
         {
             var partitions = PartitionTableReader.ReadPartitionsWithWholeDiskFallback(reader, cancellationToken);
@@ -1114,6 +1131,53 @@ public sealed class MainWindow : Window
         {
             return false;
         }
+    }
+
+    private async Task<bool> SelectReferencedFileAsync(ImageReferenceAccessException reference, ImageFileAccessPolicy policy)
+    {
+        var cancel = new Button { Content = "開くのを中止", IsCancel = true, IsDefault = true };
+        var select = new Button { Content = "関連ファイルを選択" };
+        var dialog = new Window
+        {
+            Title = "関連ファイルの確認",
+            Width = 620,
+            MaxHeight = 600,
+            SizeToContent = SizeToContent.Height,
+            CanResize = false,
+            Content = new StackPanel
+            {
+                Margin = new Thickness(20), Spacing = 16,
+                Children =
+                {
+                    new ScrollViewer
+                    {
+                        MaxHeight = 400,
+                        Content = new TextBlock
+                        {
+                            Text = reference.Message + "\n\n信頼できる親ディスクや分割ファイルを選択してください。選択したファイルだけを、今回の読み込みに限って使用します。",
+                            TextWrapping = Avalonia.Media.TextWrapping.Wrap,
+                        },
+                    },
+                    new StackPanel
+                    {
+                        Orientation = Orientation.Horizontal,
+                        HorizontalAlignment = HorizontalAlignment.Right,
+                        Spacing = 12, Children = { cancel, select },
+                    },
+                },
+            },
+        };
+        cancel.Click += (_, _) => dialog.Close(false);
+        select.Click += (_, _) => dialog.Close(true);
+        if (!await dialog.ShowDialog<bool>(this)) return false;
+        var files = await StorageProvider.OpenFilePickerAsync(new FilePickerOpenOptions
+        {
+            Title = "信頼できる関連ファイルを選択", AllowMultiple = false,
+        });
+        var selected = files.SingleOrDefault()?.TryGetLocalPath();
+        if (selected is null) return false;
+        policy.SelectFile(reference.ReferencePath, selected);
+        return true;
     }
 
     private async Task ShowErrorAsync(string title, string message)
